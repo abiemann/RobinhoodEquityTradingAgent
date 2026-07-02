@@ -27,9 +27,9 @@ Edit values here; the Instructions reference them by name only.
 | `SCAN_TITLE` | `"Volume field probe"` | Exact title of the saved Robinhood scan the routine runs. Resolved to its scan_id via `get_scans` each run — the id itself is never hardcoded. This scan is known-good: STOCK-only filter with `Last`, `Relative volume`, `% Change`, and `Volume` visible, sorted by relative volume descending. |
 | `HIGH_LOOKBACK_DAYS` | `5` | Trading-day window used to find each name's recent intraday high. |
 | `VOLUME_LOOKBACK_DAYS` | `20` | Trading-day window used to compute each name's median daily dollar volume for the liquidity floor. |
-| `MIN_MEDIAN_DOLLAR_VOLUME` | `1000000` | Liquidity floor: skip any name whose **median** daily dollar volume (median over `VOLUME_LOOKBACK_DAYS` of volume × close) is below this. Median, not mean, so a single one-day volume spike — exactly what this strategy chases — can't lift an otherwise-thin name over the floor. Removes names that can't be exited at size. |
+| `MIN_MEDIAN_DOLLAR_VOLUME` | `175000` | Liquidity floor: skip any name whose **median** daily dollar volume (median over `VOLUME_LOOKBACK_DAYS` of volume × close) is below this. Median, not mean, so a single one-day volume spike — exactly what this strategy chases — can't lift an otherwise-thin name over the floor. Removes names that can't be exited at size. |
 | `DIP_ENTRY_PCT` | `5` | Buy when current price is more than this % below the `HIGH_LOOKBACK_DAYS` high. |
-| `TAKE_PROFIT_PCT` | `10` | Sell a held position when it is up this % or more vs. entry. |
+| `TAKE_PROFIT_PCT` | `5` | Sell a held position when it is up this % or more vs. entry. |
 | `BUY_SIZE_PCT` | `20` | Order size for each buy, as a % of total account value. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | `0.5` | For extended-hours buys only: how far above the current price to set the limit, so the order is marketable but capped against wide after-hours spreads. Raise it if extended-hours orders aren't filling; lower it to cap slippage. |
 | `REGULAR_HOURS_ONLY` | `false` | If `true`, the routine only opens new positions during regular market hours and skips all buys in extended sessions. If `false`, it also buys in extended hours using whole-share limit orders. See Tradeoffs. |
