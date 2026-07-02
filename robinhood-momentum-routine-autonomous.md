@@ -78,8 +78,11 @@ At the start of each run, compute trailing-day P&L = `get_realized_pnl` (today, 
 1. Evaluate the daily-loss circuit breaker. If tripped, halt new buys and skip to the report.
 
 **SECOND — build this run's working list by RELATIVE VOLUME + MOVEMENT.**
+
 2. Ensure the scan exists: call `get_scans`; if no suitable saved scan exists, create one ONCE via `create_scan` from a broad active preset (e.g. `DAILY_GAINERS`). The scan must return **`Last`, `Relative volume`, `% Change`, and `Volume` as visible columns**. All screening (price band, relative volume, and movement) is applied client-side in Step 4 from these columns — the routine does not rely on server-side price or relative-volume filters.
+
 3. Sort the scan by relative volume, highest first: `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`.
+
 4. `run_scan` to get live rows, then **filter the returned rows client-side**, keeping only rows where ALL of these hold:
    - `PRICE_MIN` ≤ `Last` ≤ `PRICE_MAX`
    - `Relative volume` ≥ `MIN_REL_VOLUME`
@@ -87,16 +90,23 @@ At the start of each run, compute trailing-day P&L = `get_realized_pnl` (today, 
 5. **WORKING LIST** = the top `TOP_N` surviving rows by `Relative volume` (descending). This is live data. If the market is closed, relative volume reads ~1 everywhere, the list comes back empty, and the routine simply opens no new positions this run (see Tradeoffs) — proceed to holdings management and the report.
 
 **THIRD — manage what I already hold (account-wide, not limited to the working list).**
+
 6. `get_equity_positions` for the account. For each held position, get average_buy_price (cost basis) and current price (`get_equity_quotes` → last_trade_price), then compute gain % = (current − avg) / avg × 100.
+
 7. If a position is up `TAKE_PROFIT_PCT` or more vs. entry: sell the entire position at market (`place_equity_order`, market sell) AND cancel any open stop-loss order tied to it — find it via `get_equity_orders` and cancel with `cancel_equity_order`. Fire the trade notification for the sell.
 
 **FOURTH — look for new entries (from the WORKING LIST only, highest relative volume first).**
+
 8. For each ticker in the WORKING LIST: pull daily bars via `get_equity_historicals` covering at least `VOLUME_LOOKBACK_DAYS` trading days (request a wide enough range, e.g. ~30 calendar days). From these bars:
    - **Liquidity floor:** compute median daily dollar volume = median over the last `VOLUME_LOOKBACK_DAYS` bars of (bar volume × bar close). If it is below `MIN_MEDIAN_DOLLAR_VOLUME`, SKIP this name entirely (log "skipped: illiquid, median $X/day < floor") and move on — do not evaluate it for entry. Median (not mean) so a single spike day can't lift a thin name over the floor. This removes names that clear the relative-volume ratio but can't be exited at size.
    - **Recent high:** from the last `HIGH_LOOKBACK_DAYS` bars, find the highest intraday high.
+   
 9. Get the current price (`get_equity_quotes`) and calculate how far below that high it is: % below = (high − current) / high × 100.
+
 10. If the current price is more than `DIP_ENTRY_PCT`% below the high, it's a buy candidate — but SKIP it if: I already hold it (`get_equity_positions`), I already have an open order for it (`get_equity_orders`), or I just sold it this run.
+
 11. For each remaining candidate, in relative-volume order: place a buy worth `BUY_SIZE_PCT` of total account value (`get_portfolio` → total_value), routed per the **Session-Aware Order Style** rules above — a fractional market order in regular hours, or a whole-share limit order in extended hours. If buying_power isn't enough, skip it and log why. Fire the trade notification for the buy. Because each buy is `BUY_SIZE_PCT` of the account, buying power caps how many fill — the relative-volume ranking sets priority.
+
 12. After a buy fills: read the actual fill price via `get_equity_orders` and place a stop-loss sell for the full position at `STOP_LOSS_PCT` below that fill price (`place_equity_order`, stop order). If the buy filled in extended hours, place the stop as a regular-hours order (or queue it for the next open), since stop orders do not trigger in extended sessions. Fire the trade notification for the stop placement.
 
 ### REPORT
