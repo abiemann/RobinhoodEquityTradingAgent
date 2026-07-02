@@ -112,3 +112,9 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 ### REPORT
 State how many names the scan returned and how many survived the price + relative-volume + %-change filter (`TOP_N` cap applied). If the market was closed / the list was empty, say so. List any positions sold for profit and whether the circuit breaker tripped. For each ticker acted on: its relative volume, its daily % change, its median daily dollar volume, the recent high, current price, % below high, whether I bought, the fill price, and the stop price. List anything skipped and why (including liquidity-floor skips), plus any `review_equity_order` alerts.
 
+**Save the report to disk — fixed folder, fixed filename, no exceptions.** Write the full report as a Markdown file into the `run-reports` folder next to this document (create the folder if it doesn't exist). The filename is exactly:
+
+`robinhood-momentum-routine-autonomous-log-YYYY_MM_DD-HH_MM.md`
+
+where `YYYY_MM_DD` is the run's local date (year first, so filenames sort chronologically) and `HH_MM` its local start time, zero-padded, 24-hour clock — e.g. a run on 2 July 2026 at 1:05 PM saves as `robinhood-momentum-routine-autonomous-log-2026_07_02-13_05.md`. Do not save the report anywhere else, do not invent a different filename pattern, and do not overwrite or append to a previous run's file.
+
