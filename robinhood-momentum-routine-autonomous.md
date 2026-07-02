@@ -24,6 +24,7 @@ Edit values here; the Instructions reference them by name only.
 | `MIN_REL_VOLUME` | `2` | Relative-volume **floor** to qualify (today's pace vs. normal; `2` = twice normal). Not the selector — `TOP_N` ranking does that. Kept > 1 so the routine self-disables when the market is closed (rel vol reads ~1 for all names off-hours → empty list) and so quiet days don't pad the list with normal-volume names. |
 | `MIN_ABS_PCT_CHANGE` | `3` | Minimum absolute daily move, in **percent**, for a name to qualify. Filters out flat SPACs/near-NAV churners that have high relative volume but aren't going anywhere. |
 | `TOP_N` | `50` | Max names kept each run. After filtering, survivors are ranked by relative volume (highest first) and the top `TOP_N` become the working list. |
+| `SCAN_TITLE` | `"Volume field probe"` | Exact title of the saved Robinhood scan the routine runs. Resolved to its scan_id via `get_scans` each run — the id itself is never hardcoded. This scan is known-good: STOCK-only filter with `Last`, `Relative volume`, `% Change`, and `Volume` visible, sorted by relative volume descending. |
 | `HIGH_LOOKBACK_DAYS` | `5` | Trading-day window used to find each name's recent intraday high. |
 | `VOLUME_LOOKBACK_DAYS` | `20` | Trading-day window used to compute each name's median daily dollar volume for the liquidity floor. |
 | `MIN_MEDIAN_DOLLAR_VOLUME` | `1000000` | Liquidity floor: skip any name whose **median** daily dollar volume (median over `VOLUME_LOOKBACK_DAYS` of volume × close) is below this. Median, not mean, so a single one-day volume spike — exactly what this strategy chases — can't lift an otherwise-thin name over the floor. Removes names that can't be exited at size. |
@@ -72,6 +73,8 @@ Note: this session logic governs BUYS. Stop-loss orders (Step 12) and market pro
 ### DAILY-LOSS CIRCUIT BREAKER — added guardrail (delete this block and Step 3 to disable)
 Each run, after managing existing holdings (FIRST) and before any new buys, compute trailing-day P&L = `get_realized_pnl` (today, this account) + current unrealized P&L (`get_equity_positions` cost basis vs. `get_equity_quotes`). If the cumulative loss is `DAILY_LOSS_HALT_PCT` or more of total_value, HALT: make NO new buys for the rest of the day (still honor profit-taking sells and existing stops), fire an info notification that the circuit breaker tripped, and skip to the report.
 
+**Confirmed `get_realized_pnl` call (verified live 2026-07-02):** `{ "account_number": "<resolved at runtime>", "span": "day", "asset_classes": ["equity"] }`. `asset_classes` is documented as optional but the backend REQUIRES it — omitting it fails with `un-specified asset class`. If the call errors anyway, do NOT substitute $0 (that silently understates the day's losses — realized losses from triggered stops would be invisible): treat the circuit breaker as indeterminate, make no new buys this run, and report the error.
+
 ### RUN THESE STEPS IN ORDER
 
 **FIRST — manage what I already hold (account-wide, not limited to the working list).**
@@ -85,9 +88,9 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 
 **THIRD — build this run's working list by RELATIVE VOLUME + MOVEMENT.**
 
-4. Ensure the scan exists: call `get_scans`; if no suitable saved scan exists, create one ONCE via `create_scan` from a broad active preset (e.g. `DAILY_GAINERS`). The scan must return **`Last`, `Relative volume`, `% Change`, and `Volume` as visible columns**. All screening (price band, relative volume, and movement) is applied client-side in Step 6 from these columns — the routine does not rely on server-side price or relative-volume filters.
+4. Resolve the scan by title: call `get_scans` and select the saved scan whose title is exactly `SCAN_TITLE`; use its scan_id for the rest of this run (re-resolve every run — never hardcode or carry over a scan_id). Only if no scan with that title exists, create it ONCE via `create_scan` (broad active preset, e.g. `DAILY_GAINERS`, with title = `SCAN_TITLE`). Either way the scan must return **`Last`, `Relative volume`, `% Change`, and `Volume` as visible columns** — if any are missing, skip the entry phase and report the problem (current scan tooling cannot add columns). All screening (price band, relative volume, and movement) is applied client-side in Step 6 from these columns — the routine does not rely on server-side price or relative-volume filters.
 
-5. Sort the scan by relative volume, highest first: `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`.
+5. Ensure the sort: if `get_scans` did not already show this scan sorted by relative volume descending, set it via `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`. (The saved scan persists its sort, so this call is normally unnecessary.)
 
 6. `run_scan` to get live rows, then **filter the returned rows client-side**, keeping only rows where ALL of these hold:
    - `PRICE_MIN` ≤ `Last` ≤ `PRICE_MAX`
