@@ -6,10 +6,10 @@ A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** a
 
 Each run, the agent:
 
-1. Checks a daily-loss circuit breaker and halts new buys if the account is down past a set threshold for the day.
-2. Builds a working list — stocks in the `$PRICE_MIN–$PRICE_MAX` band, trading at elevated **relative volume**, that have **moved** at least a minimum % on the day, ranked by relative volume.
-3. Applies a **median dollar-volume liquidity floor** so thin names that can't be exited at size are dropped.
-4. Manages existing holdings — sells winners up `TAKE_PROFIT_PCT`+ and cancels their stops.
+1. Manages existing holdings — sells winners up `TAKE_PROFIT_PCT`+ and cancels their stops.
+2. Checks a daily-loss circuit breaker and halts new buys if the account is down past a set threshold for the day.
+3. Builds a working list — stocks in the `$PRICE_MIN–$PRICE_MAX` band, trading at elevated **relative volume**, that have **moved** at least a minimum % on the day, ranked by relative volume.
+4. Applies a **median dollar-volume liquidity floor** so thin names that can't be exited at size are dropped.
 5. Opens new positions — buys names trading more than `DIP_ENTRY_PCT`% below their recent high, then places a stop `STOP_LOSS_PCT`% below the fill.
 
 All trading is scoped to a single account, resolved **by name** at runtime.

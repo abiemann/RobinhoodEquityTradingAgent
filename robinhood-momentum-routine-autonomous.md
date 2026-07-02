@@ -6,7 +6,7 @@
 Configure this agent to run on **Claude Sonnet** (current version: Claude Sonnet 4.6, API string `claude-sonnet-4-6`). This is an instruction-following and tool-orchestration workload — explicit ordered steps, simple arithmetic, sequential tool calls — not a deep-reasoning one, so Sonnet is the appropriate and more cost-effective choice; a larger model buys nothing the design leans on. This requirement is set in the agent platform's configuration, not enforced by this document. Validate the approval-gated test runs on whichever model you deploy, and if you ever change models, re-validate before granting autonomy rather than assuming behavior transfers.
 
 ## Tradeoffs / known limitations
-- **Does not function when the market is closed.** Relative volume reads ~1 for every name outside live trading, so with `MIN_REL_VOLUME` > 1 the entry scan returns an empty working list off-hours and no new positions are opened. This is by design. Holdings management (profit-taking and stops, Step 3) does not depend on the scan and is unaffected — but note it, too, can only transact while the market (or an eligible extended session) is open.
+- **Does not function when the market is closed.** Relative volume reads ~1 for every name outside live trading, so with `MIN_REL_VOLUME` > 1 the entry scan returns an empty working list off-hours and no new positions are opened. This is by design. Holdings management (profit-taking and stops, steps 1–2) does not depend on the scan and is unaffected — but note it, too, can only transact while the market (or an eligible extended session) is open.
 - **Relative volume alone surfaces SPACs churning at NAV** — names with enormous relative volume but ~0% price change. The `MIN_ABS_PCT_CHANGE` filter exists specifically to remove them: raising `MIN_REL_VOLUME` does NOT help (SPACs have the highest relative volume of all), so the day-change filter is what enforces "actually moving," not just "active."
 - **Extended-hours buys are not immediately stop-protected.** Stop-loss orders (and market profit-taking sells) generally only work in the regular session. So a position opened in extended hours has no active stop until the regular market opens — a gap-down overnight would not be caught. Set **`REGULAR_HOURS_ONLY = true`** to eliminate this risk: the routine then buys only during regular hours, where every fill can be immediately stop-protected and sized as a fractional market order. The default (`false`) allows extended-hours entries via whole-share limit orders but accepts the unprotected-overnight-gap risk in exchange for acting on after-hours moves — the tradeoff is your call.
 
@@ -54,7 +54,7 @@ For every intended order: first call `review_equity_order` as a compliance check
 ### SESSION-AWARE ORDER STYLE (regular vs. extended hours)
 Before placing any BUY, determine the current trading session — regular market hours (09:30–16:00 ET) vs. extended hours (pre-market / after-hours) — using `get_equity_tradability` (per-session eligibility) together with the current time. Then:
 
-- **If `REGULAR_HOURS_ONLY` is `true`:** only open new positions during regular hours. In any extended session, skip all new buys (log "extended hours, REGULAR_HOURS_ONLY — no new buys") and proceed to holdings management / report.
+- **If `REGULAR_HOURS_ONLY` is `true`:** only open new positions during regular hours. In any extended session, skip all new buys (log "extended hours, REGULAR_HOURS_ONLY — no new buys") and proceed to the report (holdings were already managed in FIRST).
 - **Regular market hours:** place a **market** order sized in **dollars** (fractional shares allowed) worth `BUY_SIZE_PCT` of total account value, via the `dollar_based_amount` field.
 - **Extended hours (only when `REGULAR_HOURS_ONLY` is `false`):** market orders and fractional shares are not accepted, so place a **limit** order for a **whole (integer) number of shares**. Compute quantity = floor( (`BUY_SIZE_PCT`/100 × total_value) ÷ limit_price ), where limit_price = current price × (1 + `EXT_HOURS_LIMIT_BUFFER_PCT`/100). If the quantity is 0 (share price exceeds the per-order budget), skip and log. Verify via `get_equity_tradability` that the symbol is eligible in the current extended session before placing; if not, skip it.
 
@@ -67,33 +67,33 @@ Before placing any BUY, determine the current trading session — regular market
 ```
 Regular-hours fractional market buy — same shape but `"type": "market"`, `"market_hours": "regular_hours"`, and replace `quantity`/`limit_price` with `"dollar_based_amount": "<BUY_SIZE_PCT × total_value>"`. Stop-loss sell — `"side": "sell"`, `"type": "stop"`, `"quantity": "<full position>"`, `"stop_price": "<price>"`, `"market_hours": "regular_hours"`. (`time_in_force` defaults to `"gfd"`.) Confirm the market-order and stop field names on the first regular-hours run; only the extended-hours limit path is verified so far.
 
-Note: this session logic governs BUYS. Stop-loss orders (Step 12) and market profit-taking sells (Step 7) generally execute only during regular hours — a stop placed in extended hours may be rejected or won't trigger until the regular session opens (see Tradeoffs).
+Note: this session logic governs BUYS. Stop-loss orders (Step 12) and market profit-taking sells (Step 2) generally execute only during regular hours — a stop placed in extended hours may be rejected or won't trigger until the regular session opens (see Tradeoffs).
 
-### DAILY-LOSS CIRCUIT BREAKER — added guardrail (delete this block and Step 1 to disable)
-At the start of each run, compute trailing-day P&L = `get_realized_pnl` (today, this account) + current unrealized P&L (`get_equity_positions` cost basis vs. `get_equity_quotes`). If the cumulative loss is `DAILY_LOSS_HALT_PCT` or more of total_value, HALT: make NO new buys for the rest of the day (still honor profit-taking sells and existing stops), fire an info notification that the circuit breaker tripped, and skip to the report.
+### DAILY-LOSS CIRCUIT BREAKER — added guardrail (delete this block and Step 3 to disable)
+Each run, after managing existing holdings (FIRST) and before any new buys, compute trailing-day P&L = `get_realized_pnl` (today, this account) + current unrealized P&L (`get_equity_positions` cost basis vs. `get_equity_quotes`). If the cumulative loss is `DAILY_LOSS_HALT_PCT` or more of total_value, HALT: make NO new buys for the rest of the day (still honor profit-taking sells and existing stops), fire an info notification that the circuit breaker tripped, and skip to the report.
 
 ### RUN THESE STEPS IN ORDER
 
-**FIRST — circuit breaker check** (remove if the block above is deleted).
-1. Evaluate the daily-loss circuit breaker. If tripped, halt new buys and skip to the report.
+**FIRST — manage what I already hold (account-wide, not limited to the working list).**
 
-**SECOND — build this run's working list by RELATIVE VOLUME + MOVEMENT.**
+1. `get_equity_positions` for the account. For each held position, get average_buy_price (cost basis) and current price (`get_equity_quotes` → last_trade_price), then compute gain % = (current − avg) / avg × 100.
 
-2. Ensure the scan exists: call `get_scans`; if no suitable saved scan exists, create one ONCE via `create_scan` from a broad active preset (e.g. `DAILY_GAINERS`). The scan must return **`Last`, `Relative volume`, `% Change`, and `Volume` as visible columns**. All screening (price band, relative volume, and movement) is applied client-side in Step 4 from these columns — the routine does not rely on server-side price or relative-volume filters.
+2. If a position is up `TAKE_PROFIT_PCT` or more vs. entry: sell the entire position at market (`place_equity_order`, market sell) AND cancel any open stop-loss order tied to it — find it via `get_equity_orders` and cancel with `cancel_equity_order`. Fire the trade notification for the sell.
 
-3. Sort the scan by relative volume, highest first: `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`.
+**SECOND — circuit breaker check** (remove if the DAILY-LOSS CIRCUIT BREAKER block above is deleted).
+3. Evaluate the daily-loss circuit breaker. If tripped, halt new buys and skip to the report.
 
-4. `run_scan` to get live rows, then **filter the returned rows client-side**, keeping only rows where ALL of these hold:
+**THIRD — build this run's working list by RELATIVE VOLUME + MOVEMENT.**
+
+4. Ensure the scan exists: call `get_scans`; if no suitable saved scan exists, create one ONCE via `create_scan` from a broad active preset (e.g. `DAILY_GAINERS`). The scan must return **`Last`, `Relative volume`, `% Change`, and `Volume` as visible columns**. All screening (price band, relative volume, and movement) is applied client-side in Step 6 from these columns — the routine does not rely on server-side price or relative-volume filters.
+
+5. Sort the scan by relative volume, highest first: `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`.
+
+6. `run_scan` to get live rows, then **filter the returned rows client-side**, keeping only rows where ALL of these hold:
    - `PRICE_MIN` ≤ `Last` ≤ `PRICE_MAX`
    - `Relative volume` ≥ `MIN_REL_VOLUME`
    - `abs(% Change) × 100` ≥ `MIN_ABS_PCT_CHANGE` — NOTE: the scan returns `% Change` as a decimal fraction (e.g. `0.0301` means 3.01%), so multiply by 100 before comparing to `MIN_ABS_PCT_CHANGE`, which is expressed in percent. This drops flat SPAC/near-NAV names that clear the volume bar but aren't moving.
-5. **WORKING LIST** = the top `TOP_N` surviving rows by `Relative volume` (descending). This is live data. If the market is closed, relative volume reads ~1 everywhere, the list comes back empty, and the routine simply opens no new positions this run (see Tradeoffs) — proceed to holdings management and the report.
-
-**THIRD — manage what I already hold (account-wide, not limited to the working list).**
-
-6. `get_equity_positions` for the account. For each held position, get average_buy_price (cost basis) and current price (`get_equity_quotes` → last_trade_price), then compute gain % = (current − avg) / avg × 100.
-
-7. If a position is up `TAKE_PROFIT_PCT` or more vs. entry: sell the entire position at market (`place_equity_order`, market sell) AND cancel any open stop-loss order tied to it — find it via `get_equity_orders` and cancel with `cancel_equity_order`. Fire the trade notification for the sell.
+7. **WORKING LIST** = the top `TOP_N` surviving rows by `Relative volume` (descending). This is live data. If the market is closed, relative volume reads ~1 everywhere, the list comes back empty, and the routine simply opens no new positions this run (see Tradeoffs) — proceed to the report.
 
 **FOURTH — look for new entries (from the WORKING LIST only, highest relative volume first).**
 
