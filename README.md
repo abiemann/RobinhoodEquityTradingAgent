@@ -64,6 +64,18 @@ All tunable values live in the **Constants** table at the top of the routine doc
 3. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
 4. Only after the above look right, consider dropping the approval gate.
 
+## Usage Example
+
+Run the routine as a **scheduled task in Cowork** (Claude desktop app). The task's prompt tells the agent to read `robinhood-momentum-routine-autonomous.md` and execute it exactly as written — so edits to the document take effect on the next run without touching the task. Set the working folder to this repo, pick the model (per the runtime requirement), and choose Act mode:
+
+![Edit scheduled task dialog in Cowork, with the prompt pointing at the routine document and Sonnet selected as the model](images/cowork-edit-scheduled-task.png)
+
+Schedule it for market hours — this example fires every 30 minutes, Monday–Friday, 6:00 AM–1:59 PM PT (covering the 9:30 AM–4:00 PM ET session):
+
+![Scheduled tasks list in Cowork showing the Robinhood momentum routine running every 30 minutes on weekdays](images/cowork-scheduled-tasks.png)
+
+Note: scheduled tasks only run while the computer is awake — enable **Keep awake** (visible above the task card) so mid-day runs aren't missed.
+
 ## Disclaimer
 
 This is an execution framework for a self-specified strategy. It is **not financial advice** and not a recommendation of any screen, ticker, or parameter. Automated trading of volatile, unusually-active stocks carries real risk of loss. Understand the code, start with the approval gate on, and use money you can afford to lose.
