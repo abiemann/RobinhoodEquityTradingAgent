@@ -114,7 +114,7 @@ State how many names the scan returned and how many survived the price + relativ
 
 **Save the report to disk — fixed folder, fixed filename, no exceptions.** Write the full report as a Markdown file into the `run-reports` folder next to this document (create the folder if it doesn't exist). The filename is exactly:
 
-`robinhood-momentum-routine-autonomous-log-YYYY_MM_DD-HH_MM.md`
+`rhmra-log-YYYY_MM_DD-HH_MM.md`
 
-where `YYYY_MM_DD` is the run's local date (year first, so filenames sort chronologically) and `HH_MM` its local start time, zero-padded, 24-hour clock — e.g. a run on 2 July 2026 at 1:05 PM saves as `robinhood-momentum-routine-autonomous-log-2026_07_02-13_05.md`. Do not save the report anywhere else, do not invent a different filename pattern, and do not overwrite or append to a previous run's file.
+where `rhmra` abbreviates this document's name (fixed literal — do not expand it), `YYYY_MM_DD` is the run's local date (year first, so filenames sort chronologically), and `HH_MM` its local start time, zero-padded, 24-hour clock — e.g. a run on 2 July 2026 at 1:05 PM saves as `rhmra-log-2026_07_02-13_05.md`. Do not save the report anywhere else, do not invent a different filename pattern, and do not overwrite or append to a previous run's file.
 
