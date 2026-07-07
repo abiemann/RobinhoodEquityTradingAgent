@@ -125,6 +125,8 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 
 State how many names the scan returned and how many survived the price + relative-volume + %-change filter (`TOP_N` cap applied). If the market was closed / the list was empty, say so. List any positions sold for profit and whether the circuit breaker tripped. For each ticker acted on: its relative volume, its daily % change, its median daily dollar volume, the recent high, current price, % below high, whether I bought, the fill price, and the stop price. List anything skipped and why (including liquidity-floor skips), plus any `review_equity_order` alerts. End the report with **Total tokens used** for the run: state the exact figure if the runtime exposes one; otherwise give a rough estimate of everything processed this run (prompts, responses, tool results — roughly characters ÷ 4), clearly labeled `(estimate)`. Never present an estimate as an exact count.
 
+**After saving the report, output a brief on-screen run summary** (inside a `<run-summary>` tag) covering: scan results, orders placed/skipped and why, circuit-breaker status, stop-coverage status, and the token estimate in the form `~N tokens (estimate)`. Keep it to 3–5 sentences.
+
 **Save the report to disk — fixed folder, fixed filename, no exceptions.** Write the full report as a Markdown file into the `run-reports` folder next to this document (create the folder if it doesn't exist). The filename is exactly:
 
 `rhmra-log-YYYY_MM_DD-HH_MM.md`
