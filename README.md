@@ -20,7 +20,7 @@ All trading is scoped to a single account, resolved **by name** at runtime.
 
 ## Configuration
 
-All tunable values live in the **Constants** table at the top of the routine document — edit there, nowhere else. Key ones:
+All tunable values live in the **Constants** table at the top of the routine document — edit there, nowhere else. Purpose of each:
 
 | Constant | Purpose |
 |---|---|
@@ -28,10 +28,14 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
+| `SCAN_TITLE` | Saved Robinhood scan the routine runs, resolved by exact title each run. |
 | `MIN_MEDIAN_DOLLAR_VOLUME` | Liquidity floor (median $ volume). |
+| `HIGH_LOOKBACK_DAYS` / `VOLUME_LOOKBACK_DAYS` | Lookback windows for the recent high and the liquidity median. |
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
+| `MIN_ORDER_DOLLARS` | Smallest allowed buy when downsizing to available buying power; below it, skip. |
+| `DUST_SWEEP_ENABLED` | Daily cleanup of fractional stop-loss residue ("dust") on the first regular-session run. |
 | `DAILY_LOSS_HALT_PCT` | Daily-loss circuit breaker. |
 | `REGULAR_HOURS_ONLY` | If `true`, no extended-hours entries. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
