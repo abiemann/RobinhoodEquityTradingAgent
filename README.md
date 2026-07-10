@@ -29,7 +29,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
 | `MIN_MEDIAN_DOLLAR_VOLUME` | Liquidity floor (median $ volume). |
-| `TOP_N` | Max candidate list size. |
+| `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
 | `DAILY_LOSS_HALT_PCT` | Daily-loss circuit breaker. |
