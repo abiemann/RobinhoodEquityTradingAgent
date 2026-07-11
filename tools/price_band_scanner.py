@@ -185,8 +185,9 @@ GRID = "#e1e0d9"
 BASE = "#c3c2b7"
 
 
-def render_chart(path, stats, rows_used, total_items, date_str):
-    rowh, top, left, right = 40, 78, 250, 70
+def render_chart(path, stats, rows_used, total_items, date_str, degenerate=False):
+    rowh, left, right = 40, 250, 70
+    top = 100 if degenerate else 78
     plot_w = 1000 - left - right
     h = top + rowh * len(stats) + 60
     cv = Canvas(1000, h)
@@ -199,6 +200,8 @@ def render_chart(path, stats, rows_used, total_items, date_str):
     cv.text(20, 16, f"PRICEBANDSCANNER {date_str}", INK, 2)
     cv.text(20, 36, f"MEDIAN % CHANGE BY PRICE BAND ({rows_used} OF {total_items} MOST-ACTIVE STOCKS)", MUTED, 2)
     cv.text(20, 56, "SHADE = BAND: LIGHT = CHEAP, DARK = PRICEY", MUTED, 2)
+    if degenerate:
+        cv.text(20, 78, "WARNING: DEGENERATE SAMPLE (MARKET CLOSED) - NOT ACTIVITY-RANKED", "#d03b3b", 2)
     step = max(1, round((hi - lo) / 8))
     t = lo
     while t <= hi:
@@ -253,6 +256,15 @@ def main():
     rows = result.get("results", [])
     total_items = result.get("total_items", len(rows))
 
+    rel_vols = []
+    for row in rows:
+        try:
+            rel_vols.append(float(row.get("columns", {})["Relative volume"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    max_rv = max(rel_vols) if rel_vols else None
+    degenerate = max_rv is not None and max_rv < 1.5
+
     buckets = {b: [] for b in bands}
     skipped = 0
     for row in rows:
@@ -290,6 +302,12 @@ def main():
 
     print(f"Sample: {len(rows)} rows returned of {total_items} total scan matches"
           f" (top of the scan's sort order){'; ' + str(skipped) + ' rows skipped (missing fields)' if skipped else ''}")
+    if degenerate:
+        print(f"WARNING: DEGENERATE SAMPLE - max relative volume in the sample is {max_rv:.2f} "
+              "(~1 means the market is closed or the day has rolled over). The scan's "
+              "relative-volume sort is meaningless right now, so these rows are NOT the day's "
+              "most-active names (ties often fall alphabetical). Treat this run's band "
+              "comparison as invalid.")
     print()
     fmt = "{:<12} {:>6} {:>9} {:>9} {:>7}   {:<18} {:<18}"
     print(fmt.format("Band", "Count", "Median%", "Mean%", "Pos%", "Best", "Worst"))
@@ -310,13 +328,14 @@ def main():
               ", ".join(f"{s['band']} ({s['median_pct']:+.2f}%, n={s['count']})" for s in ranked[::-1][:3]))
 
     if args.chart_out:
-        render_chart(args.chart_out, stats, len(rows) - skipped, total_items, args.chart_date)
+        render_chart(args.chart_out, stats, len(rows) - skipped, total_items, args.chart_date, degenerate)
         print(f"\nChart written to {args.chart_out}")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump({"total_items": total_items, "rows_used": len(rows) - skipped,
-                       "rows_skipped": skipped, "bands": stats}, f, indent=2)
+                       "rows_skipped": skipped, "max_relative_volume": max_rv,
+                       "degenerate_sample": degenerate, "bands": stats}, f, indent=2)
         print(f"\nJSON written to {args.json_out}")
     return 0
 

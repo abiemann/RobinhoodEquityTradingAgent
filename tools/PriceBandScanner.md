@@ -40,6 +40,7 @@ Example of the chart a run produces (frozen copy of the 2026-07-10 test render �
 
 The log must contain:
 - Run timestamp (Pacific) and the sample caveat: N rows used of `total_items` scan matches — the scan returns the day's top names by **relative volume**, so this measures the most ACTIVE stocks (the population the momentum routine actually trades), not the whole market.
+- If the script printed its `DEGENERATE SAMPLE` warning (max relative volume ~1 — market closed or day rolled over, so the sample is not activity-ranked), reproduce that warning prominently at the top of the log alongside any out-of-window warning, and state that the band comparison is invalid for this run.
 - The per-band table exactly as the script printed it.
 - The most-growth / most-losses rankings, flagging any band with fewer than 5 names as too thin to conclude anything from.
 - **Total tokens used** for the run: exact if the runtime exposes a figure, otherwise a rough estimate clearly labeled `(estimate)` — same rule as the momentum routine.
