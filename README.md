@@ -35,6 +35,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `HIGH_LOOKBACK_DAYS` / `VOLUME_LOOKBACK_DAYS` | Lookback windows for the recent high and the liquidity median. |
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
+| `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
 | `MIN_ORDER_DOLLARS` | Smallest allowed buy when downsizing to available buying power; below it, skip. |
 | `DUST_SWEEP_ENABLED` | Daily cleanup of fractional stop-loss residue ("dust") on the first regular-session run. |
@@ -54,6 +55,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 - **Daily-loss circuit breaker** halts new buys after a set drawdown.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Per-position stop-loss** and a **max position cap**.
+- **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
 - **Append-only trade ledger** (`trade-ledger.csv`, local/gitignored): every fill recorded with order id, price, reason, and realized P&L — the raw data for win-rate and expectancy review.
