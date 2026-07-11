@@ -55,6 +55,13 @@ You are running an automated trading routine on a Robinhood brokerage account. U
 ### ORDER HANDLING — AUTONOMOUS, WITH NOTIFICATION
 For every intended order: first call `review_equity_order` as a compliance check. If it returns any non-empty alert, DO NOT place — skip that order and log the alert verbatim. If the review is clean, place the order immediately with `place_equity_order` using a fresh UUID ref_id — no human approval required. **Immediately after any buy or sell is placed, GENERATE AN INFO NOTIFICATION** stating: action (buy / sell), ticker, quantity, order type, price or fill, and reason (profit-take, dip-buy, stop, or dust sweep). Record the compliance/market_data_disclosure from each review in the final report.
 
+### TRADE LEDGER — append-only record of every fill
+Maintain `trade-ledger.csv` next to this document; create it with this header row if missing:
+
+`timestamp_pt,order_id,symbol,side,quantity,price,notional,reason,realized_pnl`
+
+Append one row per FILL this run: buys (reason `dip-buy`), profit-take sells (`profit-take`), dust sweeps (`dust-sweep`), and — discovered via `get_equity_orders` — stop-loss sells that FILLED since the previous run (`stop-fill`). Before appending, read the file and dedupe by order_id: never append an order_id already present, never modify or delete existing rows. For sells, realized_pnl = (price − average cost) × quantity; leave it blank for buys. Use the broker's fill price and time (timestamps in Pacific). The ledger is local telemetry (gitignored): it exists for win-rate / expectancy analysis and NEVER informs order decisions — broker state remains the only source of truth for trading logic. State in the report how many rows were appended.
+
 ### SESSION-AWARE ORDER STYLE (regular vs. extended hours)
 Before placing any BUY, determine the current trading session — regular market hours (09:30–16:00 ET) vs. extended hours (pre-market / after-hours) — using `get_equity_tradability` (per-session eligibility) together with the current time. Then:
 

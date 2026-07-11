@@ -56,6 +56,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 - **Per-position stop-loss** and a **max position cap**.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
+- **Append-only trade ledger** (`trade-ledger.csv`, local/gitignored): every fill recorded with order id, price, reason, and realized P&L — the raw data for win-rate and expectancy review.
 
 ## Known tradeoffs
 

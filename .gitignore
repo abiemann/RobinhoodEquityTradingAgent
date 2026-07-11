@@ -2,3 +2,4 @@ run-reports/
 tmp_eval/
 tmp_*
 tools/logs/
+trade-ledger.csv
