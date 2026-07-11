@@ -27,6 +27,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | Constant | Purpose |
 |---|---|
 | `AGENTIC_ACCOUNT_NAME` | Account to trade, matched by name (default `"Agentic"`). |
+| `DRY_RUN` | If `true`, log would-be entries instead of placing them; protection of existing positions stays live. |
 | `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
@@ -68,10 +69,11 @@ All tunable values live in the **Constants** table at the top of the routine doc
 
 ## Testing before going live
 
-1. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
-2. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
-3. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
-4. Only after the above look right, consider dropping the approval gate.
+1. Set `DRY_RUN = true` in the Constants table and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
+2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
+3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
+4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
+5. Only after the above look right, consider dropping the approval gate and flipping `DRY_RUN` to `false`.
 
 ## Tools
 
