@@ -123,17 +123,16 @@ def _oklch_hex(L, C, H):
     return "#%02x%02x%02x" % (enc(r), enc(g), enc(bl))
 
 
-def green_ramp(n):
-    out = []
-    for i in range(n):
-        L = 0.75 - (0.385 * i / max(1, n - 1))
-        c = 0.12 if 0.45 <= L <= 0.70 else 0.10
-        hx = None
-        while hx is None and c > 0.02:
-            hx = _oklch_hex(L, c, 150)
-            c -= 0.01
-        out.append(hx or "#2c7f44")
-    return out
+def value_color(v):
+    hue = 150 if v >= 0 else 25
+    t = min(abs(v), 5.0) / 5.0
+    L = 0.78 - t * (0.78 - 0.42)
+    c = 0.12 if 0.45 <= L <= 0.70 else 0.10
+    hx = None
+    while hx is None and c > 0.02:
+        hx = _oklch_hex(L, c, hue)
+        c -= 0.01
+    return hx or "#888888"
 
 
 class Canvas:
@@ -199,7 +198,7 @@ def render_chart(path, stats, rows_used, total_items, date_str, degenerate=False
         return left + (v - lo) / (hi - lo) * plot_w
     cv.text(20, 16, f"PRICEBANDSCANNER {date_str}", INK, 2)
     cv.text(20, 36, f"MEDIAN % CHANGE BY PRICE BAND ({rows_used} OF {total_items} MOST-ACTIVE STOCKS)", MUTED, 2)
-    cv.text(20, 56, "SHADE = BAND: LIGHT = CHEAP, DARK = PRICEY", MUTED, 2)
+    cv.text(20, 56, "COLOR = MEDIAN MOVE: LIGHT = 0%, DARK = +/-5% (CLAMPED), GREEN = GAIN, RED = LOSS", MUTED, 2)
     if degenerate:
         cv.text(20, 78, "WARNING: DEGENERATE SAMPLE (MARKET CLOSED) - NOT ACTIVITY-RANKED", "#d03b3b", 2)
     step = max(1, round((hi - lo) / 8))
@@ -210,7 +209,6 @@ def render_chart(path, stats, rows_used, total_items, date_str, degenerate=False
         lbl = f"{'+' if t > 0 else ''}{t}%"
         cv.text(x - cv.text_width(lbl, 2) / 2, h - 32, lbl, MUTED, 2)
         t += step
-    ramp = green_ramp(len(stats))
     for i, s in enumerate(stats):
         y = top + i * rowh
         label = s["band"] + (f"  N={s['count']}" if s["count"] else "  N=0")
@@ -222,7 +220,7 @@ def render_chart(path, stats, rows_used, total_items, date_str, degenerate=False
             continue
         v = s["median_pct"]
         x0, x1 = X(min(0.0, v)), X(max(0.0, v))
-        cv.rect(x0, y + 2, x1 if x1 > x0 + 1 else x0 + 2, y + 22, ramp[i])
+        cv.rect(x0, y + 2, x1 if x1 > x0 + 1 else x0 + 2, y + 22, value_color(v))
         vlbl = f"{'+' if v > 0 else ''}{v:.2f}%"
         if v >= 0:
             cv.text(x1 + 8, y + 6, vlbl, MUTED, 2)

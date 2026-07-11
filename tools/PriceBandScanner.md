@@ -34,9 +34,9 @@ Run AFTER the US market close (1:00 PM PT) and BEFORE 5:00 PM PT. At 5:00 PM PT 
 
 Write the report to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md`, where the date is the run's **US Pacific** date (`America/Los_Angeles` — convert explicitly; the sandbox clock may be Eastern). The constant prefix plus year-first date makes alphabetical sorting chronological. One log per day: if today's file already exists, overwrite it — the latest post-close run supersedes. The chart PNG from Step 3 shares the log's basename (`PriceBandScanner-log-YYYY_MM_DD.png`, same overwrite rule); reference it from the markdown log as `![band chart](PriceBandScanner-log-YYYY_MM_DD.png)`.
 
-Example of the chart a run produces (frozen copy of the 2026-07-10 test render — the live dailies land in the gitignored `tools/logs/`):
+Example of the chart a run produces (frozen render from 2026-07-10 data — the live dailies land in the gitignored `tools/logs/`):
 
-![Example PriceBandScanner chart: median % change per price band, bands shaded light to dark green from cheapest to priciest](../images/pricebandscanner-example.png)
+![Example PriceBandScanner chart: median % change per price band, bar color encoding the move — light to dark green for gains of 0 to +5%, light to dark red for losses, clamped at +/-5%](../images/pricebandscanner-example.png)
 
 The log must contain:
 - Run timestamp (Pacific) and the sample caveat: N rows used of `total_items` scan matches — the scan returns the day's top names by **relative volume**, so this measures the most ACTIVE stocks (the population the momentum routine actually trades), not the whole market.
