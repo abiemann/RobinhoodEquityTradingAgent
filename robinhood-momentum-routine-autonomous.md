@@ -20,8 +20,8 @@ Edit values here; the Instructions reference them by name only.
 | Constant | Value | Meaning |
 |---|---|---|
 | `AGENTIC_ACCOUNT_NAME` | `"Agentic"` | The ONLY account the routine may read or trade. |
-| `PRICE_MIN` | `100` | Lower bound of the last-price band (USD). |
-| `PRICE_MAX` | `400` | Upper bound of the last-price band (USD). |
+| `PRICE_MIN` | `2.50` | Lower bound of the last-price band (USD). |
+| `PRICE_MAX` | `5` | Upper bound of the last-price band (USD). |
 | `MIN_REL_VOLUME` | `2` | Relative-volume **floor** to qualify (today's pace vs. normal; `2` = twice normal). Not the selector — `TOP_N` ranking does that. Kept > 1 so the routine self-disables when the market is closed (rel vol reads ~1 for all names off-hours → empty list) and so quiet days don't pad the list with normal-volume names. |
 | `MIN_ABS_PCT_CHANGE` | `3` | Minimum absolute daily move, in **percent**, for a name to qualify. Filters out flat SPACs/near-NAV churners that have high relative volume but aren't going anywhere. |
 | `TOP_N` | `15` | Max names kept each run. After filtering, survivors are ranked by relative volume (highest first) and the top `TOP_N` become the working list. |

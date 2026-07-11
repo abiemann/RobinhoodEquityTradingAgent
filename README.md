@@ -2,6 +2,8 @@
 
 A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** account. It screens for liquid, unusually-active stocks in a set price band, takes profits on winners, buys pullbacks, and sets protective stops — placing orders through the Robinhood agentic-trading MCP tools with per-trade notifications.
 
+> ⚠️ **This project is not production ready. Use it at your own risk.** See the [Disclaimer](#disclaimer).
+
 ## What it does
 
 Each run, the agent:
@@ -86,4 +88,4 @@ Note: scheduled tasks only run while the computer is awake — enable **Keep awa
 
 ## Disclaimer
 
-This is an execution framework for a self-specified strategy. It is **not financial advice** and not a recommendation of any screen, ticker, or parameter. Automated trading of volatile, unusually-active stocks carries real risk of loss. Understand the code, start with the approval gate on, and use money you can afford to lose.
+**This project is not production ready — use it entirely at your own risk.** It is a personal execution framework for a self-specified strategy, hardened through live iteration but never formally validated: there is no backtesting, no test suite, and the strategy parameters are untested against historical data. It is **not financial advice** and not a recommendation of any screen, ticker, or parameter. Automated trading of volatile, unusually-active stocks carries real risk of loss, and an autonomous agent acts on your account without asking first. Understand the code, start with the order-approval gate on, and use only money you can afford to lose.
