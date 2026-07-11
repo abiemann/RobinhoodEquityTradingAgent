@@ -13,6 +13,12 @@ by hand. Computes, per symbol:
 The script does NOT know about held positions or open orders — overlay those
 skips (Step 10 of the routine) on its output.
 
+TESTED BY tests/test_scripts.py — after ANY edit to this file, run
+`python3 tests/test_scripts.py` (Windows: `py -3 tests\test_scripts.py`)
+and require all tests to pass before committing. Expected values are
+live-verified; if an intentional behavior change breaks one, update the
+expectation deliberately — never delete a test to go green.
+
 Usage:
   python evaluate_candidates.py --bars hist1.json [hist2.json ...] \
       --quotes quotes.json \

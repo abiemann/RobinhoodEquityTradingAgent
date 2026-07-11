@@ -14,6 +14,12 @@ Accepted --scan-file shapes: {"data":{"result":{...}}}, {"result":{...}},
 or the bare result object. Rows missing Last or % Change are skipped and
 counted. The scan's "% Change" column is a decimal fraction (0.0301 = 3.01%)
 and is converted to percent here.
+
+TESTED BY tests/test_scripts.py — after ANY edit to this file, run
+`python3 tests/test_scripts.py` (Windows: `py -3 tests\test_scripts.py`)
+and require all tests to pass before committing. Expected values are
+live-verified; if an intentional behavior change breaks one, update the
+expectation deliberately — never delete a test to go green.
 """
 
 import argparse
