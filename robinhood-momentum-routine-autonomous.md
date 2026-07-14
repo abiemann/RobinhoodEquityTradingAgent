@@ -42,6 +42,7 @@ Edit values here; the Instructions reference them by name only.
 | `REENTRY_COOLDOWN_DAYS` | `3` | After a symbol's stop-loss FILLS, do not re-enter that symbol for this many calendar days — a revenge-trade guard: a name that just proved it can fall `STOP_LOSS_PCT`% does not get bought again on the next dip signal. Checked against the broker's filled-order history (`get_equity_orders`) each run, never against local files. |
 | `DAILY_LOSS_HALT_PCT` | `5` | Halt new buys for the day if trailing-day loss reaches this % of total account value. |
 | `STOP_COUNT_HALT` | `3` | Halt new buys for the rest of the day once this many stop-loss sells have FILLED today. A regime guard: at `STOP_LOSS_PCT` = 5 and ~20% positions, each stop costs only ~1% of the account, so several stop-outs can bleed all day without ever tripping `DAILY_LOSS_HALT_PCT`. Counted from the broker's filled-order history; resets naturally at the next trading day. |
+| `SKIP_BUY_IF_SPY_RED` | `true` | If `true`, each run checks SPY's day change before scanning: SPY below its previous close = the broad market is selling, so skip scanning and new buys FOR THIS RUN ONLY. Per-run and self-clearing — the next run re-checks, so a green afternoon resumes buying the same day. Holdings management, stop repairs, and dust sweeps are never gated by this. |
 
 ---
 
@@ -116,6 +117,8 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 3. Evaluate the daily-loss circuit breaker AND the stop-count guard. If either trips, halt new buys and skip to the report.
 
 **Buying-power gate (run this check between SECOND and THIRD):** you already know buying_power and total_value (`get_portfolio`, FIRST). The EFFECTIVE order size this run = min(`BUY_SIZE_PCT`/100 × total_value, buying_power rounded down to the dollar). If it is below `MIN_ORDER_DOLLARS`, no buy is possible this run — and the scan exists only to feed buys, so skip Steps 4–12 ENTIRELY: no `get_scans`, no `run_scan`, no filtering, no historicals, no script. Go straight to the report and state: "scan and entry evaluation skipped: effective order size $X < MIN_ORDER_DOLLARS $Y — cash settling, see Tradeoffs". Otherwise proceed: a downsized order is still an order.
+
+**SPY red-day gate (only when `SKIP_BUY_IF_SPY_RED` is `true`; evaluate alongside the buying-power gate):** fetch SPY's quote (`get_equity_quotes`, symbol `SPY`) and compare the current price to the official previous close from the same response. If SPY is trading BELOW its previous close, skip Steps 4–12 for THIS RUN ONLY — no scan, no entries — and state in the report: "scan and entry evaluation skipped: SPY $X vs prev close $Y (−Z.ZZ%) — SKIP_BUY_IF_SPY_RED". No notification (this is a routine per-run skip, not a tripped guard). The gate is self-clearing: the next run re-checks SPY fresh.
 
 **THIRD — build this run's working list by RELATIVE VOLUME + MOVEMENT.**
 

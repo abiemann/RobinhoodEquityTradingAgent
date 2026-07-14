@@ -42,6 +42,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `DUST_SWEEP_ENABLED` | Daily cleanup of fractional stop-loss residue ("dust") on the first regular-session run. |
 | `DAILY_LOSS_HALT_PCT` | Daily-loss circuit breaker. |
 | `STOP_COUNT_HALT` | Halt new buys for the day after this many stop fills. |
+| `SKIP_BUY_IF_SPY_RED` | Skip scanning/buying for the current run while SPY trades below its previous close. |
 | `REGULAR_HOURS_ONLY` | If `true`, no extended-hours entries. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
 
@@ -56,6 +57,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 - **Account scope** resolved by name every run; halts if the name matches zero, multiple, or a non-agentic account — never falls back to another account.
 - **Daily-loss circuit breaker** halts new buys after a set drawdown.
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
+- **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Per-position stop-loss** and a **max position cap**.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
