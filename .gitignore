@@ -4,3 +4,4 @@ tmp_*
 tools/logs/
 trade-ledger.csv
 __pycache__/
+ALERTS.md

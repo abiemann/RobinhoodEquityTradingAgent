@@ -59,7 +59,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
-- **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level.
+- **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level. A double failure halts new entries for that run and raises a line in the local `ALERTS.md` for human attention.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
