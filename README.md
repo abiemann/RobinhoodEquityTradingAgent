@@ -44,6 +44,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `DAILY_LOSS_HALT_PCT` | Daily-loss circuit breaker. |
 | `STOP_COUNT_HALT` | Halt new buys for the day after this many stop fills. |
 | `SKIP_BUY_IF_SPY_RED` | Skip scanning/buying for the current run while SPY trades below its previous close. |
+| `NO_BUY_FIRST_MINUTES` | Opening blackout: no buys during the session's first N minutes (selling/protection unaffected). |
 | `REGULAR_HOURS_ONLY` | If `true`, no extended-hours entries. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
 
@@ -59,6 +60,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 - **Daily-loss circuit breaker** halts new buys after a set drawdown.
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
+- **Opening blackout**: no buys in the session's first `NO_BUY_FIRST_MINUTES` — indicators can't see violence inside the first forming bars; profit-taking and stops stay active.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level. A double failure halts new entries for that run and raises a line in the local `ALERTS.md` for human attention.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
