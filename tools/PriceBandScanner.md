@@ -28,7 +28,8 @@ Run AFTER the US market close (1:00 PM PT) and BEFORE 5:00 PM PT. At 5:00 PM PT 
    `python3 tools/price_band_scanner.py --scan-file <path> --band-edges <BAND_EDGES> --chart-out tools/logs/PriceBandScanner-log-<YYYY_MM_DD>.png --chart-date <YYYY-MM-DD>`
    (dates in Pacific, same as the log filename; `--chart-out` renders a PNG bar chart of the band medians — pure stdlib, no libraries to install.)
    It buckets rows by `Last` price, converts `% Change` from decimal fraction to percent, and prints per-band count, median %, mean %, breadth (% positive), and best/worst names, plus most-growth / most-losses rankings by median. If the script is missing or errors, write a log reporting the failure and stop — this tool is non-critical; do not improvise a replacement.
-4. Write the log (below) and finish. No scratch files are needed — the script reads the saved tool-result file directly.
+4. **View the chart you just rendered**: read the PNG file with your file-reading tool so the image displays inline in this run's transcript — this is what makes the chart visible when a human clicks the run in the scheduler's history. While looking at it, sanity-check: band labels legible, bars present and colored by move (green gains / red losses), and the red DEGENERATE SAMPLE banner present if (and only if) the script warned. If the image is broken or contradicts the script's table, say so in the log.
+5. Write the log (below) and finish. No scratch files are needed — the script reads the saved tool-result file directly.
 
 ## LOG — fixed folder, fixed filename
 
