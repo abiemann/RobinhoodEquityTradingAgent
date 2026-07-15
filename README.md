@@ -12,7 +12,7 @@ Each run, the agent:
 2. Checks a daily-loss circuit breaker and halts new buys if the account is down past a set threshold for the day.
 3. Builds a working list — stocks in the `$PRICE_MIN–$PRICE_MAX` band, trading at elevated **relative volume**, that have **moved** at least a minimum % on the day, ranked by relative volume.
 4. Applies a **median dollar-volume liquidity floor** so thin names that can't be exited at size are dropped.
-5. Opens new positions — buys names trading more than `DIP_ENTRY_PCT`% below their recent high, then places a stop `STOP_LOSS_PCT`% below the fill.
+5. Opens new positions — buys names trading more than `DIP_ENTRY_PCT`% below their recent high **whose RSI has curled up from oversold** (reversal confirmation — depth alone is a falling knife), then places a stop `STOP_LOSS_PCT`% below the fill.
 
 All trading is scoped to a single account, resolved **by name** at runtime.
 
@@ -36,6 +36,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | `HIGH_LOOKBACK_DAYS` / `VOLUME_LOOKBACK_DAYS` | Lookback windows for the recent high and the liquidity median. |
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
+| `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up. |
 | `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
 | `MIN_ORDER_DOLLARS` | Smallest allowed buy when downsizing to available buying power; below it, skip. |

@@ -55,6 +55,66 @@ def load_results(path):
     raise ValueError(f"{path}: unrecognized shape - expected a get_equity_historicals response")
 
 
+def wilder_rsi(closes, period=14):
+    closes = [float(c) for c in closes]
+    if len(closes) < period + 1:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out = []
+    for i in range(period, len(gains) + 1):
+        if i > period:
+            avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+        out.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+    return out
+
+
+def load_rsi_map(path, period):
+    """Map SYMBOL -> ascending RSI values. Accepts, per symbol: a raw
+    get_equity_technical_indicators response, a bare series list, a plain
+    {"rsi": [...]} list, or {"closes": [...]} (Wilder RSI computed here)."""
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    out = {}
+    for sym, val in doc.items():
+        if isinstance(val, dict) and "data" in val:
+            val = val["data"]
+        if isinstance(val, dict) and "indicators" in val:
+            val = val["indicators"][0]["series"]
+        if isinstance(val, dict) and "rsi" in val:
+            val = val["rsi"]
+        if isinstance(val, dict) and "closes" in val:
+            out[sym.upper()] = wilder_rsi(val["closes"], period)
+            continue
+        if isinstance(val, list):
+            out[sym.upper()] = [float(x["value"]) if isinstance(x, dict) else float(x) for x in val]
+            continue
+        out[sym.upper()] = []
+    return out
+
+
+def rsi_gate(values, oversold, lookback, confirm):
+    """Returns (passes, reason). Deterministic curl check: min RSI over the
+    last `lookback` values must be <= oversold, AND the last `confirm` steps
+    must each be rising. Missing/short data BLOCKS (conservative)."""
+    if not values or len(values) < max(lookback, confirm + 1):
+        return False, f"RSI gate: no/insufficient data ({len(values or [])} values) - blocked"
+    window_min = min(values[-lookback:])
+    if window_min > oversold:
+        return False, f"RSI gate: never oversold (min {window_min:.1f} > {oversold:g})"
+    for i in range(1, confirm + 1):
+        if not values[-i] > values[-i - 1]:
+            return False, f"RSI gate: still falling ({values[-i - 1]:.1f} -> {values[-i]:.1f})"
+    return True, (f"RSI curl confirmed: min {window_min:.1f} <= {oversold:g}, "
+                  f"rising {values[-2]:.1f} -> {values[-1]:.1f}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bars", nargs="+", required=True, help="raw get_equity_historicals JSON file(s)")
@@ -64,7 +124,18 @@ def main():
     ap.add_argument("--min-median-dollar-volume", type=float, required=True)
     ap.add_argument("--dip-entry-pct", type=float, required=True)
     ap.add_argument("--json-out", help="optional path for machine-readable results")
+    ap.add_argument("--rsi-file", help="JSON map SYMBOL -> RSI data (raw indicator response, bare series, {'rsi': [...]}, or {'closes': [...]} fallback); enables the RSI curl-up entry gate")
+    ap.add_argument("--rsi-oversold", type=float, help="RSI_OVERSOLD (required with --rsi-file)")
+    ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
+    ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")
+    ap.add_argument("--rsi-period", type=int, default=14, help="RSI_PERIOD, used only for the closes fallback (default 14)")
     args = ap.parse_args()
+
+    rsi_map = None
+    if args.rsi_file:
+        if args.rsi_oversold is None or args.rsi_lookback_bars is None or args.rsi_confirm_bars is None:
+            ap.error("--rsi-file requires --rsi-oversold, --rsi-lookback-bars, and --rsi-confirm-bars")
+        rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
 
     with open(args.quotes, "r", encoding="utf-8") as f:
         quotes = {sym.upper(): float(px) for sym, px in json.load(f).items()}
@@ -112,7 +183,18 @@ def main():
         row["pct_below_high"] = (row["recent_high"] - current) / row["recent_high"] * 100.0
 
         if row["pct_below_high"] > args.dip_entry_pct:
-            row["buy_candidate"] = True
+            if rsi_map is None:
+                row["buy_candidate"] = True
+                row["rsi_gate"] = "disabled"
+            else:
+                ok, reason = rsi_gate(rsi_map.get(sym, []), args.rsi_oversold,
+                                      args.rsi_lookback_bars, args.rsi_confirm_bars)
+                row["rsi_gate"] = "pass" if ok else "block"
+                row["rsi_reason"] = reason
+                if ok:
+                    row["buy_candidate"] = True
+                else:
+                    row["skip_reason"] = reason
         elif row["pct_below_high"] <= 0:
             row["skip_reason"] = "at or above recent high - not a dip"
         else:

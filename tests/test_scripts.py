@@ -114,6 +114,52 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertFalse(res["GHST"]["buy_candidate"])
         self.assertIn("no real", res["GHST"]["skip_reason"])
 
+    def run_eval_rsi(self, rsi_payload):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        with tempfile.TemporaryDirectory() as td:
+            rsi_path = os.path.join(td, "rsi.json")
+            with open(rsi_path, "w", encoding="utf-8") as f:
+                json.dump(rsi_payload, f)
+            return self.run_eval(payload, {"SYNX": 4.0},
+                                 extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                        "--min-median-dollar-volume", "0",
+                                        "--rsi-file", rsi_path, "--rsi-oversold", "35",
+                                        "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1"])["SYNX"]
+
+    def test_rsi_gate_blocks_falling_knife(self):
+        res = self.run_eval_rsi({"SYNX": {"rsi": [42, 39, 36, 33, 31, 29]}})
+        self.assertEqual(res["rsi_gate"], "block")
+        self.assertFalse(res["buy_candidate"])
+        self.assertIn("still falling", res["rsi_reason"])
+
+    def test_rsi_gate_passes_oversold_curl(self):
+        res = self.run_eval_rsi({"SYNX": {"rsi": [40, 36, 33, 30, 29, 34]}})
+        self.assertEqual(res["rsi_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+        self.assertIn("curl confirmed", res["rsi_reason"])
+
+    def test_rsi_gate_blocks_never_oversold(self):
+        res = self.run_eval_rsi({"SYNX": {"rsi": [55, 52, 50, 48, 47, 49]}})
+        self.assertEqual(res["rsi_gate"], "block")
+        self.assertFalse(res["buy_candidate"])
+        self.assertIn("never oversold", res["rsi_reason"])
+
+    def test_rsi_gate_blocks_missing_data(self):
+        res = self.run_eval_rsi({})
+        self.assertEqual(res["rsi_gate"], "block")
+        self.assertFalse(res["buy_candidate"])
+        self.assertIn("no/insufficient data", res["rsi_reason"])
+
+    def test_rsi_closes_fallback_wilder(self):
+        falling = list(range(60, 40, -1))
+        rising_tail = falling + [41, 42.5]
+        res = self.run_eval_rsi({"SYNX": {"closes": rising_tail}})
+        self.assertEqual(res["rsi_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+
     def test_liquidity_floor_skips(self):
         bars = [bar(f"2026-07-{d:02d}", 4.5, 5.0, 100) for d in (1, 2, 3, 6, 7)]
         payload = {"results": [{"symbol": "THIN", "bars": bars}]}
