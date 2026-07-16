@@ -33,7 +33,9 @@ Run AFTER the US market close (1:00 PM PT) and BEFORE 5:00 PM PT. At 5:00 PM PT 
 
 ## LOG — fixed folder, fixed filename
 
-Write the report to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md`, where the date is the run's **US Pacific** date (`America/Los_Angeles` — convert explicitly; the sandbox clock may be Eastern). The constant prefix plus year-first date makes alphabetical sorting chronological. One log per day: if today's file already exists, overwrite it — the latest post-close run supersedes. The chart PNG from Step 3 shares the log's basename (`PriceBandScanner-log-YYYY_MM_DD.png`, same overwrite rule); reference it from the markdown log as `![band chart](PriceBandScanner-log-YYYY_MM_DD.png)`.
+Write the report to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md`, where the date is the run's **US Pacific** date (`America/Los_Angeles` — convert explicitly; the sandbox clock may be Eastern). The constant prefix plus year-first date makes alphabetical sorting chronological. One log per day: if today's file already exists, overwrite it — the latest post-close run supersedes. The chart PNG from Step 3 shares the log's basename (`PriceBandScanner-log-YYYY_MM_DD.png`, same overwrite rule).
+
+**Link the chart at the END of the log as a clickable LINK, not an inline image** — use `[View chart: PriceBandScanner-log-YYYY_MM_DD.png](PriceBandScanner-log-YYYY_MM_DD.png)`, NOT the image form `![...]`. The image form is rendered inline and shows only the unresolved path in the scheduler's log viewer; the link form is clickable and opens the PNG in the file panel (the same way the log filename itself opens). The relative filename resolves because the PNG sits next to the log.
 
 Example of the chart a run produces (frozen render from 2026-07-10 data — the live dailies land in the gitignored `tools/logs/`):
 
