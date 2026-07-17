@@ -50,6 +50,9 @@ When `DRY_RUN` is `true`: run every step normally, but in Steps 11–12 place NO
 
 Everything that protects EXISTING positions is ALWAYS live in both modes — profit-taking sells, the stop-coverage audit and its repairs, and the dust sweep. Safety is never simulated: switching modes must never leave a real position unprotected.
 
+### BROKER TIMESTAMPS — compare as strings, never parse full precision
+Broker order timestamps carry VARIABLE-precision fractional seconds (observed live: `.16`, `.785`, `.708917`) and the sandbox's Python `datetime.fromisoformat()` rejects some of them (observed 2026-07-17: `ValueError: Invalid isoformat string: '2026-07-09T15:41:35.16+00:00'`). In any ad-hoc code that filters or windows by order time — re-entry cooldown, stop-count "filled today", dust provenance, ledger recovery — do NOT parse timestamps with `fromisoformat`. Use one of these, in order of preference: (1) compare ISO-8601 UTC timestamps AS STRINGS — they sort chronologically; compute the cutoff as an ISO string (e.g. `datetime.now(timezone.utc) - timedelta(days=N)` formatted `%Y-%m-%dT%H:%M:%S`) and use plain `>=` on strings; (2) if a datetime object is truly needed, parse only the first 19 characters: `datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")`, treating it as UTC. A timestamp parse error must never abort a safety check — on any parse failure, fall back to string comparison.
+
 ### TRADE LEDGER — append-only record of every fill
 Maintain `trade-ledger.csv` next to this document; create it with this header row if missing:
 
