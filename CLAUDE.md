@@ -19,3 +19,6 @@ When a change to a routine document alters behavior that README.md describes (co
 
 ## Local-only files
 `run-reports/`, `tools/logs/`, `trade-ledger.csv`, and `tmp_*` are gitignored on purpose — they contain account activity or are regenerated. Never commit them or weaken `.gitignore`.
+
+## DRY_RUN must be true in every commit
+`Constants.md` is committed, but its `DRY_RUN` value must read `true` in every commit — the safe default for anyone cloning. The user trades live via a LOCAL, uncommitted `DRY_RUN = false` edit. Before committing `Constants.md`, check that line: if it reads `false`, temporarily set it to `true`, commit, then restore `false` in the working tree. Never publish `false`.

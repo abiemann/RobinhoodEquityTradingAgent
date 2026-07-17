@@ -22,12 +22,13 @@ All trading is scoped to a single account, resolved **by name** at runtime.
 
 ## Configuration
 
-**Live trading is off unless you turn it on.** The routine places real entry orders only when a file named `LIVE_TRADING` exists next to the routine document; with no such file it runs in **dry run** — logging every would-be buy and stop instead of placing it. The file is gitignored, so a fresh clone never trades live, and enabling it is a local act rather than a committed edit. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
+**Live trading is off unless you turn it on.** `DRY_RUN` is `true` in the committed `Constants.md`, so a fresh clone runs in **dry run** — logging every would-be buy and stop instead of placing it. To trade live, set `DRY_RUN` to `false` as a **local, uncommitted edit**; never commit `false`. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
 
-All other tunable values live in the **Constants** table at the top of the routine document — edit there, nowhere else. Purpose of each:
+All tunable values live in **`Constants.md`** next to the routine document — edit there, nowhere else. Purpose of each:
 
 | Constant | Purpose |
 |---|---|
+| `DRY_RUN` | If `true` (the committed default), log would-be entries instead of placing them; set `false` locally (uncommitted) to trade live. |
 | `AGENTIC_ACCOUNT_NAME` | Account to trade, matched by name (default `"Agentic"`). |
 | `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
@@ -41,7 +42,6 @@ All other tunable values live in the **Constants** table at the top of the routi
 | `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
 | `MIN_ORDER_DOLLARS` | Smallest allowed buy when downsizing to available buying power; below it, skip. |
-| `DUST_SWEEP_ENABLED` | Daily cleanup of fractional stop-loss residue ("dust") on the first regular-session run. |
 | `DAILY_LOSS_HALT_PCT` | Daily-loss circuit breaker. |
 | `STOP_COUNT_HALT` | Halt new buys for the day after this many stop fills. |
 | `SKIP_BUY_IF_SPY_RED` | Skip scanning/buying for the current run while SPY trades below its previous close. |
@@ -77,11 +77,11 @@ All other tunable values live in the **Constants** table at the top of the routi
 
 ## Testing before going live
 
-1. Leave dry run on (no `LIVE_TRADING` file) and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
+1. Leave `DRY_RUN = true` and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
 4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
-5. Only after the above look right, consider dropping the approval gate and going live by creating the `LIVE_TRADING` file.
+5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `Constants.md` (an uncommitted edit).
 
 ## Tools
 
