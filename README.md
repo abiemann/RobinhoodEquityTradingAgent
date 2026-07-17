@@ -22,12 +22,13 @@ All trading is scoped to a single account, resolved **by name** at runtime.
 
 ## Configuration
 
-All tunable values live in the **Constants** table at the top of the routine document — edit there, nowhere else. Purpose of each:
+**Live trading is off unless you turn it on.** The routine places real entry orders only when a file named `LIVE_TRADING` exists next to the routine document; with no such file it runs in **dry run** — logging every would-be buy and stop instead of placing it. The file is gitignored, so a fresh clone never trades live, and enabling it is a local act rather than a committed edit. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
+
+All other tunable values live in the **Constants** table at the top of the routine document — edit there, nowhere else. Purpose of each:
 
 | Constant | Purpose |
 |---|---|
 | `AGENTIC_ACCOUNT_NAME` | Account to trade, matched by name (default `"Agentic"`). |
-| `DRY_RUN` | If `true` (the default), log would-be entries instead of placing them; protection of existing positions stays live. To trade live on a given machine, create an empty `LIVE_TRADING` file next to the routine document (gitignored) — the repo default stays safe, and going live is never a committed edit. |
 | `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
@@ -76,11 +77,11 @@ All tunable values live in the **Constants** table at the top of the routine doc
 
 ## Testing before going live
 
-1. Set `DRY_RUN = true` in the Constants table and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
+1. Leave dry run on (no `LIVE_TRADING` file) and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
 4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
-5. Only after the above look right, consider dropping the approval gate and flipping `DRY_RUN` to `false`.
+5. Only after the above look right, consider dropping the approval gate and going live by creating the `LIVE_TRADING` file.
 
 ## Tools
 
