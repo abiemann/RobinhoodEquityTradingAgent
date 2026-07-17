@@ -27,7 +27,7 @@ All tunable values live in the **Constants** table at the top of the routine doc
 | Constant | Purpose |
 |---|---|
 | `AGENTIC_ACCOUNT_NAME` | Account to trade, matched by name (default `"Agentic"`). |
-| `DRY_RUN` | If `true`, log would-be entries instead of placing them; protection of existing positions stays live. |
+| `DRY_RUN` | If `true` (the default), log would-be entries instead of placing them; protection of existing positions stays live. To trade live on a given machine, create an empty `LIVE_TRADING` file next to the routine document (gitignored) — the repo default stays safe, and going live is never a committed edit. |
 | `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
