@@ -19,6 +19,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
 SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
+FILTER = os.path.join(ROOT, "filter_scan.py")
 
 
 def bar(date, close, high, volume, interpolated=False):
@@ -225,6 +226,46 @@ class PriceBandScannerTests(unittest.TestCase):
         self.assertIsNotNone(png)
         self.assertGreater(len(png), 1000)
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+
+
+class FilterScanTests(unittest.TestCase):
+    def run_filter(self, rows, top_n=15):
+        with tempfile.TemporaryDirectory() as td:
+            scan = os.path.join(td, "scan.json")
+            out = os.path.join(td, "out.json")
+            with open(scan, "w", encoding="utf-8") as f:
+                json.dump({"data": {"result": {"results": rows, "total_items": len(rows)}}}, f)
+            run_cli(FILTER, ["--scan-file", scan, "--price-min", "2.50", "--price-max", "5",
+                             "--min-rel-volume", "2", "--min-abs-pct-change", "3",
+                             "--top-n", str(top_n), "--json-out", out])
+            with open(out, encoding="utf-8") as f:
+                return json.load(f)
+
+    def test_filters_band_relvol_and_move(self):
+        rows = [scan_row("KEEP", 4.45, 0.1528, 557.75),
+                scan_row("LOWPX", 2.49, 0.10, 50.0),
+                scan_row("HIPX", 5.01, 0.10, 50.0),
+                scan_row("LOWRV", 3.00, 0.10, 1.9),
+                scan_row("FLAT", 3.00, 0.0299, 50.0),
+                scan_row("NEGMOVE", 3.00, -0.0500, 9.0),
+                scan_row("EDGEPX", 5.00, 0.0300, 2.0),
+                {"ticker": "BROKEN", "columns": {"Symbol": "BROKEN"}}]
+        data = self.run_filter(rows)
+        symbols = [w["symbol"] for w in data["working_list"]]
+        self.assertEqual(symbols, ["KEEP", "NEGMOVE", "EDGEPX"])
+        self.assertEqual(data["rows_skipped"], 1)
+        keep = data["working_list"][0]
+        self.assertAlmostEqual(keep["day_pct_change"], 15.28, delta=0.001)
+        edge = data["working_list"][2]
+        self.assertAlmostEqual(edge["last"], 5.00, delta=0.001)
+        self.assertAlmostEqual(edge["day_pct_change"], 3.00, delta=0.001)
+
+    def test_top_n_caps_by_relative_volume(self):
+        rows = [scan_row(f"S{i}", 3.0, 0.05, 10.0 + i) for i in range(6)]
+        data = self.run_filter(rows, top_n=3)
+        symbols = [w["symbol"] for w in data["working_list"]]
+        self.assertEqual(symbols, ["S5", "S4", "S3"])
+        self.assertEqual(data["passed_filters"], 6)
 
 
 if __name__ == "__main__":

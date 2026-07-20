@@ -53,6 +53,15 @@ Everything that protects EXISTING positions is ALWAYS live in both modes — pro
 ### BROKER TIMESTAMPS — compare as strings, never parse full precision
 Broker order timestamps carry VARIABLE-precision fractional seconds (observed live: `.16`, `.785`, `.708917`) and the sandbox's Python `datetime.fromisoformat()` rejects some of them (observed 2026-07-17: `ValueError: Invalid isoformat string: '2026-07-09T15:41:35.16+00:00'`). In any ad-hoc code that filters or windows by order time — re-entry cooldown, stop-count "filled today", dust provenance, ledger recovery — do NOT parse timestamps with `fromisoformat`. Use one of these, in order of preference: (1) compare ISO-8601 UTC timestamps AS STRINGS — they sort chronologically; compute the cutoff as an ISO string (e.g. `datetime.now(timezone.utc) - timedelta(days=N)` formatted `%Y-%m-%dT%H:%M:%S`) and use plain `>=` on strings; (2) if a datetime object is truly needed, parse only the first 19 characters: `datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")`, treating it as UTC. A timestamp parse error must never abort a safety check — on any parse failure, fall back to string comparison.
 
+### BROKER ORDER OBJECTS — the schema is known, do not rediscover it
+Every filter over `get_equity_orders` results (stop-coverage audit, stop-count guard, re-entry cooldown, stop-fill discovery, ledger dedupe) uses this VERIFIED schema — never probe or guess it ad hoc (a 2026-07-20 run wasted queries filtering on `type == "stop"` and a nonexistent `order_id` field):
+- Orders live at `data.orders[]`. The order id field is **`id`** — there is NO `order_id` field in the response.
+- **There is no `"stop"` order type.** A stop-loss order is `type: "market"` with **`trigger: "stop"`** and `stop_price` set (`price` is null). A plain market order is `type: "market"` with `trigger: "immediate"`. Always identify stops by `trigger == "stop"`, never by `type`.
+- Quantities and prices are STRINGS (`"117.000000"`, `"2.570000"`).
+- `state` values: `confirmed` (an active/working stop), `filled`, `cancelled`, `rejected`, `failed`, plus transient `new`/`queued`/`unconfirmed`/`partially_filled`.
+- Fills carry an `executions[]` array (per-execution `price`, `quantity`, `timestamp`); `average_price` is set once filled.
+- `created_at`/`last_transaction_at` have variable-precision fractional seconds — handle per BROKER TIMESTAMPS above.
+
 ### TRADE LEDGER — append-only record of every fill
 Maintain `trade-ledger.csv` next to this document; create it with this header row if missing:
 
@@ -116,13 +125,14 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 
 5. Ensure the sort: if `get_scans` did not already show this scan sorted by relative volume descending, set it via `update_scan_config` with sorting_column `"Relative volume"`, sorting_direction `"desc"`. (The saved scan persists its sort, so this call is normally unnecessary.)
 
-6. `run_scan` to get live rows, then **filter the returned rows client-side**, keeping only rows where ALL of these hold:
-   - `PRICE_MIN` ≤ `Last` ≤ `PRICE_MAX`
-   - `Relative volume` ≥ `MIN_REL_VOLUME`
-   - `abs(% Change) × 100` ≥ `MIN_ABS_PCT_CHANGE` — NOTE: the scan returns `% Change` as a decimal fraction (e.g. `0.0301` means 3.01%), so multiply by 100 before comparing to `MIN_ABS_PCT_CHANGE`, which is expressed in percent. This drops flat SPAC/near-NAV names that clear the volume bar but aren't moving.
+6. `run_scan` to get live rows, then build the working list with the checked-in script — NEVER re-implement the filter or probe the response structure ad hoc:
+   `python3 filter_scan.py --scan-file <saved result file> --price-min <PRICE_MIN> --price-max <PRICE_MAX> --min-rel-volume <MIN_REL_VOLUME> --min-abs-pct-change <MIN_ABS_PCT_CHANGE> --top-n <TOP_N>`
+   — all five values from `Constants.md`. The script applies the full screen (price band, relative-volume floor, minimum absolute day move including the % Change decimal-fraction→percent conversion), ranks by relative volume, and prints the final working list.
 
-   **Oversized result → saved to file (happens every run):** the `run_scan` result exceeds the context cap, so the harness saves it to a file and replies with a WINDOWS path (`C:\Users\...`). If your shell is a Linux sandbox (typical for scheduled runs), that path will fail with `No such file or directory` — do NOT retry it or hand-edit it (past runs corrupted it while retyping). Instead, copy the file's exact basename (`mcp-…-run_scan-<id>.txt`) and locate it in one step: `find /sessions -name '<basename>' 2>/dev/null | head -1` — it lives under `/sessions/<session>/mnt/.claude/projects/…/tool-results/`. Then run your jq/python filter against that found path.
-7. **WORKING LIST** = the top `TOP_N` surviving rows by `Relative volume` (descending). This is live data. If the market is closed, relative volume reads ~1 everywhere, the list comes back empty, and the routine simply opens no new positions this run (see Tradeoffs) — proceed to the report.
+   **The response schema is KNOWN and stable — do not rediscover it each run** (runs were wasting commands guessing `instruments`/`cells`; observed 2026-07-20): rows live at `data.result.results[]`; each row is `{ticker, instrument_id, columns: {"Last", "% Change", "Relative volume", "Volume", "Symbol", …}}`; prices and volumes are STRINGS; `% Change` is a decimal fraction (`0.0301` = 3.01%). Only if `filter_scan.py` itself errors on the file should you inspect the structure — and then report the schema drift prominently, because it means the broker changed the API.
+
+   **Oversized result → saved to file (happens every run):** the `run_scan` result exceeds the context cap, so the harness saves it to a file and replies with a WINDOWS path (`C:\Users\...`). If your shell is a Linux sandbox (typical for scheduled runs), that path will fail with `No such file or directory` — do NOT retry it or hand-edit it (past runs corrupted it while retyping). Instead, copy the file's exact basename (`mcp-…-run_scan-<id>.txt`) and locate it in one step: `find /sessions -name '<basename>' 2>/dev/null | head -1` — it lives under `/sessions/<session>/mnt/.claude/projects/…/tool-results/`. Then pass that found path to `filter_scan.py` as `--scan-file`.
+7. **WORKING LIST** = `filter_scan.py`'s ranked output (top `TOP_N` by relative volume, descending). This is live data. If the market is closed, relative volume reads ~1 everywhere, the list comes back empty, and the routine simply opens no new positions this run (see Tradeoffs) — proceed to the report.
 
 **FOURTH — look for new entries (from the WORKING LIST only, highest relative volume first).**
 

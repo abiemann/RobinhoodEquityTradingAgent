@@ -85,7 +85,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 
 ## Tools
 
-- **tests/test_scripts.py** — dependency-free regression tests for the two deterministic scripts (`py -3 tests/test_scripts.py` / `python3 tests/test_scripts.py`); run them before committing script changes. Expected values were verified against live API data.
+- **tests/test_scripts.py** — dependency-free regression tests for the three deterministic scripts (`py -3 tests/test_scripts.py` / `python3 tests/test_scripts.py`); run them before committing script changes. Expected values were verified against live API data.
 - **PriceBandScanner** (`tools/PriceBandScanner.md` + `tools/price_band_scanner.py`) — a read-only companion agent, scheduled once daily after market close. It runs the same saved scan, buckets the day's most-active stocks into price bands, and reports each band's median/mean % change, breadth, and best/worst names — evidence for choosing the `PRICE_MIN`/`PRICE_MAX` band. It never touches accounts or orders. Logs to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md` plus a same-named `.png` chart of the band medians (local only, gitignored). **Schedule it after the US close but before Asia starts trading — i.e., before 5:00 PM PT, when Robinhood's overnight (24/5) session opens and its prints would contaminate the day's data; ~1:05 PM PT is ideal.**
 
 ## Usage Example
