@@ -3,7 +3,7 @@
 Rules for any AI agent (or human) editing this repository.
 
 ## Tests are mandatory for script changes
-After editing `evaluate_candidates.py`, `filter_scan.py`, or `tools/price_band_scanner.py`, run:
+After editing `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, or `tools/price_band_scanner.py`, run:
 
 ```
 python3 tests/test_scripts.py     # Windows: py -3 tests\test_scripts.py

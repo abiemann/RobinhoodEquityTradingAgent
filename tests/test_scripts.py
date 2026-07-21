@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
 SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
+CLOCK = os.path.join(ROOT, "market_clock.py")
 
 
 def bar(date, close, high, volume, interpolated=False):
@@ -266,6 +267,65 @@ class FilterScanTests(unittest.TestCase):
         symbols = [w["symbol"] for w in data["working_list"]]
         self.assertEqual(symbols, ["S5", "S4", "S3"])
         self.assertEqual(data["passed_filters"], 6)
+
+
+class MarketClockTests(unittest.TestCase):
+    def clock(self, now_utc, blackout=0):
+        args = ["--now-utc", now_utc, "--json"]
+        if blackout:
+            args += ["--no-buy-first-minutes", str(blackout)]
+        return json.loads(run_cli(CLOCK, args))
+
+    def test_summer_offsets_are_daylight(self):
+        # 2026-07-21 15:07Z — the run that had to improvise a clock.
+        c = self.clock("2026-07-21T15:07:00Z")
+        self.assertEqual(c["et"], "2026-07-21 11:07:00 EDT")
+        self.assertEqual(c["pt"], "2026-07-21 08:07:00 PDT")
+        self.assertEqual(c["session"], "regular")
+        self.assertEqual(c["minutes_since_open"], 97)
+
+    def test_winter_offsets_are_standard(self):
+        c = self.clock("2026-01-15T15:07:00Z")
+        self.assertEqual(c["et"], "2026-01-15 10:07:00 EST")
+        self.assertEqual(c["pt"], "2026-01-15 07:07:00 PST")
+
+    def test_dst_spring_forward_boundary_eastern(self):
+        # 2026 spring-forward: 2nd Sunday of March = Mar 8, 02:00 EST = 07:00Z.
+        before = self.clock("2026-03-08T06:59:00Z")
+        after = self.clock("2026-03-08T07:00:00Z")
+        self.assertEqual(before["et"], "2026-03-08 01:59:00 EST")
+        self.assertEqual(after["et"], "2026-03-08 03:00:00 EDT")
+
+    def test_dst_fall_back_boundary_eastern(self):
+        # 2026 fall-back: 1st Sunday of November = Nov 1, 02:00 EDT = 06:00Z.
+        before = self.clock("2026-11-01T05:59:00Z")
+        after = self.clock("2026-11-01T06:00:00Z")
+        self.assertEqual(before["et"], "2026-11-01 01:59:00 EDT")
+        self.assertEqual(after["et"], "2026-11-01 01:00:00 EST")
+
+    def test_zones_switch_at_their_own_local_2am(self):
+        # Between 07:00Z and 10:00Z on spring-forward day, ET is already on
+        # daylight time while PT is still on standard time.
+        c = self.clock("2026-03-08T08:00:00Z")
+        self.assertEqual(c["et"], "2026-03-08 04:00:00 EDT")
+        self.assertEqual(c["pt"], "2026-03-08 00:00:00 PST")
+
+    def test_opening_blackout_window(self):
+        # Open 09:30 ET = 13:30Z in summer; blackout covers the first 45 min.
+        self.assertTrue(self.clock("2026-07-21T13:35:00Z", blackout=45)["opening_blackout"])
+        self.assertTrue(self.clock("2026-07-21T14:14:00Z", blackout=45)["opening_blackout"])
+        self.assertFalse(self.clock("2026-07-21T14:15:00Z", blackout=45)["opening_blackout"])
+
+    def test_sessions_and_weekend(self):
+        self.assertEqual(self.clock("2026-07-21T12:00:00Z")["session"], "pre-market")
+        self.assertEqual(self.clock("2026-07-21T20:30:00Z")["session"], "after-hours")
+        self.assertEqual(self.clock("2026-07-22T01:00:00Z")["session"], "closed")
+        self.assertEqual(self.clock("2026-07-18T15:00:00Z")["session"], "closed-weekend")
+
+    def test_pacific_trading_day_rolls_before_utc_day(self):
+        # 2026-07-22 03:00Z is still 2026-07-21 in Pacific — the date used
+        # for "filled today" counting must be the Pacific one.
+        self.assertEqual(self.clock("2026-07-22T03:00:00Z")["date_pt"], "2026-07-21")
 
 
 if __name__ == "__main__":
