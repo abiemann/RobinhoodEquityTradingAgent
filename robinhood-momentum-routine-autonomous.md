@@ -190,7 +190,11 @@ State how many names the scan returned and how many survived the price + relativ
 
 **After saving the report, output a brief on-screen run summary** (inside a `<run-summary>` tag) covering: scan results, orders placed/skipped and why, circuit-breaker status, stop-coverage status, and the token estimate in the form `~N tokens (estimate)`. Keep it to 3–5 sentences.
 
-**Then END your final transcript message by NAMING the report file in plain text — every run, no exceptions.** Naming an output file in the closing message is what makes the scheduler render it as a file card with a working **"Open in <editor>"** button; a run that never names its file leaves the user hunting for it by path. Use plain text, NOT a markdown link — the transcript viewer renders links to local files but cannot open them (verified 2026-07-17: project-relative paths and absolute `file:///` URIs both render, neither responds to a click), and a link that looks clickable but does nothing is worse than no link. Close with a line like: "Output file — open from the file panel on the right: rhmra-log-YYYY_MM_DD-HH_MM.md (run report)." Name every file the run created or modified this way, including `ALERTS.md` if it was touched.
+**END your final transcript message with this line — verbatim except the filename, every run, no exceptions:**
+
+Output file — open from the file panel on the right: rhmra-log-YYYY_MM_DD-HH_MM.md (run report)
+
+Three things are load-bearing: it must be the **LAST** line (nothing after it — the run-summary goes BEFORE it), the filename must be **BARE** (no `run-reports/` prefix, no directory), and it must be **unformatted text** — no backticks/code span, no markdown link. That exact shape is what makes the scheduler render a file card with a working **"Open in <editor>"** button. Evidence (2026-07-22): the 14:27 run used this line and got the card; the 09:07 run wrote ``Report saved to `run-reports/rhmra-log-….md` `` and followed it with a summary, and got no card — leaving the user to hunt for the file by path. Markdown links never work (2026-07-17: relative paths and `file:///` URIs both render, neither responds to a click). If the run created or modified any other file (e.g. `ALERTS.md`), name it the same way on its own line just above this one.
 
 **Save the report to disk — fixed folder, fixed filename, no exceptions.** Create the full report as a Markdown file in the `run-reports` folder next to this document (create the folder if it doesn't exist).
 
