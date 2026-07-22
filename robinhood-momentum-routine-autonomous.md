@@ -53,7 +53,9 @@ Everything that protects EXISTING positions is ALWAYS live in both modes — pro
 ### CURRENT TIME — establish ONCE at run start, from the script
 You have no reliable internal clock, and the obvious shell workarounds FAIL SILENTLY on some hosts: `TZ=America/New_York date` returns GMT on Windows/Git Bash (no tzdata) instead of erroring, and Python's `zoneinfo` raises `ZoneInfoNotFoundError` there. A wrong-but-plausible clock mis-evaluates the opening blackout and "filled today" counting. So as the FIRST action of every run, before any step, run:
 
-`python3 market_clock.py --no-buy-first-minutes <NO_BUY_FIRST_MINUTES>`
+`python3 market_clock.py`
+
+**Do NOT pass `--no-buy-first-minutes` — the script reads it from Constants.md itself.** That flag exists only as a test override; the routine must never substitute the value on the command line. An agent invoked this script with `--no-buy-first-minutes 5` against a Constants.md value of 45 on 2026-07-22 (safe by luck because the arithmetic still tripped the block; the mismatch could have unlocked buying inside the blackout window). More generally: any `<CONSTANT_NAME>` placeholder in a shell command is an invitation for the agent to type a value from memory instead of the file — treat those with suspicion in future edits.
 
 Always `python3` — this document is executed in a Linux sandbox where `py` does not exist and returns `bash: py: command not found` (observed 2026-07-22 in the 11:07 and 11:37 runs). The `py -3` form belongs only in local test-runner instructions on a Windows dev machine, never in this routine. The same applies to every other `python3` command in this document.
 

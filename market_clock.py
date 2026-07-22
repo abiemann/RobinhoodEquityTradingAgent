@@ -17,9 +17,16 @@ This script depends only on UTC (always available) and computes the US
 Eastern/Pacific offsets from the DST rule itself, so it gives the same
 answer on Windows and in the Linux sandbox.
 
-Usage:
-  python3 market_clock.py [--no-buy-first-minutes 45] [--json]
-  python3 market_clock.py --now-utc 2026-07-21T15:07:00Z    # for testing
+Usage (routine):  python3 market_clock.py [--json]
+Testing:           python3 market_clock.py --now-utc 2026-07-21T15:07:00Z
+                   python3 market_clock.py --no-buy-first-minutes 5    # override
+
+The blackout minute count is read from Constants.md (the row for
+NO_BUY_FIRST_MINUTES). The routine must NOT substitute the value on the
+command line — an agent invoked this with `--no-buy-first-minutes 5`
+against a Constants.md of 45 on 2026-07-22 (safe by luck, could have
+unlocked buying inside the blackout). --no-buy-first-minutes stays as a
+test override only.
 
 US DST rule (since 2007): starts the second Sunday in March at 02:00
 local standard time, ends the first Sunday in November at 02:00 local
@@ -33,6 +40,8 @@ and require all tests to pass before committing.
 
 import argparse
 import json
+import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -95,13 +104,39 @@ def session_state(et_dt):
     return "closed", since_open
 
 
+def read_no_buy_first_minutes(constants_path=None):
+    """Extract NO_BUY_FIRST_MINUTES from Constants.md next to this script.
+
+    Reading it here — instead of taking it as a CLI flag the routine
+    substitutes by hand — closes an improvisation gap: on 2026-07-22 an
+    agent invoked this script with `--no-buy-first-minutes 5` when
+    Constants.md said 45 (safe by luck; the mismatch could have unlocked
+    buying inside the blackout window).
+    """
+    if constants_path is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        constants_path = os.path.join(here, "Constants.md")
+    with open(constants_path, encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"\|\s*`NO_BUY_FIRST_MINUTES`\s*\|\s*`(\d+)`", line)
+            if m:
+                return int(m.group(1))
+    raise ValueError(f"NO_BUY_FIRST_MINUTES row not found in {constants_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--no-buy-first-minutes", type=int, default=0,
-                    help="NO_BUY_FIRST_MINUTES from Constants.md; reports the opening-blackout verdict")
+    ap.add_argument("--no-buy-first-minutes", type=int, default=None,
+                    help="OPTIONAL override for tests; the routine must NOT pass this — the value is read from Constants.md so the agent never re-types it")
+    ap.add_argument("--constants", help="path to Constants.md (testing only)")
     ap.add_argument("--now-utc", help="override the clock, ISO-8601 UTC (testing only)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    if args.no_buy_first_minutes is None:
+        blackout_minutes = read_no_buy_first_minutes(args.constants)
+    else:
+        blackout_minutes = args.no_buy_first_minutes
 
     if args.now_utc:
         utc = datetime.strptime(args.now_utc.rstrip("Z")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
@@ -113,7 +148,7 @@ def main():
     state, since_open = session_state(et)
 
     in_blackout = (state == "regular" and since_open is not None
-                   and since_open < args.no_buy_first_minutes)
+                   and since_open < blackout_minutes)
 
     out = {
         "utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -132,9 +167,8 @@ def main():
         print(f"ET      {out['et']}")
         print(f"PT      {out['pt']}   (trading day {out['date_pt']} Pacific)")
         print(f"Session {state}" + (f"  |  {since_open} min since 09:30 ET open" if since_open is not None else ""))
-        if args.no_buy_first_minutes:
-            verdict = "BLOCKED — opening blackout" if in_blackout else "clear"
-            print(f"Blackout (first {args.no_buy_first_minutes} min): {verdict}")
+        verdict = "BLOCKED — opening blackout" if in_blackout else "clear"
+        print(f"Blackout (first {blackout_minutes} min, from Constants.md): {verdict}")
     return 0
 
 

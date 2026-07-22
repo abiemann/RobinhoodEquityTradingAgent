@@ -316,6 +316,23 @@ class MarketClockTests(unittest.TestCase):
         self.assertTrue(self.clock("2026-07-21T14:14:00Z", blackout=45)["opening_blackout"])
         self.assertFalse(self.clock("2026-07-21T14:15:00Z", blackout=45)["opening_blackout"])
 
+    def test_reads_no_buy_first_minutes_from_constants_md(self):
+        # No --no-buy-first-minutes flag: the script must read the value from
+        # Constants.md rather than defaulting silently. Regression for the
+        # 2026-07-22 06:37 run where an agent passed 5 against a real 45.
+        c = self.clock("2026-07-22T13:37:00Z")   # 09:37 ET = 7 min past open
+        self.assertTrue(c["opening_blackout"],
+                        "with Constants.md at 45, 7 min past open must block; a silent 0 default would falsely clear")
+
+    def test_missing_constants_file_errors_loudly(self):
+        # If Constants.md cannot be found, the script must fail rather than
+        # default to 0 (which silently disables the blackout).
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run([sys.executable, CLOCK, "--constants", os.path.join(td, "nope.md"),
+                                "--now-utc", "2026-07-22T13:37:00Z", "--json"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+
     def test_sessions_and_weekend(self):
         self.assertEqual(self.clock("2026-07-21T12:00:00Z")["session"], "pre-market")
         self.assertEqual(self.clock("2026-07-21T20:30:00Z")["session"], "after-hours")
