@@ -53,7 +53,9 @@ Everything that protects EXISTING positions is ALWAYS live in both modes — pro
 ### CURRENT TIME — establish ONCE at run start, from the script
 You have no reliable internal clock, and the obvious shell workarounds FAIL SILENTLY on some hosts: `TZ=America/New_York date` returns GMT on Windows/Git Bash (no tzdata) instead of erroring, and Python's `zoneinfo` raises `ZoneInfoNotFoundError` there. A wrong-but-plausible clock mis-evaluates the opening blackout and "filled today" counting. So as the FIRST action of every run, before any step, run:
 
-`python3 market_clock.py --no-buy-first-minutes <NO_BUY_FIRST_MINUTES>`  (Windows: `py -3 market_clock.py …`)
+`python3 market_clock.py --no-buy-first-minutes <NO_BUY_FIRST_MINUTES>`
+
+Always `python3` — this document is executed in a Linux sandbox where `py` does not exist and returns `bash: py: command not found` (observed 2026-07-22 in the 11:07 and 11:37 runs). The `py -3` form belongs only in local test-runner instructions on a Windows dev machine, never in this routine. The same applies to every other `python3` command in this document.
 
 It prints the authoritative UTC / ET / PT times, the Pacific trading date, the market session (`pre-market`, `regular`, `after-hours`, `closed`, `closed-weekend`), minutes since the 09:30 ET open, and the opening-blackout verdict. Add `--json` if you want to parse it.
 
