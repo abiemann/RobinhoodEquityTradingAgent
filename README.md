@@ -53,6 +53,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 
 - A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
 - An agent runner/scheduler that loads the routine and honors per-tool approval settings.
+- **Python 3** available to the agent's shell as `python3` — standard library only, nothing to install. It is not optional: the routine runs `market_clock.py` as the very first action of every run and halts entries if it cannot. The command is written literally in the routine (three invocations) rather than being configurable, deliberately — a substitutable value in a command that runs before the guardrails is a value that can be typed wrong. If your environment names the interpreter differently, edit those three lines once.
 - **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
 
 ## Guardrails
@@ -83,10 +84,17 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
 5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `Constants.md` (an uncommitted edit).
 
+## Deterministic layer
+
+The routine document is executed by an LLM, so **none of the math lives in it.** Every calculation sits in a small, dependency-free Python script that the agent runs and reads the verdict from — it orchestrates, it never computes. The documents may not re-implement this math, and a script's behavior may not be re-derived at runtime: each one owns its rules, its input schema, and its edge cases, so thirty-minute runs cannot drift from one another.
+
+- **market_clock.py** — the run's clock, executed as the **first action of every run**, before anything else. Everything time-dependent reads from it: the report header and filename, the market session, "stops filled today (Pacific)", re-entry cooldown windows, and the opening-blackout verdict (which it reads from `Constants.md` itself, so the value is never re-typed). It derives the US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
+- **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. It also documents the scan response's schema in one place so no run has to rediscover it.
+- **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars.
+- **tests/test_scripts.py** — 24 dependency-free regression tests covering all three (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
+
 ## Tools
 
-- **market_clock.py** — the routine's authoritative clock, run once at the start of each run. Prints UTC/ET/PT, the Pacific trading date, the market session, minutes since the open, and the opening-blackout verdict. It derives the US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata (Windows returns GMT) — a wrong-but-plausible clock would mis-evaluate the blackout gate and "filled today" counting.
-- **tests/test_scripts.py** — dependency-free regression tests for the four deterministic scripts (`py -3 tests/test_scripts.py` / `python3 tests/test_scripts.py`); run them before committing script changes. Expected values were verified against live API data.
 - **PriceBandScanner** (`tools/PriceBandScanner.md` + `tools/price_band_scanner.py`) — a read-only companion agent, scheduled once daily after market close. It runs the same saved scan, buckets the day's most-active stocks into price bands, and reports each band's median/mean % change, breadth, and best/worst names — evidence for choosing the `PRICE_MIN`/`PRICE_MAX` band. It never touches accounts or orders. Logs to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md` plus a same-named `.png` chart of the band medians (local only, gitignored). **Schedule it after the US close but before Asia starts trading — i.e., before 5:00 PM PT, when Robinhood's overnight (24/5) session opens and its prints would contaminate the day's data; ~1:05 PM PT is ideal.**
 
 ## Usage Example
