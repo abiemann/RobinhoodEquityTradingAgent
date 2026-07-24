@@ -22,7 +22,7 @@ All tunable values for `robinhood-momentum-routine-autonomous.md` live HERE and 
 | `RSI_INTERVAL` | `30minute` | Bar interval for the entry-gate RSI — matches the run cadence. |
 | `RSI_OVERSOLD` | `35` | The candidate must have printed RSI at/below this within the last `RSI_LOOKBACK_BARS` bars to be buyable (35, not the classic 30 — starting point to tune; these small-cap dips rarely print 30). |
 | `RSI_LOOKBACK_BARS` | `5` | Window (in `RSI_INTERVAL` bars) in which the oversold touch must have occurred. |
-| `RSI_CONFIRM_BARS` | `1` | Consecutive rising RSI values required — the "curl up" saying the fall has at least locally stopped. |
+| `RSI_CONFIRM_BARS` | `2` | Consecutive rising RSI values required — the "curl up" saying the fall has at least locally stopped. Raised 1→2 on 2026-07-24: a single-bar uptick let a 30-min pause in a collapse pass as a bottom (three knives bought and stopped out inside 46 min; all three had exactly one rising bar, the day's one survivor had two). |
 | `TAKE_PROFIT_PCT` | `2.5` | Sell a held position when it is up this % or more vs. entry. |
 | `BUY_SIZE_PCT` | `20` | Order size for each buy, as a % of total account value. |
 | `MIN_ORDER_DOLLARS` | `50` | Smallest allowed buy. When buying power can't fund a full `BUY_SIZE_PCT` order, the order is DOWNSIZED to available buying power — but never below this floor; below it, skip the buy (tiny fills create dust positions that can't carry a whole-share stop). |
