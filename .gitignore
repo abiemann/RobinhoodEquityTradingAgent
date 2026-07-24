@@ -1,6 +1,7 @@
 run-reports/
 tmp_eval/
 tmp_*
+scratch_*
 tools/logs/
 trade-ledger.csv
 __pycache__/
