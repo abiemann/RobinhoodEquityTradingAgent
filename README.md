@@ -66,6 +66,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level. A double failure halts new entries for that run and raises a line in the local `ALERTS.md` for human attention.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
+- **Connector-failure discipline**: a failed broker call is retried exactly once and is never treated as an empty result; if positions can't be fetched and the portfolio shows nonzero equity, the run places no orders at all. Every failure is reported even when the retry recovered.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
 - **Append-only trade ledger** (`trade-ledger.csv`, local/gitignored): every fill recorded with order id, price, reason, realized P&L, and the rules version (git hash of the routine doc) that produced it — the raw data for win-rate and expectancy review per rule era.
