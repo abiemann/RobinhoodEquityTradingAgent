@@ -280,6 +280,31 @@ further supports position.
 **The lesson, stated exactly: an instruction that enumerates ONE forbidden form implicitly permits
 every other wrong form.** Specify the required shape, not the prohibited one.
 
+**2026-07-27 — the three-property theory above is FALSIFIED as sufficient. Do not re-derive it.**
+Two runs that day closed with byte-identical line shapes — last line, bare filename, unformatted
+text, all three properties satisfied — and only one produced a card:
+
+    12:37  Output file — open from the file panel on the right: rhmra-log-2026_07_27-12_37.md (run report)   -> CARD
+    13:07  Output file — open from the file panel on the right: rhmra-log-2026_07_27-13_07.md (run report)   -> NO CARD
+
+Both reports were complete on disk (8,365 and 3,481 chars), so nothing failed in writing. The
+difference was a discrete `Presented file(s)` step in the transcript, present in the run that got a
+card and absent in the one that did not. It does not expand into a tool call, so it is the harness
+surfacing a file rather than something the agent invokes.
+
+Across four runs checked that day the trigger tracked one thing exactly: **whether the run READ the
+file back after writing it.** 11:37, 12:07 and 12:37 all show "read a file" in their step summary,
+all three presented, all three got cards; 13:07 shows no read, no presentation, no card. Hence the
+read-back rule now in the REPORT section — which also earns its place independently as a
+persistence check, so it stands even if this mechanism is later shown to be something else.
+
+**Standing caution for whoever reads this next:** this question has now produced three confident
+diagnoses that were each incomplete (`250e979` "not a markdown link", `5088538` the three
+properties, and before those a claim that script-created files could not get cards at all, which
+Alexander disproved with a screenshot). Every one was inferred from correlation on a handful of
+runs, and n here is 4. Write rules around the ACTION to take, not around a theory of what the
+harness does with it.
+
 **Also disproved here:** the claim that a script-created file cannot get a transcript card. The
 user produced a screenshot disproving it. Cards come from *naming the file in the closing message*,
 regardless of who created it.

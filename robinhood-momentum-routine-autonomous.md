@@ -212,6 +212,8 @@ Three things are load-bearing: it must be the **LAST** line (nothing after it �
 
 **Use the file-writing TOOL to create it — never a shell command.** Create the report with the harness's file-creation tool (the `Write` tool), passing the full report text as its content. Do NOT write the report by shelling out: no `cat > file << EOF` heredoc, no `echo`/`printf` redirection, no Python `open(...).write(...)`, no PowerShell `Set-Content`/`Out-File`. Two reasons: a Write-tool creation shows up in the transcript as a file chip the user can open on the spot, and shell redirection mangles UTF-8 on some hosts — the em-dashes and ✓/🔔 characters this report uses come out as mojibake. This is separate from, and does not replace, naming the file in the closing message (see the run-summary rule below) — do BOTH. The same applies to `ALERTS.md` and any other file a run creates.
 
+**Then READ THE REPORT BACK, once — even though the `Write` tool reported success.** Two reasons, either sufficient on its own: it confirms the report actually reached disk (the "issued is not persisted" failure the ledger read-back guards against, applied to the only other file every run writes), and reading the file back is what causes the transcript to PRESENT it with a working "Open in \<editor\>" button. A run that writes its report and never reads it produces no file card, leaving the user to hunt for the file by path. Read `ALERTS.md` back too whenever a run creates or appends to it.
+
 The filename is exactly:
 
 `rhmra-log-YYYY_MM_DD-HH_MM.md`
