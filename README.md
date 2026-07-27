@@ -71,6 +71,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 - **Connector-failure discipline**: a failed broker call is retried exactly once and is never treated as an empty result; if positions can't be fetched and the portfolio shows nonzero equity, the run places no orders at all. Every failure is reported even when the retry recovered.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
+- **Per-run gate record** (`run-reports/rhmra-gates-*.json`, local/gitignored): every candidate's measured values at every gate — median dollar volume, % below high, quoted spread, RSI verdict — for names that passed as well as names that were blocked, alongside the thresholds in force that run. A blocked name explains itself in the report; this exists so a name that cleared every gate and *then* lost money can still be investigated from the readings it cleared them with.
 - **Append-only trade ledger** (`trade-ledger.csv`, local/gitignored): every fill recorded with order id, price, reason, realized P&L, and the rules version (git hash of the routine doc) that produced it — the raw data for win-rate and expectancy review per rule era.
 
 ## Why the rules look like this
