@@ -247,10 +247,17 @@ def main():
                 row["buy_candidate"] = True
                 row["rsi_gate"] = "disabled"
             else:
-                ok, reason = rsi_gate(rsi_map.get(sym, []), args.rsi_oversold,
+                series = rsi_map.get(sym, [])
+                ok, reason = rsi_gate(series, args.rsi_oversold,
                                       args.rsi_lookback_bars, args.rsi_confirm_bars)
                 row["rsi_gate"] = "pass" if ok else "block"
                 row["rsi_reason"] = reason
+                # the raw series, not just the verdict: spread_pct,
+                # median_dollar_volume and pct_below_high are already numbers, so
+                # their thresholds can be swept from a saved run. Storing these
+                # makes RSI_OVERSOLD and RSI_CONFIRM_BARS equally answerable
+                # after the fact, without re-fetching indicators.
+                row["rsi_series"] = series
                 if ok:
                     row["buy_candidate"] = True
                 else:

@@ -241,6 +241,13 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertFalse(two["buy_candidate"])
         self.assertIn("confirm bar 2 of 2", two["rsi_reason"])
 
+    def test_rsi_series_is_recorded_for_threshold_sweeps(self):
+        # the saved series must let a later analysis re-answer the gate at other
+        # RSI_OVERSOLD / RSI_CONFIRM_BARS values without re-fetching indicators
+        series = [45.42, 41.38, 12.20, 11.00, 9.39, 9.88]
+        res = self.run_eval_rsi({"SYNX": {"rsi": series}})
+        self.assertEqual(res["rsi_series"], series)
+
     def test_rsi_block_at_first_bar_is_labelled_bar_1(self):
         res = self.run_eval_rsi({"SYNX": {"rsi": [42, 39, 36, 33, 31, 29]}})
         self.assertIn("confirm bar 1 of 1", res["rsi_reason"])
