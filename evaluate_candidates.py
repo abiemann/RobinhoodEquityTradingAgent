@@ -9,6 +9,10 @@ by hand. Computes, per symbol:
   - recent high: max high_price over the last --high-lookback-days bars,
     REAL bars only (interpolated bars are placeholder prices nobody paid)
   - % below high vs the current price, and the dip-entry verdict
+  - bid/ask spread gate (optional, --max-spread-buy-pct): rejects a name whose
+    quoted spread is too wide to exit cleanly. A spread approaching
+    STOP_LOSS_PCT puts the protective stop at the bid the moment it is
+    placed, so the position is stopped out on arrival.
 
 The script does NOT know about held positions or open orders — overlay those
 skips (Step 10 of the routine) on its output.
@@ -24,14 +28,19 @@ Usage:
       --quotes quotes.json \
       --volume-lookback-days 20 --high-lookback-days 5 \
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
-      [--json-out results.json]
+      [--max-spread-buy-pct 2.0] [--json-out results.json]
 
 --bars files: raw get_equity_historicals responses. Accepted shapes:
   {"data": {"results": [...]}}   (full tool response)
   {"results": [...]}             (data envelope)
   [...]                          (bare results list)
---quotes file: plain JSON map of SYMBOL -> current price, e.g.
+--quotes file: JSON map of SYMBOL -> current price, e.g.
   {"FISN": 9.843, "TTRX": "7.84"}
+  To enable the spread gate, give an object per symbol carrying bid and ask —
+  either plain keys, or the raw quote object copied verbatim out of a
+  get_equity_quotes response (no hand-transcribing needed):
+  {"GRDX": {"price": 3.08, "bid": 2.97, "ask": 3.09}}
+  {"GRDX": {"last_trade_price": "3.08", "bid_price": "2.97", "ask_price": "3.09"}}
 All four constant flags are REQUIRED so values always come from the routine
 document's Constants table — no silent stale defaults.
 """
@@ -53,6 +62,39 @@ def load_results(path):
         if "data" in doc and isinstance(doc["data"], dict) and "results" in doc["data"]:
             return doc["data"]["results"]
     raise ValueError(f"{path}: unrecognized shape - expected a get_equity_historicals response")
+
+
+def parse_quote(sym, val):
+    """Returns (price, bid, ask); bid/ask are None when not supplied. Accepts a
+    bare number/string, or an object using price/bid/ask or the raw API's
+    last_trade_price/bid_price/ask_price."""
+    if not isinstance(val, dict):
+        return float(val), None, None
+    price = val.get("price", val.get("last_trade_price"))
+    if price is None:
+        raise ValueError(f"{sym}: quote object has no price / last_trade_price")
+    bid = val.get("bid", val.get("bid_price"))
+    ask = val.get("ask", val.get("ask_price"))
+    return (float(price),
+            float(bid) if bid is not None else None,
+            float(ask) if ask is not None else None)
+
+
+def spread_gate(bid, ask, max_pct):
+    """Returns (passes, reason, spread_pct) using the relative spread
+    (ask - bid) / mid. Missing or nonsensical quote data BLOCKS, matching the
+    RSI gate: a name we cannot price is a name we cannot promise to exit."""
+    if bid is None or ask is None:
+        return False, "spread gate: no bid/ask in --quotes - blocked", None
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return False, f"spread gate: unusable quote (bid {bid:g}, ask {ask:g}) - blocked", None
+    # rounded so a spread sitting exactly on the threshold cannot be rejected by
+    # binary-float noise (4.04 - 3.96 is 0.08000000000000007)
+    pct = round((ask - bid) / ((bid + ask) / 2.0) * 100.0, 6)
+    if pct > max_pct:
+        return False, (f"spread gate: {pct:.2f}% wide (bid ${bid:.4f} / ask ${ask:.4f}) "
+                       f"> max {max_pct:g}%"), pct
+    return True, f"spread {pct:.2f}% <= {max_pct:g}%", pct
 
 
 def wilder_rsi(closes, period=14):
@@ -123,6 +165,7 @@ def main():
     ap.add_argument("--high-lookback-days", type=int, required=True)
     ap.add_argument("--min-median-dollar-volume", type=float, required=True)
     ap.add_argument("--dip-entry-pct", type=float, required=True)
+    ap.add_argument("--max-spread-buy-pct", type=float, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in --quotes")
     ap.add_argument("--json-out", help="optional path for machine-readable results")
     ap.add_argument("--rsi-file", help="JSON map SYMBOL -> RSI data (raw indicator response, bare series, {'rsi': [...]}, or {'closes': [...]} fallback); enables the RSI curl-up entry gate")
     ap.add_argument("--rsi-oversold", type=float, help="RSI_OVERSOLD (required with --rsi-file)")
@@ -138,7 +181,7 @@ def main():
         rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
 
     with open(args.quotes, "r", encoding="utf-8") as f:
-        quotes = {sym.upper(): float(px) for sym, px in json.load(f).items()}
+        quotes = {sym.upper(): parse_quote(sym, val) for sym, val in json.load(f).items()}
 
     bars_by_symbol = {}
     for path in args.bars:
@@ -156,10 +199,10 @@ def main():
     rows = []
     for sym in sorted(set(bars_by_symbol) & set(quotes)):
         bars = bars_by_symbol[sym]
-        current = quotes[sym]
+        current, bid, ask = quotes[sym]
         row = {"symbol": sym, "current_price": current, "buy_candidate": False,
                "median_dollar_volume": None, "recent_high": None,
-               "pct_below_high": None, "skip_reason": None,
+               "pct_below_high": None, "skip_reason": None, "spread_pct": None,
                "insufficient_history": len(bars) < args.volume_lookback_days}
 
         window = bars[-args.volume_lookback_days:]
@@ -183,6 +226,18 @@ def main():
         row["pct_below_high"] = (row["recent_high"] - current) / row["recent_high"] * 100.0
 
         if row["pct_below_high"] > args.dip_entry_pct:
+            # Spread first: it is free (the quote is already in hand) and a block
+            # here saves the routine an RSI indicator call for this name.
+            if args.max_spread_buy_pct is not None:
+                ok, reason, pct = spread_gate(bid, ask, args.max_spread_buy_pct)
+                row["spread_pct"] = pct
+                row["spread_gate"] = "pass" if ok else "block"
+                row["spread_reason"] = reason
+                if not ok:
+                    row["skip_reason"] = reason
+                    rows.append(row)
+                    continue
+
             if rsi_map is None:
                 row["buy_candidate"] = True
                 row["rsi_gate"] = "disabled"
@@ -202,9 +257,9 @@ def main():
                                   f"(need >{args.dip_entry_pct:g}%)")
         rows.append(row)
 
-    fmt = "{:<7} {:>14} {:>9} {:>9} {:>8} {}"
-    print(fmt.format("Symbol", "Median $Vol", "5d High", "Current", "%Below", "Verdict"))
-    print("-" * 78)
+    fmt = "{:<7} {:>14} {:>9} {:>9} {:>8} {:>7} {}"
+    print(fmt.format("Symbol", "Median $Vol", "5d High", "Current", "%Below", "Spread", "Verdict"))
+    print("-" * 86)
     for r in rows:
         print(fmt.format(
             r["symbol"],
@@ -212,6 +267,7 @@ def main():
             "-" if r["recent_high"] is None else f"${r['recent_high']:.3f}",
             f"${r['current_price']:.3f}",
             "-" if r["pct_below_high"] is None else f"{r['pct_below_high']:+.2f}%",
+            "-" if r["spread_pct"] is None else f"{r['spread_pct']:.2f}%",
             ("BUY CANDIDATE" if r["buy_candidate"] else f"SKIP ({r['skip_reason']})")
             + (" [insufficient history]" if r["insufficient_history"] else ""),
         ))

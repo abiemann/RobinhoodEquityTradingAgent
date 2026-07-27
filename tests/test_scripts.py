@@ -162,6 +162,63 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertEqual(res["rsi_gate"], "pass")
         self.assertTrue(res["buy_candidate"])
 
+    def run_eval_spread(self, quote, max_spread="2.0"):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        return self.run_eval(payload, {"SYNX": quote},
+                             extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                    "--min-median-dollar-volume", "0",
+                                    "--max-spread-buy-pct", max_spread])["SYNX"]
+
+    def test_spread_gate_blocks_wide_book(self):
+        # GRDX as quoted at its 2026-07-24 buy: 3.88% spread, stop filled on arrival
+        res = self.run_eval_spread({"price": 3.0783, "bid": 2.97, "ask": 3.09})
+        self.assertEqual(res["spread_gate"], "block")
+        self.assertFalse(res["buy_candidate"])
+        self.assertAlmostEqual(res["spread_pct"], 3.96, delta=0.01)
+        self.assertIn("spread gate", res["skip_reason"])
+
+    def test_spread_gate_passes_tight_book(self):
+        # MGNX from the same run: a penny wide on a $3.68 bid
+        res = self.run_eval_spread({"price": 3.6999, "bid": 3.68, "ask": 3.69})
+        self.assertEqual(res["spread_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+        self.assertAlmostEqual(res["spread_pct"], 0.27, delta=0.01)
+
+    def test_spread_gate_accepts_raw_quote_object(self):
+        res = self.run_eval_spread({"last_trade_price": "3.6999",
+                                    "bid_price": "3.680000", "ask_price": "3.690000"})
+        self.assertEqual(res["spread_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+
+    def test_spread_gate_blocks_missing_and_zero_quotes(self):
+        bare = self.run_eval_spread(4.0)
+        self.assertEqual(bare["spread_gate"], "block")
+        self.assertIn("no bid/ask", bare["skip_reason"])
+        zero = self.run_eval_spread({"price": 4.0, "bid": 0, "ask": 4.1})
+        self.assertEqual(zero["spread_gate"], "block")
+        self.assertIn("unusable quote", zero["skip_reason"])
+
+    def test_spread_gate_disabled_when_flag_absent(self):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        res = self.run_eval(payload, {"SYNX": {"price": 4.0, "bid": 2.97, "ask": 3.09}},
+                            extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                   "--min-median-dollar-volume", "0"])["SYNX"]
+        self.assertNotIn("spread_gate", res)
+        self.assertTrue(res["buy_candidate"])
+
+    def test_spread_gate_boundary_passes_at_threshold(self):
+        # exactly 2.00% wide - the rule rejects only spreads GREATER than the max
+        res = self.run_eval_spread({"price": 4.0, "bid": 3.96, "ask": 4.04})
+        self.assertAlmostEqual(res["spread_pct"], 2.00, delta=0.001)
+        self.assertEqual(res["spread_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+
     def test_liquidity_floor_skips(self):
         bars = [bar(f"2026-07-{d:02d}", 4.5, 5.0, 100) for d in (1, 2, 3, 6, 7)]
         payload = {"results": [{"symbol": "THIN", "bars": bars}]}

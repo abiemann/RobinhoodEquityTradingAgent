@@ -39,6 +39,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
 | `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up. |
+| `MAX_SPREAD_BUY_PCT` | Max quoted bid/ask spread for an entry — a buy crosses the spread, so a wide book starts the position underwater and can put the stop at the bid on arrival. |
 | `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
 | `MIN_ORDER_DOLLARS` | Smallest allowed buy when downsizing to available buying power; below it, skip. |
@@ -46,7 +47,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 | `STOP_COUNT_HALT` | Halt new buys for the day after this many stop fills. |
 | `SKIP_BUY_IF_SPY_RED` | Skip scanning/buying for the current run while SPY trades below its previous close. |
 | `NO_BUY_FIRST_MINUTES` | Opening blackout: no buys during the session's first N minutes (selling/protection unaffected). |
-| `REGULAR_HOURS_ONLY` | If `true`, no extended-hours entries. |
+| `REGULAR_HOURS_BUY_ONLY` | If `true` (the default), no extended-hours entries; selling and stop protection still run in every session. Setting it `false` also requires raising `MAX_SPREAD_BUY_PCT`, since extended-hours spreads are far wider. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
 
 ## Requirements
@@ -64,6 +65,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
 - **Opening blackout**: no buys in the session's first `NO_BUY_FIRST_MINUTES` — indicators can't see violence inside the first forming bars; profit-taking and stops stay active.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
+- **Spread gate**: no entry when the quoted bid/ask spread is wider than `MAX_SPREAD_BUY_PCT`. A buy crosses the spread, so a wide book starts the position underwater — and a spread approaching `STOP_LOSS_PCT` puts the protective stop at the bid the moment it is placed, stopping the position out on arrival.
 - **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level. A double failure halts new entries for that run and raises a line in the local `ALERTS.md` for human attention.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
 - **Connector-failure discipline**: a failed broker call is retried exactly once and is never treated as an empty result; if positions can't be fetched and the portfolio shows nonzero equity, the run places no orders at all. Every failure is reported even when the retry recovered.
@@ -81,7 +83,7 @@ It is a separate file for a practical reason. The routine document is executed b
 
 - **Does not function when the market is closed** — relative volume reads ~1 off-hours, so the entry list is empty by design.
 - **A relative-volume + movement screen structurally surfaces volatile names** (falling knives, momentum spikes). The filters keep them *tradable*, not *safe* — human judgment is the intended backstop during testing.
-- **Extended-hours buys are not immediately stop-protected** (stops only trigger in the regular session). Set `REGULAR_HOURS_ONLY = true` to avoid this.
+- **Extended-hours buys are not immediately stop-protected** (stops only trigger in the regular session), so `REGULAR_HOURS_BUY_ONLY` defaults to `true` and no position is opened outside the session. Selling and protection are never gated by session. Turning extended-hours entries back on also means retuning `MAX_SPREAD_BUY_PCT` — off-session books are several times wider.
 
 ## Testing before going live
 
