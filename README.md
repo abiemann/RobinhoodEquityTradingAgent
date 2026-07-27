@@ -71,6 +71,12 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 - **Info notification** on every buy and sell.
 - **Append-only trade ledger** (`trade-ledger.csv`, local/gitignored): every fill recorded with order id, price, reason, realized P&L, and the rules version (git hash of the routine doc) that produced it — the raw data for win-rate and expectancy review per rule era.
 
+## Why the rules look like this
+
+Nearly every guardrail above was written after something broke in live trading. [**`INCIDENTS.md`**](INCIDENTS.md) is the record: what happened, what it cost, and the rule it produced. A broker cancelling a freshly placed stop **77 ms** after creation and leaving a position naked for 23 minutes. A timezone lookup that returns the wrong hour with **no error at all** on hosts without tzdata. A run that reported ledger rows which never reached disk. A one-bar RSI "curl" that bought three falling knives in 46 minutes. Three recurring lessons ended up as slogans in the code: *placement is not protection*, *issued is not persisted*, *available is not correct*.
+
+It is a separate file for a practical reason. The routine document is executed by an LLM on every run, so its prose is a fixed cost paid ~16 times a day — writing a spec for an agent is closer to API design than to documentation. The rules live in the routine; the history lives in `INCIDENTS.md`, which the runtime never loads.
+
 ## Known tradeoffs
 
 - **Does not function when the market is closed** — relative volume reads ~1 off-hours, so the entry list is empty by design.
