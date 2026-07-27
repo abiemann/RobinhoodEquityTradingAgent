@@ -30,7 +30,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 |---|---|
 | `DRY_RUN` | If `true` (the committed default), log would-be entries instead of placing them; set `false` locally (uncommitted) to trade live. |
 | `AGENTIC_ACCOUNT_NAME` | Account to trade, matched by name (default `"Agentic"`). |
-| `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. |
+| `PRICE_MIN` / `PRICE_MAX` | Price band for the screen. See [PriceBandScanner](#tools) for evidence on choosing it. |
 | `MIN_REL_VOLUME` | Relative-volume floor (also self-disables the routine when the market is closed). |
 | `MIN_ABS_PCT_CHANGE` | Minimum daily move — filters out flat names. |
 | `SCAN_TITLE` | Saved Robinhood scan the routine runs, resolved by exact title each run. |
