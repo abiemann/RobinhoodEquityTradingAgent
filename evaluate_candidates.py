@@ -152,9 +152,14 @@ def rsi_gate(values, oversold, lookback, confirm):
         return False, f"RSI gate: never oversold (min {window_min:.1f} > {oversold:g})"
     for i in range(1, confirm + 1):
         if not values[-i] > values[-i - 1]:
-            return False, f"RSI gate: still falling ({values[-i - 1]:.1f} -> {values[-i]:.1f})"
+            # name WHICH confirmation bar failed: "bar 1 of N" is a name still
+            # dropping outright, "bar 2 of 2" is one whose latest bar ticked up
+            # inside a longer fall - the case RSI_CONFIRM_BARS>1 exists to catch,
+            # and the only way a report can show that this setting did the work
+            return False, (f"RSI gate: still falling at confirm bar {i} of {confirm} "
+                           f"({values[-i - 1]:.1f} -> {values[-i]:.1f})")
     return True, (f"RSI curl confirmed: min {window_min:.1f} <= {oversold:g}, "
-                  f"rising {values[-2]:.1f} -> {values[-1]:.1f}")
+                  f"rising {confirm} bar(s) {values[-confirm - 1]:.1f} -> {values[-1]:.1f}")
 
 
 def main():

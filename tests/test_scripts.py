@@ -219,6 +219,32 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertEqual(res["spread_gate"], "pass")
         self.assertTrue(res["buy_candidate"])
 
+    def test_rsi_confirm_bars_2_names_which_bar_failed(self):
+        # LODE's real series on 2026-07-24: a collapse whose LAST bar ticked up.
+        # confirm=1 buys it; confirm=2 blocks it. The reason must say which bar
+        # failed, or a report cannot show that RSI_CONFIRM_BARS did the blocking.
+        series = {"SYNX": {"rsi": [45.42, 41.38, 12.20, 11.00, 9.39, 9.88]}}
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        with tempfile.TemporaryDirectory() as td:
+            rsi_path = os.path.join(td, "rsi.json")
+            with open(rsi_path, "w", encoding="utf-8") as f:
+                json.dump(series, f)
+            common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                      "--min-median-dollar-volume", "0", "--rsi-file", rsi_path,
+                      "--rsi-oversold", "35", "--rsi-lookback-bars", "5"]
+            one = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "1"])["SYNX"]
+            two = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "2"])["SYNX"]
+        self.assertTrue(one["buy_candidate"])
+        self.assertFalse(two["buy_candidate"])
+        self.assertIn("confirm bar 2 of 2", two["rsi_reason"])
+
+    def test_rsi_block_at_first_bar_is_labelled_bar_1(self):
+        res = self.run_eval_rsi({"SYNX": {"rsi": [42, 39, 36, 33, 31, 29]}})
+        self.assertIn("confirm bar 1 of 1", res["rsi_reason"])
+
     def test_liquidity_floor_skips(self):
         bars = [bar(f"2026-07-{d:02d}", 4.5, 5.0, 100) for d in (1, 2, 3, 6, 7)]
         payload = {"results": [{"symbol": "THIN", "bars": bars}]}
