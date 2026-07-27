@@ -114,6 +114,30 @@ agent's instinct to use bash "since it's quicker" was right.
 `EQUITY_MAX_SELL_SHARES_EXCEEDED` — the resting stop reserves the position's whole shares.
 Cancel-first is mandatory, not stylistic.
 
+**2026-07-27, MGNX — the confirm-cancel step was removed on purpose. Do not restore it.**
+The routine used to cancel, re-fetch the stop to confirm `state == cancelled`, then review, then
+sell. Measured against the broker's own timestamps on the +$10.60 MGNX profit-take: stop cancelled
+`13:39:54.169Z`, sell placed `13:40:22.385Z`, sell filled `13:40:22.497Z`. **28.2 seconds between
+cancel and placement; 112 ms of actual execution.** The entire delay was agent round-trips — three
+of them, at roughly 9 s each — and it cost about $0.81 of drift on 81.4 shares (~7% of the gain),
+the quote having been ~$3.84 at the decision and $3.8301 at the fill.
+
+The re-fetch was redundant *because of* the JFIN finding above: a sell reviewed while the stop
+still holds the shares bounces at review. So a clean `review_equity_order` already proves the
+shares are free, which proves the cancel took effect. The re-fetch established nothing the next
+call did not, and it lengthened the window in which the position sits with neither a stop nor a
+sell — removing it makes that window shorter, not longer. The alert path is still handled: an
+alert on share count means the cancel has not settled, so wait ~2 s and re-review once.
+
+Loading `cancel_equity_order` / `review_equity_order` / `place_equity_order` moved into Step 1 for
+the same reason — a tool-load turn inside the exit sequence is another ~9 s of drift, and by then
+the gain that justified the exit is already stale.
+
+**Not available: native OCO.** Investigated 2026-07-15 — the broker allows one open sell per share,
+so a resting sell-limit would displace the resting stop, trading bounded missed profit for
+unbounded unprotected downside. Rejected by Alexander ("it's best to be protected"). A one-cancels-
+other order would remove this dance entirely; do not relitigate until the broker offers one.
+
 ## FIRST — stop-coverage audit
 
 **Week 1 (~2026-07-08).** A stop silently expired overnight and a position fell **49%** while
