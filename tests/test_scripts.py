@@ -129,7 +129,8 @@ class EvaluateCandidatesTests(unittest.TestCase):
                                  extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
                                         "--min-median-dollar-volume", "0",
                                         "--rsi-file", rsi_path, "--rsi-oversold", "35",
-                                        "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1"])["SYNX"]
+                                        "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
+                                        "--rsi-max-entry", "60"])["SYNX"]
 
     def test_rsi_gate_blocks_falling_knife(self):
         res = self.run_eval_rsi({"SYNX": {"rsi": [42, 39, 36, 33, 31, 29]}})
@@ -234,12 +235,35 @@ class EvaluateCandidatesTests(unittest.TestCase):
                 json.dump(series, f)
             common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
                       "--min-median-dollar-volume", "0", "--rsi-file", rsi_path,
-                      "--rsi-oversold", "35", "--rsi-lookback-bars", "5"]
+                      "--rsi-oversold", "35", "--rsi-lookback-bars", "5",
+                      "--rsi-max-entry", "60"]
             one = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "1"])["SYNX"]
             two = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "2"])["SYNX"]
         self.assertTrue(one["buy_candidate"])
         self.assertFalse(two["buy_candidate"])
         self.assertIn("confirm bar 2 of 2", two["rsi_reason"])
+
+    def test_rsi_max_entry_blocks_a_spent_bounce(self):
+        # BIYA's real series, 2026-07-27: oversold 4 bars back, then a 44-point
+        # single-bar leap to overbought. Passed the gate, was bought, and stopped
+        # out 6 minutes later for -$11.48. The oversold touch was stale.
+        res = self.run_eval_rsi({"SYNX": {"rsi": [24.58, 24.34, 24.34, 68.92, 75.59, 76.65]}})
+        self.assertEqual(res["rsi_gate"], "block")
+        self.assertFalse(res["buy_candidate"])
+        self.assertIn("bounce already run", res["rsi_reason"])
+
+    def test_rsi_max_entry_allows_a_live_bounce(self):
+        # MGNX's real series, 2026-07-24: oversold and still low while curling.
+        # Bought, and taken for +$10.60 - must stay buyable.
+        res = self.run_eval_rsi({"SYNX": {"rsi": [27.18, 25.95, 11.64, 11.12, 31.43, 35.94]}})
+        self.assertEqual(res["rsi_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
+
+    def test_rsi_max_entry_boundary_passes_at_cap(self):
+        # exactly at the cap - the rule rejects only values ABOVE it
+        res = self.run_eval_rsi({"SYNX": {"rsi": [30, 28, 25, 40, 55, 60]}})
+        self.assertEqual(res["rsi_gate"], "pass")
+        self.assertTrue(res["buy_candidate"])
 
     def test_rsi_series_is_recorded_for_threshold_sweeps(self):
         # the saved series must let a later analysis re-answer the gate at other

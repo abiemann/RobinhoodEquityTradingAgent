@@ -220,6 +220,23 @@ falling" by the 07:37 and 08:07 runs; one flat half-hour unlocked them. **For a 
 1-bar confirm is a delay, not a filter.** Replayed at `confirm=2`, all three losers are blocked and
 the day's one survivor (MGNX, two rising bars) still passes — honest caveat, n=4 in-sample.
 
+**2026-07-27, BIYA — the mirror image of the falling knife** (`RSI_MAX_ENTRY` = 60). The first buy
+made under the new entry wall stopped out in **six minutes** for −$11.48. The gate record explains
+it in one line: RSI ran `24.6 → 24.3 → 24.3 → 68.9 → 75.6 → 76.6` — a **44-point leap in a single
+bar** — and the gate passed it, correctly by its own rules. `RSI_OVERSOLD` is tested as a *minimum
+over `RSI_LOOKBACK_BARS`*, so the oversold touch sat four bars back at the edge of the window,
+already fully reversed, while the current reading was 76.6 and rising. Both conditions were
+satisfied literally by a name that was overbought and whose move was spent.
+
+Liquidity ($5.7M median) and spread (0.53%) were genuinely fine — those gates were not at fault.
+The fix is a ceiling on the CURRENT value: `confirm` stops you buying too early, and nothing had
+stopped you buying too late. Separation is wide rather than fitted — BIYA at 76.6, MGNX (taken for
++$10.60) at 35.9; any cap between 50 and 70 splits them.
+
+**This is also the case the persisted gate record was built for** (2026-07-26, `ba01864`). Alexander
+asked for it so that *"we can research how a bad trade made it through our wall of decisions"* — the
+first bad trade arrived the next session, and the record answered it without re-fetching anything.
+
 **Standing constraint (Alexander, 2026-07-24): no depth-based exclusions, ever.** A proposed
 `DIP_ENTRY_MAX_PCT` cap was rejected — "I want this agent to be good at buying all dips."
 Knife-filtering must come from TIMING signals (has the fall stopped?), never from excluding depth.

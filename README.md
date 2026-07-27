@@ -38,7 +38,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 | `HIGH_LOOKBACK_DAYS` / `VOLUME_LOOKBACK_DAYS` | Lookback windows for the recent high and the liquidity median. |
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
-| `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up. |
+| `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` / `RSI_MAX_ENTRY` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up — and only while it has not already run (`RSI_MAX_ENTRY` caps the current RSI, so a bounce that is already spent is not chased). |
 | `MAX_SPREAD_BUY_PCT` | Max quoted bid/ask spread for an entry — a buy crosses the spread, so a wide book starts the position underwater and can put the stop at the bid on arrival. |
 | `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |

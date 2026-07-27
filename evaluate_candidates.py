@@ -141,15 +141,25 @@ def load_rsi_map(path, period):
     return out
 
 
-def rsi_gate(values, oversold, lookback, confirm):
+def rsi_gate(values, oversold, lookback, confirm, max_entry=None):
     """Returns (passes, reason). Deterministic curl check: min RSI over the
-    last `lookback` values must be <= oversold, AND the last `confirm` steps
-    must each be rising. Missing/short data BLOCKS (conservative)."""
+    last `lookback` values must be <= oversold, the CURRENT value must be at or
+    below `max_entry`, AND the last `confirm` steps must each be rising.
+    Missing/short data BLOCKS (conservative).
+
+    `max_entry` closes the mirror image of the falling knife. The oversold test
+    looks back `lookback` bars, so a touch that has already been fully reversed
+    still satisfies it -- a name can leap from oversold to overbought inside the
+    window and pass while rising. That is not catching a bounce, it is buying
+    after the move is spent."""
     if not values or len(values) < max(lookback, confirm + 1):
         return False, f"RSI gate: no/insufficient data ({len(values or [])} values) - blocked"
     window_min = min(values[-lookback:])
     if window_min > oversold:
         return False, f"RSI gate: never oversold (min {window_min:.1f} > {oversold:g})"
+    if max_entry is not None and values[-1] > max_entry:
+        return False, (f"RSI gate: bounce already run (now {values[-1]:.1f} > max entry "
+                       f"{max_entry:g}; was oversold at {window_min:.1f})")
     for i in range(1, confirm + 1):
         if not values[-i] > values[-i - 1]:
             # name WHICH confirmation bar failed: "bar 1 of N" is a name still
@@ -176,13 +186,16 @@ def main():
     ap.add_argument("--rsi-oversold", type=float, help="RSI_OVERSOLD (required with --rsi-file)")
     ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
     ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")
+    ap.add_argument("--rsi-max-entry", type=float, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with --rsi-file)")
     ap.add_argument("--rsi-period", type=int, default=14, help="RSI_PERIOD, used only for the closes fallback (default 14)")
     args = ap.parse_args()
 
     rsi_map = None
     if args.rsi_file:
-        if args.rsi_oversold is None or args.rsi_lookback_bars is None or args.rsi_confirm_bars is None:
-            ap.error("--rsi-file requires --rsi-oversold, --rsi-lookback-bars, and --rsi-confirm-bars")
+        if (args.rsi_oversold is None or args.rsi_lookback_bars is None
+                or args.rsi_confirm_bars is None or args.rsi_max_entry is None):
+            ap.error("--rsi-file requires --rsi-oversold, --rsi-lookback-bars, "
+                     "--rsi-confirm-bars, and --rsi-max-entry")
         rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
 
     with open(args.quotes, "r", encoding="utf-8") as f:
@@ -248,8 +261,8 @@ def main():
                 row["rsi_gate"] = "disabled"
             else:
                 series = rsi_map.get(sym, [])
-                ok, reason = rsi_gate(series, args.rsi_oversold,
-                                      args.rsi_lookback_bars, args.rsi_confirm_bars)
+                ok, reason = rsi_gate(series, args.rsi_oversold, args.rsi_lookback_bars,
+                                      args.rsi_confirm_bars, args.rsi_max_entry)
                 row["rsi_gate"] = "pass" if ok else "block"
                 row["rsi_reason"] = reason
                 # the raw series, not just the verdict: spread_pct,
