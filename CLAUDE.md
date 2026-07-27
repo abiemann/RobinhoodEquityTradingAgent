@@ -11,6 +11,11 @@ python3 tests/test_scripts.py     # Windows: py -3 tests\test_scripts.py
 
 All tests must pass (exit 0, "OK") before committing. The suite is stdlib-only — no installs needed. Expected values were verified against live API data; if an intentional behavior change breaks a test, update the expectation deliberately and say so in the commit — never delete or weaken a test to go green.
 
+## Read INCIDENTS.md before changing a rule
+`INCIDENTS.md` holds the history behind the routine's rules — the live failures, dollar losses, and near-misses that produced them. The routine document itself is read by an LLM on all ~16 runs a day, so it carries rules only; the provenance lives in INCIDENTS.md and the runtime never loads it.
+
+Before removing or "simplifying" anything in `robinhood-momentum-routine-autonomous.md` that looks redundant, over-specific, or paranoid, check INCIDENTS.md for its entry — most of those oddities were written after something broke. When you add a rule because something broke, put the rule in the routine and the story in INCIDENTS.md; when you remove a rule, remove its entry too.
+
 ## The deterministic layer is sacred
 The markdown documents (`robinhood-momentum-routine-autonomous.md`, `tools/PriceBandScanner.md`) are executed by LLM agents each run; the Python scripts exist so that all math is deterministic and tested. Never move logic from the scripts back into the documents, and never let a document instruct an agent to re-implement script math ad hoc (a documented fallback for a missing/broken script is the only exception).
 
