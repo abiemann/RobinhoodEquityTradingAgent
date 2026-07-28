@@ -53,8 +53,33 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _guard(self):
+        """Returns the request path, or None having already sent an error.
+
+        Rejects anything whose Host header is not loopback: a browser's
+        same-origin policy does NOT protect a localhost server from a page that
+        resolves its own domain to 127.0.0.1 (DNS rebinding), and this server
+        reads brokerage account data. Also enforces the path whitelist, which
+        do_GET and do_HEAD must BOTH honour — do_HEAD is inherited and would
+        otherwise serve headers for any file in the repo."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            self.send_error(403, "non-loopback Host header")
+            return None
+        return self.path.split("?", 1)[0]
+
+    def do_HEAD(self):
+        path = self._guard()
+        if path is None:
+            return
+        if path.startswith(ALLOWED_PREFIXES) or path in ALLOWED_EXACT:
+            return super().do_HEAD()
+        self.send_error(403, "not served")
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path = self._guard()
+        if path is None:
+            return
         if path == "/":
             self.send_response(302)
             self.send_header("Location", "/dashboard/index.html")
