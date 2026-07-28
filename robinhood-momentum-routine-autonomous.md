@@ -194,7 +194,7 @@ Each run, after managing existing holdings (FIRST) and before any new buys, comp
 12. After a buy fills: read the actual fill price via `get_equity_orders` and place a stop-loss sell for the position at `STOP_LOSS_PCT` below that fill price (`place_equity_order`, stop order, `time_in_force` `"gtc"`, whole shares — floor a fractional position). If the buy filled in extended hours, place the stop as a regular-hours GTC order, since stop orders do not trigger in extended sessions — do NOT plan to "queue it for the next open": each run is a fresh session with no memory, so anything not placed now never happens. The Step 2 stop-coverage audit is the backstop if placement fails. Fire the trade notification for the stop placement, then VERIFY the stop's state per ORDER HANDLING — placement is not protection.
 
 ### REPORT
-**Scratch hygiene:** all scratch lives in the sandbox temp directory or the session outputs directory (Step 8), both session-scoped — there is nothing to delete in the project folder, and you must NOT attempt project-folder deletions: they are permission-gated in Cowork and pause the run on a user prompt, which an unattended run must never do. Never create `tmp_*` files or folders next to this document; the ONLY thing a run writes into the project folder is its report in `run-reports/`. If stray `tmp_*` leftovers from an older run are sitting next to this document, leave them alone and mention them in the report. Then produce the report:
+**Scratch hygiene:** all scratch lives in the sandbox temp directory or the session outputs directory (Step 8), both session-scoped — there is nothing to delete in the project folder, and you must NOT attempt project-folder deletions: they are permission-gated in Cowork and pause the run on a user prompt, which an unattended run must never do. Never create `tmp_*` files or folders next to this document; the ONLY things a run writes into the project folder are its three outputs in `run-reports/` — the report, the gate record (Step 8), and the status snapshot (below). If stray `tmp_*` leftovers from an older run are sitting next to this document, leave them alone and mention them in the report. Then produce the report:
 
 State how many names the scan returned and how many survived the price + relative-volume + %-change filter (`TOP_N` cap applied). If the market was closed / the list was empty, say so. If the buying-power gate skipped the scan, state that (with the effective-order-size numbers) in place of scan counts. List any positions sold for profit, any dust sweeps executed (or dust pending sweep), and whether the circuit breaker tripped. **Report every candidate's full gate scorecard — the ones that PASSED as well as the ones that were blocked.** For each name that reached evaluation: relative volume, daily % change, median daily dollar volume, quoted spread % (and bid/ask), recent high, current price, % below high, the RSI gate's verdict AND its reason string with the actual values, then whether it was bought, the fill price, and the stop price. A bought name needs this most: a blocked name's story is its skip reason, but a name that cleared every gate and then lost money can only be investigated from the readings it cleared them with. Do not report a passing gate as a bare "✓" — carry the number. List anything skipped and why, quoting the script's own skip reason VERBATIM — liquidity-floor, spread-gate, and RSI-gate skips all carry the measured numbers and, for the RSI gate, which confirmation bar failed. Do not paraphrase these into "did not qualify": the reason string is how a human sees which gate did the work. Also list any `review_equity_order` alerts. Near the top of the report, state the **Rules version** — the rules_version stamp defined in the TRADE LEDGER block — so every report is attributable to the exact rule set that produced it. Include a **Notifications** section reproducing, verbatim and in firing order, every INFO NOTIFICATION from this run (write "none" if no orders or halts occurred) — the report must never contain fewer notifications than the run fired.
 
@@ -206,13 +206,38 @@ State how many names the scan returned and how many survived the price + relativ
 
 Output file — open from the file panel on the right: rhmra-log-YYYY_MM_DD-HH_MM.md (run report)
 
-Three things are load-bearing: it must be the **LAST** line (nothing after it — the run-summary goes BEFORE it), the filename must be **BARE** (no `run-reports/` prefix, no directory), and it must be **unformatted text** — no backticks/code span, no markdown link. That exact shape is what makes the scheduler render a file card with a working **"Open in <editor>"** button. A code span, a `run-reports/` prefix, or any text printed after the line each cost the card on a real run. Markdown links never work — they render, but do not respond to a click. If the run created or modified any other file (e.g. `ALERTS.md`), name it the same way on its own line just above this one.
+Three things are load-bearing: it must be the **LAST** line (nothing after it — the run-summary goes BEFORE it), the filename must be **BARE** (no `run-reports/` prefix, no directory), and it must be **unformatted text** — no backticks/code span, no markdown link. That exact shape is what makes the scheduler render a file card with a working **"Open in <editor>"** button. A code span, a `run-reports/` prefix, or any text printed after the line each cost the card on a real run. Markdown links never work — they render, but do not respond to a click. If the run created or modified any other USER-FACING file (e.g. `ALERTS.md`), name it the same way on its own line just above this one — but never the telemetry JSONs (`rhmra-gates-*.json`, `rhmra-status-*.json`), which are machine-read and must not produce file cards.
 
 **Save the report to disk — fixed folder, fixed filename, no exceptions.** Create the full report as a Markdown file in the `run-reports` folder next to this document (create the folder if it doesn't exist).
 
 **Use the file-writing TOOL to create it — never a shell command.** Create the report with the harness's file-creation tool (the `Write` tool), passing the full report text as its content. Do NOT write the report by shelling out: no `cat > file << EOF` heredoc, no `echo`/`printf` redirection, no Python `open(...).write(...)`, no PowerShell `Set-Content`/`Out-File`. Two reasons: a Write-tool creation shows up in the transcript as a file chip the user can open on the spot, and shell redirection mangles UTF-8 on some hosts — the em-dashes and ✓/🔔 characters this report uses come out as mojibake. This is separate from, and does not replace, naming the file in the closing message (see the run-summary rule below) — do BOTH. The same applies to `ALERTS.md` and any other file a run creates.
 
 **Then READ THE REPORT BACK, once — even though the `Write` tool reported success.** Two reasons, either sufficient on its own: it confirms the report actually reached disk (the "issued is not persisted" failure the ledger read-back guards against, applied to the only other file every run writes), and reading the file back is what causes the transcript to PRESENT it with a working "Open in \<editor\>" button. A run that writes its report and never reads it produces no file card, leaving the user to hunt for the file by path. Read `ALERTS.md` back too whenever a run creates or appends to it.
+
+**Publish the STATUS SNAPSHOT — every run, no exceptions, including skipped and halted runs.** After the report, `Write` one more file: `run-reports/rhmra-status-YYYY_MM_DD-HH_MM.json` (same run-START timestamp as the report). It is machine-read telemetry for external consumers (a dashboard); the report tells the story, this file carries the numbers. EXACTLY this shape — substitute the placeholders, add no fields, remove no fields:
+
+```json
+{ "schema_version": 1,
+  "run_start_pt": "<run start, ISO 8601 with PT offset, from market_clock>",
+  "rules_version": "<the rules_version stamp>",
+  "dry_run": <true|false>,
+  "session": "<market_clock session value>",
+  "account": { "total_value": <number>, "cash": <number>,
+               "buying_power": <number>, "equity_value": <number> },
+  "realized_pnl_today": <number — the get_realized_pnl figure from SECOND>,
+  "positions": [
+    { "symbol": "<TICKER>", "quantity": <number>, "avg_buy_price": <number>,
+      "current_price": <number — this run's quote>,
+      "stop_price": <number, or null if no active stop>,
+      "stop_state": "<confirmed|queued|none>" }
+  ],
+  "guards": { "circuit_breaker": "<clear|tripped>", "stop_fills_today": <integer>,
+              "entry_phase": "<ran|skipped|halted>",
+              "entry_skip_reason": "<the gate's own wording, or null when the phase ran>" }
+}
+```
+
+Rules: every value is data this run ALREADY holds (portfolio, positions, quotes, the stop audit, the gate verdicts) — never make a new API call for the snapshot, and publish RAW facts only — no derived values (no unrealized P&L, no position totals; consumers do their own arithmetic). A held position with no active stop publishes `"stop_price": null, "stop_state": "none"` — never omit the position. An empty account publishes `"positions": []`. Then verify it parses and persisted by running EXACTLY: `python3 -c "import json; json.load(open('<absolute path>/run-reports/rhmra-status-<stamp>.json'))"` — silence is success; on error, re-write once and if it still fails state so in the report. This file and the gate record are telemetry: do NOT name them in the closing message — ONLY the report (and `ALERTS.md` when touched) get file-card lines there.
 
 The filename is exactly:
 
