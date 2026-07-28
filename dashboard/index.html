@@ -36,11 +36,14 @@
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
   .hint { text-transform:none; letter-spacing:0; font-weight:400; }
   .runs { display:flex; gap:6px; flex-wrap:wrap; }
-  .run { font-size:12px; padding:3px 8px; border-radius:6px; border:1px solid var(--line);
-         cursor:default; }
-  .run.ran { border-color:var(--green); color:var(--green); }
-  .run.halted { border-color:var(--red); color:var(--red); }
-  .run.skipped { color:var(--dim); }
+  .run { display:inline-flex; flex-direction:column; align-items:center; gap:2px;
+         padding:4px 10px; border-radius:6px; border:1px solid var(--line); cursor:default; }
+  .run .t { font-size:12px; font-weight:600; color:var(--dim); }
+  .run .o { font-size:11px; color:var(--dim); white-space:nowrap; }
+  .run.ran { border-color:var(--green); }
+  .run.ran .t { color:var(--green); }
+  .run.halted { border-color:var(--red); }
+  .run.halted .t { color:var(--red); }
 </style>
 </head>
 <body>
@@ -81,6 +84,7 @@ const fmt$ = n => (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
 const cls = n => n > 0 ? "pos" : n < 0 ? "neg" : "";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const getJSON = u => fetch(u, { cache: "no-store" }).then(r => r.json());
+const sgn$ = n => (n > 0 ? "+" : n < 0 ? "-" : "") + "$" + Math.abs(n).toFixed(2);
 
 function banner(msg) {
   $("banner").innerHTML = `<section class="error">${esc(msg)}</section>`;
@@ -130,54 +134,104 @@ function renderSnapshot(snap) {
     <th>Current</th><th>Unrealized</th><th>Stop</th><th>To stop</th></tr>${rows}</table>`;
 }
 
-async function renderRuns(statusNames) {
+// Ledger rows, parsed once per refresh and shared by the runs strip and the era
+// table. timestamp_pt is ISO with a PT offset; its first 19 chars are PT
+// wall-clock, which sorts and compares chronologically as a plain string --
+// no Date parsing, so no dependence on the viewer's own timezone.
+function parseLedger(csv) {
+  const lines = csv.trim().split(/\r?\n/);
+  const head = lines.shift().split(",");
+  const i = Object.fromEntries(head.map((h, n) => [h, n]));
+  for (const need of ["timestamp_pt", "side", "reason", "realized_pnl", "rules_version"]) {
+    if (i[need] === undefined) {
+      banner(`trade-ledger.csv is missing the "${need}" column — expected schema has changed.`);
+      return null;
+    }
+  }
+  return lines.map(l => l.split(",")).filter(f => f.length === head.length).map(f => ({
+    ts: f[i.timestamp_pt].slice(0, 19), day: f[i.timestamp_pt].slice(0, 10),
+    side: f[i.side], reason: f[i.reason], ver: f[i.rules_version],
+    pnl: f[i.realized_pnl] === "" ? null : parseFloat(f[i.realized_pnl]),
+  }));
+}
+
+// Compress the gate's own sentence to one token for the chip; the untouched
+// sentence stays in the tooltip.
+function skipLabel(reason) {
+  for (const [re, label] of [[/blackout/i, "blackout"], [/\bSPY\b/i, "spy-red"],
+                             [/pre-market/i, "pre-market"], [/after-hours|extended/i, "after-hours"],
+                             [/buying power|MIN_ORDER_DOLLARS/i, "low buying power"]]) {
+    if (re.test(reason || "")) return label;
+  }
+  return "no scan";
+}
+
+function tradeLabels(fills) {
+  const out = [], name = { "dip-buy": "buy", "profit-take": "sell",
+                           "stop-fill": "stop-sell", "dust-sweep": "dust" };
+  for (const kind of ["dip-buy", "profit-take", "stop-fill", "dust-sweep"]) {
+    const g = fills.filter(f => f.reason === kind);
+    if (!g.length) continue;
+    const n = g.length > 1 ? ` &times;${g.length}` : "";
+    if (kind === "dip-buy") { out.push(`buy${n}`); continue; }
+    const sum = g.reduce((s, f) => s + (f.pnl ?? 0), 0);
+    out.push(`${name[kind]}${n} (<span class="${cls(sum)}">${sgn$(sum)}</span>)`);
+  }
+  return out;
+}
+
+async function renderRuns(statusNames, rows) {
   if (!statusNames.length) return;
   const today = statusNames[statusNames.length - 1].slice(13, 23); // YYYY_MM_DD of newest
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
-  const chips = await Promise.all(todays.map(async n => {
+  // a fill belongs to the last run that had started before it
+  const starts = todays.map(n => `${n.slice(13, 23).replace(/_/g, "-")}T${n.slice(24, 29).replace("_", ":")}:00`);
+  const chips = await Promise.all(todays.map(async (n, k) => {
     try {
       const s = await getJSON("/run-reports/" + n);
-      const t = n.slice(24, 29).replace("_", ":");
       const phase = s.guards?.entry_phase ?? "?";
-      // "skipped" here means the run executed but did not look for entries --
-      // NOT that the scheduler skipped the run. Label it so the two cannot be
-      // confused: the scheduler uses "Skipped" for a run that never happened.
-      const label = { ran: "scanned", skipped: "no scan", halted: "halted" }[phase] ?? phase;
-      const tip = s.guards?.entry_skip_reason ?? "entry phase ran — scan and evaluation performed";
-      return `<span class="run ${esc(phase)}" title="${esc(tip)}">${t} ${esc(label)}</span>`;
-    } catch { return `<span class="run" title="unreadable">${esc(n)}</span>`; }
+      const reason = s.guards?.entry_skip_reason;
+      // the last run of the day still needs an upper bound, or it would sweep up
+      // the next morning's fills in the window before that day's first snapshot
+      const next = starts[k + 1] ?? `${today.replace(/_/g, "-")}T23:59:59`;
+      const fills = (rows || []).filter(r => r.ts >= starts[k] && r.ts < next);
+      const parts = tradeLabels(fills);
+      // holdings management runs even when the scan does not, so a run can both
+      // trade and report a skipped entry phase -- show both.
+      if (phase === "skipped") parts.push(skipLabel(reason));
+      else if (phase === "halted") parts.push("halted");
+      else if (!parts.length) parts.push("scanned");
+      const tip = reason || "entry phase ran — scan and evaluation performed";
+      return `<span class="run ${esc(phase)}" title="${esc(tip)}">` +
+             `<span class="t">${starts[k].slice(11, 16)}</span>` +
+             `<span class="o">${parts.join(", ")}</span></span>`;
+    } catch { return `<span class="run" title="unreadable"><span class="t">?</span>` +
+                     `<span class="o">${esc(n)}</span></span>`; }
   }));
   $("runs").innerHTML = chips.join("");
 }
 
-function renderEras(csv) {
-  const lines = csv.trim().split(/\r?\n/);
-  const head = lines.shift().split(",");
-  const iPnl = head.indexOf("realized_pnl"), iVer = head.indexOf("rules_version");
-  if (iPnl < 0 || iVer < 0) { banner("trade-ledger.csv header does not match the expected schema."); return; }
-  const iTs = head.indexOf("timestamp_pt"), iSide = head.indexOf("side"), iReason = head.indexOf("reason");
+function renderEras(rows) {
+  if (!rows) return;
   const eras = new Map();
-  for (const line of lines) {
-    const f = line.split(",");
-    if (f.length !== head.length) continue;
-    const day = f[iTs].slice(0, 10);
-    const e = eras.get(f[iVer]) ?? { buys: 0, sells: 0, stops: 0, sum: 0, first: day, last: day };
-    if (f[iSide] === "buy") e.buys++;
-    if (f[iSide] === "sell") e.sells++;
-    if (f[iReason] === "stop-fill") e.stops++;
-    if (f[iPnl] !== "") e.sum += parseFloat(f[iPnl]);
-    if (day < e.first) e.first = day;
-    if (day > e.last) e.last = day;
-    eras.set(f[iVer], e);
+  for (const r of rows) {
+    const e = eras.get(r.ver) ?? { buys: 0, sells: 0, stops: 0, sum: 0, first: r.day, last: r.day };
+    if (r.side === "buy") e.buys++;
+    if (r.side === "sell") e.sells++;
+    if (r.reason === "stop-fill") e.stops++;
+    if (r.pnl !== null) e.sum += r.pnl;
+    if (r.day < e.first) e.first = r.day;
+    if (r.day > e.last) e.last = r.day;
+    eras.set(r.ver, e);
   }
   if (!eras.size) return;
-  const rows = [...eras]
+  const trs = [...eras]
     .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first))
     .map(([v, e]) => {
       const dates = e.first === e.last ? e.first : `${e.first} → ${e.last}`;
       return `<tr><td>${esc(v)}</td><td>${dates}</td><td>${e.buys}</td><td>${e.sells}</td><td>${e.stops}</td><td class="${cls(e.sum)}">${fmt$(e.sum)}</td></tr>`;
     }).join("");
-  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${rows}</table>`;
+  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${trs}</table>`;
 }
 
 async function refresh() {
@@ -188,8 +242,9 @@ async function refresh() {
     else if (latest.data) renderSnapshot(latest.data);
     else $("mode").textContent = "no snapshot yet";
     const idx = await getJSON("/api/index");
-    await renderRuns(idx.status);
-    renderEras(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
+    const rows = parseLedger(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
+    await renderRuns(idx.status, rows);
+    renderEras(rows);
     $("updated").textContent = "refreshed " + new Date().toLocaleTimeString();
   } catch (e) { banner("Dashboard failed to load: " + e); }
 }
