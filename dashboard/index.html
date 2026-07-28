@@ -34,6 +34,7 @@
   .badge.warn { background:#3a1f1d; color:var(--red); font-weight:600; }
   .empty { color:var(--dim); font-style:italic; }
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
+  .hint { text-transform:none; letter-spacing:0; font-weight:400; }
   .runs { display:flex; gap:6px; flex-wrap:wrap; }
   .run { font-size:12px; padding:3px 8px; border-radius:6px; border:1px solid var(--line);
          cursor:default; }
@@ -48,6 +49,7 @@
   <span id="mode" class="pill">loading…</span>
   <span id="staleness" class="pill"></span>
   <span id="rules" class="pill"></span>
+  <span id="updated" class="pill"></span>
 </header>
 
 <div id="banner"></div>
@@ -63,7 +65,7 @@
 </section>
 
 <section>
-  <h2>Runs today</h2>
+  <h2>Runs today <span class="hint">— every run listed executed; the label is what its <em>entry phase</em> did</span></h2>
   <div class="runs" id="runs"><span class="empty">no snapshots yet</span></div>
 </section>
 
@@ -78,6 +80,7 @@ const $ = id => document.getElementById(id);
 const fmt$ = n => (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
 const cls = n => n > 0 ? "pos" : n < 0 ? "neg" : "";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const getJSON = u => fetch(u, { cache: "no-store" }).then(r => r.json());
 
 function banner(msg) {
   $("banner").innerHTML = `<section class="error">${esc(msg)}</section>`;
@@ -133,11 +136,15 @@ async function renderRuns(statusNames) {
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
   const chips = await Promise.all(todays.map(async n => {
     try {
-      const s = await (await fetch("/run-reports/" + n)).json();
+      const s = await getJSON("/run-reports/" + n);
       const t = n.slice(24, 29).replace("_", ":");
       const phase = s.guards?.entry_phase ?? "?";
-      const tip = s.guards?.entry_skip_reason ?? "entry phase ran";
-      return `<span class="run ${esc(phase)}" title="${esc(tip)}">${t} ${esc(phase)}</span>`;
+      // "skipped" here means the run executed but did not look for entries --
+      // NOT that the scheduler skipped the run. Label it so the two cannot be
+      // confused: the scheduler uses "Skipped" for a run that never happened.
+      const label = { ran: "scanned", skipped: "no scan", halted: "halted" }[phase] ?? phase;
+      const tip = s.guards?.entry_skip_reason ?? "entry phase ran — scan and evaluation performed";
+      return `<span class="run ${esc(phase)}" title="${esc(tip)}">${t} ${esc(label)}</span>`;
     } catch { return `<span class="run" title="unreadable">${esc(n)}</span>`; }
   }));
   $("runs").innerHTML = chips.join("");
@@ -173,17 +180,24 @@ function renderEras(csv) {
   $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${rows}</table>`;
 }
 
-(async () => {
+async function refresh() {
   try {
-    const latest = await (await fetch("/api/latest")).json();
+    $("banner").innerHTML = "";
+    const latest = await getJSON("/api/latest");
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
     else $("mode").textContent = "no snapshot yet";
-    const idx = await (await fetch("/api/index")).json();
+    const idx = await getJSON("/api/index");
     await renderRuns(idx.status);
-    renderEras(await (await fetch("/trade-ledger.csv")).text());
+    renderEras(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
+    $("updated").textContent = "refreshed " + new Date().toLocaleTimeString();
   } catch (e) { banner("Dashboard failed to load: " + e); }
-})();
+}
+
+// runs land every ~30 min, so 30s polling is ample and costs only local reads.
+// cache: no-store throughout, or the browser serves a stale snapshot forever.
+refresh();
+setInterval(refresh, 30000);
 </script>
 </body>
 </html>
