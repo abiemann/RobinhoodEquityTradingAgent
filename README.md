@@ -8,11 +8,12 @@ A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** a
 
 Each run, the agent:
 
-1. Manages existing holdings — sells winners up `TAKE_PROFIT_PCT`+ and cancels their stops.
-2. Checks a daily-loss circuit breaker and halts new buys if the account is down past a set threshold for the day.
-3. Builds a working list — stocks in the `$PRICE_MIN–$PRICE_MAX` band, trading at elevated **relative volume**, that have **moved** at least a minimum % on the day, ranked by relative volume.
-4. Applies a **median dollar-volume liquidity floor** so thin names that can't be exited at size are dropped.
-5. Opens new positions — buys names trading more than `DIP_ENTRY_PCT`% below their recent high **whose RSI has curled up from oversold** (reversal confirmation — depth alone is a falling knife), then places a stop `STOP_LOSS_PCT`% below the fill.
+1. Manages existing holdings — on a winner up `TAKE_PROFIT_PCT`+ it **cancels the stop first, then sells** (a resting stop reserves the shares, so selling first is rejected); re-places any stop that has silently gone missing; and sweeps the sub-share residue a whole-share stop leaves behind.
+2. Checks the guards — a daily-loss circuit breaker and a stop-count guard, either of which halts new buys for the rest of the day.
+3. Decides whether to look for entries at all — the scan is skipped outright outside regular hours, inside the opening blackout, while SPY trades below its previous close, or when buying power is too thin to fund an order.
+4. Builds a working list — stocks in the `$PRICE_MIN–$PRICE_MAX` band, trading at elevated **relative volume**, that have **moved** at least a minimum % on the day, ranked by relative volume.
+5. Screens for exitability — a **median dollar-volume liquidity floor** and a **bid/ask spread ceiling**, dropping names that can't be got out of cleanly.
+6. Opens new positions — buys names trading more than `DIP_ENTRY_PCT`% below their recent high **whose RSI was oversold and has just turned back up** (reversal confirmation: depth alone is a falling knife, and a bounce that has already run is not chased), then places a stop `STOP_LOSS_PCT`% below the fill **and verifies it survived** — placement is not protection.
 
 All trading is scoped to a single account, resolved **by name** at runtime.
 
@@ -56,6 +57,32 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 - An agent runner/scheduler that loads the routine and honors per-tool approval settings.
 - **Python 3** available to the agent's shell as `python3` — standard library only, nothing to install. It is not optional: the routine runs `market_clock.py` as the very first action of every run and halts entries if it cannot. The command is written literally in the routine (three invocations) rather than being configurable, deliberately — a substitutable value in a command that runs before the guardrails is a value that can be typed wrong. If your environment names the interpreter differently, edit those three lines once.
 - **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
+
+## Python 3 install (Windows)
+
+The agent's own `python3` lives in the sandbox its runner provides — you do not install that one. You need Python on your **own** machine for two things: running the test suite before committing a script change, and running the [Dashboard](#tools).
+
+**Windows does not ship Python, and PowerShell does not include it.** On a fresh machine `python` and `python3` are Microsoft Store *App Execution Alias* stubs — they open the Store instead of running anything, and print:
+
+```
+Python was not found; run without arguments to install from the Microsoft Store
+```
+
+That message means you hit the alias, not that an install is broken. It is worth recognising, because it looks like a failure rather than a missing program.
+
+1. Install from [python.org/downloads](https://www.python.org/downloads/) — any current 3.x.
+2. Keep the **py launcher** option enabled (it is on by default). That is what provides the `py` command these docs use on Windows.
+3. Verify in PowerShell — this should print a version, not a Store message:
+
+```
+py -3 --version
+```
+
+Then use `py -3` anywhere these docs show `python3` — e.g. `py -3 tests\test_scripts.py` or `py -3 dashboard\serve.py`. There is nothing else to install: every script here is standard library only.
+
+Optionally, to stop the Store stubs shadowing your real install, turn them off under **Settings → Apps → Advanced app settings → App execution aliases**.
+
+On macOS and Linux `python3` is normally already present — check with `python3 --version` — and the commands work as written.
 
 ## Guardrails
 
