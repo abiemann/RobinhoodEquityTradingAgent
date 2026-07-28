@@ -301,6 +301,32 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertIn("still falling", res["OTHR"]["rsi_reason"])
         self.assertEqual(res["SYNX"]["rsi_series"], [40, 36, 33, 30, 29, 34])
 
+    def test_malformed_authored_json_fails_loudly(self):
+        # Both real 2026-07-28 failures were MID-document slips in LLM-authored
+        # files: a missing ] (11:06) and an extra } BEFORE a closing ] (12:36,
+        # byte-for-byte below). No parser can safely recover either, so the
+        # script must fail loudly -- the routine's pre-run json.load validation
+        # is the layer that catches these cheaply. Pins strictness so a future
+        # "tolerant reader" does not sneak in; one was built and rejected the
+        # day of the incident because it covered only never-observed cases.
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "NVA", "bars": bars}]}
+        good = json.dumps(self.raw_rsi_response("NVA", [40.26, 38.82, 37.38, 42.02, 43.16, 41.41]))
+        nva_exact = good.replace("]}]}", "]}}]}")        # the 12:36 file's actual defect
+        common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                  "--min-median-dollar-volume", "0", "--rsi-oversold", "35",
+                  "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
+                  "--rsi-max-entry", "60"]
+        with tempfile.TemporaryDirectory() as td:
+            for name, text in (("interior.json", nva_exact), ("truncated.json", good[:-40])):
+                p = os.path.join(td, name)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(text)
+                with self.assertRaises(AssertionError, msg=name):
+                    self.run_eval(payload, {"NVA": 4.0}, extra=common + ["--rsi-file", p])
+
     def test_rsi_series_is_recorded_for_threshold_sweeps(self):
         # the saved series must let a later analysis re-answer the gate at other
         # RSI_OVERSOLD / RSI_CONFIRM_BARS values without re-fetching indicators

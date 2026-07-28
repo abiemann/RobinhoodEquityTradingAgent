@@ -54,9 +54,21 @@ import statistics
 import sys
 
 
-def load_results(path):
+def load_json(path):
+    """Strict json.load -- deliberately. Inline tool responses reach files via
+    an LLM's Write call, i.e. re-generated token by token, and the observed
+    slips are MID-document (2026-07-28: a missing ] at 11:06, an extra }
+    BEFORE a closing ] at 12:36) -- shapes no parser can safely recover. A
+    lenient trailing-garbage reader was built and rejected the same day: it
+    covered only a case that has never occurred. The routine validates every
+    authored file with json.load BEFORE invoking this script; a malformed
+    file that reaches here must fail loudly, not be guessed at."""
     with open(path, "r", encoding="utf-8") as f:
-        doc = json.load(f)
+        return json.load(f)
+
+
+def load_results(path):
+    doc = load_json(path)
     if isinstance(doc, list):
         return doc
     if isinstance(doc, dict):
@@ -148,8 +160,7 @@ def load_rsi_map(paths, period):
     what produced a malformed-JSON run failure; see INCIDENTS.md."""
     out = {}
     for path in ([paths] if isinstance(paths, str) else paths):
-        with open(path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
+        doc = load_json(path)
         if isinstance(doc, dict) and isinstance(doc.get("data"), dict) and "symbol" in doc["data"]:
             doc = {doc["data"]["symbol"]: doc}          # raw single-symbol response
         for sym, val in doc.items():
@@ -214,8 +225,7 @@ def main():
                      "--rsi-confirm-bars, and --rsi-max-entry")
         rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
 
-    with open(args.quotes, "r", encoding="utf-8") as f:
-        quotes = {sym.upper(): parse_quote(sym, val) for sym, val in json.load(f).items()}
+    quotes = {sym.upper(): parse_quote(sym, val) for sym, val in load_json(args.quotes).items()}
 
     bars_by_symbol = {}
     for path in args.bars:
