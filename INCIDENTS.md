@@ -184,6 +184,28 @@ fail identically once the payload is large — the limit is on the command, not 
 quoted inside it. The data was already sitting in a harness-saved file the whole time; the routine
 just never told the agent to use it.
 
+**2026-07-28, the RSI map was the one place a run still had to retype data.** The 11:06 run failed
+with `json.decoder.JSONDecodeError: Expecting ',' delimiter` — it had hand-assembled
+`{"INLF": {"data": {... "indicators": [{"series": [...]}]}}}` and dropped the `]` closing the
+`indicators` array. It then read `evaluate_candidates.py` mid-run with `sed` (which this document
+forbids) to work out the expected shape, and recovered by rewriting in a simpler form.
+
+**The cause was this document, not the run.** Step 10 said *"save the responses into a scratch JSON
+map (SYMBOL → response)"* — and a symbol-keyed map is something that can only be built by hand.
+Meanwhile `--bars` had taken N raw response files and read the symbol out of each ever since the
+E2BIG fix, so the historicals path had been transcription-free for six days while the RSI path
+still required assembling nested JSON by eye. The rule "never hand-transcribe tool data" was
+applied to one of the two and not the other.
+
+Fixed by making `--rsi-file` behave exactly like `--bars`: `nargs="+"`, and a file whose
+`data.symbol` is present is keyed from that. Responses are now saved verbatim. The symbol-keyed
+map still parses, so older invocations keep working.
+
+**Worth generalising: if a rule exists because retyping data is dangerous, audit every path that
+takes data, not just the one that failed.** The E2BIG fix looked complete because the failure it
+was written for could not recur; the identical hazard simply moved to the input nobody had broken
+yet.
+
 **2026-07-24, inline responses and the scratch-location conflict** (commit `f07b961`). The 07:37
 run — the first ever to traverse the whole entry path — hit two gaps at once. (1) Historicals came
 back **inline** (5 candidates × 26 bars), so the "use the harness-saved file" route did not exist,

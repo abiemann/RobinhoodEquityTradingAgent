@@ -34,6 +34,9 @@ Usage:
   {"data": {"results": [...]}}   (full tool response)
   {"results": [...]}             (data envelope)
   [...]                          (bare results list)
+--rsi-file: one or more files, each a RAW get_equity_technical_indicators
+  response saved verbatim (the symbol is read from data.symbol, so responses
+  are never re-keyed or retyped). A symbol-keyed map is still accepted.
 --quotes file: JSON map of SYMBOL -> current price, e.g.
   {"FISN": 9.843, "TTRX": "7.84"}
   To enable the spread gate, give an object per symbol carrying bid and ask —
@@ -117,27 +120,40 @@ def wilder_rsi(closes, period=14):
     return out
 
 
-def load_rsi_map(path, period):
-    """Map SYMBOL -> ascending RSI values. Accepts, per symbol: a raw
-    get_equity_technical_indicators response, a bare series list, a plain
-    {"rsi": [...]} list, or {"closes": [...]} (Wilder RSI computed here)."""
-    with open(path, "r", encoding="utf-8") as f:
-        doc = json.load(f)
+def _rsi_series(val, period):
+    """Ascending RSI values from any accepted per-symbol shape."""
+    if isinstance(val, dict) and "data" in val:
+        val = val["data"]
+    if isinstance(val, dict) and "indicators" in val:
+        val = val["indicators"][0]["series"]
+    if isinstance(val, dict) and "rsi" in val:
+        val = val["rsi"]
+    if isinstance(val, dict) and "closes" in val:
+        return wilder_rsi(val["closes"], period)
+    if isinstance(val, list):
+        return [float(x["value"]) if isinstance(x, dict) else float(x) for x in val]
+    return []
+
+
+def load_rsi_map(paths, period):
+    """Map SYMBOL -> ascending RSI values, merged across one or more files.
+
+    Each file is EITHER a raw get_equity_technical_indicators response for a
+    single symbol -- the symbol is read out of data.symbol, so responses are
+    saved verbatim and nothing is ever re-keyed by hand -- OR a symbol-keyed
+    map whose values are a raw response, a bare series, {"rsi": [...]}, or
+    {"closes": [...]} (Wilder RSI computed here).
+
+    The raw-file form exists because hand-assembling the keyed map is exactly
+    what produced a malformed-JSON run failure; see INCIDENTS.md."""
     out = {}
-    for sym, val in doc.items():
-        if isinstance(val, dict) and "data" in val:
-            val = val["data"]
-        if isinstance(val, dict) and "indicators" in val:
-            val = val["indicators"][0]["series"]
-        if isinstance(val, dict) and "rsi" in val:
-            val = val["rsi"]
-        if isinstance(val, dict) and "closes" in val:
-            out[sym.upper()] = wilder_rsi(val["closes"], period)
-            continue
-        if isinstance(val, list):
-            out[sym.upper()] = [float(x["value"]) if isinstance(x, dict) else float(x) for x in val]
-            continue
-        out[sym.upper()] = []
+    for path in ([paths] if isinstance(paths, str) else paths):
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("data"), dict) and "symbol" in doc["data"]:
+            doc = {doc["data"]["symbol"]: doc}          # raw single-symbol response
+        for sym, val in doc.items():
+            out[sym.upper()] = _rsi_series(val, period)
     return out
 
 
@@ -182,7 +198,7 @@ def main():
     ap.add_argument("--dip-entry-pct", type=float, required=True)
     ap.add_argument("--max-spread-buy-pct", type=float, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in --quotes")
     ap.add_argument("--json-out", help="optional path for machine-readable results")
-    ap.add_argument("--rsi-file", help="JSON map SYMBOL -> RSI data (raw indicator response, bare series, {'rsi': [...]}, or {'closes': [...]} fallback); enables the RSI curl-up entry gate")
+    ap.add_argument("--rsi-file", nargs="+", help="one or more RSI files - each a RAW get_equity_technical_indicators response (symbol read from it) or a symbol-keyed map; enables the RSI curl-up entry gate")
     ap.add_argument("--rsi-oversold", type=float, help="RSI_OVERSOLD (required with --rsi-file)")
     ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
     ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")

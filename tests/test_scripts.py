@@ -265,6 +265,42 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertEqual(res["rsi_gate"], "pass")
         self.assertTrue(res["buy_candidate"])
 
+    def raw_rsi_response(self, symbol, values):
+        """Real get_equity_technical_indicators shape, verified live 2026-07-28."""
+        return {"data": {"symbol": symbol, "interval": "30minute", "bounds": "regular",
+                         "indicators": [{"type": "rsi", "params": {"period": 14},
+                                         "series": [{"begins_at": f"2026-07-28T{16+i//2:02d}:"
+                                                                  f"{'30' if i % 2 else '00'}:00Z",
+                                                     "value": v} for i, v in enumerate(values)]}]},
+                "guide": "Convert begins_at (UTC) to the user's timezone for display."}
+
+    def test_rsi_accepts_raw_response_files_without_hand_keying(self):
+        # a run must be able to save each response VERBATIM and pass the files;
+        # hand-building a symbol-keyed map is what broke the 2026-07-28 11:06 run
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}, {"symbol": "OTHR", "bars": bars}]}
+        with tempfile.TemporaryDirectory() as td:
+            p1 = os.path.join(td, "rsi1.json")
+            p2 = os.path.join(td, "rsi2.json")
+            with open(p1, "w", encoding="utf-8") as f:
+                json.dump(self.raw_rsi_response("SYNX", [40, 36, 33, 30, 29, 34]), f)
+            with open(p2, "w", encoding="utf-8") as f:
+                json.dump(self.raw_rsi_response("OTHR", [42, 39, 36, 33, 31, 29]), f)
+            res = self.run_eval(payload, {"SYNX": 4.0, "OTHR": 4.0},
+                                extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                       "--min-median-dollar-volume", "0",
+                                       "--rsi-file", p1, p2, "--rsi-oversold", "35",
+                                       "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
+                                       "--rsi-max-entry", "60"])
+        # symbols came out of data.symbol in each file, and both files merged
+        self.assertEqual(res["SYNX"]["rsi_gate"], "pass")
+        self.assertTrue(res["SYNX"]["buy_candidate"])
+        self.assertEqual(res["OTHR"]["rsi_gate"], "block")
+        self.assertIn("still falling", res["OTHR"]["rsi_reason"])
+        self.assertEqual(res["SYNX"]["rsi_series"], [40, 36, 33, 30, 29, 34])
+
     def test_rsi_series_is_recorded_for_threshold_sweeps(self):
         # the saved series must let a later analysis re-answer the gate at other
         # RSI_OVERSOLD / RSI_CONFIRM_BARS values without re-fetching indicators
