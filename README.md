@@ -91,9 +91,11 @@ On macOS and Linux `python3` is normally already present — check with `python3
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
 - **Opening blackout**: no buys in the session's first `NO_BUY_FIRST_MINUTES` — indicators can't see violence inside the first forming bars; profit-taking and stops stay active.
+- **RSI reversal gate**: a dip is only buyable once it was oversold, has turned back up for `RSI_CONFIRM_BARS` consecutive bars, and has not already run past `RSI_MAX_ENTRY`. Depth alone is a falling knife; a bounce that already happened is a chase. Both thresholds were tightened after live losses.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Spread gate**: no entry when the quoted bid/ask spread is wider than `MAX_SPREAD_BUY_PCT`. A buy crosses the spread, so a wide book starts the position underwater — and a spread approaching `STOP_LOSS_PCT` puts the protective stop at the bid the moment it is placed, stopping the position out on arrival.
 - **Per-position stop-loss** and a **max position cap** — every stop is verified after placement, and broker-cancelled stops are re-placed immediately at a fresh level. A double failure halts new entries for that run and raises a line in the local `ALERTS.md` for human attention.
+- **Stop-coverage audit**, run against every held position every run: stops vanish silently — a `gfd` stop expires at that day's close — so a position found without an active stop gets one placed at a fresh level. This exists because a position once rode to −49% while believed protected.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
 - **Connector-failure discipline**: a failed broker call is retried exactly once and is never treated as an empty result; if positions can't be fetched and the portfolio shows nonzero equity, the run places no orders at all. Every failure is reported even when the retry recovered.
 - **Broker compliance check** (`review_equity_order`) before every order.
@@ -110,8 +112,9 @@ It is a separate file for a practical reason. The routine document is executed b
 
 ## Known tradeoffs
 
-- **Does not function when the market is closed** — relative volume reads ~1 off-hours, so the entry list is empty by design.
-- **A relative-volume + movement screen structurally surfaces volatile names** (falling knives, momentum spikes). The filters keep them *tradable*, not *safe* — human judgment is the intended backstop during testing.
+- **Opens no positions when the market is closed** — with `REGULAR_HOURS_BUY_ONLY` on, any non-regular session skips the scan and entry evaluation outright, so no candidate list is built at all. (Turn it off and the older backstop still applies: relative volume reads ~1 off-hours, so the list comes back empty anyway.) Holdings management, stop repairs and dust sweeps run in every session regardless.
+- **A relative-volume + movement screen structurally surfaces volatile names** (falling knives, momentum spikes). The RSI reversal gate and the spread ceiling exist specifically to refuse the worst of them, and both were tightened after live losses — but they lower the rate, not to zero. Expect stop-outs; the position cap, daily-loss breaker and stop-count guard are what bound them.
+- **Cash-account settlement starves next-day buying power** — sale proceeds settle T+1, so the day after exits, buying power can sit well below `BUY_SIZE_PCT` × total value (on 2026-07-27: $869 available against $1,467 total). The routine downsizes rather than skipping — orders are capped at available buying power and never fall below `MIN_ORDER_DOLLARS` — so starved days typically buy one name instead of several.
 - **Extended-hours buys are not immediately stop-protected** (stops only trigger in the regular session), so `REGULAR_HOURS_BUY_ONLY` defaults to `true` and no position is opened outside the session. Selling and protection are never gated by session. Turning extended-hours entries back on also means retuning `MAX_SPREAD_BUY_PCT` — off-session books are several times wider.
 
 ## Testing before going live
