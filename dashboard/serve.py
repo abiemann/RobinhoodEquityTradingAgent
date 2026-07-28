@@ -14,8 +14,13 @@ plus two conveniences so the page never has to guess filenames:
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
 
-Run:  python3 dashboard/serve.py   (Windows: py -3 dashboard\\serve.py)
-then open http://127.0.0.1:8765/
+Run:   python3 dashboard/serve.py   (Windows: py -3 dashboard\\serve.py)
+       then open http://127.0.0.1:8765/
+       An optional first argument overrides the port: serve.py 9000
+
+Stop:  Ctrl+C in this terminal. If it was started detached, kill it by port —
+       PowerShell: Stop-Process -Id (Get-NetTCPConnection -LocalPort 8765 -State Listen).OwningProcess -Force
+       macOS/Linux: lsof -ti:8765 | xargs kill
 """
 
 import glob
