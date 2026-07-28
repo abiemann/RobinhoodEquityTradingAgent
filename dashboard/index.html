@@ -6,7 +6,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { --bg:#14161a; --panel:#1d2026; --line:#2c3037; --text:#d7dae0; --dim:#8a8f98;
-          --green:#4cc38a; --red:#e5534b; --amber:#d4a72c; }
+          --green:#4cc38a; --red:#e5534b; --amber:#d4a72c;
+          /* same saturation/lightness as --green, hue rotated to blue */
+          --blue:#4c8ac3; }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--text);
          font:14px/1.5 system-ui, "Segoe UI", sans-serif; padding:24px; }
@@ -36,12 +38,12 @@
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
   .hint { text-transform:none; letter-spacing:0; font-weight:400; }
   .runs { display:flex; gap:6px; flex-wrap:wrap; }
+  /* every run gets the same treatment — a run that skipped the scan still ran */
   .run { display:inline-flex; flex-direction:column; align-items:center; gap:2px;
-         padding:4px 10px; border-radius:6px; border:1px solid var(--line); cursor:default; }
-  .run .t { font-size:12px; font-weight:600; color:var(--dim); }
+         padding:4px 10px; border-radius:6px; border:1px solid var(--blue); cursor:default; }
+  .run .t { font-size:12px; font-weight:600; color:var(--text); }
   .run .o { font-size:11px; color:var(--dim); white-space:nowrap; }
-  .run.ran { border-color:var(--green); }
-  .run.ran .t { color:var(--green); }
+  /* the one exception: a tripped guard is an alert, not a routine outcome */
   .run.halted { border-color:var(--red); }
   .run.halted .t { color:var(--red); }
 </style>
