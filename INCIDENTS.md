@@ -216,6 +216,27 @@ rate cannot be pushed to zero by instructions alone. (Improvement to note: 11:06
 and read forbidden code to recover; 12:36 caught its own error BEFORE running anything, fixed the
 file, ran clean — and then bought AVIR, the first entry through the completed wall.)
 
+**2026-07-29, 12:01 — third occurrence, and the instruction was the cause.** Same defect again: an
+extra brace, this time in both RSI files, plus a separate typo in a long UUID-laden output path
+(`…8dea34` written as `…8dea94`). The pre-run `json.load` validation added the day before CAUGHT
+it before the script ran, so the cost was a rewrite rather than a crash — the guard worked.
+
+**The realisation that closed it: "save the response verbatim" was never protecting the values.**
+There is no copy operation in this harness; the agent regenerates every token of the file either
+way. Asking for the raw nested response therefore made the numbers no safer and simply added ~200
+tokens of structure to get wrong on top of them. Across three failures, 3 were structural and 0
+were value errors.
+
+So the routine now asks for the smallest thing the script actually reads — ONE file, a flat map of
+symbol → array of RSI numbers, e.g. `{"EMAT": [41.6, 40.2, 39.1]}`. `begins_at`, `params`,
+`bounds` and the long `guide` string were pure transcription surface and are never read. One file
+also means one path to mistype instead of several, which addresses the path typo in the same
+change. No script change — `load_rsi_map` already accepts a bare list per symbol.
+
+**This is not a reversal of the raw-file fix above.** That one removed hand-assembly of *nested
+responses*; nesting was the failure, not keying. A map of flat number arrays is a different
+object, and the script still accepts raw responses for anything that already passes them.
+
 The fix is procedural, and a rejected alternative is worth recording. The routine now requires
 validating every authored JSON with one `json.load` command BEFORE the script runs — one cheap
 pre-check covering every malformation, with "re-Write that file" as the recovery. A lenient
