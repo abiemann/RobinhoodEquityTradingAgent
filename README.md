@@ -152,27 +152,19 @@ Then click **Add**, then:
 1. Complete Robinhood's authorization flow.
 2. Restart Claude so the MCP settings take effect.
 
-### Scheduled task
+### Scheduled Task
 
-Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use a capable model (this workspace's task uses **5.6 Luna**). The prompt can be:
+Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use a capable model. The prompt can be:
 
 > Read `\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 
 For the recurring schedule, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. Keep the computer awake while the task is expected to run. Before enabling live orders, keep `DRY_RUN = true` and leave `place_equity_order` set to **Needs approval**.
 
-The routine's fenced lease is mandatory even if the scheduler normally avoids overlap. If one run is still active, the later run exits before any broker call; if an abandoned lease expires, the later run may take over and the old fencing token can no longer authorize mutations.
+Only one instance of the trading agent can operate at a time. If another scheduled instance starts while one is already running, the new instance stops before connecting to Robinhood or placing or cancelling any orders. If the first instance crashed, its lock expires automatically so the next scheduled run can take over safely; the old instance can no longer place or cancel orders.
 
-## Usage Example
+### Scheduled Task Example
 
-Run the routine as a **scheduled task in Cowork** (Claude desktop app). The task's prompt tells the agent to read `robinhood-momentum-routine-autonomous.md` and execute it exactly as written — so edits to the document take effect on the next run without touching the task. Set the working folder to this repo, pick the model (per the runtime requirement), and choose Act mode:
-
-![Edit scheduled task dialog in Cowork, with the prompt pointing at the routine document and Sonnet selected as the model](images/cowork-edit-scheduled-task.png)
-
-Schedule it for market hours — this example fires every 30 minutes, Monday–Friday, 6:00 AM–1:59 PM PT (covering the 9:30 AM–4:00 PM ET session):
-
-![Scheduled tasks list in Cowork showing the Robinhood momentum routine running every 30 minutes on weekdays](images/cowork-scheduled-tasks.png)
-
-Note: scheduled tasks only run while the computer is awake — enable **Keep awake** (visible above the task card) so mid-day runs aren't missed.
+![Claude scheduled task configured to run the Robinhood trading routine](images/scheduled-task-example.png)
 
 ## Tools
 
