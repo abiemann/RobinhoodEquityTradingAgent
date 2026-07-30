@@ -131,7 +131,26 @@ In Codex, open **Settings → Plugins → MCP → Add server** and enter:
 | URL / endpoint | `https://agent.robinhood.com/mcp/trading` |
 | Command, arguments, environment variables, working directory | Leave blank; these apply to STDIO servers |
 
-Save the connector and complete Robinhood's authorization flow. A successful setup exposes tools such as `get_accounts`. The routine then selects the account whose nickname is exactly `Agentic` on every run; never paste or save an account number in the connector configuration or task prompt.
+Save the connector, then:
+
+1. Complete Robinhood's authorization flow.
+2. Restart Codex so the MCP settings take effect.
+
+A successful setup exposes tools such as `get_accounts`. The routine then selects the account whose nickname is exactly `Agentic` on every run; never paste or save an account number in the connector configuration or task prompt.
+
+### Robinhood MCP connector (CLAUDE)
+
+In Claude, open **Settings → Connectors → Add → Add custom connector** and enter:
+
+| Field | Value |
+|---|---|
+| Name | `Robinhood Trading` (any descriptive name is fine) |
+| URL | `https://agent.robinhood.com/mcp/trading` |
+
+Then click **Add**, then:
+
+1. Complete Robinhood's authorization flow.
+2. Restart Claude so the MCP settings take effect.
 
 ### Scheduled task
 
