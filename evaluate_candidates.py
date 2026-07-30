@@ -50,8 +50,31 @@ document's Constants table — no silent stale defaults.
 
 import argparse
 import json
+import math
 import statistics
 import sys
+
+
+def _reject_nonfinite_json(token):
+    raise ValueError(f"non-finite JSON constant {token!r} is not allowed")
+
+
+def finite_float(value, field):
+    """Parse a finite float or fail closed with a useful field name."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field}: invalid number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field}: must be finite")
+    return number
+
+
+def finite_float_arg(value):
+    try:
+        return finite_float(value, "argument")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def load_json(path):
@@ -62,9 +85,10 @@ def load_json(path):
     lenient trailing-garbage reader was built and rejected the same day: it
     covered only a case that has never occurred. The routine validates every
     authored file with json.load BEFORE invoking this script; a malformed
-    file that reaches here must fail loudly, not be guessed at."""
+    file that reaches here must fail loudly, not be guessed at. Non-finite JSON
+    constants are rejected here; numeric strings are checked at their field."""
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return json.load(f, parse_constant=_reject_nonfinite_json)
 
 
 def load_results(path):
@@ -84,15 +108,15 @@ def parse_quote(sym, val):
     bare number/string, or an object using price/bid/ask or the raw API's
     last_trade_price/bid_price/ask_price."""
     if not isinstance(val, dict):
-        return float(val), None, None
+        return finite_float(val, f"{sym}: quote price"), None, None
     price = val.get("price", val.get("last_trade_price"))
     if price is None:
         raise ValueError(f"{sym}: quote object has no price / last_trade_price")
     bid = val.get("bid", val.get("bid_price"))
     ask = val.get("ask", val.get("ask_price"))
-    return (float(price),
-            float(bid) if bid is not None else None,
-            float(ask) if ask is not None else None)
+    return (finite_float(price, f"{sym}: quote price"),
+            finite_float(bid, f"{sym}: bid") if bid is not None else None,
+            finite_float(ask, f"{sym}: ask") if ask is not None else None)
 
 
 def spread_gate(bid, ask, max_pct):
@@ -101,11 +125,20 @@ def spread_gate(bid, ask, max_pct):
     RSI gate: a name we cannot price is a name we cannot promise to exit."""
     if bid is None or ask is None:
         return False, "spread gate: no bid/ask in --quotes - blocked", None
+    try:
+        finite = all(math.isfinite(value) for value in (bid, ask, max_pct))
+    except TypeError:
+        finite = False
+    if not finite:
+        return False, "spread gate: non-finite quote or threshold - blocked", None
     if bid <= 0 or ask <= 0 or ask < bid:
         return False, f"spread gate: unusable quote (bid {bid:g}, ask {ask:g}) - blocked", None
     # rounded so a spread sitting exactly on the threshold cannot be rejected by
     # binary-float noise (4.04 - 3.96 is 0.08000000000000007)
-    pct = round((ask - bid) / ((bid + ask) / 2.0) * 100.0, 6)
+    mid = bid / 2.0 + ask / 2.0
+    pct = round((ask - bid) / mid * 100.0, 6)
+    if not math.isfinite(pct):
+        return False, "spread gate: non-finite computed spread - blocked", None
     if pct > max_pct:
         return False, (f"spread gate: {pct:.2f}% wide (bid ${bid:.4f} / ask ${ask:.4f}) "
                        f"> max {max_pct:g}%"), pct
@@ -113,7 +146,7 @@ def spread_gate(bid, ask, max_pct):
 
 
 def wilder_rsi(closes, period=14):
-    closes = [float(c) for c in closes]
+    closes = [finite_float(c, "RSI close") for c in closes]
     if len(closes) < period + 1:
         return []
     gains, losses = [], []
@@ -143,7 +176,8 @@ def _rsi_series(val, period):
     if isinstance(val, dict) and "closes" in val:
         return wilder_rsi(val["closes"], period)
     if isinstance(val, list):
-        return [float(x["value"]) if isinstance(x, dict) else float(x) for x in val]
+        return [finite_float(x["value"], "RSI value") if isinstance(x, dict)
+                else finite_float(x, "RSI value") for x in val]
     return []
 
 
@@ -181,6 +215,19 @@ def rsi_gate(values, oversold, lookback, confirm, max_entry=None):
     after the move is spent."""
     if not values or len(values) < max(lookback, confirm + 1):
         return False, f"RSI gate: no/insufficient data ({len(values or [])} values) - blocked"
+    try:
+        finite = all(math.isfinite(value) for value in values)
+    except TypeError:
+        finite = False
+    if not finite:
+        return False, "RSI gate: non-finite data - blocked"
+    try:
+        thresholds = (oversold,) + (() if max_entry is None else (max_entry,))
+        finite_thresholds = all(math.isfinite(value) for value in thresholds)
+    except TypeError:
+        finite_thresholds = False
+    if not finite_thresholds:
+        return False, "RSI gate: non-finite threshold - blocked"
     window_min = min(values[-lookback:])
     if window_min > oversold:
         return False, f"RSI gate: never oversold (min {window_min:.1f} > {oversold:g})"
@@ -205,15 +252,15 @@ def main():
     ap.add_argument("--quotes", required=True, help="JSON map of SYMBOL -> current price")
     ap.add_argument("--volume-lookback-days", type=int, required=True)
     ap.add_argument("--high-lookback-days", type=int, required=True)
-    ap.add_argument("--min-median-dollar-volume", type=float, required=True)
-    ap.add_argument("--dip-entry-pct", type=float, required=True)
-    ap.add_argument("--max-spread-buy-pct", type=float, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in --quotes")
+    ap.add_argument("--min-median-dollar-volume", type=finite_float_arg, required=True)
+    ap.add_argument("--dip-entry-pct", type=finite_float_arg, required=True)
+    ap.add_argument("--max-spread-buy-pct", type=finite_float_arg, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in --quotes")
     ap.add_argument("--json-out", help="optional path for machine-readable results")
     ap.add_argument("--rsi-file", nargs="+", help="one or more RSI files - each a RAW get_equity_technical_indicators response (symbol read from it) or a symbol-keyed map; enables the RSI curl-up entry gate")
-    ap.add_argument("--rsi-oversold", type=float, help="RSI_OVERSOLD (required with --rsi-file)")
+    ap.add_argument("--rsi-oversold", type=finite_float_arg, help="RSI_OVERSOLD (required with --rsi-file)")
     ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
     ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")
-    ap.add_argument("--rsi-max-entry", type=float, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with --rsi-file)")
+    ap.add_argument("--rsi-max-entry", type=finite_float_arg, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with --rsi-file)")
     ap.add_argument("--rsi-period", type=int, default=14, help="RSI_PERIOD, used only for the closes fallback (default 14)")
     args = ap.parse_args()
 
@@ -251,8 +298,17 @@ def main():
 
         window = bars[-args.volume_lookback_days:]
         # interpolated bars carry volume 0, so they naturally contribute $0 days
-        dollar_vols = [float(b["volume"]) * float(b["close_price"]) for b in window]
+        dollar_vols = []
+        for b in window:
+            volume = finite_float(b["volume"], f"{sym}: bar volume")
+            close = finite_float(b["close_price"], f"{sym}: bar close")
+            dollar_volume = volume * close
+            if not math.isfinite(dollar_volume):
+                raise ValueError(f"{sym}: bar dollar volume must be finite")
+            dollar_vols.append(dollar_volume)
         row["median_dollar_volume"] = statistics.median(dollar_vols)
+        if not math.isfinite(row["median_dollar_volume"]):
+            raise ValueError(f"{sym}: median dollar volume must be finite")
 
         if row["median_dollar_volume"] < args.min_median_dollar_volume:
             row["skip_reason"] = (f"illiquid: median ${row['median_dollar_volume']:,.0f}/day "
@@ -266,8 +322,11 @@ def main():
             rows.append(row)
             continue
 
-        row["recent_high"] = max(float(b["high_price"]) for b in real_recent)
+        row["recent_high"] = max(finite_float(b["high_price"], f"{sym}: bar high")
+                                 for b in real_recent)
         row["pct_below_high"] = (row["recent_high"] - current) / row["recent_high"] * 100.0
+        if not math.isfinite(row["pct_below_high"]):
+            raise ValueError(f"{sym}: percent below high must be finite")
 
         if row["pct_below_high"] > args.dip_entry_pct:
             # Spread first: it is free (the quote is already in hand) and a block
@@ -327,7 +386,7 @@ def main():
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump({"params": vars(args), "results": rows}, f, indent=2)
+            json.dump({"params": vars(args), "results": rows}, f, indent=2, allow_nan=False)
         print(f"JSON written to {args.json_out}")
 
     return 0

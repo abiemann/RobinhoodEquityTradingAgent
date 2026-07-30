@@ -21,7 +21,8 @@ per run): {"data": {"result": {"results": [...], "total_items": N, ...}},
 {"Last": "4.45", "% Change": "0.1528", "Relative volume": "557.75",
 "Volume": "20372901", "Symbol": "XYZ", ...}} — prices and volumes are
 STRINGS, and "% Change" is a DECIMAL FRACTION (0.0301 = 3.01%), converted
-to percent here. Rows missing needed fields are skipped and counted.
+to percent here. Rows missing or carrying non-finite needed fields are skipped
+and counted.
 
 TESTED BY tests/test_scripts.py — after ANY edit to this file, run
 `python3 tests/test_scripts.py` (Windows: `py -3 tests\test_scripts.py`)
@@ -32,12 +33,35 @@ expectation deliberately — never delete a test to go green.
 
 import argparse
 import json
+import math
 import sys
+
+
+def _reject_nonfinite_json(token):
+    raise ValueError(f"non-finite JSON constant {token!r} is not allowed")
+
+
+def finite_float(value, field):
+    """Parse a finite float or fail closed with a useful field name."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field}: invalid number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field}: must be finite")
+    return number
+
+
+def finite_float_arg(value):
+    try:
+        return finite_float(value, "argument")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def load_result(path):
     with open(path, "r", encoding="utf-8") as f:
-        doc = json.load(f)
+        doc = json.load(f, parse_constant=_reject_nonfinite_json)
     if isinstance(doc, dict):
         if "data" in doc and isinstance(doc["data"], dict) and "result" in doc["data"]:
             return doc["data"]["result"]
@@ -51,10 +75,10 @@ def load_result(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scan-file", required=True, help="raw run_scan JSON result file")
-    ap.add_argument("--price-min", type=float, required=True)
-    ap.add_argument("--price-max", type=float, required=True)
-    ap.add_argument("--min-rel-volume", type=float, required=True)
-    ap.add_argument("--min-abs-pct-change", type=float, required=True,
+    ap.add_argument("--price-min", type=finite_float_arg, required=True)
+    ap.add_argument("--price-max", type=finite_float_arg, required=True)
+    ap.add_argument("--min-rel-volume", type=finite_float_arg, required=True)
+    ap.add_argument("--min-abs-pct-change", type=finite_float_arg, required=True,
                     help="minimum absolute day move in PERCENT (scan emits a decimal fraction; converted here)")
     ap.add_argument("--top-n", type=int, required=True)
     ap.add_argument("--json-out", help="optional path for the machine-readable working list")
@@ -69,10 +93,12 @@ def main():
     for row in rows:
         cols = row.get("columns", {})
         try:
-            last = float(cols["Last"])
-            rel_vol = float(cols["Relative volume"])
-            pct = float(cols["% Change"]) * 100.0
-            volume = float(cols.get("Volume", "0"))
+            last = finite_float(cols["Last"], "Last")
+            rel_vol = finite_float(cols["Relative volume"], "Relative volume")
+            pct = finite_float(cols["% Change"], "% Change") * 100.0
+            if not math.isfinite(pct):
+                raise ValueError("% Change: percent must be finite")
+            volume = finite_float(cols.get("Volume", "0"), "Volume")
         except (KeyError, TypeError, ValueError):
             skipped_fields += 1
             continue
@@ -106,7 +132,7 @@ def main():
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump({"total_items": total_items, "rows_returned": len(rows),
                        "rows_skipped": skipped_fields, "passed_filters": len(survivors),
-                       "working_list": working}, f, indent=2)
+                       "working_list": working}, f, indent=2, allow_nan=False)
         print(f"\nJSON written to {args.json_out}")
     return 0
 

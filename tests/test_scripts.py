@@ -22,6 +22,9 @@ SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
 
+sys.path.insert(0, ROOT)
+from evaluate_candidates import spread_gate
+
 
 def bar(date, close, high, volume, interpolated=False):
     b = {"begins_at": date + "T00:00:00Z", "open_price": str(close), "close_price": str(close),
@@ -201,6 +204,49 @@ class EvaluateCandidatesTests(unittest.TestCase):
         zero = self.run_eval_spread({"price": 4.0, "bid": 0, "ask": 4.1})
         self.assertEqual(zero["spread_gate"], "block")
         self.assertIn("unusable quote", zero["skip_reason"])
+
+    def test_nonfinite_quotes_and_spread_threshold_fail_loudly(self):
+        for quote in (
+            {"price": "NaN", "bid": 3.68, "ask": 3.69},
+            {"price": 3.70, "bid": "Infinity", "ask": 3.69},
+            {"price": 3.70, "bid": 3.68, "ask": "-Infinity"},
+        ):
+            with self.assertRaises(AssertionError):
+                self.run_eval_spread(quote)
+        with self.assertRaises(AssertionError):
+            self.run_eval_spread({"price": 3.70, "bid": 3.68, "ask": 3.69},
+                                 max_spread="NaN")
+
+    def test_spread_gate_directly_blocks_nonfinite_values(self):
+        for bid, ask, threshold in (
+            (float("nan"), 4.0, 2.0),
+            (3.0, float("inf"), 2.0),
+            (3.0, 4.0, float("nan")),
+        ):
+            passes, reason, pct = spread_gate(bid, ask, threshold)
+            self.assertFalse(passes)
+            self.assertIsNone(pct)
+            self.assertIn("non-finite", reason)
+
+    def test_nonfinite_historical_and_rsi_values_fail_loudly(self):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        bars[-1]["close_price"] = "NaN"
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        with self.assertRaises(AssertionError):
+            self.run_eval(payload, {"SYNX": 4.0},
+                          extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                 "--min-median-dollar-volume", "0"])
+        huge_bars = [bar("2026-07-01", 1.0, 2.0, "1e308"),
+                     bar("2026-07-02", 1.0, 2.0, "1e308")]
+        huge_payload = {"results": [{"symbol": "HUGE", "bars": huge_bars}]}
+        with self.assertRaises(AssertionError):
+            self.run_eval(huge_payload, {"HUGE": 1.0},
+                          extra=["--volume-lookback-days", "2", "--high-lookback-days", "2",
+                                 "--min-median-dollar-volume", "0"])
+        with self.assertRaises(AssertionError):
+            self.run_eval_rsi({"SYNX": {"rsi": [40, 36, 33, 30, 29, "NaN"]}})
 
     def test_spread_gate_disabled_when_flag_absent(self):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
@@ -443,6 +489,28 @@ class FilterScanTests(unittest.TestCase):
         symbols = [w["symbol"] for w in data["working_list"]]
         self.assertEqual(symbols, ["S5", "S4", "S3"])
         self.assertEqual(data["passed_filters"], 6)
+
+    def test_nonfinite_scan_fields_are_skipped(self):
+        rows = [scan_row("KEEP", 4.0, 0.05, 10.0)]
+        for symbol, field, value in (
+            ("BADLAST", "Last", "NaN"),
+            ("BADRV", "Relative volume", "Infinity"),
+            ("BADPCT", "% Change", "-Infinity"),
+            ("BADPCTOVERFLOW", "% Change", "1e308"),
+            ("BADVOL", "Volume", "NaN"),
+        ):
+            row = scan_row(symbol, 4.0, 0.05, 10.0)
+            row["columns"][field] = value
+            rows.append(row)
+        data = self.run_filter(rows)
+        self.assertEqual([w["symbol"] for w in data["working_list"]], ["KEEP"])
+        self.assertEqual(data["rows_skipped"], 5)
+
+    def test_nonfinite_json_constant_fails_loudly(self):
+        row = scan_row("BAD", 4.0, 0.05, 10.0)
+        row["columns"]["Last"] = float("nan")
+        with self.assertRaises(AssertionError):
+            self.run_filter([row])
 
 
 class MarketClockTests(unittest.TestCase):
