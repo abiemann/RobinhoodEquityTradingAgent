@@ -3,7 +3,7 @@
 Rules for any AI agent (or human) editing this repository.
 
 ## Tests are mandatory for script changes
-After editing `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, or `tools/price_band_scanner.py`, run:
+After editing `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `dashboard/serve.py`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
 
 ```
 python3 tests/test_scripts.py     # Windows: py -3 tests\test_scripts.py
@@ -26,4 +26,4 @@ When a change to a routine document alters behavior that README.md describes (co
 `run-reports/`, `tools/logs/`, `trade-ledger.csv`, and `tmp_*` are gitignored on purpose — they contain account activity or are regenerated. Never commit them or weaken `.gitignore`.
 
 ## DRY_RUN must be true in every commit
-`Constants.md` is committed, but its `DRY_RUN` value must read `true` in every commit — the safe default for anyone cloning. The user trades live via a LOCAL, uncommitted `DRY_RUN = false` edit. Before committing `Constants.md`, check that line: if it reads `false`, temporarily set it to `true`, commit, then restore `false` in the working tree. Never publish `false`. Do the flip with a precise text edit of that ONE line — never by round-tripping the whole file through PowerShell `Get-Content`/`Set-Content`, which mis-decodes UTF-8 and corrupts every non-ASCII character (happened 2026-07-16).
+`constants.md` is committed, but its `DRY_RUN` value must read `true` in every commit — the safe default for anyone cloning. The user trades live via a LOCAL, uncommitted `DRY_RUN = false` edit. Before committing `constants.md`, check that line: if it reads `false`, temporarily set it to `true`, commit, then restore `false` in the working tree. Never publish `false`. Do the flip with a precise text edit of that ONE line — never by round-tripping the whole file through PowerShell `Get-Content`/`Set-Content`, which mis-decodes UTF-8 and corrupts every non-ASCII character (happened 2026-07-16).

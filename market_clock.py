@@ -17,16 +17,22 @@ This script depends only on UTC (always available) and computes the US
 Eastern/Pacific offsets from the DST rule itself, so it gives the same
 answer on Windows and in the Linux sandbox.
 
-Usage (routine):  python3 market_clock.py [--json]
+Usage (routine):  python3 market_clock.py --json
+Human-readable:    python3 market_clock.py
 Testing:           python3 market_clock.py --now-utc 2026-07-21T15:07:00Z
                    python3 market_clock.py --no-buy-first-minutes 5    # override
 
-The blackout minute count is read from Constants.md (the row for
+The blackout minute count is read from constants.md (the row for
 NO_BUY_FIRST_MINUTES). The routine must NOT substitute the value on the
 command line — an agent invoked this with `--no-buy-first-minutes 5`
-against a Constants.md of 45 on 2026-07-22 (safe by luck, could have
+against a constants.md of 45 on 2026-07-22 (safe by luck, could have
 unlocked buying inside the blackout). --no-buy-first-minutes stays as a
 test override only.
+
+NYSE full closures and 1:00 p.m. ET early closes live in the reviewed,
+checked-in market_calendar.py table (currently 2026--2028). A weekday beyond
+that coverage is calendar-unknown and cannot open a new entry; the routine
+may keep managing existing positions.
 
 US DST rule (since 2007): starts the second Sunday in March at 02:00
 local standard time, ends the first Sunday in November at 02:00 local
@@ -45,11 +51,11 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+from market_calendar import REGULAR_OPEN_MINUTE, core_session_schedule
+
 EASTERN_STD_OFFSET = -5
 PACIFIC_STD_OFFSET = -8
 
-REGULAR_OPEN = (9, 30)
-REGULAR_CLOSE = (16, 0)
 PREMARKET_OPEN = (4, 0)
 AFTERHOURS_CLOSE = (20, 0)
 
@@ -84,38 +90,54 @@ def zone_time(utc_dt, std_offset, std_name, dst_name):
 
 
 def session_state(et_dt):
-    """Market session for an Eastern-time datetime, plus minutes since the open."""
+    """Return session, clock and calendar verdicts for an Eastern datetime.
+
+    ``entry_session_open`` means the current date/time is a known window in
+    which a new entry MAY be considered. It deliberately says nothing about
+    the other entry gates or per-symbol broker tradability.
+    """
     if et_dt.weekday() >= 5:
-        return "closed-weekend", None
+        return "closed-weekend", None, "weekend", False, None
+    calendar_status, close_m = core_session_schedule(et_dt.date())
+    if calendar_status == "unknown":
+        return "calendar-unknown", None, calendar_status, False, None
+    if calendar_status == "holiday":
+        return "closed-holiday", None, calendar_status, False, None
+
     minutes = et_dt.hour * 60 + et_dt.minute
-    open_m = REGULAR_OPEN[0] * 60 + REGULAR_OPEN[1]
-    close_m = REGULAR_CLOSE[0] * 60 + REGULAR_CLOSE[1]
+    open_m = REGULAR_OPEN_MINUTE
     pre_m = PREMARKET_OPEN[0] * 60 + PREMARKET_OPEN[1]
     after_m = AFTERHOURS_CLOSE[0] * 60 + AFTERHOURS_CLOSE[1]
     since_open = minutes - open_m
     if minutes < pre_m:
-        return "closed", since_open
+        return "closed", since_open, calendar_status, False, close_m
     if minutes < open_m:
-        return "pre-market", since_open
+        return "pre-market", since_open, calendar_status, calendar_status == "normal", close_m
     if minutes < close_m:
-        return "regular", since_open
+        return "regular", since_open, calendar_status, True, close_m
+    if calendar_status == "early-close":
+        return "closed-early", since_open, calendar_status, False, close_m
     if minutes < after_m:
-        return "after-hours", since_open
-    return "closed", since_open
+        return "after-hours", since_open, calendar_status, True, close_m
+    return "closed", since_open, calendar_status, False, close_m
+
+
+def format_et_time(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def read_no_buy_first_minutes(constants_path=None):
-    """Extract NO_BUY_FIRST_MINUTES from Constants.md next to this script.
+    """Extract NO_BUY_FIRST_MINUTES from constants.md next to this script.
 
     Reading it here — instead of taking it as a CLI flag the routine
     substitutes by hand — closes an improvisation gap: on 2026-07-22 an
     agent invoked this script with `--no-buy-first-minutes 5` when
-    Constants.md said 45 (safe by luck; the mismatch could have unlocked
+    constants.md said 45 (safe by luck; the mismatch could have unlocked
     buying inside the blackout window).
     """
     if constants_path is None:
         here = os.path.dirname(os.path.abspath(__file__))
-        constants_path = os.path.join(here, "Constants.md")
+        constants_path = os.path.join(here, "constants.md")
     with open(constants_path, encoding="utf-8") as f:
         for line in f:
             m = re.match(r"\|\s*`NO_BUY_FIRST_MINUTES`\s*\|\s*`(\d+)`", line)
@@ -127,8 +149,8 @@ def read_no_buy_first_minutes(constants_path=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-buy-first-minutes", type=int, default=None,
-                    help="OPTIONAL override for tests; the routine must NOT pass this — the value is read from Constants.md so the agent never re-types it")
-    ap.add_argument("--constants", help="path to Constants.md (testing only)")
+                    help="OPTIONAL override for tests; the routine must NOT pass this — the value is read from constants.md so the agent never re-types it")
+    ap.add_argument("--constants", help="path to constants.md (testing only)")
     ap.add_argument("--now-utc", help="override the clock, ISO-8601 UTC (testing only)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -145,7 +167,7 @@ def main():
 
     et, et_name, _ = zone_time(utc, EASTERN_STD_OFFSET, "EST", "EDT")
     pt, pt_name, _ = zone_time(utc, PACIFIC_STD_OFFSET, "PST", "PDT")
-    state, since_open = session_state(et)
+    state, since_open, calendar_status, entry_session_open, regular_close = session_state(et)
 
     in_blackout = (state == "regular" and since_open is not None
                    and since_open < blackout_minutes)
@@ -156,6 +178,9 @@ def main():
         "pt": f"{pt:%Y-%m-%d %H:%M:%S} {pt_name}",
         "date_pt": pt.strftime("%Y-%m-%d"),
         "session": state,
+        "calendar_status": calendar_status,
+        "regular_close_et": None if regular_close is None else format_et_time(regular_close),
+        "entry_session_open": entry_session_open,
         "minutes_since_open": since_open,
         "opening_blackout": in_blackout,
     }
@@ -167,8 +192,11 @@ def main():
         print(f"ET      {out['et']}")
         print(f"PT      {out['pt']}   (trading day {out['date_pt']} Pacific)")
         print(f"Session {state}" + (f"  |  {since_open} min since 09:30 ET open" if since_open is not None else ""))
+        close_label = "closed" if out["regular_close_et"] is None else f"{out['regular_close_et']} ET"
+        print(f"Calendar {calendar_status}  |  regular close {close_label}  |  "
+              f"new-entry window {'open' if entry_session_open else 'closed'}")
         verdict = "BLOCKED — opening blackout" if in_blackout else "clear"
-        print(f"Blackout (first {blackout_minutes} min, from Constants.md): {verdict}")
+        print(f"Blackout (first {blackout_minutes} min, from constants.md): {verdict}")
     return 0
 
 

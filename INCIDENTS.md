@@ -52,10 +52,10 @@ timezone library.** The named failing commands stay in the routine deliberately 
 from rediscovering them.
 
 **2026-07-22, the constant-substitution near-miss** (commit `67555a8`). A run invoked the script
-with `--no-buy-first-minutes 5` while `Constants.md` said `45`. Safe only by luck: the arithmetic
+with `--no-buy-first-minutes 5` while `constants.md` said `45`. Safe only by luck: the arithmetic
 still tripped the block. The mismatch could have unlocked buying inside the blackout window. Fix:
-the script reads the value from `Constants.md` itself; the flag survives only as a test override;
-a missing `Constants.md` now errors loudly rather than defaulting to 0 (which would have silently
+the script reads the value from `constants.md` itself; the flag survives only as a test override;
+a missing `constants.md` now errors loudly rather than defaulting to 0 (which would have silently
 disabled the gate — the worst failure mode for a safety script).
 
 **Generalised lesson for editors:** any `<CONSTANT_NAME>` placeholder in a shell command is an
@@ -67,6 +67,15 @@ placeholder in a command line with suspicion. `filter_scan.py` still has five of
 tests locally, but the routine reads it as an equally valid choice, and the Linux sandbox agent
 picked `py -3` first — exit 127, `bash: py: command not found`, in both the 11:07 and 11:37 runs.
 `py -3` belongs only in CLAUDE.md and README.md.
+
+**2026-07-29, exchange-calendar gap (P1 review finding).** The clock classified every weekday by
+fixed wall-clock hours, so an NYSE holiday could look like a normal regular session. With
+`REGULAR_HOURS_BUY_ONLY = false`, that gap could also reach the extended-hours entry path. No loss
+was attributed to it; the safety review caught it before a trade. The fix adds a reviewed,
+checked-in NYSE calendar for 2026-2028, recognizes full closures and 1:00 p.m. ET early closes,
+and fails closed outside the reviewed coverage. `entry_session_open` is now the single
+unconditional entry clearance: it blocks scanning and new buys but never disables profit-taking,
+stop repairs, dust sweeps, or the other protection work.
 
 ## BROKER TIMESTAMPS
 
@@ -380,7 +389,7 @@ regardless of who created it.
 ## REPORT — write with the tool, never a shell
 
 **2026-07-16.** PowerShell `Get-Content`/`Set-Content` round-trips and shell redirection mis-decode
-UTF-8: em-dashes and ✓/🔔 came out as mojibake across `Constants.md`, costing a cleanup commit
+UTF-8: em-dashes and ✓/🔔 came out as mojibake across `constants.md`, costing a cleanup commit
 (`fbdc579`). Use the `Write` tool for every file a run creates.
 
 ---

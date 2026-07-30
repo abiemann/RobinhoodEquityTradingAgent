@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the two deterministic scripts.
+"""Regression suite for deterministic subroutines and routine contracts.
 
 Run:  py -3 tests/test_scripts.py   (or: python3 tests/test_scripts.py)
 
@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import date
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
@@ -28,6 +29,10 @@ DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
+from market_calendar import (CALENDAR_YEARS, CLOSED_DATES,
+                             EARLY_CLOSE_MINUTES_BY_DATE,
+                             NORMAL_REGULAR_CLOSE_MINUTE,
+                             REGULAR_OPEN_MINUTE)
 
 DASHBOARD_SPEC = importlib.util.spec_from_file_location("dashboard_serve", DASHBOARD)
 assert DASHBOARD_SPEC and DASHBOARD_SPEC.loader
@@ -635,6 +640,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertEqual(c["et"], "2026-07-21 11:07:00 EDT")
         self.assertEqual(c["pt"], "2026-07-21 08:07:00 PDT")
         self.assertEqual(c["session"], "regular")
+        self.assertEqual(c["calendar_status"], "normal")
+        self.assertEqual(c["regular_close_et"], "16:00")
+        self.assertIs(type(c["entry_session_open"]), bool)
+        self.assertTrue(c["entry_session_open"])
         self.assertEqual(c["minutes_since_open"], 97)
 
     def test_winter_offsets_are_standard(self):
@@ -671,14 +680,14 @@ class MarketClockTests(unittest.TestCase):
 
     def test_reads_no_buy_first_minutes_from_constants_md(self):
         # No --no-buy-first-minutes flag: the script must read the value from
-        # Constants.md rather than defaulting silently. Regression for the
+        # constants.md rather than defaulting silently. Regression for the
         # 2026-07-22 06:37 run where an agent passed 5 against a real 45.
         c = self.clock("2026-07-22T13:37:00Z")   # 09:37 ET = 7 min past open
         self.assertTrue(c["opening_blackout"],
-                        "with Constants.md at 45, 7 min past open must block; a silent 0 default would falsely clear")
+                        "with constants.md at 45, 7 min past open must block; a silent 0 default would falsely clear")
 
     def test_missing_constants_file_errors_loudly(self):
-        # If Constants.md cannot be found, the script must fail rather than
+        # If constants.md cannot be found, the script must fail rather than
         # default to 0 (which silently disables the blackout).
         with tempfile.TemporaryDirectory() as td:
             r = subprocess.run([sys.executable, CLOCK, "--constants", os.path.join(td, "nope.md"),
@@ -687,10 +696,100 @@ class MarketClockTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
 
     def test_sessions_and_weekend(self):
-        self.assertEqual(self.clock("2026-07-21T12:00:00Z")["session"], "pre-market")
-        self.assertEqual(self.clock("2026-07-21T20:30:00Z")["session"], "after-hours")
-        self.assertEqual(self.clock("2026-07-22T01:00:00Z")["session"], "closed")
-        self.assertEqual(self.clock("2026-07-18T15:00:00Z")["session"], "closed-weekend")
+        pre = self.clock("2026-07-21T12:00:00Z")
+        self.assertEqual(pre["session"], "pre-market")
+        self.assertTrue(pre["entry_session_open"])
+        after = self.clock("2026-07-21T20:30:00Z")
+        self.assertEqual(after["session"], "after-hours")
+        self.assertTrue(after["entry_session_open"])
+        closed = self.clock("2026-07-22T01:00:00Z")
+        self.assertEqual(closed["session"], "closed")
+        self.assertFalse(closed["entry_session_open"])
+        weekend = self.clock("2026-07-18T15:00:00Z")
+        self.assertEqual(weekend["session"], "closed-weekend")
+        self.assertFalse(weekend["entry_session_open"])
+
+    def test_exchange_calendar_table_is_valid(self):
+        self.assertEqual(CALENDAR_YEARS, frozenset({2026, 2027, 2028}))
+        expected_closed = frozenset({
+            # Published NYSE full closures, 2026
+            date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16),
+            date(2026, 4, 3), date(2026, 5, 25), date(2026, 6, 19),
+            date(2026, 7, 3), date(2026, 9, 7), date(2026, 11, 26),
+            date(2026, 12, 25),
+            # 2027
+            date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15),
+            date(2027, 3, 26), date(2027, 5, 31), date(2027, 6, 18),
+            date(2027, 7, 5), date(2027, 9, 6), date(2027, 11, 25),
+            date(2027, 12, 24),
+            # 2028 (New Year's Day is Saturday, so NYSE does not observe it)
+            date(2028, 1, 17), date(2028, 2, 21), date(2028, 4, 14),
+            date(2028, 5, 29), date(2028, 6, 19), date(2028, 7, 4),
+            date(2028, 9, 4), date(2028, 11, 23), date(2028, 12, 25),
+        })
+        expected_early_closes = {
+            date(2026, 11, 27): 13 * 60,
+            date(2026, 12, 24): 13 * 60,
+            date(2027, 11, 26): 13 * 60,
+            date(2028, 7, 3): 13 * 60,
+            date(2028, 11, 24): 13 * 60,
+        }
+        self.assertEqual(CLOSED_DATES, expected_closed)
+        self.assertEqual(EARLY_CLOSE_MINUTES_BY_DATE, expected_early_closes)
+        self.assertFalse(CLOSED_DATES & set(EARLY_CLOSE_MINUTES_BY_DATE))
+        scheduled_days = set(CLOSED_DATES) | set(EARLY_CLOSE_MINUTES_BY_DATE)
+        self.assertTrue(all(day.year in CALENDAR_YEARS and day.weekday() < 5
+                            for day in scheduled_days))
+        self.assertTrue(all(REGULAR_OPEN_MINUTE < close < NORMAL_REGULAR_CLOSE_MINUTE
+                            for close in EARLY_CLOSE_MINUTES_BY_DATE.values()))
+
+    def test_exchange_holidays_block_new_entry_windows(self):
+        # These UTC instants are 11:00 ET, inside a normal full-day core
+        # session. They must still be closed on their published holidays.
+        for now_utc in ("2026-04-03T15:00:00Z", "2026-06-19T15:00:00Z",
+                        "2026-07-03T15:00:00Z", "2026-11-26T16:00:00Z",
+                        "2026-12-25T16:00:00Z", "2027-12-24T16:00:00Z"):
+            c = self.clock(now_utc)
+            self.assertEqual(c["session"], "closed-holiday", now_utc)
+            self.assertEqual(c["calendar_status"], "holiday", now_utc)
+            self.assertFalse(c["entry_session_open"], now_utc)
+            self.assertIsNone(c["minutes_since_open"], now_utc)
+            self.assertFalse(c["opening_blackout"], now_utc)
+
+    def test_early_close_limits_new_entries_to_shortened_regular_session(self):
+        for premarket, before_close, at_close in (
+            ("2026-11-27T14:00:00Z", "2026-11-27T17:59:00Z", "2026-11-27T18:00:00Z"),
+            ("2026-12-24T14:00:00Z", "2026-12-24T17:59:00Z", "2026-12-24T18:00:00Z"),
+            ("2028-07-03T13:00:00Z", "2028-07-03T16:59:00Z", "2028-07-03T17:00:00Z"),
+        ):
+            pre = self.clock(premarket)
+            self.assertEqual(pre["session"], "pre-market", premarket)
+            self.assertEqual(pre["calendar_status"], "early-close", premarket)
+            self.assertFalse(pre["entry_session_open"], premarket)
+
+            before = self.clock(before_close)
+            self.assertEqual(before["session"], "regular", before_close)
+            self.assertEqual(before["regular_close_et"], "13:00", before_close)
+            self.assertTrue(before["entry_session_open"], before_close)
+
+            closed = self.clock(at_close)
+            self.assertEqual(closed["session"], "closed-early", at_close)
+            self.assertFalse(closed["entry_session_open"], at_close)
+
+    def test_unknown_calendar_coverage_blocks_new_entries(self):
+        c = self.clock("2029-01-02T16:00:00Z")  # Tuesday, 11:00 ET
+        self.assertEqual(c["session"], "calendar-unknown")
+        self.assertEqual(c["calendar_status"], "unknown")
+        self.assertFalse(c["entry_session_open"])
+        self.assertIsNone(c["regular_close_et"])
+
+    def test_routine_has_an_unconditional_calendar_entry_gate(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+        self.assertIn("`python3 market_clock.py --json`", routine)
+        self.assertIn("entry_session_open", routine)
+        self.assertIn("exactly the JSON boolean `true`", routine)
+        self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
 
     def test_pacific_trading_day_rolls_before_utc_day(self):
         # 2026-07-22 03:00Z is still 2026-07-21 in Pacific — the date used

@@ -23,9 +23,9 @@ All trading is scoped to a single account, resolved **by name** at runtime.
 
 ## Configuration
 
-**Live trading is off unless you turn it on.** `DRY_RUN` is `true` in the committed `Constants.md`, so a fresh clone runs in **dry run** — logging every would-be buy and stop instead of placing it. To trade live, set `DRY_RUN` to `false` as a **local, uncommitted edit**; never commit `false`. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
+**Live trading is off unless you turn it on.** `DRY_RUN` is `true` in the committed `constants.md`, so a fresh clone runs in **dry run** — logging every would-be buy and stop instead of placing it. To trade live, set `DRY_RUN` to `false` as a **local, uncommitted edit**; never commit `false`. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
 
-All tunable values live in **`Constants.md`** next to the routine document — edit there, nowhere else. Purpose of each:
+All tunable values live in **`constants.md`** next to the routine document — edit there, nowhere else. Purpose of each:
 
 | Constant | Purpose |
 |---|---|
@@ -48,7 +48,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 | `STOP_COUNT_HALT` | Halt new buys for the day after this many stop fills. |
 | `SKIP_BUY_IF_SPY_RED` | Skip scanning/buying for the current run while SPY trades below its previous close. |
 | `NO_BUY_FIRST_MINUTES` | Opening blackout: no buys during the session's first N minutes (selling/protection unaffected). |
-| `REGULAR_HOURS_BUY_ONLY` | If `true` (the default), no extended-hours entries; selling and stop protection still run in every session. Setting it `false` also requires raising `MAX_SPREAD_BUY_PCT`, since extended-hours spreads are far wider. |
+| `REGULAR_HOURS_BUY_ONLY` | If `true` (the default), no extended-hours entries; selling and stop protection still run in every session. If `false`, ordinary pre-/after-hours entries remain possible only when the exchange-calendar gate permits them; it never overrides a holiday, an early-close session restriction, or an unknown-calendar block. Raising `MAX_SPREAD_BUY_PCT` is also required because extended-hours spreads are far wider. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
 
 ## Requirements
@@ -91,6 +91,7 @@ On macOS and Linux `python3` is normally already present — check with `python3
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
 - **Opening blackout**: no buys in the session's first `NO_BUY_FIRST_MINUTES` — indicators can't see violence inside the first forming bars; profit-taking and stops stay active.
+- **Exchange-calendar gate**: no new entries on a full NYSE closure, outside an eligible session window, after a published 1:00 p.m. ET early close, or when the reviewed calendar has no coverage for the date. Existing-position profit-taking, stop audits/repairs, and dust sweeps stay active.
 - **RSI reversal gate**: a dip is only buyable once it was oversold, has turned back up for `RSI_CONFIRM_BARS` consecutive bars, and has not already run past `RSI_MAX_ENTRY`. Depth alone is a falling knife; a bounce that already happened is a chase. Both thresholds were tightened after live losses.
 - **Liquidity floor** (median $ volume) keeps positions exitable.
 - **Spread gate**: no entry when the quoted bid/ask spread is wider than `MAX_SPREAD_BUY_PCT`. A buy crosses the spread, so a wide book starts the position underwater — and a spread approaching `STOP_LOSS_PCT` puts the protective stop at the bid the moment it is placed, stopping the position out on arrival.
@@ -112,7 +113,7 @@ It is a separate file for a practical reason. The routine document is executed b
 
 ## Known tradeoffs
 
-- **Opens no positions when the market is closed** — with `REGULAR_HOURS_BUY_ONLY` on, any non-regular session skips the scan and entry evaluation outright, so no candidate list is built at all. (Turn it off and the older backstop still applies: relative volume reads ~1 off-hours, so the list comes back empty anyway.) Holdings management, stop repairs and dust sweeps run in every session regardless.
+- **Opens no positions outside a known entry window** — full NYSE closures, weekends, closed hours, the period after a published early close, and calendar years not covered by the reviewed table skip scanning and entry evaluation outright. With `REGULAR_HOURS_BUY_ONLY` on, ordinary pre-/after-hours do too; turning it off permits them only on an otherwise eligible normal day. Holdings management, stop repairs and dust sweeps run in every session regardless.
 - **A relative-volume + movement screen structurally surfaces volatile names** (falling knives, momentum spikes). The RSI reversal gate and the spread ceiling exist specifically to refuse the worst of them, and both were tightened after live losses — but they lower the rate, not to zero. Expect stop-outs; the position cap, daily-loss breaker and stop-count guard are what bound them.
 - **Cash-account settlement starves next-day buying power** — sale proceeds settle T+1, so the day after exits, buying power can sit well below `BUY_SIZE_PCT` × total value (on 2026-07-27: $869 available against $1,467 total). The routine downsizes rather than skipping — orders are capped at available buying power and never fall below `MIN_ORDER_DOLLARS` — so starved days typically buy one name instead of several.
 - **Extended-hours buys are not immediately stop-protected** (stops only trigger in the regular session), so `REGULAR_HOURS_BUY_ONLY` defaults to `true` and no position is opened outside the session. Selling and protection are never gated by session. Turning extended-hours entries back on also means retuning `MAX_SPREAD_BUY_PCT` — off-session books are several times wider.
@@ -123,16 +124,16 @@ It is a separate file for a practical reason. The routine document is executed b
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
 4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
-5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `Constants.md` (an uncommitted edit).
+5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `constants.md` (an uncommitted edit).
 
 ## Deterministic layer
 
 The routine document is executed by an LLM, so **none of the math lives in it.** Every calculation sits in a small, dependency-free Python script that the agent runs and reads the verdict from — it orchestrates, it never computes. The documents may not re-implement this math, and a script's behavior may not be re-derived at runtime: each one owns its rules, its input schema, and its edge cases, so thirty-minute runs cannot drift from one another.
 
-- **market_clock.py** — the run's clock, executed as the **first action of every run**, before anything else. Everything time-dependent reads from it: the report header and filename, the market session, "stops filled today (Pacific)", re-entry cooldown windows, and the opening-blackout verdict (which it reads from `Constants.md` itself, so the value is never re-typed). It derives the US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
+- **market_clock.py** + **market_calendar.py** — the run's clock and reviewed NYSE calendar, executed as the **first action of every run**, before anything else. Together they provide the report header and filename, market session, exchange-calendar verdict, entry-window verdict, "stops filled today (Pacific)", re-entry cooldown windows, and opening-blackout verdict (which reads `NO_BUY_FIRST_MINUTES` from `constants.md` itself, so the value is never re-typed). The checked-in calendar covers 2026–2028 full closures and 1:00 p.m. ET early closes; dates outside that coverage fail closed for entries. The clock derives US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
 - **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. It also documents the scan response's schema in one place so no run has to rediscover it.
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars.
-- **tests/test_scripts.py** — 47 dependency-free regression tests covering all three of the above plus the PriceBandScanner tool (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
+- **tests/test_scripts.py** — dependency-free regression tests covering the evaluator, scanner, clock/calendar, dashboard path guard, and routine contracts (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
 
 ## Usage Example
 

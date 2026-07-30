@@ -12,7 +12,7 @@ Usage:
       --price-min 2.50 --price-max 5 --min-rel-volume 2 \
       --min-abs-pct-change 3 --top-n 15 [--json-out working_list.json]
 
-All five constant flags are REQUIRED so values always come from Constants.md
+All five constant flags are REQUIRED so values always come from constants.md
 — no silent stale defaults.
 
 Verified response schema (live 2026-07-06 → 2026-07-17; do NOT rediscover it
