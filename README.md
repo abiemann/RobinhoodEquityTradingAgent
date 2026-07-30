@@ -55,7 +55,7 @@ All tunable values live in **`constants.md`** next to the routine document — e
 
 - A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
 - An agent runner/scheduler that loads the routine and honors per-tool approval settings.
-- **Python 3** available to the agent's shell as `python3` — standard library only, nothing to install. It is not optional: after the configuration preflight, the routine runs `market_clock.py` as its first operational action and halts entries if the clock itself cannot run. An unreadable configuration is stricter: it halts the entire run before the clock or broker calls. The command is written literally in the routine (three invocations) rather than being configurable, deliberately — a substitutable value in a command that runs before the guardrails is a value that can be typed wrong. If your environment names the interpreter differently, edit those three lines once.
+- **Python 3** available to the agent's shell — standard library only, nothing to install. On Windows/PowerShell use `py -3`; on Linux/macOS use `python3`. It is not optional: after the configuration preflight, the routine runs `market_clock.py` as its first operational action and halts entries if the clock itself cannot run. An unreadable configuration is stricter: it halts the entire run before the clock or broker calls. Verify the selected launcher (`py -3 --version` or `python3 --version`) before running.
 - **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
 
 ## Python 3 install (Windows)
@@ -83,6 +83,26 @@ Then use `py -3` anywhere these docs show `python3` — e.g. `py -3 tests\test_s
 Optionally, to stop the Store stubs shadowing your real install, turn them off under **Settings → Apps → Advanced app settings → App execution aliases**.
 
 On macOS and Linux `python3` is normally already present — check with `python3 --version` — and the commands work as written.
+
+### Windows and Codex shell troubleshooting
+
+The PowerShell window opened by the user and the shell used by Codex or a scheduled task may be different environments. It is therefore possible for this to succeed in ordinary PowerShell:
+
+```
+PS D:\Projects\RobinhoodEquityTradingAgent> py -3 --version
+Python 3.13.7
+```
+
+while the same command reports `No installed Python found!` inside a restricted agent shell. That does not mean Python is missing or needs to be reinstalled; the restricted shell cannot see the host Python installation or its launcher registry. Do not work around this by replacing the clock with PowerShell date math or by using `python`/`python3` blindly.
+
+Use the following decision path:
+
+1. Verify `py -3 --version` in the same environment that will run the routine.
+2. If it succeeds, use `py -3` for every Python command in the routine.
+3. If it fails only inside Codex, use the runner's supplied Python 3 runtime for local tests, or run the scheduled routine in a host-capable runner that can see the installation. The routine must still halt if its required `market_clock.py` command cannot run.
+4. If it fails in ordinary PowerShell too, install Python from [python.org/downloads](https://www.python.org/downloads/), keep the `py` launcher enabled, and verify again.
+
+This environment difference is a sandbox boundary, not a project dependency issue. The scripts use Python's standard library only; no `pip install` step is required.
 
 ## Guardrails
 
@@ -135,6 +155,29 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 - **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. Its `--json-out` file is the routine's machine-readable handoff; downstream steps consume that JSON's unrounded values, never the human-formatted stdout table. It also documents the scan response's schema in one place so no run has to rediscover it.
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars.
 - **tests/test_scripts.py** — dependency-free regression tests covering the evaluator, scanner, clock/calendar, dashboard path guard, and routine contracts (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
+
+## First-time app setup
+
+### Robinhood MCP connector
+
+In Codex, open **Settings → Plugins → MCP → Add server** and enter:
+
+| Field | Value |
+|---|---|
+| Name | `Robinhood Trading` (any descriptive name is fine) |
+| Type | `Streamable HTTP` |
+| URL / endpoint | `https://agent.robinhood.com/mcp/trading` |
+| Command, arguments, environment variables, working directory | Leave blank; these apply to STDIO servers |
+
+Save the connector and complete Robinhood's authorization flow. A successful setup exposes tools such as `get_accounts`. The routine then selects the account whose nickname is exactly `Agentic` on every run; never paste or save an account number in the connector configuration or task prompt.
+
+### Scheduled task
+
+Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use a capable model (this workspace's task uses **5.6 Luna**). The prompt can be:
+
+> Read `D:\Projects\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
+
+For the recurring schedule, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. Keep the computer awake while the task is expected to run. Before enabling live orders, keep `DRY_RUN = true` and leave `place_equity_order` set to **Needs approval**.
 
 ## Usage Example
 
