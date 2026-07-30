@@ -695,6 +695,24 @@ class MarketClockTests(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
 
+    def test_unreadable_or_malformed_constants_file_errors_loudly(self):
+        # Invalid UTF-8 and a non-numeric blackout row are both configuration
+        # failures. Neither may silently become a zero-minute blackout.
+        cases = (
+            ("invalid-utf8.md", b"\xff"),
+            ("malformed.md", b"| `NO_BUY_FIRST_MINUTES` | `not-a-number` |\n"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for filename, content in cases:
+                with self.subTest(filename=filename):
+                    constants = os.path.join(td, filename)
+                    with open(constants, "wb") as f:
+                        f.write(content)
+                    r = subprocess.run([sys.executable, CLOCK, "--constants", constants,
+                                        "--now-utc", "2026-07-22T13:37:00Z", "--json"],
+                                       capture_output=True, text=True)
+                    self.assertNotEqual(r.returncode, 0)
+
     def test_sessions_and_weekend(self):
         pre = self.clock("2026-07-21T12:00:00Z")
         self.assertEqual(pre["session"], "pre-market")
@@ -790,6 +808,51 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("entry_session_open", routine)
         self.assertIn("exactly the JSON boolean `true`", routine)
         self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
+
+    def test_routine_full_halts_when_constants_cannot_be_read(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        preflight_start = routine.index("**Mandatory configuration preflight")
+        clock_command = routine.index("`python3 market_clock.py --json`")
+        self.assertLess(preflight_start, clock_command)
+        preflight = routine[preflight_start:routine.index("\n\nNote the `DRY_RUN`", preflight_start)]
+        self.assertIn("Before `market_clock.py`, `get_accounts`", preflight)
+        self.assertIn("FULL-RUN HALT immediately", preflight)
+        self.assertIn("This is NOT DRY RUN", preflight)
+        self.assertIn("do not review, place, or cancel any order", preflight)
+        self.assertIn("normal report, ledger, status snapshot", preflight)
+        self.assertNotIn("treat it as `true`", routine)
+
+        dry_run = routine.split("### DRY RUN", 1)[1].split("### CURRENT TIME", 1)[0]
+        self.assertIn("NOT DRY RUN", dry_run)
+        self.assertIn("never substitute `true`", dry_run)
+
+    def test_routine_has_one_canonical_stop_market_schema(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        schema = routine.split("### BROKER ORDER OBJECTS", 1)[1].split("### TRADE LEDGER", 1)[0]
+        self.assertIn("Canonical equity stop-market payload", schema)
+        self.assertIn('"type": "market"', schema)
+        self.assertIn('"trigger": "stop"', schema)
+        self.assertIn('"stop_price": "<two-decimal price>"', schema)
+        self.assertIn('"time_in_force": "gtc"', schema)
+        self.assertNotIn('"type": "stop"', routine)
+
+        placement = routine.split("### SESSION-AWARE ORDER STYLE", 1)[1].split("### DAILY-LOSS", 1)[0]
+        self.assertIn("Canonical equity stop-market payload", placement)
+        retry = routine.split("**Verify every stop after placing it", 1)[1].split("**ALERTS.md", 1)[0]
+        self.assertIn("Canonical-stop requirement for every retry", retry)
+        self.assertIn("Canonical equity stop-market payload", retry)
+        audit = routine.split("**Stop-coverage audit", 1)[1].split("**Dust sweep", 1)[0]
+        self.assertIn("Canonical stop for a coverage repair", audit)
+        self.assertIn("Canonical equity stop-market payload", audit)
+        step_12 = routine.split("12. After a buy fills:", 1)[1].split("### REPORT", 1)[0]
+        self.assertIn("Canonical equity stop-market payload", step_12)
+        whole_share_guard = routine.split("**Whole-share stop guard", 1)[1].split("12. After a buy fills:", 1)[0]
+        self.assertIn("do NOT submit a zero-share stop", whole_share_guard)
+        self.assertIn("`confirmed` or `queued` (active/working stops)", schema)
 
     def test_routine_requires_full_stop_quantity_coverage(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

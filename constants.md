@@ -1,6 +1,6 @@
 # Constants — the routine's tunable values
 
-All tunable values for `robinhood-momentum-routine-autonomous.md` live HERE and nowhere else. The routine loads this file at the start of every run and references the values by name only. If this file is missing or unreadable, the routine HALTS and places no orders.
+All tunable values for `robinhood-momentum-routine-autonomous.md` live HERE and nowhere else. The routine loads and validates this file before every other action. If it is missing, unreadable, malformed, incomplete, duplicated, or a required value cannot be read, the entire run HALTS: it makes no account or market calls and does not review, place, or cancel any order, including existing-position protection. This is not DRY RUN and never falls back to defaults or guesses.
 
 **`DRY_RUN` rule:** the committed value of `DRY_RUN` is always `true` (anyone cloning this repo gets log-only entries). To trade live on your machine, set it to `false` as a LOCAL, UNCOMMITTED edit — never commit `false`.
 

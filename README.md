@@ -23,9 +23,9 @@ All trading is scoped to a single account, resolved **by name** at runtime.
 
 ## Configuration
 
-**Live trading is off unless you turn it on.** `DRY_RUN` is `true` in the committed `constants.md`, so a fresh clone runs in **dry run** — logging every would-be buy and stop instead of placing it. To trade live, set `DRY_RUN` to `false` as a **local, uncommitted edit**; never commit `false`. (Protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes.)
+**Live trading is off unless you turn it on.** `DRY_RUN` is `true` in the committed `constants.md`, so a fresh clone runs in **dry run** — logging every would-be buy and stop instead of placing it. To trade live, set `DRY_RUN` to `false` as a **local, uncommitted edit**; never commit `false`. After a successful configuration preflight, protection of existing positions — profit-taking, stop repairs, dust sweeps — is always live in both modes. A configuration-read failure is not dry run: it halts the entire run.
 
-All tunable values live in **`constants.md`** next to the routine document — edit there, nowhere else. Purpose of each:
+All tunable values live in **`constants.md`** next to the routine document — edit there, nowhere else. Before the clock, account lookup, or any broker action, the routine must read and validate every required value. A missing, unreadable, malformed, incomplete, duplicated, or ambiguous value causes a full-run configuration halt: no broker calls or orders, including protective sells/repairs; no defaults, cached values, or guesses. Purpose of each:
 
 | Constant | Purpose |
 |---|---|
@@ -55,7 +55,7 @@ All tunable values live in **`constants.md`** next to the routine document — e
 
 - A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
 - An agent runner/scheduler that loads the routine and honors per-tool approval settings.
-- **Python 3** available to the agent's shell as `python3` — standard library only, nothing to install. It is not optional: the routine runs `market_clock.py` as the very first action of every run and halts entries if it cannot. The command is written literally in the routine (three invocations) rather than being configurable, deliberately — a substitutable value in a command that runs before the guardrails is a value that can be typed wrong. If your environment names the interpreter differently, edit those three lines once.
+- **Python 3** available to the agent's shell as `python3` — standard library only, nothing to install. It is not optional: after the configuration preflight, the routine runs `market_clock.py` as its first operational action and halts entries if the clock itself cannot run. An unreadable configuration is stricter: it halts the entire run before the clock or broker calls. The command is written literally in the routine (three invocations) rather than being configurable, deliberately — a substitutable value in a command that runs before the guardrails is a value that can be typed wrong. If your environment names the interpreter differently, edit those three lines once.
 - **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
 
 ## Python 3 install (Windows)
@@ -87,6 +87,7 @@ On macOS and Linux `python3` is normally already present — check with `python3
 ## Guardrails
 
 - **Account scope** resolved by name every run; halts if the name matches zero, multiple, or a non-agentic account — never falls back to another account.
+- **Configuration preflight**: an unreadable, malformed, incomplete, duplicated, or ambiguous `constants.md` is a full-run halt, not dry run. It prevents every broker action, including profit-taking, stop repairs, and dust sweeps; the routine never uses a default, cached value, or guess.
 - **Daily-loss circuit breaker** halts new buys after a set drawdown.
 - **Stop-count guard**: several stop fills in one day halt new buys until the next session — catches the slow bleed the P&L breaker can miss.
 - **SPY red-day gate**: no dip-buying while the broad market itself is selling; per-run and self-clearing, so a green afternoon resumes trading the same day.
@@ -123,14 +124,14 @@ It is a separate file for a practical reason. The routine document is executed b
 1. Leave `DRY_RUN = true` and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
-4. Confirm the market-order and stop-order field names against the tool schema on the first regular-hours run (only the extended-hours limit path is verified so far).
+4. In dry run, confirm the broker accepts the documented order flows. The stop-market payload is already canonical — `type: "market"` plus `trigger: "stop"`, never a stop type — so do not rediscover or improvise stop fields during a live run; a review alert is a safety failure to report, not a reason to try another schema.
 5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `constants.md` (an uncommitted edit).
 
 ## Deterministic layer
 
 The routine document is executed by an LLM, so **none of the math lives in it.** Every calculation sits in a small, dependency-free Python script that the agent runs and reads the verdict from — it orchestrates, it never computes. The documents may not re-implement this math, and a script's behavior may not be re-derived at runtime: each one owns its rules, its input schema, and its edge cases, so thirty-minute runs cannot drift from one another.
 
-- **market_clock.py** + **market_calendar.py** — the run's clock and reviewed NYSE calendar, executed as the **first action of every run**, before anything else. Together they provide the report header and filename, market session, exchange-calendar verdict, entry-window verdict, "stops filled today (Pacific)", re-entry cooldown windows, and opening-blackout verdict (which reads `NO_BUY_FIRST_MINUTES` from `constants.md` itself, so the value is never re-typed). The checked-in calendar covers 2026–2028 full closures and 1:00 p.m. ET early closes; dates outside that coverage fail closed for entries. The clock derives US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
+- **market_clock.py** + **market_calendar.py** — the run's clock and reviewed NYSE calendar, executed as the **first operational action after the configuration preflight**. Together they provide the report header and filename, market session, exchange-calendar verdict, entry-window verdict, "stops filled today (Pacific)", re-entry cooldown windows, and opening-blackout verdict (which reads `NO_BUY_FIRST_MINUTES` from `constants.md` itself, so the value is never re-typed). The checked-in calendar covers 2026–2028 full closures and 1:00 p.m. ET early closes; dates outside that coverage fail closed for entries. The clock derives US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
 - **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. It also documents the scan response's schema in one place so no run has to rediscover it.
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars.
 - **tests/test_scripts.py** — dependency-free regression tests covering the evaluator, scanner, clock/calendar, dashboard path guard, and routine contracts (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.

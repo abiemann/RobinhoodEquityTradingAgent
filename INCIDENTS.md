@@ -58,6 +58,8 @@ the script reads the value from `constants.md` itself; the flag survives only as
 a missing `constants.md` now errors loudly rather than defaulting to 0 (which would have silently
 disabled the gate — the worst failure mode for a safety script).
 
+**2026-07-29, configuration-halt precedence gap (P1 review finding).** The routine correctly said an unreadable `constants.md` should halt, but its DRY RUN and generic clock-failure fallbacks still let live profit-taking, stop repairs, and dust sweeps run. That made a configuration failure a partial run rather than a halt. No loss was attributed; the safety review caught it. Constants validation now happens before the clock or any broker call, and a read/validation failure stops the entire run without defaults, cached values, or safety orders.
+
 **Generalised lesson for editors:** any `<CONSTANT_NAME>` placeholder in a shell command is an
 invitation for the model to type a value from memory instead of reading the file. Treat every
 placeholder in a command line with suspicion. `filter_scan.py` still has five of them.
@@ -91,6 +93,8 @@ parse error must never abort a safety check, hence the string-comparison rule.
 with `trigger: "stop"`. Every order filter in the routine (stop-coverage audit, stop-count guard,
 re-entry cooldown, stop-fill discovery, ledger dedupe) depended on that wrong shape. Fixed by
 documenting the verified schema once (commit `224b125`).
+
+**2026-07-29, stop-payload schema contradiction (P1 review finding).** The same document later told order placement to send a stop type, contradicting the verified market-plus-stop-trigger schema above. A live agent could therefore choose the rejected shape while attempting protection. The routine now has one canonical stop-market payload for both review and placement: market type, stop trigger, stop price, whole-share quantity, regular-hours session, and GTC time in force.
 
 ## TRADE LEDGER — rules_version and `--no-optional-locks`
 
