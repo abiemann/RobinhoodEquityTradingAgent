@@ -55,8 +55,13 @@ All tunable values live in **`constants.md`** next to the routine document — e
 
 - A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
 - An agent runner/scheduler that loads the routine and honors per-tool approval settings.
-- **Python 3** available to the agent's shell — standard library only, nothing to install. On Windows/PowerShell use `py -3`; on Linux/macOS use `python3`. It is not optional: after the configuration preflight, the routine runs `market_clock.py` as its first operational action, then acquires `run_lock.py`'s fenced lease before any broker call. A clock failure blocks entries; a coordination failure blocks the entire broker run. An unreadable configuration is stricter still: it halts before the clock or lock. Verify the selected launcher (`py -3 --version` or `python3 --version`) before running.
-- **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
+
+## Tested On
+
+| AI | Model / configuration |
+|---|---|
+| Claude | Sonnet 4.6 |
+| Codex | Luna 5.6 (high) |
 
 ## Guardrails
 
