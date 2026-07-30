@@ -112,7 +112,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 
 ## First-time app setup
 
-### Robinhood MCP connector
+### Robinhood MCP connector (CODEX)
 
 In Codex, open **Settings → Plugins → MCP → Add server** and enter:
 
@@ -129,7 +129,7 @@ Save the connector and complete Robinhood's authorization flow. A successful set
 
 Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use a capable model (this workspace's task uses **5.6 Luna**). The prompt can be:
 
-> Read `D:\Projects\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
+> Read `\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 
 For the recurring schedule, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. Keep the computer awake while the task is expected to run. Before enabling live orders, keep `DRY_RUN = true` and leave `place_equity_order` set to **Needs approval**.
 
