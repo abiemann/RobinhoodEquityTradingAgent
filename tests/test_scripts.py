@@ -791,6 +791,20 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("exactly the JSON boolean `true`", routine)
         self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
 
+    def test_routine_requires_full_stop_quantity_coverage(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        audit = routine.split("**Stop-coverage audit", 1)[1].split("**Dust sweep", 1)[0]
+        self.assertIn("required_stop_qty = floor(position quantity)", audit)
+        self.assertIn("exact decimals", audit)
+        self.assertIn("dedupe rows by `id` before counting", audit)
+        self.assertIn("covered_stop_qty >= required_stop_qty", audit)
+        self.assertIn("covered_stop_qty < required_stop_qty", audit)
+        self.assertIn("supplemental stop for exactly `repair_qty`", audit)
+        self.assertIn("covered_stop_qty > required_stop_qty", audit)
+        self.assertIn("do not automatically cancel a currently protective stop", audit)
+
     def test_pacific_trading_day_rolls_before_utc_day(self):
         # 2026-07-22 03:00Z is still 2026-07-21 in Pacific — the date used
         # for "filled today" counting must be the Pacific one.

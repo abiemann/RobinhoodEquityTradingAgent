@@ -157,6 +157,8 @@ attempted a duplicate repair. Robinhood holds live stops in state `confirmed`, w
 filter silently hides — only the broker's share-reservation rejection stopped the duplicate. Query
 by symbol, never by `state=open`.
 
+**2026-07-29, stop-quantity coverage gap (P1 review finding).** The audit called any confirmed or queued stop active regardless of quantity, so a stale partial stop could leave most of a position naked while still passing. No loss was attributed; the review caught it before one. The audit now sums valid distinct active-stop quantities against `floor(position quantity)`, supplements only a shortfall so existing protection stays in place, and halts new entries when stop quantity data is malformed or over-covered.
+
 ## Step 6 — scan schema and the oversized-result file
 
 **2026-07-20.** The 08:06 and 08:36 runs each independently rediscovered the scan result's JSON
