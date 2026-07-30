@@ -12,6 +12,7 @@ verified against live API data on 2026-07-07.
 import http.client
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -539,6 +540,33 @@ class FilterScanTests(unittest.TestCase):
         self.assertEqual(symbols, ["S5", "S4", "S3"])
         self.assertEqual(data["passed_filters"], 6)
 
+    def test_json_handoff_has_complete_unrounded_working_list(self):
+        row = scan_row("PREC", 4.45678, 0.0345678, 12.34567)
+        row["columns"]["Volume"] = "1234.56789"
+        data = self.run_filter([row])
+
+        self.assertEqual(set(data), {"total_items", "rows_returned", "rows_skipped",
+                                     "passed_filters", "working_list"})
+        self.assertEqual(data["total_items"], 1)
+        self.assertEqual(data["rows_returned"], 1)
+        self.assertEqual(data["rows_skipped"], 0)
+        self.assertEqual(data["passed_filters"], 1)
+        for counter in ("total_items", "rows_returned", "rows_skipped", "passed_filters"):
+            self.assertIs(type(data[counter]), int)
+            self.assertGreaterEqual(data[counter], 0)
+        self.assertEqual(len(data["working_list"]), 1)
+        handoff = data["working_list"][0]
+        self.assertEqual(set(handoff), {"symbol", "last", "rel_volume", "day_pct_change", "volume"})
+        self.assertEqual(handoff["symbol"], "PREC")
+        self.assertTrue(handoff["symbol"])
+        for field in ("last", "rel_volume", "day_pct_change", "volume"):
+            self.assertIs(type(handoff[field]), float)
+            self.assertTrue(math.isfinite(handoff[field]))
+        self.assertAlmostEqual(handoff["last"], 4.45678)
+        self.assertAlmostEqual(handoff["rel_volume"], 12.34567)
+        self.assertAlmostEqual(handoff["day_pct_change"], 3.45678)
+        self.assertAlmostEqual(handoff["volume"], 1234.56789)
+
     def test_nonfinite_scan_fields_are_skipped(self):
         rows = [scan_row("KEEP", 4.0, 0.05, 10.0)]
         for symbol, field, value in (
@@ -827,6 +855,29 @@ class MarketClockTests(unittest.TestCase):
         dry_run = routine.split("### DRY RUN", 1)[1].split("### CURRENT TIME", 1)[0]
         self.assertIn("NOT DRY RUN", dry_run)
         self.assertIn("never substitute `true`", dry_run)
+
+    def test_routine_uses_machine_readable_scan_handoff(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        scan_phase = routine.split("6. `run_scan`", 1)[1].split("**FOURTH", 1)[0]
+        self.assertIn("--json-out <scratch>/working-list.json", scan_phase)
+        self.assertIn("NEW session-scoped scratch directory", scan_phase)
+        self.assertIn("Machine-readable handoff (REQUIRED)", scan_phase)
+        self.assertIn("working_list", scan_phase)
+        self.assertIn("SOLE authority for candidate data and scan counts", scan_phase)
+        self.assertIn("formatted stdout table is diagnostic-only", scan_phase)
+        self.assertIn("All four counters must be non-negative JSON integers", scan_phase)
+        self.assertIn("finite JSON-number", scan_phase)
+        self.assertIn("no duplicate symbols", scan_phase)
+        self.assertIn("skip the entry phase (Steps 8–12)", scan_phase)
+        self.assertIn("any schema/value check fails", scan_phase)
+        self.assertIn("do NOT fall back to formatted stdout, a stale file, or ad-hoc filtering", scan_phase)
+        self.assertIn("empty `working_list: []` is valid", scan_phase)
+        prefilter = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split("**The next three bullets", 1)[0]
+        self.assertIn("unrounded `volume` × `last`", prefilter)
+        self.assertIn("Only `evaluate_candidates.py --json-out` is an exception", routine)
+        self.assertIn("transient scratch handoff", routine)
 
     def test_routine_has_one_canonical_stop_market_schema(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

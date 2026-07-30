@@ -170,6 +170,8 @@ shape, guessing `instruments` / `cells` before landing on `data.result.results[]
 commands and tokens and risking a live mis-parse, on the same day production testing began. Fixed
 with the checked-in `filter_scan.py` (commit `224b125`), which documents the schema once.
 
+**2026-07-30, scan-handoff formatting gap (P1 review finding).** The routine then treated the script's formatted stdout table as its working list. That presentation rounds Last to 3 decimals, relative volume to 2, and volume to 0, yet the next step multiplies volume by price; it also makes headers and spacing part of trading state. No loss was attributed; the review caught it. The routine now writes a fresh per-run `filter_scan.py --json-out` file, consumes only its validated JSON fields, and skips entries rather than falling back to stdout or stale output when that handoff fails.
+
 **Windows path in a Linux sandbox.** The harness replies with a `C:\Users\…` path for oversized
 results; past runs corrupted it while retyping. Locate by basename with `find` instead.
 
