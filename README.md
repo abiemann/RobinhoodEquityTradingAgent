@@ -153,7 +153,7 @@ Note: scheduled tasks only run while the computer is awake — enable **Keep awa
 
 ## Troubleshooting
 
-For Windows Python 3 installation and Codex-shell troubleshooting, see [Python 3 install (Windows)](python-3-install-windows.md).
+For Windows Python 3 installation and Codex-shell troubleshooting, see [Python 3 install (Windows)](PY3-INSTALL-WIN.md).
 
 ## Disclaimer
 
