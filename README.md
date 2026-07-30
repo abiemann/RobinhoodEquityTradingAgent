@@ -128,8 +128,7 @@ In Codex, open **Settings → Plugins → MCP → Add server** and enter:
 |---|---|
 | Name | `Robinhood Trading` (any descriptive name is fine) |
 | Type | `Streamable HTTP` |
-| URL / endpoint | `https://agent.robinhood.com/mcp/trading` |
-| Command, arguments, environment variables, working directory | Leave blank; these apply to STDIO servers |
+| URL | `https://agent.robinhood.com/mcp/trading` |
 
 Save the connector, then:
 
@@ -137,6 +136,8 @@ Save the connector, then:
 2. Restart Codex so the MCP settings take effect.
 
 A successful setup exposes tools such as `get_accounts`. The routine then selects the account whose nickname is exactly `Agentic` on every run; never paste or save an account number in the connector configuration or task prompt.
+
+![Codex Robinhood MCP connector configuration](images/codex-robinhood-mcp-connector.png)
 
 ### Robinhood MCP connector (CLAUDE)
 
