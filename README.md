@@ -58,52 +58,6 @@ All tunable values live in **`constants.md`** next to the routine document — e
 - **Python 3** available to the agent's shell — standard library only, nothing to install. On Windows/PowerShell use `py -3`; on Linux/macOS use `python3`. It is not optional: after the configuration preflight, the routine runs `market_clock.py` as its first operational action and halts entries if the clock itself cannot run. An unreadable configuration is stricter: it halts the entire run before the clock or broker calls. Verify the selected launcher (`py -3 --version` or `python3 --version`) before running.
 - **Model:** configure the runner to use **Claude Sonnet** (current: `claude-sonnet-4-6`).
 
-## Python 3 install (Windows)
-
-The agent's own `python3` lives in the sandbox its runner provides — you do not install that one. You need Python on your **own** machine for two things: running the test suite before committing a script change, and running the [Dashboard](#tools).
-
-**Windows does not ship Python, and PowerShell does not include it.** On a fresh machine `python` and `python3` are Microsoft Store *App Execution Alias* stubs — they open the Store instead of running anything, and print:
-
-```
-Python was not found; run without arguments to install from the Microsoft Store
-```
-
-That message means you hit the alias, not that an install is broken. It is worth recognising, because it looks like a failure rather than a missing program.
-
-1. Install from [python.org/downloads](https://www.python.org/downloads/) — any current 3.x.
-2. Keep the **py launcher** option enabled (it is on by default). That is what provides the `py` command these docs use on Windows.
-3. Verify in PowerShell — this should print a version, not a Store message:
-
-```
-py -3 --version
-```
-
-Then use `py -3` anywhere these docs show `python3` — e.g. `py -3 tests\test_scripts.py` or `py -3 dashboard\serve.py`. There is nothing else to install: every script here is standard library only.
-
-Optionally, to stop the Store stubs shadowing your real install, turn them off under **Settings → Apps → Advanced app settings → App execution aliases**.
-
-On macOS and Linux `python3` is normally already present — check with `python3 --version` — and the commands work as written.
-
-### Windows and Codex shell troubleshooting
-
-The PowerShell window opened by the user and the shell used by Codex or a scheduled task may be different environments. It is therefore possible for this to succeed in ordinary PowerShell:
-
-```
-PS D:\Projects\RobinhoodEquityTradingAgent> py -3 --version
-Python 3.13.7
-```
-
-while the same command reports `No installed Python found!` inside a restricted agent shell. That does not mean Python is missing or needs to be reinstalled; the restricted shell cannot see the host Python installation or its launcher registry. Do not work around this by replacing the clock with PowerShell date math or by using `python`/`python3` blindly.
-
-Use the following decision path:
-
-1. Verify `py -3 --version` in the same environment that will run the routine.
-2. If it succeeds, use `py -3` for every Python command in the routine.
-3. If it fails only inside Codex, use the runner's supplied Python 3 runtime for local tests, or run the scheduled routine in a host-capable runner that can see the installation. The routine must still halt if its required `market_clock.py` command cannot run.
-4. If it fails in ordinary PowerShell too, install Python from [python.org/downloads](https://www.python.org/downloads/), keep the `py` launcher enabled, and verify again.
-
-This environment difference is a sandbox boundary, not a project dependency issue. The scripts use Python's standard library only; no `pip install` step is required.
-
 ## Guardrails
 
 - **Account scope** resolved by name every run; halts if the name matches zero, multiple, or a non-agentic account — never falls back to another account.
@@ -196,6 +150,10 @@ Note: scheduled tasks only run while the computer is awake — enable **Keep awa
 - **PriceBandScanner** (`tools/PriceBandScanner.md` + `tools/price_band_scanner.py`) — a read-only companion agent, scheduled once daily after market close. It runs the same saved scan, buckets the day's most-active stocks into price bands, and reports each band's median/mean % change, breadth, and best/worst names — evidence for choosing the `PRICE_MIN`/`PRICE_MAX` band. It never touches accounts or orders. Logs to `tools/logs/PriceBandScanner-log-YYYY_MM_DD.md` plus a same-named `.png` chart of the band medians (local only, gitignored). **Schedule it after the US close but before Asia starts trading — i.e., before 5:00 PM PT, when Robinhood's overnight (24/5) session opens and its prints would contaminate the day's data; ~1:05 PM PT is ideal.**
 
 - **Dashboard** (`dashboard/serve.py` + `dashboard/index.html`) — a local web view of the day's trading. Run `python3 dashboard/serve.py` (Windows: `py -3 dashboard\serve.py`) and open `http://127.0.0.1:8765/`. Stop it with **Ctrl+C** in its terminal; if it was started detached, kill it by port — Windows PowerShell: `Stop-Process -Id (Get-NetTCPConnection -LocalPort 8765 -State Listen).OwningProcess -Force`, or macOS/Linux: `lsof -ti:8765 | xargs kill`. Pass a different port as the first argument (`py -3 dashboard\serve.py 9000`) if 8765 is taken. Shows account value, cash, and buying power; open positions with purchase price, current price, unrealized P&L, **stop coverage** (a position without an active stop is flagged UNPROTECTED), and distance to stop; a timeline of today's runs with the reason each one skipped or traded; and per-rules-era ledger totals (dates, buys, sells, stop-fills, realized P&L), newest era first. Standard library only — no install, no build step. It is a pure viewer: it reads the per-run status snapshots, gate records, and ledger that the routine already writes, holds **no broker credentials**, places no orders, and binds to localhost only (the data includes account activity and must never be exposed off-machine). Data freshness matches the run cadence — a snapshot up to ~30 minutes old is normal and the page says how old it is. If the snapshot format ever changes (`schema_version`), the dashboard refuses to render rather than misreading it.
+
+## Troubleshooting
+
+For Windows Python 3 installation and Codex-shell troubleshooting, see [Python 3 install (Windows)](python-3-install-windows.md).
 
 ## Disclaimer
 
