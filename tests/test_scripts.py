@@ -9,11 +9,14 @@ tested exactly as the agents invoke them. Expected values for FISN/TTRX were
 verified against live API data on 2026-07-07.
 """
 
+import http.client
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,9 +24,15 @@ EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
 SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
+DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
+
+DASHBOARD_SPEC = importlib.util.spec_from_file_location("dashboard_serve", DASHBOARD)
+assert DASHBOARD_SPEC and DASHBOARD_SPEC.loader
+DASHBOARD_SERVER = importlib.util.module_from_spec(DASHBOARD_SPEC)
+DASHBOARD_SPEC.loader.exec_module(DASHBOARD_SERVER)
 
 
 def bar(date, close, high, volume, interpolated=False):
@@ -119,7 +128,7 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertFalse(res["GHST"]["buy_candidate"])
         self.assertIn("no real", res["GHST"]["skip_reason"])
 
-    def run_eval_rsi(self, rsi_payload):
+    def run_eval_rsi(self, rsi_payload, period=14):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
                 bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
                 bar("2026-07-07", 4.6, 4.9, 900000)]
@@ -133,7 +142,7 @@ class EvaluateCandidatesTests(unittest.TestCase):
                                         "--min-median-dollar-volume", "0",
                                         "--rsi-file", rsi_path, "--rsi-oversold", "35",
                                         "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
-                                        "--rsi-max-entry", "60"])["SYNX"]
+                                        "--rsi-max-entry", "60", "--rsi-period", str(period)])["SYNX"]
 
     def test_rsi_gate_blocks_falling_knife(self):
         res = self.run_eval_rsi({"SYNX": {"rsi": [42, 39, 36, 33, 31, 29]}})
@@ -165,6 +174,41 @@ class EvaluateCandidatesTests(unittest.TestCase):
         res = self.run_eval_rsi({"SYNX": {"closes": rising_tail}})
         self.assertEqual(res["rsi_gate"], "pass")
         self.assertTrue(res["buy_candidate"])
+
+    def test_rsi_closes_fallback_uses_configured_period(self):
+        # This has only five RSI values at period 2, but none at period 14.
+        # It proves the fallback receives the configured period rather than a
+        # silent code default.
+        closes = [10, 9, 8, 7, 6, 6.1, 6.2]
+        configured = self.run_eval_rsi({"SYNX": {"closes": closes}}, period=2)
+        default_period = self.run_eval_rsi({"SYNX": {"closes": closes}}, period=14)
+        self.assertEqual(configured["rsi_gate"], "pass")
+        self.assertTrue(configured["buy_candidate"])
+        self.assertEqual(default_period["rsi_gate"], "block")
+        self.assertIn("insufficient", default_period["rsi_reason"])
+
+    def test_rsi_file_requires_an_explicit_period(self):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        with tempfile.TemporaryDirectory() as td:
+            rsi_path = os.path.join(td, "rsi.json")
+            with open(rsi_path, "w", encoding="utf-8") as f:
+                json.dump({"SYNX": {"rsi": [40, 36, 33, 30, 29, 34]}}, f)
+            with self.assertRaises(AssertionError):
+                self.run_eval(payload, {"SYNX": 4.0},
+                              extra=["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                                     "--min-median-dollar-volume", "0", "--rsi-file", rsi_path,
+                                     "--rsi-oversold", "35", "--rsi-lookback-bars", "5",
+                                     "--rsi-confirm-bars", "1", "--rsi-max-entry", "60"])
+
+    def test_routine_passes_configured_rsi_period(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+        command = next(line for line in routine.splitlines()
+                       if "python3 evaluate_candidates.py" in line)
+        self.assertIn("--rsi-period <RSI_PERIOD>", command)
 
     def run_eval_spread(self, quote, max_spread="2.0"):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
@@ -282,7 +326,7 @@ class EvaluateCandidatesTests(unittest.TestCase):
             common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
                       "--min-median-dollar-volume", "0", "--rsi-file", rsi_path,
                       "--rsi-oversold", "35", "--rsi-lookback-bars", "5",
-                      "--rsi-max-entry", "60"]
+                      "--rsi-max-entry", "60", "--rsi-period", "14"]
             one = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "1"])["SYNX"]
             two = self.run_eval(payload, {"SYNX": 4.0}, extra=common + ["--rsi-confirm-bars", "2"])["SYNX"]
         self.assertTrue(one["buy_candidate"])
@@ -339,7 +383,7 @@ class EvaluateCandidatesTests(unittest.TestCase):
                                        "--min-median-dollar-volume", "0",
                                        "--rsi-file", p1, p2, "--rsi-oversold", "35",
                                        "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
-                                       "--rsi-max-entry", "60"])
+                                       "--rsi-max-entry", "60", "--rsi-period", "14"])
         # symbols came out of data.symbol in each file, and both files merged
         self.assertEqual(res["SYNX"]["rsi_gate"], "pass")
         self.assertTrue(res["SYNX"]["buy_candidate"])
@@ -364,7 +408,7 @@ class EvaluateCandidatesTests(unittest.TestCase):
         common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
                   "--min-median-dollar-volume", "0", "--rsi-oversold", "35",
                   "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
-                  "--rsi-max-entry", "60"]
+                  "--rsi-max-entry", "60", "--rsi-period", "14"]
         with tempfile.TemporaryDirectory() as td:
             for name, text in (("interior.json", nva_exact), ("truncated.json", good[:-40])):
                 p = os.path.join(td, name)
@@ -511,6 +555,71 @@ class FilterScanTests(unittest.TestCase):
         row["columns"]["Last"] = float("nan")
         with self.assertRaises(AssertionError):
             self.run_filter([row])
+
+
+class DashboardServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = self.temp_dir.name
+        os.makedirs(os.path.join(self.repo, "dashboard"))
+        os.makedirs(os.path.join(self.repo, "run-reports"))
+        for name, content in (
+            ("README.md", "private dashboard test fixture"),
+            ("trade-ledger.csv", "symbol,price\\nTEST,1.00\\n"),
+            (os.path.join("dashboard", "index.html"), "<h1>Dashboard fixture</h1>"),
+            (os.path.join("run-reports", "rhmra-status-test.json"), "{}"),
+        ):
+            with open(os.path.join(self.repo, name), "w", encoding="utf-8") as f:
+                f.write(content)
+        self.original_repo = DASHBOARD_SERVER.REPO
+        DASHBOARD_SERVER.REPO = self.repo
+
+        class QuietHandler(DASHBOARD_SERVER.Handler):
+            def log_message(self, format, *args):
+                pass
+
+        self.server = DASHBOARD_SERVER.ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join()
+        self.server.server_close()
+        DASHBOARD_SERVER.REPO = self.original_repo
+        self.temp_dir.cleanup()
+
+    def request(self, method, path, host="127.0.0.1"):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        try:
+            connection.request(method, path, headers={"Host": host})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_whitelist_rejects_traversal_and_serves_allowed_files(self):
+        for method in ("GET", "HEAD"):
+            for path in ("/dashboard/../README.md", "/dashboard/%2e%2e/README.md",
+                         "/run-reports/%2e%2e/README.md"):
+                status, body = self.request(method, path)
+                self.assertEqual(status, 403, f"{method} {path}")
+                self.assertNotIn(b"private dashboard test fixture", body)
+
+            # The standard handler decodes URLs once. A doubly encoded dot
+            # sequence is therefore a literal nonexistent filename (404), not
+            # a second decode into traversal; pin that distinction as well.
+            status, body = self.request(method, "/dashboard/%252e%252e/README.md")
+            self.assertEqual(status, 404, method)
+            self.assertNotIn(b"private dashboard test fixture", body)
+
+        status, body = self.request("GET", "/dashboard/index.html")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Dashboard fixture", body)
+        self.assertEqual(self.request("GET", "/run-reports/rhmra-status-test.json")[0], 200)
+        self.assertEqual(self.request("GET", "/trade-ledger.csv")[0], 200)
+        self.assertEqual(self.request("GET", "/README.md")[0], 403)
+        self.assertEqual(self.request("GET", "/dashboard/index.html", host="example.test")[0], 403)
 
 
 class MarketClockTests(unittest.TestCase):

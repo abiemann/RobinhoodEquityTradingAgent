@@ -26,11 +26,13 @@ Stop:  Ctrl+C in this terminal. If it was started detached, kill it by port —
 import glob
 import json
 import os
+import posixpath
 import sys
+import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+DEFAULT_PORT = 8765
 
 ALLOWED_PREFIXES = ("/dashboard/", "/run-reports/")
 ALLOWED_EXACT = ("/trade-ledger.csv",)
@@ -39,6 +41,28 @@ ALLOWED_EXACT = ("/trade-ledger.csv",)
 def _reports(pattern):
     files = glob.glob(os.path.join(REPO, "run-reports", pattern))
     return sorted(os.path.basename(f) for f in files)
+
+
+def _canonical_request_path(request_path):
+    """Decode and normalize a URL path before authorizing it.
+
+    SimpleHTTPRequestHandler does this same one-pass decoding and POSIX-path
+    normalization when it maps a request to disk.  The whitelist must see the
+    same path; checking the raw URL lets /dashboard/%2e%2e/ escape it.
+    """
+    path = request_path.split("?", 1)[0].split("#", 1)[0]
+    try:
+        path = urllib.parse.unquote(path, errors="surrogatepass")
+    except UnicodeDecodeError:
+        path = urllib.parse.unquote(path)
+    if "\x00" in path or any(part in (".", "..") or "\\" in part
+                         for part in path.split("/")):
+        return None
+    trailing_slash = path.rstrip().endswith("/")
+    path = posixpath.normpath(path)
+    if trailing_slash and path != "/":
+        path += "/"
+    return path
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -66,7 +90,18 @@ class Handler(SimpleHTTPRequestHandler):
         if host not in ("127.0.0.1", "localhost", "::1"):
             self.send_error(403, "non-loopback Host header")
             return None
-        return self.path.split("?", 1)[0]
+        path = _canonical_request_path(self.path)
+        if path is None:
+            self.send_error(403, "path traversal")
+            return None
+        if not path.startswith("/"):
+            self.send_error(400, "invalid request path")
+            return None
+        # Leave self.path untouched: SimpleHTTPRequestHandler performs the
+        # same single decode when mapping to disk. Replacing it here would make
+        # the superclass decode a second time and reintroduce traversal via
+        # double-encoded dot segments.
+        return path
 
     def do_HEAD(self):
         path = self._guard()
@@ -103,7 +138,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_error(403, "not served")
 
 
-if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Dashboard: http://127.0.0.1:{PORT}/  (serving {REPO}, localhost only, Ctrl+C to stop)")
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"Dashboard: http://127.0.0.1:{port}/  (serving {REPO}, localhost only, Ctrl+C to stop)")
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

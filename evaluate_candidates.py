@@ -261,15 +261,17 @@ def main():
     ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
     ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")
     ap.add_argument("--rsi-max-entry", type=finite_float_arg, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with --rsi-file)")
-    ap.add_argument("--rsi-period", type=int, default=14, help="RSI_PERIOD, used only for the closes fallback (default 14)")
+    ap.add_argument("--rsi-period", type=int,
+                    help="RSI_PERIOD, required with --rsi-file so the closes fallback uses the configured period")
     args = ap.parse_args()
 
     rsi_map = None
     if args.rsi_file:
-        if (args.rsi_oversold is None or args.rsi_lookback_bars is None
-                or args.rsi_confirm_bars is None or args.rsi_max_entry is None):
-            ap.error("--rsi-file requires --rsi-oversold, --rsi-lookback-bars, "
-                     "--rsi-confirm-bars, and --rsi-max-entry")
+        if (args.rsi_period is None or args.rsi_oversold is None
+                or args.rsi_lookback_bars is None or args.rsi_confirm_bars is None
+                or args.rsi_max_entry is None):
+            ap.error("--rsi-file requires --rsi-period, --rsi-oversold, "
+                     "--rsi-lookback-bars, --rsi-confirm-bars, and --rsi-max-entry")
         rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
 
     quotes = {sym.upper(): parse_quote(sym, val) for sym, val in load_json(args.quotes).items()}

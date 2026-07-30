@@ -39,7 +39,7 @@ All tunable values live in **`Constants.md`** next to the routine document — e
 | `HIGH_LOOKBACK_DAYS` / `VOLUME_LOOKBACK_DAYS` | Lookback windows for the recent high and the liquidity median. |
 | `TOP_N` | Max candidate list size. (fewer is better) |
 | `DIP_ENTRY_PCT` / `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | Entry, profit-take, and stop thresholds. |
-| `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` / `RSI_MAX_ENTRY` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up — and only while it has not already run (`RSI_MAX_ENTRY` caps the current RSI, so a bounce that is already spent is not chased). |
+| `RSI_PERIOD` / `RSI_INTERVAL` / `RSI_OVERSOLD` / `RSI_LOOKBACK_BARS` / `RSI_CONFIRM_BARS` / `RSI_MAX_ENTRY` | RSI curl-up entry gate: a dip is only buyable once it was oversold and has turned up — and only while it has not already run (`RSI_MAX_ENTRY` caps the current RSI, so a bounce that is already spent is not chased). `RSI_PERIOD` is passed to both the broker indicator request and the local Wilder-closes fallback. |
 | `MAX_SPREAD_BUY_PCT` | Max quoted bid/ask spread for an entry — a buy crosses the spread, so a wide book starts the position underwater and can put the stop at the bid on arrival. |
 | `REENTRY_COOLDOWN_DAYS` | No re-entry for this many days after a symbol stops out. |
 | `BUY_SIZE_PCT` / `MAX_POSITION_PCT` | Position sizing and cap. |
@@ -132,7 +132,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 - **market_clock.py** — the run's clock, executed as the **first action of every run**, before anything else. Everything time-dependent reads from it: the report header and filename, the market session, "stops filled today (Pacific)", re-entry cooldown windows, and the opening-blackout verdict (which it reads from `Constants.md` itself, so the value is never re-typed). It derives the US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
 - **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. It also documents the scan response's schema in one place so no run has to rediscover it.
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars.
-- **tests/test_scripts.py** — 43 dependency-free regression tests covering all three of the above plus the PriceBandScanner tool (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
+- **tests/test_scripts.py** — 47 dependency-free regression tests covering all three of the above plus the PriceBandScanner tool (`python3 tests/test_scripts.py`, or `py -3 tests\test_scripts.py` on Windows). Run them before committing any script change; expected values were verified against live API data.
 
 ## Usage Example
 
