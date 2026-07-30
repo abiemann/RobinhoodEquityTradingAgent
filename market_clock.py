@@ -4,8 +4,10 @@
 Every time-dependent decision in robinhood-momentum-routine-autonomous.md
 (opening blackout, session-aware order style, "filled today" counting,
 re-entry cooldown, dust lookback, ledger timestamps, report header) reads
-its time from THIS script — run once at the start of a run. The routine
-never derives the time any other way.
+its time from THIS script. The routine captures one start clock for all
+run-wide timestamps and historical windows, then invokes the same script
+immediately before each buy so a long run cannot use a stale session verdict.
+It never derives the time any other way.
 
 Why a script instead of a shell command: the obvious approaches are not
 portable and fail SILENTLY. On Windows (Git Bash / CPython without the
@@ -18,6 +20,7 @@ Eastern/Pacific offsets from the DST rule itself, so it gives the same
 answer on Windows and in the Linux sandbox.
 
 Usage (routine):  python3 market_clock.py --json
+Pre-buy recheck:  python3 market_clock.py --json
 Human-readable:    python3 market_clock.py
 Testing:           python3 market_clock.py --now-utc 2026-07-21T15:07:00Z
                    python3 market_clock.py --no-buy-first-minutes 5    # override

@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +27,7 @@ EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
 SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
+RUN_LOCK = os.path.join(ROOT, "run_lock.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 sys.path.insert(0, ROOT)
@@ -632,6 +634,141 @@ class FilterScanTests(unittest.TestCase):
             self.run_filter([row])
 
 
+class RunLockTests(unittest.TestCase):
+    def invoke(self, lock_file, action, token=None, now=None, lease_seconds=60):
+        args = [sys.executable, RUN_LOCK, action,
+                "--lock-file", lock_file,
+                "--lease-seconds", str(lease_seconds)]
+        if token is not None:
+            args += ["--token", token]
+        if now is not None:
+            args += ["--now-utc", now]
+        proc = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+        try:
+            document = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f"run_lock.py emitted non-JSON stdout: {proc.stdout!r}; stderr={proc.stderr!r}")
+        return proc, document
+
+    def test_only_one_concurrent_run_acquires_the_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_file = os.path.join(td, "lease.sqlite3")
+
+            def attempt(_):
+                return self.invoke(lock_file, "acquire",
+                                   now="2026-07-30T16:00:00Z")
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                attempts = list(pool.map(attempt, range(8)))
+
+        winners = [(proc, doc) for proc, doc in attempts if proc.returncode == 0]
+        blocked = [(proc, doc) for proc, doc in attempts if proc.returncode == 2]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(blocked), 7)
+        self.assertTrue(winners[0][1]["ok"])
+        self.assertTrue(winners[0][1]["token"])
+        for _, document in blocked:
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["reason"], "active_run")
+            self.assertNotIn("token", document.get("holder", {}))
+
+    def test_renew_release_and_reacquire_require_the_owner_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_file = os.path.join(td, "lease.sqlite3")
+            first_proc, first = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:00:00Z"
+            )
+            self.assertEqual(first_proc.returncode, 0)
+            token = first["token"]
+
+            blocked_proc, blocked = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:00:30Z"
+            )
+            self.assertEqual(blocked_proc.returncode, 2)
+            self.assertEqual(blocked["reason"], "active_run")
+
+            renew_proc, renewed = self.invoke(
+                lock_file, "renew", token=token,
+                now="2026-07-30T16:00:50Z"
+            )
+            self.assertEqual(renew_proc.returncode, 0)
+            self.assertTrue(renewed["ok"])
+            self.assertEqual(renewed["expires_at"], "2026-07-30T16:01:50Z")
+
+            wrong_proc, wrong = self.invoke(
+                lock_file, "release", token="not-the-owner",
+                now="2026-07-30T16:01:00Z"
+            )
+            self.assertEqual(wrong_proc.returncode, 3)
+            self.assertEqual(wrong["reason"], "ownership_lost")
+
+            still_blocked_proc, _ = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:01:20Z"
+            )
+            self.assertEqual(still_blocked_proc.returncode, 2)
+
+            release_proc, released = self.invoke(
+                lock_file, "release", token=token,
+                now="2026-07-30T16:01:30Z"
+            )
+            self.assertEqual(release_proc.returncode, 0)
+            self.assertTrue(released["ok"])
+
+            replacement_proc, replacement = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:01:31Z"
+            )
+            self.assertEqual(replacement_proc.returncode, 0)
+            self.assertNotEqual(replacement["token"], token)
+
+    def test_expired_takeover_fences_the_old_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_file = os.path.join(td, "lease.sqlite3")
+            _, first = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:00:00Z"
+            )
+            first_token = first["token"]
+
+            takeover_proc, takeover = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:01:00Z"
+            )
+            self.assertEqual(takeover_proc.returncode, 0)
+            self.assertTrue(takeover["recovered_expired_lease"])
+            self.assertNotEqual(takeover["token"], first_token)
+
+            stale_renew_proc, stale_renew = self.invoke(
+                lock_file, "renew", token=first_token,
+                now="2026-07-30T16:01:01Z"
+            )
+            self.assertEqual(stale_renew_proc.returncode, 3)
+            self.assertEqual(stale_renew["reason"], "ownership_lost")
+
+            stale_release_proc, stale_release = self.invoke(
+                lock_file, "release", token=first_token,
+                now="2026-07-30T16:01:02Z"
+            )
+            self.assertEqual(stale_release_proc.returncode, 3)
+            self.assertEqual(stale_release["reason"], "ownership_lost")
+
+            owner_renew_proc, owner_renew = self.invoke(
+                lock_file, "renew", token=takeover["token"],
+                now="2026-07-30T16:01:03Z"
+            )
+            self.assertEqual(owner_renew_proc.returncode, 0)
+            self.assertTrue(owner_renew["ok"])
+
+    def test_corrupt_coordination_database_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_file = os.path.join(td, "lease.sqlite3")
+            with open(lock_file, "wb") as f:
+                f.write(b"not a sqlite database")
+            proc, document = self.invoke(
+                lock_file, "acquire", now="2026-07-30T16:00:00Z"
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertFalse(document["ok"])
+        self.assertEqual(document["reason"], "coordination_state_error")
+
+
 class DashboardServerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -878,6 +1015,48 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("entry_session_open", routine)
         self.assertIn("exactly the JSON boolean `true`", routine)
         self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
+
+    def test_routine_fences_overlaps_and_rechecks_time_before_buys(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        coordination = routine.split(
+            "### RUN COORDINATION — fenced single-flight lease", 1
+        )[1].split("### WINDOWS / CODEX PYTHON ENVIRONMENT", 1)[0]
+        self.assertIn("before `rules_version`, `get_accounts`, or ANY broker call", coordination)
+        self.assertIn("`python3 run_lock.py acquire`", coordination)
+        self.assertIn("`schema_version` exactly `1`", coordination)
+        self.assertIn("`ok` exactly the JSON boolean `true`", coordination)
+        self.assertIn("`RUN_LOCK_TOKEN`", coordination)
+        self.assertIn('`reason: "active_run"`', coordination)
+        self.assertIn("OVERLAP HALT", coordination)
+        self.assertIn("Make no broker calls", coordination)
+        self.assertIn('supersede REPORT, its "every run" status-snapshot rule', coordination)
+        self.assertIn("expires after 20 minutes", coordination)
+        self.assertIn("At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT", coordination)
+        self.assertIn("immediately before EVERY `cancel_equity_order` and `place_equity_order`", coordination)
+        self.assertIn("ownership is lost: make no further broker calls or order changes", coordination)
+        self.assertIn("`python3 run_lock.py release --token <RUN_LOCK_TOKEN>`", coordination)
+        self.assertIn("final operational action", coordination)
+
+        order_handling = routine.split(
+            "### ORDER HANDLING — AUTONOMOUS, WITH NOTIFICATION", 1
+        )[1].split("### DRY RUN", 1)[0]
+        self.assertIn("renew this run's fencing lease", order_handling)
+        self.assertIn("do not cancel or place", order_handling)
+
+        pre_buy = routine.split(
+            "**PRE-BUY LEASE + CLOCK REVALIDATION (EVERY candidate, including DRY RUN):**", 1
+        )[1].split("11. For each remaining candidate", 1)[0]
+        self.assertIn("run a fresh `market_clock.py --json`", pre_buy)
+        self.assertIn("`entry_session_open` is exactly `true`", pre_buy)
+        self.assertIn("`opening_blackout` is exactly `false`", pre_buy)
+        self.assertIn('`session` must also be exactly `"regular"`', pre_buy)
+        self.assertIn("immediately before `place_equity_order`", pre_buy)
+        self.assertIn("run the fresh clock check AGAIN", pre_buy)
+        self.assertIn("never place a payload reviewed for a different session", pre_buy)
+        self.assertIn("Do not fall back to the START CLOCK", pre_buy)
+        self.assertIn("In DRY RUN", pre_buy)
 
     def test_routine_full_halts_when_constants_cannot_be_read(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

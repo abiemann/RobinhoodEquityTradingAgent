@@ -79,6 +79,26 @@ and fails closed outside the reviewed coverage. `entry_session_open` is now the 
 unconditional entry clearance: it blocks scanning and new buys but never disables profit-taking,
 stop repairs, dust sweeps, or the other protection work.
 
+## RUN COORDINATION — overlap and stale-session fencing
+
+**2026-07-30, overlapping-run race (P1 review finding).** Runs are scheduled 30 minutes apart,
+but the routine had no shared ownership check. A slow first run and a newly started second run
+could both read the same positions, open orders, and buying power, then independently place the
+same candidate. The first run also treated its start-time session as valid indefinitely, so a
+long evaluation could review or place after an early close or other session transition. No loss
+was attributed; the review caught both paths.
+
+The fix uses `run_lock.py`, not a hand-authored lock file. A one-row SQLite transaction makes
+acquisition and expired-lease takeover atomic across Windows and Unix. Each owner receives a
+random fencing token and must renew at phase boundaries and immediately before every broker
+mutation; after takeover, the old token cannot renew, release, cancel, or place. The 20-minute
+lease is intentionally shorter than the 30-minute schedule so a crashed task does not strand the
+account behind a permanent lock. A still-running old task may finish read-only work after expiry,
+but it cannot mutate once a newer owner exists. Every buy also re-runs `market_clock.py` before
+review and immediately before placement; the fresh reading controls only current entry
+eligibility and routing, while the original clock remains authoritative for filenames, trading
+date, ledger windows, and the report.
+
 ## BROKER TIMESTAMPS
 
 **2026-07-17.** `datetime.fromisoformat()` in the sandbox raised
