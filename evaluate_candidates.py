@@ -5,7 +5,8 @@ robinhood-momentum-routine-autonomous.md, Step 8).
 Consumes RAW get_equity_historicals JSON responses — do not transcribe bars
 by hand. Computes, per symbol:
   - liquidity floor: median daily dollar volume (volume x close) over the last
-    --volume-lookback-days bars; interpolated bars count as $0 days
+    --volume-lookback-days bars; interpolated bars count as $0 days. A symbol
+    with fewer than either configured history window is blocked before math.
   - recent high: max high_price over the last --high-lookback-days bars,
     REAL bars only (interpolated bars are placeholder prices nobody paid)
   - % below high vs the current price, and the dip-entry verdict
@@ -46,6 +47,10 @@ Usage:
   {"GRDX": {"last_trade_price": "3.08", "bid_price": "2.97", "ask_price": "3.09"}}
 All four constant flags are REQUIRED so values always come from the routine
 document's Constants table — no silent stale defaults.
+
+When --json-out is used, the root includes schema_version and
+rsi_gate_enabled. The routine uses the latter to distinguish the exploratory
+pre-RSI pass from the final RSI-enforced gate record.
 """
 
 import argparse
@@ -293,10 +298,20 @@ def main():
     for sym in sorted(set(bars_by_symbol) & set(quotes)):
         bars = bars_by_symbol[sym]
         current, bid, ask = quotes[sym]
+        required_history = max(args.volume_lookback_days, args.high_lookback_days)
         row = {"symbol": sym, "current_price": current, "buy_candidate": False,
                "median_dollar_volume": None, "recent_high": None,
                "pct_below_high": None, "skip_reason": None, "spread_pct": None,
-               "insufficient_history": len(bars) < args.volume_lookback_days}
+               "insufficient_history": len(bars) < required_history}
+
+        if row["insufficient_history"]:
+            row["skip_reason"] = (
+                f"insufficient history: {len(bars)} bars < required {required_history} "
+                f"(volume lookback {args.volume_lookback_days}, "
+                f"high lookback {args.high_lookback_days})"
+            )
+            rows.append(row)
+            continue
 
         window = bars[-args.volume_lookback_days:]
         # interpolated bars carry volume 0, so they naturally contribute $0 days
@@ -375,7 +390,7 @@ def main():
     for r in rows:
         print(fmt.format(
             r["symbol"],
-            f"${r['median_dollar_volume']:,.0f}",
+            "-" if r["median_dollar_volume"] is None else f"${r['median_dollar_volume']:,.0f}",
             "-" if r["recent_high"] is None else f"${r['recent_high']:.3f}",
             f"${r['current_price']:.3f}",
             "-" if r["pct_below_high"] is None else f"{r['pct_below_high']:+.2f}%",
@@ -388,7 +403,9 @@ def main():
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump({"params": vars(args), "results": rows}, f, indent=2, allow_nan=False)
+            json.dump({"schema_version": 1, "rsi_gate_enabled": rsi_map is not None,
+                       "params": vars(args), "results": rows},
+                      f, indent=2, allow_nan=False)
         print(f"JSON written to {args.json_out}")
 
     return 0

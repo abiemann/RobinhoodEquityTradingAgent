@@ -82,7 +82,7 @@ def run_cli(script, args):
 
 
 class EvaluateCandidatesTests(unittest.TestCase):
-    def run_eval(self, hist_payload, quotes, extra=None):
+    def run_eval(self, hist_payload, quotes, extra=None, return_document=False):
         with tempfile.TemporaryDirectory() as td:
             hist = os.path.join(td, "hist.json")
             qts = os.path.join(td, "quotes.json")
@@ -96,7 +96,10 @@ class EvaluateCandidatesTests(unittest.TestCase):
                                "--min-median-dollar-volume", "175000", "--dip-entry-pct", "5",
                                "--json-out", out] + (extra or []))
             with open(out, encoding="utf-8") as f:
-                return {r["symbol"]: r for r in json.load(f)["results"]}
+                document = json.load(f)
+            if return_document:
+                return document
+            return {r["symbol"]: r for r in document["results"]}
 
     def test_live_verified_fisn_ttrx(self):
         payload = {"data": {"results": [{"symbol": "FISN", "bars": FISN_BARS},
@@ -112,6 +115,45 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertFalse(ttrx["buy_candidate"])
         self.assertIn("above", ttrx["skip_reason"])
         self.assertLess(ttrx["pct_below_high"], 0)
+
+    def test_json_output_identifies_whether_rsi_gate_was_enabled(self):
+        bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
+                bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
+                bar("2026-07-07", 4.6, 4.9, 900000)]
+        payload = {"results": [{"symbol": "SYNX", "bars": bars}]}
+        common = ["--volume-lookback-days", "5", "--high-lookback-days", "5",
+                  "--min-median-dollar-volume", "0"]
+
+        pre_rsi = self.run_eval(payload, {"SYNX": 4.0}, extra=common, return_document=True)
+        self.assertEqual(pre_rsi["schema_version"], 1)
+        self.assertIs(pre_rsi["rsi_gate_enabled"], False)
+
+        with tempfile.TemporaryDirectory() as td:
+            rsi_path = os.path.join(td, "rsi.json")
+            with open(rsi_path, "w", encoding="utf-8") as f:
+                json.dump({"SYNX": [40, 36, 33, 30, 29, 34]}, f)
+            final = self.run_eval(
+                payload, {"SYNX": 4.0},
+                extra=common + ["--rsi-file", rsi_path, "--rsi-oversold", "35",
+                                "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
+                                "--rsi-max-entry", "60", "--rsi-period", "14"],
+                return_document=True,
+            )
+        self.assertEqual(final["schema_version"], 1)
+        self.assertIs(final["rsi_gate_enabled"], True)
+        self.assertEqual(final["results"][0]["rsi_gate"], "pass")
+
+    def test_insufficient_history_is_blocked_before_candidate_math(self):
+        payload = {"results": [{"symbol": "SHORT",
+                                "bars": [bar("2026-07-30", 4.5, 5.0, 900000)]}]}
+        short = self.run_eval(payload, {"SHORT": 4.0})["SHORT"]
+
+        self.assertTrue(short["insufficient_history"])
+        self.assertFalse(short["buy_candidate"])
+        self.assertIsNone(short["median_dollar_volume"])
+        self.assertIsNone(short["recent_high"])
+        self.assertIsNone(short["pct_below_high"])
+        self.assertIn("1 bars < required 20", short["skip_reason"])
 
     def test_interpolated_bars_excluded_from_high(self):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
@@ -876,8 +918,32 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("empty `working_list: []` is valid", scan_phase)
         prefilter = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split("**The next three bullets", 1)[0]
         self.assertIn("unrounded `volume` × `last`", prefilter)
-        self.assertIn("Only `evaluate_candidates.py --json-out` is an exception", routine)
-        self.assertIn("transient scratch handoff", routine)
+        self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)
+        self.assertIn("Transient JSON handoffs are deliberately different", routine)
+
+    def test_routine_uses_final_evaluator_json_as_sole_entry_authority(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        phase = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split(
+            "11. For each remaining candidate", 1
+        )[0]
+        self.assertIn("--json-out <scratch>/pre-rsi-gates.json", phase)
+        self.assertIn("PRE-RSI machine-readable handoff (REQUIRED)", phase)
+        self.assertIn("`schema_version` exactly `1`", phase)
+        self.assertIn("`rsi_gate_enabled` exactly the JSON boolean `false`", phase)
+        self.assertIn("SOLE authority for the pre-RSI verdicts", phase)
+        self.assertIn("candidate evaluation handoff failure", phase)
+        self.assertIn("Do NOT use formatted stdout, a stale gate file, or ad-hoc calculations", phase)
+        self.assertIn("final `buy_candidate` is exactly `true`", phase)
+        self.assertIn("`rsi_gate` is exactly `\"pass\"`", phase)
+        self.assertIn("`insufficient_history` is exactly `false`", phase)
+        self.assertIn("`rsi_gate_enabled` must be exactly the JSON boolean `true`", phase)
+        self.assertIn("SOLE authority for Step 11 and the report", phase)
+        self.assertIn("NEVER buy from the PRE-RSI JSON", phase)
+        self.assertIn("final candidate evaluation handoff failure", phase)
+        self.assertNotIn("fall back to ad-hoc code", phase)
+        self.assertNotIn("calculate how far below that high", phase)
 
     def test_routine_has_one_canonical_stop_market_schema(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

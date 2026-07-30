@@ -178,9 +178,20 @@ results; past runs corrupted it while retyping. Locate by basename with `find` i
 ## Step 8 — the script owns the math
 
 **Week 1.** A live run multiplied a share volume by the **date string**, twice, before getting it
-right. That is why all entry math lives in tested Python and why any ad-hoc fallback must verify
-its field mapping against a hand-checked row first — a wrong index that doesn't crash silently
-corrupts every entry decision.
+right. That is why all entry math lives in tested Python and why a script or handoff failure must
+block entry rather than reopen an ad-hoc calculation path — a wrong index that doesn't crash
+silently corrupts every entry decision.
+
+**2026-07-30, evaluator-handoff and short-history gaps (P1 review findings).** The routine wrote
+candidate-evaluator JSON but still told the agent to use formatted stdout, manually repeat some
+of the math, and fall back to ad-hoc code if the evaluator failed. Its pre-RSI and final passes
+also shared the persistent output path, so a failed final pass could leave an RSI-disabled
+artifact where the complete gate record was expected. Separately, the evaluator merely labelled
+an abbreviated bar history and could still approve a high-volume one-bar name using that smaller
+sample. No loss was attributed; the review caught both paths. The pre-RSI pass now writes a
+transient, validated JSON handoff; only a validated final RSI-enabled JSON result can authorize
+entry or become the persistent gate record. Evaluator or handoff failures skip entries, and fewer
+bars than either configured history window blocks the name before any candidate math runs.
 
 **2026-07-22, unasked-for judgment** (commit `2b4ffff`). A run remarked *"the bars don't have
 explicit interpolated fields, so I'm treating them as real data points"* — reasoning about a
