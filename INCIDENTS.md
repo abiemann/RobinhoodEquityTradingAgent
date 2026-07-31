@@ -125,6 +125,19 @@ made returned-order filtering tolerate both normalized `type: "stop_market"` res
 older broker-returned `type: "market"` plus `trigger: "stop"` shape without inferring stops from
 `stop_price` alone.
 
+## CONFIGURATION PREFLIGHT — ad-hoc validator rejected a valid value form
+
+**2026-07-31, ambiguous scheduled-run preflight.** A scheduled agent generated its own PowerShell
+table/value checks, then reported that the first command had "rejected its own value-form check."
+The file was ultimately valid and no broker call preceded the successful second check, but the
+diagnostic could not identify a bad constant because the generated validator itself was the variable.
+
+Fixed by making `validate_constants.py --json` the mandatory first-action authority. It owns the
+exact 31-row schema, literal forms, ranges, and cross-setting safety constraints; returns the parsed
+values so the agent never re-parses the table; and emits line-specific errors before any broker or
+market action. Scheduled runs may no longer invent a PowerShell/regex substitute or decide that a
+validator failure is harmless and continue.
+
 ## DAILY-LOSS CIRCUIT BREAKER — cost basis is not a daily baseline
 
 **2026-07-31, false daily-P&L sign (P1 review finding).** The breaker added Robinhood's

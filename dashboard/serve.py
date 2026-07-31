@@ -28,13 +28,16 @@ import glob
 import json
 import os
 import posixpath
-import re
 import sys
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PORT = 8765
+
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+from validate_constants import ConstantsValidationError, validate_constants_file
 
 ALLOWED_PREFIXES = ("/dashboard/", "/run-reports/")
 ALLOWED_EXACT = ("/trade-ledger.csv",)
@@ -48,22 +51,13 @@ def _reports(pattern):
 def _dry_run_config():
     """Return the current DRY_RUN value without exposing the full config file."""
     try:
-        with open(os.path.join(REPO, "constants.md"), encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        return {"dry_run": None, "error": "constants.md is unreadable"}
-
-    matches = re.findall(
-        r"^\|\s*`DRY_RUN`\s*\|\s*`(true|false)`\s*\|",
-        text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    if len(matches) != 1:
+        validated = validate_constants_file(os.path.join(REPO, "constants.md"))
+    except ConstantsValidationError as exc:
         return {
             "dry_run": None,
-            "error": "constants.md must contain exactly one valid DRY_RUN row",
+            "error": exc.errors[0],
         }
-    return {"dry_run": matches[0].lower() == "true"}
+    return {"dry_run": validated.values["DRY_RUN"]}
 
 
 def _canonical_request_path(request_path):

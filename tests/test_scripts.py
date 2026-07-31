@@ -14,6 +14,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,10 +31,12 @@ FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
 RUN_LOCK = os.path.join(ROOT, "run_lock.py")
 DAILY_LOSS = os.path.join(ROOT, "daily_loss.py")
+VALIDATE_CONSTANTS = os.path.join(ROOT, "validate_constants.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
+import validate_constants as constants_validator
 from market_calendar import (CALENDAR_YEARS, CLOSED_DATES,
                              EARLY_CLOSE_MINUTES_BY_DATE,
                              NORMAL_REGULAR_CLOSE_MINUTE,
@@ -83,6 +86,231 @@ def run_cli(script, args):
     if proc.returncode != 0:
         raise AssertionError(f"{os.path.basename(script)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
+
+
+class ConstantsValidatorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(
+            os.path.join(ROOT, "constants.md"), encoding="utf-8"
+        ) as handle:
+            cls.valid_text = handle.read()
+
+    @staticmethod
+    def replace_value(text, name, value):
+        pattern = re.compile(
+            rf"^(\|\s*`{re.escape(name)}`\s*\|\s*`)[^`]*(`\s*\|)",
+            re.MULTILINE,
+        )
+        replaced, count = pattern.subn(
+            lambda match: match.group(1) + value + match.group(2),
+            text,
+        )
+        if count != 1:
+            raise AssertionError(f"expected one {name} row; replaced {count}")
+        return replaced
+
+    def invoke(self, *, text=None, raw=None, expected_success=True):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "constants.md")
+            if raw is not None:
+                with open(path, "wb") as handle:
+                    handle.write(raw)
+            else:
+                with open(path, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(self.valid_text if text is None else text)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    VALIDATE_CONSTANTS,
+                    "--constants",
+                    path,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+        if expected_success:
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, "")
+            return json.loads(proc.stdout)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("validate_constants.py: ERROR:", proc.stderr)
+        return proc
+
+    def test_real_file_emits_all_typed_values_and_exact_decimals(self):
+        document = self.invoke()
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["status"], "valid")
+        self.assertEqual(document["constant_count"], 31)
+        self.assertEqual(
+            set(document["values"]),
+            set(constants_validator.REQUIRED_CONSTANTS),
+        )
+        self.assertIs(type(document["values"]["DRY_RUN"]), bool)
+        self.assertIs(type(document["values"]["TOP_N"]), int)
+        self.assertEqual(document["values"]["PRICE_MIN"], "2.50")
+        self.assertEqual(document["values"]["RSI_INTERVAL"], "30minute")
+        self.assertRegex(document["source_sha256"], r"^[0-9a-f]{64}$")
+
+        schema_names = (
+            constants_validator.BOOLEAN_CONSTANTS
+            | constants_validator.STRING_CONSTANTS
+            | set(constants_validator.INTEGER_BOUNDS)
+            | set(constants_validator.DECIMAL_BOUNDS)
+            | {"RSI_INTERVAL"}
+        )
+        self.assertEqual(schema_names, set(constants_validator.REQUIRED_CONSTANTS))
+
+    def test_runtime_accepts_both_dry_run_modes_and_digit_prefixed_interval(self):
+        for mode in ("true", "false"):
+            with self.subTest(mode=mode):
+                text = self.replace_value(self.valid_text, "DRY_RUN", mode)
+                document = self.invoke(text=text)
+                self.assertIs(document["values"]["DRY_RUN"], mode == "true")
+                self.assertEqual(
+                    document["values"]["RSI_INTERVAL"], "30minute"
+                )
+
+    def test_missing_invalid_utf8_malformed_unknown_and_duplicate_fail(self):
+        invalid_utf8 = self.invoke(raw=b"\xff", expected_success=False)
+        self.assertIn("not valid UTF-8", invalid_utf8.stderr)
+
+        missing_header = self.invoke(
+            text="# no constants table\n", expected_success=False
+        )
+        self.assertIn("expected exactly one", missing_header.stderr)
+
+        missing_row_text = re.sub(
+            r"^\| `TOP_N` .*\r?\n?", "", self.valid_text, flags=re.MULTILINE
+        )
+        missing_row = self.invoke(text=missing_row_text, expected_success=False)
+        self.assertIn("missing required constant(s): TOP_N", missing_row.stderr)
+
+        malformed_text = re.sub(
+            r"^\| `TOP_N` \| `15` \|",
+            "| `TOP_N` | 15 |",
+            self.valid_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        malformed = self.invoke(text=malformed_text, expected_success=False)
+        self.assertIn("malformed constant row for TOP_N", malformed.stderr)
+
+        extra_column_text = re.sub(
+            r"^(\| `TOP_N` \| `15` \|.*)\|$",
+            r"\1| `999` |",
+            self.valid_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        extra_column = self.invoke(
+            text=extra_column_text, expected_success=False
+        )
+        self.assertIn("malformed constant row for TOP_N", extra_column.stderr)
+
+        top_n_line = next(
+            line
+            for line in self.valid_text.splitlines()
+            if re.match(r"^\|\s*`TOP_N`\s*\|", line)
+        )
+        duplicate = self.invoke(
+            text=self.valid_text.rstrip() + "\n" + top_n_line + "\n",
+            expected_success=False,
+        )
+        self.assertIn("duplicate constant TOP_N", duplicate.stderr)
+
+        outside_table = self.invoke(
+            text=self.valid_text.rstrip() + "\n\n" + top_n_line + "\n",
+            expected_success=False,
+        )
+        self.assertIn(
+            "constant-like row TOP_N appears outside", outside_table.stderr
+        )
+
+        unknown = self.invoke(
+            text=self.valid_text.rstrip()
+            + "\n| `TYPO_CONSTANT` | `1` | typo |\n",
+            expected_success=False,
+        )
+        self.assertIn("unexpected constant TYPO_CONSTANT", unknown.stderr)
+
+    def test_invalid_literal_forms_and_ranges_name_the_constant(self):
+        cases = (
+            ("DRY_RUN", "TRUE", "must be exactly true or false"),
+            ("TOP_N", "14.0", "must be a base-10 integer"),
+            ("PRICE_MIN", "NaN", "plain nonnegative decimal"),
+            ("PRICE_MIN", "1e2", "plain nonnegative decimal"),
+            ("PRICE_MIN", "02.5", "plain nonnegative decimal"),
+            ("RSI_INTERVAL", "30 minute", "must be one of"),
+            ("NO_BUY_FIRST_MINUTES", "391", "must be <= 390"),
+            ("AGENTIC_ACCOUNT_NAME", '""', "nonempty trimmed string"),
+            (
+                "AGENTIC_ACCOUNT_NAME",
+                '"\\ud800"',
+                "unpaired Unicode surrogates",
+            ),
+        )
+        for name, value, reason in cases:
+            with self.subTest(name=name, value=value):
+                text = self.replace_value(self.valid_text, name, value)
+                proc = self.invoke(text=text, expected_success=False)
+                self.assertIn(name, proc.stderr)
+                self.assertIn(reason, proc.stderr)
+
+        oversized = self.replace_value(
+            self.valid_text, "TOP_N", "9" * 5000
+        )
+        proc = self.invoke(text=oversized, expected_success=False)
+        self.assertIn("TOP_N integer literal exceeds the supported size", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_cross_field_safety_constraints_fail_closed(self):
+        cases = (
+            ("PRICE_MIN", "5", "PRICE_MIN must be < PRICE_MAX"),
+            (
+                "RSI_OVERSOLD",
+                "61",
+                "RSI_OVERSOLD must be <= RSI_MAX_ENTRY",
+            ),
+            (
+                "RSI_CONFIRM_BARS",
+                "6",
+                "RSI_CONFIRM_BARS must be <= RSI_LOOKBACK_BARS",
+            ),
+            (
+                "MAX_SPREAD_BUY_PCT",
+                "3.5",
+                "MAX_SPREAD_BUY_PCT must be < STOP_LOSS_PCT",
+            ),
+            (
+                "BUY_SIZE_PCT",
+                "21",
+                "BUY_SIZE_PCT must be <= MAX_POSITION_PCT",
+            ),
+        )
+        for name, value, reason in cases:
+            with self.subTest(name=name):
+                text = self.replace_value(self.valid_text, name, value)
+                proc = self.invoke(text=text, expected_success=False)
+                self.assertIn(reason, proc.stderr)
+
+    def test_crlf_and_shell_metacharacters_are_inert_data(self):
+        lf = self.valid_text.replace("\r\n", "\n")
+        crlf = lf.replace("\n", "\r\n")
+        lf_values = self.invoke(text=lf)["values"]
+        crlf_values = self.invoke(text=crlf)["values"]
+        self.assertEqual(lf_values, crlf_values)
+
+        title = 'Agentic; $(Get-Process) & "quoted"'
+        encoded = json.dumps(title)
+        text = self.replace_value(
+            self.valid_text, "AGENTIC_ACCOUNT_NAME", encoded
+        )
+        document = self.invoke(text=text)
+        self.assertEqual(document["values"]["AGENTIC_ACCOUNT_NAME"], title)
 
 
 class DailyLossTests(unittest.TestCase):
@@ -1313,9 +1541,16 @@ class DashboardServerTests(unittest.TestCase):
         self.repo = self.temp_dir.name
         os.makedirs(os.path.join(self.repo, "dashboard"))
         os.makedirs(os.path.join(self.repo, "run-reports"))
+        with open(
+            os.path.join(ROOT, "constants.md"), encoding="utf-8"
+        ) as constants_file:
+            constants_text = constants_file.read()
+        self.valid_constants = ConstantsValidatorTests.replace_value(
+            constants_text, "DRY_RUN", "true"
+        )
         for name, content in (
             ("README.md", "private dashboard test fixture"),
-            ("constants.md", "| `DRY_RUN` | `true` | test mode |"),
+            ("constants.md", self.valid_constants),
             ("trade-ledger.csv", "symbol,price\\nTEST,1.00\\n"),
             (os.path.join("dashboard", "index.html"), "<h1>Dashboard fixture</h1>"),
             (os.path.join("run-reports", "rhmra-status-test.json"), "{}"),
@@ -1379,18 +1614,50 @@ class DashboardServerTests(unittest.TestCase):
 
         constants_path = os.path.join(self.repo, "constants.md")
         with open(constants_path, "w", encoding="utf-8") as f:
-            f.write("| `DRY_RUN` | `false` | live mode |")
+            f.write(
+                ConstantsValidatorTests.replace_value(
+                    self.valid_constants, "DRY_RUN", "false"
+                )
+            )
         status, body = self.request("GET", "/api/config")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"dry_run": False})
 
         with open(constants_path, "w", encoding="utf-8") as f:
-            f.write("| `DRY_RUN` | `maybe` | malformed |")
+            f.write(
+                ConstantsValidatorTests.replace_value(
+                    self.valid_constants, "DRY_RUN", "maybe"
+                )
+            )
         status, body = self.request("GET", "/api/config")
         document = json.loads(body)
         self.assertEqual(status, 200)
         self.assertIsNone(document["dry_run"])
-        self.assertIn("exactly one valid DRY_RUN row", document["error"])
+        self.assertIn("DRY_RUN must be exactly true or false", document["error"])
+
+        with open(constants_path, "w", encoding="utf-8") as f:
+            f.write(
+                ConstantsValidatorTests.replace_value(
+                    self.valid_constants, "TOP_N", "0"
+                )
+            )
+        status, body = self.request("GET", "/api/config")
+        document = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertIsNone(document["dry_run"])
+        self.assertIn("TOP_N", document["error"])
+
+        with open(constants_path, "w", encoding="utf-8") as f:
+            f.write(
+                ConstantsValidatorTests.replace_value(
+                    self.valid_constants, "TOP_N", "9" * 5000
+                )
+            )
+        status, body = self.request("GET", "/api/config")
+        document = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertIsNone(document["dry_run"])
+        self.assertIn("integer literal exceeds the supported size", document["error"])
 
 
 class MarketClockTests(unittest.TestCase):
@@ -1413,6 +1680,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIs(type(c["entry_session_open"]), bool)
         self.assertTrue(c["entry_session_open"])
         self.assertEqual(c["minutes_since_open"], 97)
+        self.assertRegex(c["constants_sha256"], r"^[0-9a-f]{64}$")
 
     def test_winter_offsets_are_standard(self):
         c = self.clock("2026-01-15T15:07:00Z")
@@ -1480,6 +1748,104 @@ class MarketClockTests(unittest.TestCase):
                                         "--now-utc", "2026-07-22T13:37:00Z", "--json"],
                                        capture_output=True, text=True)
                     self.assertNotEqual(r.returncode, 0)
+
+    def test_clock_reuses_full_validator_not_a_single_row_regex(self):
+        with open(os.path.join(ROOT, "constants.md"), encoding="utf-8") as f:
+            constants_text = f.read()
+        constants_text = ConstantsValidatorTests.replace_value(
+            constants_text, "TOP_N", "0"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            constants = os.path.join(td, "constants.md")
+            with open(constants, "w", encoding="utf-8") as f:
+                f.write(constants_text)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    CLOCK,
+                    "--constants",
+                    constants,
+                    "--now-utc",
+                    "2026-07-22T13:37:00Z",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TOP_N", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+        oversized_text = ConstantsValidatorTests.replace_value(
+            constants_text, "TOP_N", "9" * 5000
+        )
+        with tempfile.TemporaryDirectory() as td:
+            constants = os.path.join(td, "constants.md")
+            with open(constants, "w", encoding="utf-8") as f:
+                f.write(oversized_text)
+            oversized = subprocess.run(
+                [
+                    sys.executable,
+                    CLOCK,
+                    "--constants",
+                    constants,
+                    "--now-utc",
+                    "2026-07-22T13:37:00Z",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(oversized.returncode, 2)
+        self.assertIn("integer literal exceeds the supported size", oversized.stderr)
+        self.assertNotIn("Traceback", oversized.stderr)
+
+    def test_expected_constants_hash_pins_the_preflight_configuration(self):
+        with open(os.path.join(ROOT, "constants.md"), encoding="utf-8") as f:
+            constants_text = f.read()
+        constants_text = ConstantsValidatorTests.replace_value(
+            constants_text, "DRY_RUN", "true"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            constants = os.path.join(td, "constants.md")
+            with open(constants, "w", encoding="utf-8", newline="") as f:
+                f.write(constants_text)
+            expected_hash = constants_validator.validate_constants_file(
+                constants
+            ).source_sha256
+            command = [
+                sys.executable,
+                CLOCK,
+                "--constants",
+                constants,
+                "--expected-constants-sha256",
+                expected_hash,
+                "--now-utc",
+                "2026-07-22T13:37:00Z",
+                "--json",
+            ]
+            matching = subprocess.run(
+                command, capture_output=True, text=True
+            )
+            self.assertEqual(matching.returncode, 0, matching.stderr)
+            self.assertEqual(
+                json.loads(matching.stdout)["constants_sha256"],
+                expected_hash,
+            )
+
+            changed_text = ConstantsValidatorTests.replace_value(
+                constants_text, "DRY_RUN", "false"
+            )
+            with open(constants, "w", encoding="utf-8", newline="") as f:
+                f.write(changed_text)
+            changed = subprocess.run(
+                command, capture_output=True, text=True
+            )
+
+        self.assertEqual(changed.returncode, 2)
+        self.assertEqual(changed.stdout, "")
+        self.assertIn("constants.md changed after preflight", changed.stderr)
+        self.assertNotIn("usage:", changed.stderr)
 
     def test_sessions_and_weekend(self):
         pre = self.clock("2026-07-21T12:00:00Z")
@@ -1572,7 +1938,11 @@ class MarketClockTests(unittest.TestCase):
     def test_routine_has_an_unconditional_calendar_entry_gate(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
-        self.assertIn("`python3 market_clock.py --json`", routine)
+        self.assertIn(
+            "`python3 market_clock.py --json --expected-constants-sha256 "
+            "<preflight source_sha256>`",
+            routine,
+        )
         self.assertIn("entry_session_open", routine)
         self.assertIn("exactly the JSON boolean `true`", routine)
         self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
@@ -1585,6 +1955,11 @@ class MarketClockTests(unittest.TestCase):
             "### RUN COORDINATION — fenced single-flight lease", 1
         )[1].split("### WINDOWS / CODEX PYTHON ENVIRONMENT", 1)[0]
         self.assertIn("before `rules_version`, `get_accounts`, or ANY broker call", coordination)
+        self.assertIn(
+            "A configuration validation/hash failure stops the full run "
+            "before lease acquisition",
+            coordination,
+        )
         self.assertIn("`python3 run_lock.py acquire`", coordination)
         self.assertIn("`schema_version` exactly `1`", coordination)
         self.assertIn("`ok` exactly the JSON boolean `true`", coordination)
@@ -1609,7 +1984,11 @@ class MarketClockTests(unittest.TestCase):
         pre_buy = routine.split(
             "**PRE-BUY LEASE + CLOCK REVALIDATION (EVERY candidate, including DRY RUN):**", 1
         )[1].split("11. For each remaining candidate", 1)[0]
-        self.assertIn("run a fresh `market_clock.py --json`", pre_buy)
+        self.assertIn(
+            "run a fresh `market_clock.py --json "
+            "--expected-constants-sha256 <preflight source_sha256>`",
+            pre_buy,
+        )
         self.assertIn("`entry_session_open` is exactly `true`", pre_buy)
         self.assertIn("`opening_blackout` is exactly `false`", pre_buy)
         self.assertIn('`session` must also be exactly `"regular"`', pre_buy)
@@ -1624,15 +2003,42 @@ class MarketClockTests(unittest.TestCase):
             routine = f.read()
 
         preflight_start = routine.index("**Mandatory configuration preflight")
-        clock_command = routine.index("`python3 market_clock.py --json`")
+        clock_command = routine.index(
+            "`python3 market_clock.py --json --expected-constants-sha256 "
+            "<preflight source_sha256>`"
+        )
         self.assertLess(preflight_start, clock_command)
         preflight = routine[preflight_start:routine.index("\n\nNote the `DRY_RUN`", preflight_start)]
         self.assertIn("Before `market_clock.py`, `get_accounts`", preflight)
+        self.assertIn("`py -3 validate_constants.py --json`", preflight)
+        self.assertIn("Do not construct a PowerShell, regex, prose, or ad-hoc replacement validator", preflight)
+        self.assertIn("`values` as the SOLE configuration authority", preflight)
+        self.assertIn('`status` is exactly `"valid"`', preflight)
+        self.assertIn("`constant_count` is exactly `31`", preflight)
+        self.assertIn("Never independently re-read or re-parse table rows", preflight)
+        self.assertIn(
+            "`market_clock.py` is the only permitted later file reader",
+            preflight,
+        )
+        self.assertIn("Never declare the checked-in validator wrong", preflight)
         self.assertIn("FULL-RUN HALT immediately", preflight)
         self.assertIn("This is NOT DRY RUN", preflight)
         self.assertIn("do not review, place, or cancel any order", preflight)
         self.assertIn("normal report, ledger, status snapshot", preflight)
         self.assertNotIn("treat it as `true`", routine)
+        self.assertLess(
+            routine.index("validate_constants.py --json"),
+            clock_command,
+        )
+
+        rules_version = routine.split("**rules_version**", 1)[1].split(
+            "\n\nAppend one row", 1
+        )[0]
+        self.assertIn(
+            "robinhood-momentum-routine-autonomous.md constants.md "
+            "validate_constants.py",
+            rules_version,
+        )
 
         dry_run = routine.split("### DRY RUN", 1)[1].split("### CURRENT TIME", 1)[0]
         self.assertIn("NOT DRY RUN", dry_run)

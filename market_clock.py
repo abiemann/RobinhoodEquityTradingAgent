@@ -19,14 +19,15 @@ This script depends only on UTC (always available) and computes the US
 Eastern/Pacific offsets from the DST rule itself, so it gives the same
 answer on Windows and in the Linux sandbox.
 
-Usage (routine):  python3 market_clock.py --json
-Pre-buy recheck:  python3 market_clock.py --json
+Usage (routine):  python3 market_clock.py --json \
+                    --expected-constants-sha256 <preflight source_sha256>
+Pre-buy recheck:  use the same command and preflight hash
 Human-readable:    python3 market_clock.py
 Testing:           python3 market_clock.py --now-utc 2026-07-21T15:07:00Z
                    python3 market_clock.py --no-buy-first-minutes 5    # override
 
-The blackout minute count is read from constants.md (the row for
-NO_BUY_FIRST_MINUTES). The routine must NOT substitute the value on the
+The blackout minute count is read through validate_constants.py's shared,
+full-file validator. The routine must NOT substitute the value on the
 command line — an agent invoked this with `--no-buy-first-minutes 5`
 against a constants.md of 45 on 2026-07-22 (safe by luck, could have
 unlocked buying inside the blackout). --no-buy-first-minutes stays as a
@@ -49,12 +50,11 @@ and require all tests to pass before committing.
 
 import argparse
 import json
-import os
-import re
 import sys
 from datetime import datetime, timedelta, timezone
 
 from market_calendar import REGULAR_OPEN_MINUTE, core_session_schedule
+from validate_constants import ConstantsValidationError, validate_constants_file
 
 EASTERN_STD_OFFSET = -5
 PACIFIC_STD_OFFSET = -8
@@ -130,7 +130,7 @@ def format_et_time(minutes):
 
 
 def read_no_buy_first_minutes(constants_path=None):
-    """Extract NO_BUY_FIRST_MINUTES from constants.md next to this script.
+    """Load NO_BUY_FIRST_MINUTES through the full constants validator.
 
     Reading it here — instead of taking it as a CLI flag the routine
     substitutes by hand — closes an improvisation gap: on 2026-07-22 an
@@ -138,15 +138,8 @@ def read_no_buy_first_minutes(constants_path=None):
     constants.md said 45 (safe by luck; the mismatch could have unlocked
     buying inside the blackout window).
     """
-    if constants_path is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        constants_path = os.path.join(here, "constants.md")
-    with open(constants_path, encoding="utf-8") as f:
-        for line in f:
-            m = re.match(r"\|\s*`NO_BUY_FIRST_MINUTES`\s*\|\s*`(\d+)`", line)
-            if m:
-                return int(m.group(1))
-    raise ValueError(f"NO_BUY_FIRST_MINUTES row not found in {constants_path}")
+    validated = validate_constants_file(constants_path)
+    return validated.values["NO_BUY_FIRST_MINUTES"]
 
 
 def main():
@@ -154,14 +147,56 @@ def main():
     ap.add_argument("--no-buy-first-minutes", type=int, default=None,
                     help="OPTIONAL override for tests; the routine must NOT pass this — the value is read from constants.md so the agent never re-types it")
     ap.add_argument("--constants", help="path to constants.md (testing only)")
+    ap.add_argument(
+        "--expected-constants-sha256",
+        help="preflight constants hash; REQUIRED by the routine, optional for tests",
+    )
     ap.add_argument("--now-utc", help="override the clock, ISO-8601 UTC (testing only)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     if args.no_buy_first_minutes is None:
-        blackout_minutes = read_no_buy_first_minutes(args.constants)
+        try:
+            validated_constants = validate_constants_file(args.constants)
+        except ConstantsValidationError as exc:
+            print(
+                f"market_clock.py: ERROR: constants validation failed: "
+                f"{exc.errors[0]}",
+                file=sys.stderr,
+            )
+            return 2
+        blackout_minutes = validated_constants.values["NO_BUY_FIRST_MINUTES"]
+        constants_sha256 = validated_constants.source_sha256
     else:
         blackout_minutes = args.no_buy_first_minutes
+        constants_sha256 = None
+
+    if args.expected_constants_sha256 is not None:
+        expected_hash = args.expected_constants_sha256
+        if (
+            len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+        ):
+            print(
+                "market_clock.py: ERROR: --expected-constants-sha256 must be "
+                "64 lowercase hex characters",
+                file=sys.stderr,
+            )
+            return 2
+        if constants_sha256 is None:
+            print(
+                "market_clock.py: ERROR: --expected-constants-sha256 cannot "
+                "be combined with the blackout test override",
+                file=sys.stderr,
+            )
+            return 2
+        if constants_sha256 != expected_hash:
+            print(
+                "market_clock.py: ERROR: constants.md changed after preflight: "
+                "SHA-256 does not match --expected-constants-sha256",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.now_utc:
         utc = datetime.strptime(args.now_utc.rstrip("Z")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
@@ -181,6 +216,7 @@ def main():
         "pt": f"{pt:%Y-%m-%d %H:%M:%S} {pt_name}",
         "date_et": et.strftime("%Y-%m-%d"),
         "date_pt": pt.strftime("%Y-%m-%d"),
+        "constants_sha256": constants_sha256,
         "session": state,
         "calendar_status": calendar_status,
         "regular_close_et": None if regular_close is None else format_et_time(regular_close),
