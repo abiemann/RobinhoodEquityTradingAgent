@@ -179,6 +179,7 @@ def main():
         "utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "et": f"{et:%Y-%m-%d %H:%M:%S} {et_name}",
         "pt": f"{pt:%Y-%m-%d %H:%M:%S} {pt_name}",
+        "date_et": et.strftime("%Y-%m-%d"),
         "date_pt": pt.strftime("%Y-%m-%d"),
         "session": state,
         "calendar_status": calendar_status,

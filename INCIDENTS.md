@@ -125,6 +125,25 @@ made returned-order filtering tolerate both normalized `type: "stop_market"` res
 older broker-returned `type: "market"` plus `trigger: "stop"` shape without inferring stops from
 `stop_price` alone.
 
+## DAILY-LOSS CIRCUIT BREAKER — cost basis is not a daily baseline
+
+**2026-07-31, false daily-P&L sign (P1 review finding).** The breaker added Robinhood's
+cost-basis realized P&L to every open position's lifetime unrealized P&L and called the result
+"trailing-day P&L." AVIR demonstrated the error: it was bought below $4.36, closed the prior
+session around $4.51, and sold the next morning at $4.42. Robinhood correctly reported a lifetime
+realized profit of $4.28, but the account actually lost about $6.07 that broker day because the
+relevant baseline was the prior close, not the old purchase price. The guard could therefore show
+the wrong sign and admit new exposure during a real daily drawdown.
+
+Fixed by making `daily_loss.py` the sole breaker authority. It consumes fresh raw broker responses,
+fully paginates unfiltered equity orders, filters individual executions by Eastern date, includes
+fees and partial fills, reconstructs opening quantities from executions, reconciles them against
+`intraday_quantity`, and marks opening shares from split-adjusted official prior closes. It also
+reconciles every order's executions to `cumulative_quantity` and rejects stale/future current marks.
+Any missing page or execution, malformed value, stale price/close, duplicate conflict, or quantity
+mismatch blocks entries instead of falling back to cost-basis P&L. `get_realized_pnl` remains
+dashboard/report telemetry only.
+
 ## TRADE LEDGER — rules_version and `--no-optional-locks`
 
 **2026-07-14.** Two scheduled runs were killed mid `git status` index-refresh (the 09:07 and 10:07

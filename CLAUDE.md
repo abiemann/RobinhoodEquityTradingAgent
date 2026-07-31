@@ -3,7 +3,7 @@
 Rules for any AI agent (or human) editing this repository.
 
 ## Tests are mandatory for script changes
-After editing `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `run_lock.py`, `dashboard/serve.py`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
+After editing `daily_loss.py`, `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `run_lock.py`, `dashboard/serve.py`, `dashboard/index.html`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
 
 ```
 python3 tests/test_scripts.py     # Windows: py -3 tests\test_scripts.py

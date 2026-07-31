@@ -21,6 +21,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from decimal import Decimal
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
@@ -28,6 +29,7 @@ SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
 RUN_LOCK = os.path.join(ROOT, "run_lock.py")
+DAILY_LOSS = os.path.join(ROOT, "daily_loss.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 sys.path.insert(0, ROOT)
@@ -81,6 +83,542 @@ def run_cli(script, args):
     if proc.returncode != 0:
         raise AssertionError(f"{os.path.basename(script)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
+
+
+class DailyLossTests(unittest.TestCase):
+    TRADING_DATE = "2026-07-31"
+    AS_OF_UTC = "2026-07-31T20:00:00Z"
+    PREVIOUS_SESSION = "2026-07-30"
+
+    @staticmethod
+    def position(symbol, quantity, intraday_quantity):
+        return {
+            "symbol": symbol,
+            "quantity": str(quantity),
+            "intraday_quantity": str(intraday_quantity),
+            "type": "long",
+        }
+
+    @staticmethod
+    def execution(execution_id, price, quantity, timestamp="2026-07-31T15:00:00.123456789Z", fees="0"):
+        return {
+            "id": execution_id,
+            "price": str(price),
+            "quantity": str(quantity),
+            "timestamp": timestamp,
+            "fees": str(fees),
+        }
+
+    @staticmethod
+    def order(
+        order_id,
+        symbol,
+        side,
+        executions,
+        created_at="2026-07-31T14:59:00Z",
+        *,
+        state=None,
+        cumulative_quantity=None,
+    ):
+        if cumulative_quantity is None:
+            cumulative_quantity = sum(
+                (
+                    Decimal(str(execution["quantity"]))
+                    for execution in executions
+                    if execution is not None
+                ),
+                Decimal(0),
+            )
+        cumulative_decimal = Decimal(str(cumulative_quantity))
+        if state is None:
+            state = (
+                "filled"
+                if cumulative_decimal > 0
+                else "confirmed"
+            )
+        return {
+            "id": order_id,
+            "symbol": symbol,
+            "side": side,
+            "created_at": created_at,
+            "state": state,
+            "cumulative_quantity": str(cumulative_quantity),
+            "fees": "999.99",  # cumulative order fee must never be added to execution fees
+            "executions": executions,
+        }
+
+    @classmethod
+    def quote(cls, symbol, current, previous, *, nonreg=None,
+              close_date=None, last_time="2026-07-31T19:59:00Z",
+              nonreg_time="2026-07-31T19:59:30Z"):
+        quote = {
+            "symbol": symbol,
+            "last_trade_price": str(current),
+            "venue_last_trade_time": last_time,
+            "last_non_reg_trade_price": None if nonreg is None else str(nonreg),
+            "venue_last_non_reg_trade_time": None if nonreg is None else nonreg_time,
+            "adjusted_previous_close": str(previous),
+            "previous_close_date": close_date or cls.PREVIOUS_SESSION,
+            "has_traded": True,
+            "state": "active",
+        }
+        return {
+            "quote": quote,
+            "close": {
+                "symbol": symbol,
+                "date": close_date or cls.PREVIOUS_SESSION,
+                "price": str(previous),
+                "interpolated": False,
+                "source": "sip-list-exchange-close",
+            },
+        }
+
+    @staticmethod
+    def page(name, rows, next_value=None):
+        return {"data": {name: rows, "next": next_value}}
+
+    def invoke(self, *, positions=None, orders=None, quotes=None,
+               total_value="1000", halt_pct="5", expected_success=True):
+        positions = positions or [self.page("positions", [])]
+        orders = orders or [self.page("orders", [])]
+        quotes = quotes or []
+        with tempfile.TemporaryDirectory() as td:
+            def write_documents(prefix, documents):
+                paths = []
+                for index, document in enumerate(documents, 1):
+                    path = os.path.join(td, f"{prefix}-{index}.json")
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(document, f)
+                    paths.append(path)
+                return paths
+
+            portfolio_path = os.path.join(td, "portfolio.json")
+            with open(portfolio_path, "w", encoding="utf-8") as f:
+                json.dump({"data": {"total_value": total_value}}, f)
+            position_paths = write_documents("positions", positions)
+            order_paths = write_documents("orders", orders)
+            quote_paths = write_documents("quotes", quotes)
+            output_path = os.path.join(td, "daily-loss.json")
+            args = [
+                "--portfolio", portfolio_path,
+                "--positions", *position_paths,
+                "--orders", *order_paths,
+            ]
+            if quote_paths:
+                args += ["--quotes", *quote_paths]
+            args += [
+                "--trading-date", self.TRADING_DATE,
+                "--as-of-utc", self.AS_OF_UTC,
+                "--halt-pct", halt_pct,
+                "--json-out", output_path,
+            ]
+            proc = subprocess.run(
+                [sys.executable, DAILY_LOSS] + args,
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+            if not expected_success:
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertFalse(os.path.exists(output_path))
+                return proc
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(output_path, encoding="utf-8") as f:
+                return json.load(f)
+
+    def test_avir_overnight_winner_is_a_real_day_loss_and_old_order_is_included(self):
+        avir = self.order(
+            "order-avir",
+            "AVIR",
+            "sell",
+            [self.execution("exec-avir", "4.42", "67.344596", fees="0.01")],
+            created_at="2026-07-28T23:00:00Z",
+        )
+        result = self.invoke(
+            orders=[
+                self.page("orders", [], "https://example.test/orders?cursor=next"),
+                self.page("orders", [avir]),
+            ],
+            quotes=[{"data": {"results": [self.quote("AVIR", "4.42", "4.51")]}}],
+            total_value="1471.19",
+        )
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["trading_date_et"], self.TRADING_DATE)
+        self.assertEqual(result["daily_pnl"], "-6.07101364")
+        self.assertEqual(result["status"], "clear")
+        self.assertFalse(result["halt_new_buys"])
+        self.assertEqual(result["required_quote_symbols"], ["AVIR"])
+        self.assertEqual(result["reconciliation"]["unique_order_count"], 1)
+        self.assertEqual(result["reconciliation"]["today_execution_count"], 1)
+
+    def test_today_buy_uses_execution_cost_and_trips_at_loss_threshold(self):
+        result = self.invoke(
+            positions=[self.page("positions", [self.position("NEW", "10", "10")])],
+            orders=[self.page("orders", [
+                self.order("order-buy", "NEW", "buy", [
+                    self.execution("exec-buy", "10", "10", fees="0.02")
+                ])
+            ])],
+            quotes=[{"data": {"results": [self.quote("NEW", "9", "8")]}}],
+            total_value="100",
+            halt_pct="10",
+        )
+        self.assertEqual(result["daily_pnl"], "-10.02")
+        self.assertEqual(result["halt_threshold"], "10")
+        self.assertEqual(result["loss_pct_of_total"], "10.02")
+        self.assertEqual(result["status"], "tripped")
+        self.assertTrue(result["halt_new_buys"])
+
+    def test_partial_overnight_sale_uses_prior_close_and_exact_boundary_trips(self):
+        result = self.invoke(
+            positions=[self.page("positions", [self.position("PART", "6", "-4")])],
+            orders=[self.page("orders", [
+                self.order("order-sell", "PART", "sell", [
+                    self.execution("exec-sell", "90", "4")
+                ])
+            ])],
+            quotes=[{"data": {"results": [self.quote("PART", "95", "100")]}}],
+            total_value="1000",
+            halt_pct="7",
+        )
+        self.assertEqual(result["daily_pnl"], "-70")
+        self.assertEqual(result["halt_threshold"], "70")
+        self.assertEqual(result["status"], "tripped")
+
+        clear = self.invoke(
+            positions=[self.page("positions", [self.position("PART", "6", "-4")])],
+            orders=[self.page("orders", [
+                self.order("order-sell", "PART", "sell", [
+                    self.execution("exec-sell", "90", "4")
+                ])
+            ])],
+            quotes=[{"data": {"results": [self.quote("PART", "95.0001", "100")]}}],
+            total_value="1000",
+            halt_pct="7",
+        )
+        self.assertEqual(clear["daily_pnl"], "-69.9994")
+        self.assertEqual(clear["status"], "clear")
+
+    def test_same_day_round_trip_needs_no_quote_and_charges_execution_fees_once(self):
+        result = self.invoke(
+            orders=[self.page("orders", [
+                self.order("order-buy", "ROUND", "buy", [
+                    self.execution("exec-buy", "10", "10", fees="0.10")
+                ]),
+                self.order("order-sell", "ROUND", "sell", [
+                    self.execution("exec-sell", "9", "10", fees="0.10")
+                ]),
+            ], "")],
+            quotes=[],
+        )
+        self.assertEqual(result["required_quote_symbols"], [])
+        self.assertEqual(result["daily_pnl"], "-10.2")
+        self.assertEqual(result["status"], "clear")
+
+    def test_newer_nonregular_quote_is_the_current_mark(self):
+        result = self.invoke(
+            positions=[self.page("positions", [self.position("LATE", "1", "0")])],
+            quotes=[{"data": {"results": [
+                self.quote("LATE", "100", "100", nonreg="90")
+            ]}}],
+            total_value="100",
+            halt_pct="10",
+        )
+        detail = result["reconciliation"]["symbols"][0]
+        self.assertEqual(detail["current_price"], "90")
+        self.assertEqual(detail["current_price_source"], "last_non_reg_trade")
+        self.assertEqual(result["daily_pnl"], "-10")
+        self.assertEqual(result["status"], "tripped")
+
+    def test_incomplete_pagination_and_intraday_mismatch_fail_closed(self):
+        incomplete = self.invoke(
+            orders=[self.page("orders", [], "https://example.test/orders?cursor=missing")],
+            expected_success=False,
+        )
+        self.assertIn("final page unexpectedly has next", incomplete.stderr)
+
+        repeated_cursor = self.invoke(
+            orders=[
+                self.page(
+                    "orders",
+                    [],
+                    "https://example.test/orders?cursor=repeated",
+                ),
+                self.page(
+                    "orders",
+                    [],
+                    "https://example.test/orders?cursor=repeated",
+                ),
+                self.page("orders", []),
+            ],
+            expected_success=False,
+        )
+        self.assertIn("repeated next cursor", repeated_cursor.stderr)
+
+        mismatch = self.invoke(
+            positions=[self.page("positions", [self.position("BAD", "10", "5")])],
+            orders=[self.page("orders", [
+                self.order("order-buy", "BAD", "buy", [
+                    self.execution("exec-buy", "10", "4")
+                ])
+            ])],
+            expected_success=False,
+        )
+        self.assertIn("do not equal intraday_quantity", mismatch.stderr)
+
+    def test_wrong_close_date_and_nonfinite_portfolio_fail_closed(self):
+        wrong_close = self.invoke(
+            positions=[self.page("positions", [self.position("OLD", "1", "0")])],
+            quotes=[{"data": {"results": [
+                self.quote("OLD", "9", "10", close_date="2026-07-29")
+            ]}}],
+            expected_success=False,
+        )
+        self.assertIn("expected 2026-07-30", wrong_close.stderr)
+
+        nonfinite = self.invoke(total_value=float("nan"), expected_success=False)
+        self.assertIn("non-finite JSON constant", nonfinite.stderr)
+
+    def test_discovery_mode_outputs_the_reconciled_quote_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            positions_path = os.path.join(td, "positions.json")
+            orders_path = os.path.join(td, "orders.json")
+            symbols_path = os.path.join(td, "symbols.json")
+            with open(positions_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    self.page("positions", [self.position("HELD", "2", "0")]),
+                    f,
+                )
+            with open(orders_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    self.page("orders", [
+                        self.order("closed-order", "CLOSED", "sell", [
+                            self.execution("closed-execution", "9", "3")
+                        ])
+                    ]),
+                    f,
+                )
+            run_cli(
+                DAILY_LOSS,
+                [
+                    "--positions", positions_path,
+                    "--orders", orders_path,
+                    "--trading-date", self.TRADING_DATE,
+                    "--as-of-utc", self.AS_OF_UTC,
+                    "--symbols-out", symbols_path,
+                ],
+            )
+            with open(symbols_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), ["CLOSED", "HELD"])
+
+    def test_prior_day_execution_is_ignored_but_future_execution_fails(self):
+        ignored = self.invoke(
+            orders=[self.page("orders", [
+                self.order("old-order", "OLD", "buy", [
+                    self.execution(
+                        "old-execution",
+                        "10",
+                        "1",
+                        timestamp="2026-07-31T03:59:59.999999999Z",
+                    )
+                ])
+            ])],
+        )
+        self.assertEqual(ignored["daily_pnl"], "0")
+        self.assertEqual(ignored["reconciliation"]["today_execution_count"], 0)
+
+        future = self.invoke(
+            orders=[self.page("orders", [
+                self.order("future-order", "FUT", "buy", [
+                    self.execution(
+                        "future-execution",
+                        "10",
+                        "1",
+                        timestamp="2026-07-31T20:00:00.000000001Z",
+                    )
+                ])
+            ])],
+            expected_success=False,
+        )
+        self.assertIn("timestamp is later than as-of", future.stderr)
+
+    def test_conflicting_duplicate_execution_id_fails_closed(self):
+        conflict = self.invoke(
+            orders=[self.page("orders", [
+                self.order("order-one", "DUP", "buy", [
+                    self.execution("same-execution", "10", "1")
+                ]),
+                self.order("order-two", "DUP", "buy", [
+                    self.execution("same-execution", "11", "1")
+                ]),
+            ])],
+            expected_success=False,
+        )
+        self.assertIn("conflicting duplicate execution ID", conflict.stderr)
+
+    def test_missing_or_truncated_execution_list_fails_closed(self):
+        missing = self.order(
+            "filled-without-executions",
+            "CLOSED",
+            "sell",
+            [],
+            state="filled",
+            cumulative_quantity="5",
+        )
+        result = self.invoke(
+            orders=[self.page("orders", [missing])],
+            expected_success=False,
+        )
+        self.assertIn(
+            "execution quantities 0 do not equal cumulative_quantity 5",
+            result.stderr,
+        )
+
+        truncated = self.order(
+            "truncated-executions",
+            "PART",
+            "sell",
+            [self.execution("only-one", "10", "1")],
+            state="partially_filled",
+            cumulative_quantity="2",
+        )
+        result = self.invoke(
+            orders=[self.page("orders", [truncated])],
+            expected_success=False,
+        )
+        self.assertIn(
+            "execution quantities 1 do not equal cumulative_quantity 2",
+            result.stderr,
+        )
+
+        null_execution = self.order(
+            "null-execution",
+            "NULL",
+            "buy",
+            [None],
+            state="confirmed",
+            cumulative_quantity="0",
+        )
+        result = self.invoke(
+            orders=[self.page("orders", [null_execution])],
+            expected_success=False,
+        )
+        self.assertIn("null execution is indeterminate", result.stderr)
+
+    def test_future_and_stale_open_session_quotes_fail_closed(self):
+        position = [self.page(
+            "positions", [self.position("TIME", "1", "0")]
+        )]
+        future = self.invoke(
+            positions=position,
+            quotes=[{"data": {"results": [
+                self.quote(
+                    "TIME",
+                    "9",
+                    "10",
+                    last_time="2026-07-31T20:00:00.000000001Z",
+                )
+            ]}}],
+            expected_success=False,
+        )
+        self.assertIn("timestamp is later than as-of", future.stderr)
+
+        stale = self.invoke(
+            positions=position,
+            quotes=[{"data": {"results": [
+                self.quote(
+                    "TIME",
+                    "9",
+                    "10",
+                    last_time="2026-07-31T19:44:59Z",
+                )
+            ]}}],
+            expected_success=False,
+        )
+        self.assertIn("more than 15 minutes old", stale.stderr)
+
+    def test_unexpected_quote_and_oversized_quote_batch_fail_closed(self):
+        unexpected = self.invoke(
+            quotes=[{"data": {"results": [self.quote("EXTRA", "10", "10")]}}],
+            expected_success=False,
+        )
+        self.assertIn("unexpected quote result", unexpected.stderr)
+
+        too_many = [
+            self.quote(f"S{index}", "10", "10") for index in range(21)
+        ]
+        oversized = self.invoke(
+            positions=[self.page("positions", [self.position("S0", "1", "0")])],
+            quotes=[{"data": {"results": too_many}}],
+            expected_success=False,
+        )
+        self.assertIn("more than 20 results", oversized.stderr)
+
+    def test_routine_makes_helper_json_the_only_daily_loss_authority(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+        block = routine.split("### DAILY-LOSS CIRCUIT BREAKER", 1)[1].split(
+            "### RUN THESE STEPS IN ORDER", 1
+        )[0]
+        self.assertIn("SOLE authority is therefore `daily_loss.py`", block)
+        self.assertIn("use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter", block)
+        self.assertIn("Follow `data.next` until it is absent/empty", block)
+        self.assertIn("execution timestamp rather than order creation time", block)
+        self.assertIn("`intraday_quantity`", block)
+        self.assertIn("`adjusted_previous_close`", block)
+        self.assertIn("`cumulative_quantity`", block)
+        self.assertIn("Null rows/elements are indeterminate", block)
+        self.assertIn("DAILY-LOSS DISCOVERY", block)
+        self.assertIn("DAILY-LOSS FINAL", block)
+        self.assertIn(
+            "separate set of FINAL raw files",
+            block,
+        )
+        self.assertIn("Never evaluate with the earlier discovery files", block)
+        self.assertIn(
+            "--portfolio <FINAL raw portfolio file>",
+            block,
+        )
+        self.assertIn("at most 15 minutes old", block)
+        self.assertIn(
+            "`as_of_utc` exactly DAILY-LOSS FINAL's `utc`",
+            block,
+        )
+        self.assertIn("`schema_version` exactly `1`", block)
+        self.assertIn("make no new buys", block)
+        self.assertIn("NEVER feed its result into `daily_loss.py`", block)
+        self.assertNotIn("compute trailing-day P&L", block)
+        snapshot = routine.split("**Publish the STATUS SNAPSHOT", 1)[1].split(
+            "The filename is exactly:", 1
+        )[0]
+        self.assertIn("or null only when that telemetry call failed twice", snapshot)
+        self.assertIn("<clear|tripped|indeterminate>", snapshot)
+
+        with open(
+            os.path.join(ROOT, "dashboard", "index.html"),
+            encoding="utf-8",
+        ) as f:
+            dashboard = f.read()
+        self.assertIn('typeof n === "number" && Number.isFinite(n)', dashboard)
+        self.assertIn('"unavailable"', dashboard)
+
+        scratch_creation = routine.index(
+            "create one NEW session-scoped scratch directory"
+        )
+        self.assertLess(
+            scratch_creation,
+            routine.index("### DAILY-LOSS CIRCUIT BREAKER"),
+        )
+        scan_phase = routine.split("6. `run_scan`", 1)[1].split(
+            "**FOURTH", 1
+        )[0]
+        self.assertIn(
+            "Reuse the NEW session-scoped scratch directory already created",
+            scan_phase,
+        )
 
 
 class EvaluateCandidatesTests(unittest.TestCase):
@@ -867,6 +1405,8 @@ class MarketClockTests(unittest.TestCase):
         c = self.clock("2026-07-21T15:07:00Z")
         self.assertEqual(c["et"], "2026-07-21 11:07:00 EDT")
         self.assertEqual(c["pt"], "2026-07-21 08:07:00 PDT")
+        self.assertEqual(c["date_et"], "2026-07-21")
+        self.assertEqual(c["date_pt"], "2026-07-21")
         self.assertEqual(c["session"], "regular")
         self.assertEqual(c["calendar_status"], "normal")
         self.assertEqual(c["regular_close_et"], "16:00")
@@ -1201,7 +1741,16 @@ class MarketClockTests(unittest.TestCase):
     def test_pacific_trading_day_rolls_before_utc_day(self):
         # 2026-07-22 03:00Z is still 2026-07-21 in Pacific — the date used
         # for "filled today" counting must be the Pacific one.
-        self.assertEqual(self.clock("2026-07-22T03:00:00Z")["date_pt"], "2026-07-21")
+        clock = self.clock("2026-07-22T03:00:00Z")
+        self.assertEqual(clock["date_pt"], "2026-07-21")
+        self.assertEqual(clock["date_et"], "2026-07-21")
+
+    def test_eastern_broker_date_can_lead_pacific_report_date(self):
+        # 04:30Z in summer is 00:30 ET but still 21:30 PT on the prior date.
+        # The daily-loss helper must use date_et; report filenames keep date_pt.
+        clock = self.clock("2026-07-22T04:30:00Z")
+        self.assertEqual(clock["date_et"], "2026-07-22")
+        self.assertEqual(clock["date_pt"], "2026-07-21")
 
 
 if __name__ == "__main__":

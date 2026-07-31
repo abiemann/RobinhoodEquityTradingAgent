@@ -102,8 +102,12 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const fmt$ = n => (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
-const cls = n => n > 0 ? "pos" : n < 0 ? "neg" : "";
+const fmt$ = n => typeof n === "number" && Number.isFinite(n)
+  ? (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2)
+  : "unavailable";
+const cls = n => typeof n === "number" && Number.isFinite(n)
+  ? (n > 0 ? "pos" : n < 0 ? "neg" : "")
+  : "";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const getJSON = u => fetch(u, { cache: "no-store" }).then(r => r.json());
 const sgn$ = n => (n > 0 ? "+" : n < 0 ? "-" : "") + "$" + Math.abs(n).toFixed(2);
