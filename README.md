@@ -122,9 +122,9 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 
 ## First-time app setup
 
-### Robinhood MCP connector (CODEX)
+### Robinhood MCP connector (CHATGPT/CODEX)
 
-In Codex, open **Settings → Plugins → MCP → Add server** and enter:
+In ChatGPT/Codex, open **Settings → Plugins → MCP → Add server** and enter:
 
 | Field | Value |
 |---|---|
@@ -135,11 +135,11 @@ In Codex, open **Settings → Plugins → MCP → Add server** and enter:
 Save the connector, then:
 
 1. Complete Robinhood's authorization flow.
-2. Restart Codex so the MCP settings take effect.
+2. Restart ChatGPT/Codex so the MCP settings take effect.
 
 A successful setup exposes tools such as `get_accounts`.
 
-![Codex Robinhood MCP connector configuration](images/codex-robinhood-mcp-connector.png)
+![ChatGPT/Codex Robinhood MCP connector configuration](images/codex-robinhood-mcp-connector.png)
 
 ### Robinhood MCP connector (CLAUDE)
 
