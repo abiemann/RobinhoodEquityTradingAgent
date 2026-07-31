@@ -1151,14 +1151,22 @@ class MarketClockTests(unittest.TestCase):
 
         schema = routine.split("### BROKER ORDER OBJECTS", 1)[1].split("### TRADE LEDGER", 1)[0]
         self.assertIn("Canonical equity stop-market payload", schema)
-        self.assertIn('"type": "market"', schema)
-        self.assertIn('"trigger": "stop"', schema)
-        self.assertIn('"stop_price": "<two-decimal price>"', schema)
-        self.assertIn('"time_in_force": "gtc"', schema)
+        canonical_input = schema.split(
+            "**Canonical equity stop-market payload", 1
+        )[1].split("**Returned-order stop predicate", 1)[0]
+        self.assertIn('"type": "stop_market"', canonical_input)
+        self.assertIn('"stop_price": "<two-decimal price>"', canonical_input)
+        self.assertIn('"time_in_force": "gtc"', canonical_input)
+        self.assertNotIn('"trigger": "stop"', canonical_input)
+        self.assertIn("Add a fresh `ref_id` only to `place_equity_order`", canonical_input)
+        self.assertIn("`review_equity_order` has no `ref_id` input", canonical_input)
         self.assertNotIn('"type": "stop"', routine)
+        self.assertNotIn("dollar_based_amount", routine)
 
         placement = routine.split("### SESSION-AWARE ORDER STYLE", 1)[1].split("### DAILY-LOSS", 1)[0]
         self.assertIn("Canonical equity stop-market payload", placement)
+        self.assertIn('"dollar_amount": "<effective order size', placement)
+        self.assertIn('including `type: "stop_market"` and `stop_price`, with no `trigger` input', placement)
         retry = routine.split("**Verify every stop after placing it", 1)[1].split("**ALERTS.md", 1)[0]
         self.assertIn("Canonical-stop requirement for every retry", retry)
         self.assertIn("Canonical equity stop-market payload", retry)
@@ -1170,6 +1178,11 @@ class MarketClockTests(unittest.TestCase):
         whole_share_guard = routine.split("**Whole-share stop guard", 1)[1].split("12. After a buy fills:", 1)[0]
         self.assertIn("do NOT submit a zero-share stop", whole_share_guard)
         self.assertIn("`confirmed` or `queued` (active/working stops)", schema)
+        self.assertIn('`type == "stop_market"`', schema)
+        self.assertIn('`type == "stop_limit"`', schema)
+        self.assertIn('`type == "market"` and `trigger == "stop"`', schema)
+        self.assertIn("Never infer a stop from `stop_price` alone", schema)
+        self.assertIn("makes stop classification INDETERMINATE", schema)
 
     def test_routine_requires_full_stop_quantity_coverage(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

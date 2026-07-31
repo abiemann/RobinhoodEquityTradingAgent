@@ -107,7 +107,7 @@ It is a separate file for a practical reason. The routine document is executed b
 1. Leave `DRY_RUN = true` and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
-4. In dry run, confirm the broker accepts the documented order flows. The stop-market payload is already canonical — `type: "market"` plus `trigger: "stop"`, never a stop type — so do not rediscover or improvise stop fields during a live run; a review alert is a safety failure to report, not a reason to try another schema.
+4. In dry run, confirm the broker accepts the documented order flows. The current connector's canonical stop-market payload uses `type: "stop_market"` plus `stop_price`, with no `trigger` input — so do not rediscover or improvise stop fields during a live run; a review alert is a safety failure to report, not a reason to try another schema.
 5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `constants.md` (an uncommitted edit).
 
 ## Deterministic layer

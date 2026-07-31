@@ -109,12 +109,21 @@ parse error must never abort a safety check, hence the string-comparison rule.
 ## BROKER ORDER OBJECTS — the schema block
 
 **2026-07-20.** A run discovered it had been filtering `get_equity_orders` on a nonexistent
-`order_id` field and on `type == "stop"` — the real field is `id`, and stops are `type: "market"`
-with `trigger: "stop"`. Every order filter in the routine (stop-coverage audit, stop-count guard,
-re-entry cooldown, stop-fill discovery, ledger dedupe) depended on that wrong shape. Fixed by
-documenting the verified schema once (commit `224b125`).
+`order_id` field and on `type == "stop"` — the real id field was `id`, and the returned stop shape
+observed at the time was `type: "market"` with `trigger: "stop"`. Every order filter in the routine
+(stop-coverage audit, stop-count guard, re-entry cooldown, stop-fill discovery, ledger dedupe)
+depended on that wrong shape. Fixed by documenting the then-verified schema once (commit `224b125`).
 
-**2026-07-29, stop-payload schema contradiction (P1 review finding).** The same document later told order placement to send a stop type, contradicting the verified market-plus-stop-trigger schema above. A live agent could therefore choose the rejected shape while attempting protection. The routine now has one canonical stop-market payload for both review and placement: market type, stop trigger, stop price, whole-share quantity, regular-hours session, and GTC time in force.
+**2026-07-29, stop-payload schema contradiction (P1 review finding).** The same document later told order placement to send a stop type, contradicting the market-plus-stop-trigger connector input observed at the time. A live agent could therefore choose the rejected shape while attempting protection. The routine was consolidated around that connector contract.
+
+**2026-07-31, connector order-contract drift.** The connector input schema changed again:
+regular-hours notional market orders now use `dollar_amount`, and stop orders use
+`type: "stop_market"` plus `stop_price`; `dollar_based_amount` and the stop-order `trigger` input
+are no longer accepted. The routine and its contract tests had pinned the older fields, which could
+reject a buy or protective-stop repair. Updated every order payload to the current contract and
+made returned-order filtering tolerate both normalized `type: "stop_market"` results and the
+older broker-returned `type: "market"` plus `trigger: "stop"` shape without inferring stops from
+`stop_price` alone.
 
 ## TRADE LEDGER — rules_version and `--no-optional-locks`
 
