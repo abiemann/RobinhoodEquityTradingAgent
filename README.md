@@ -58,6 +58,8 @@ All tunable values live in **`constants.md`** next to the routine document — e
 
 ## Tested On
 
+The preferred models are **Claude Sonnet 4.6** and **Codex Luna 5.6 (high)**. If neither is available, let the framework select a **medium-strength** general-purpose model.
+
 | AI | Model / configuration |
 |---|---|
 | Claude | Sonnet 4.6 |
@@ -159,7 +161,7 @@ A successful setup exposes tools such as `get_accounts`.
 
 ### Scheduled Task
 
-Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use a capable model. The prompt can be:
+Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use **Claude Sonnet 4.6** or **Codex Luna 5.6 (high)**. If neither preferred model is available, let the framework select a medium-strength general-purpose model. The prompt can be:
 
 > Read `\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 

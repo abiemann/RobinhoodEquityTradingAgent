@@ -3,7 +3,7 @@
 **Description:** Read-only market-data tool. Once per day after the market closes, it scans the day's most-active stocks and reports which PRICE BANDS gained and lost the most — always in **percent** (a $2 stock and a $200 stock compare fairly), never raw dollars. Its output helps evaluate which band the momentum routine should hunt in.
 
 ## Runtime requirement — model
-Run on **Claude Sonnet**, like the momentum routine: this is instruction-following and tool orchestration, not deep reasoning.
+Prefer **Claude Sonnet 4.6** or **Codex Luna 5.6 (high)**, like the momentum routine. If neither preferred model exists in the framework, let it select a **medium-strength** general-purpose model; this is instruction-following and tool orchestration, not deep reasoning.
 
 ## Run window
 Run AFTER the US market close (1:00 PM PT) and BEFORE 5:00 PM PT. At 5:00 PM PT (8:00 PM ET) Robinhood's overnight 24/5 session opens — the venue carrying Asia-hours trading of US-listed stocks — and its thin prints would contaminate `Last` / `% Change` and possibly the relative-volume sample. Recommended schedule: **~1:05 PM PT, Mon–Fri**. If a run happens outside this window anyway, say so prominently in the log.
