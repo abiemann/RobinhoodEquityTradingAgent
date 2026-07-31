@@ -45,6 +45,9 @@
   .badge { font-size:11px; padding:1px 8px; border-radius:8px; }
   .badge.ok { background:#1c3529; color:var(--green); }
   .badge.warn { background:#3a1f1d; color:var(--red); font-weight:600; }
+  .profit-stars { display:inline-block; margin-right:6px; font-size:12px;
+                  line-height:0; letter-spacing:-2px; vertical-align:1px;
+                  white-space:nowrap; }
   .empty { color:var(--dim); font-style:italic; }
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
   .hint { text-transform:none; letter-spacing:0; font-weight:400; }
@@ -249,11 +252,26 @@ function renderEras(rows) {
     eras.set(r.ver, e);
   }
   if (!eras.size) return;
-  const trs = [...eras]
-    .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first))
+  const ordered = [...eras]
+    .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first));
+  const starCounts = new Map(
+    ordered
+      .map(([version, era], displayOrder) => ({ version, profit: era.sum, displayOrder }))
+      .filter(era => era.profit > 0)
+      .sort((a, b) => b.profit - a.profit || a.displayOrder - b.displayOrder)
+      .slice(0, 3)
+      .map((era, rank) => [era.version, 3 - rank])
+  );
+  const rankLabels = ["Largest", "Second-largest", "Third-largest"];
+  const trs = ordered
     .map(([v, e]) => {
       const dates = e.first === e.last ? e.first : `${e.first} → ${e.last}`;
-      return `<tr><td>${esc(v)}</td><td>${dates}</td><td>${e.buys}</td><td>${e.sells}</td><td>${e.stops}</td><td class="${cls(e.sum)}">${fmt$(e.sum)}</td></tr>`;
+      const starCount = starCounts.get(v) ?? 0;
+      const rank = starCount ? 3 - starCount : -1;
+      const stars = starCount
+        ? `<span class="profit-stars" role="img" aria-label="${rankLabels[rank]} realized profit" title="${rankLabels[rank]} realized profit">${"⭐".repeat(starCount)}</span>`
+        : "";
+      return `<tr><td>${esc(v)}</td><td>${dates}</td><td>${e.buys}</td><td>${e.sells}</td><td>${e.stops}</td><td class="${cls(e.sum)}">${stars}${fmt$(e.sum)}</td></tr>`;
     }).join("");
   $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${trs}</table>`;
 }
