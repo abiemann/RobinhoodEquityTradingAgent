@@ -19,7 +19,17 @@
   .pill { font-size:12px; padding:2px 10px; border-radius:10px;
           background:var(--panel); border:1px solid var(--line); color:var(--dim); }
   .pill.stale { color:var(--amber); border-color:var(--amber); }
-  .pill.live-mode { color:var(--red); border-color:var(--red); }
+  .pill.live-mode { display:inline-block; color:var(--red); border-color:var(--red);
+                    transform-origin:center;
+                    animation:live-sign-spin 4.5s ease-in-out infinite;
+                    will-change:transform; }
+  @keyframes live-sign-spin {
+    0%, 55% { transform:perspective(140px) rotateY(0deg); }
+    85%, 100% { transform:perspective(140px) rotateY(360deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pill.live-mode { animation:none; }
+  }
   section { background:var(--panel); border:1px solid var(--line); border-radius:8px;
             padding:16px; margin-bottom:16px; }
   .cards { display:flex; gap:24px; flex-wrap:wrap; }
@@ -94,6 +104,8 @@ function banner(msg) {
 
 function renderSnapshot(snap) {
   if (snap.schema_version !== 1) {
+    $("mode").textContent = "UNKNOWN";
+    $("mode").className = "pill";
     banner(`Snapshot schema_version ${esc(snap.schema_version)} is not supported by this dashboard (expects 1). Refusing to render it — update dashboard/index.html.`);
     return;
   }
@@ -242,7 +254,10 @@ async function refresh() {
     const latest = await getJSON("/api/latest");
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
-    else $("mode").textContent = "no snapshot yet";
+    else {
+      $("mode").textContent = "no snapshot yet";
+      $("mode").className = "pill";
+    }
     const idx = await getJSON("/api/index");
     const rows = parseLedger(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
     await renderRuns(idx.status, rows);
