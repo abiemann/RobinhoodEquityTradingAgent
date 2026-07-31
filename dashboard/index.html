@@ -19,6 +19,7 @@
   .pill { font-size:12px; padding:2px 10px; border-radius:10px;
           background:var(--panel); border:1px solid var(--line); color:var(--dim); }
   .pill.stale { color:var(--amber); border-color:var(--amber); }
+  .pill.dry-mode { color:var(--green); border-color:var(--green); }
   .pill.live-mode { display:inline-block; color:var(--red); border-color:var(--red);
                     transform-origin:center;
                     animation:live-sign-spin 4.5s ease-in-out infinite;
@@ -102,15 +103,24 @@ function banner(msg) {
   $("banner").innerHTML = `<section class="error">${esc(msg)}</section>`;
 }
 
+function renderMode(config) {
+  const mode = $("mode");
+  if (typeof config.dry_run !== "boolean") {
+    mode.textContent = "UNKNOWN";
+    mode.className = "pill";
+    banner(config.error || "Current DRY_RUN setting is unavailable.");
+    return;
+  }
+  mode.textContent = config.dry_run ? "DRY" : "LIVE";
+  mode.className = "pill " + (config.dry_run ? "dry-mode" : "live-mode");
+  mode.title = "Current constants.md setting";
+}
+
 function renderSnapshot(snap) {
   if (snap.schema_version !== 1) {
-    $("mode").textContent = "UNKNOWN";
-    $("mode").className = "pill";
     banner(`Snapshot schema_version ${esc(snap.schema_version)} is not supported by this dashboard (expects 1). Refusing to render it — update dashboard/index.html.`);
     return;
   }
-  $("mode").textContent = snap.dry_run ? "DRY RUN" : "LIVE";
-  $("mode").className = "pill" + (snap.dry_run ? "" : " live-mode");
   $("rules").textContent = "rules " + snap.rules_version;
 
   const ageMin = Math.round((Date.now() - new Date(snap.run_start_pt).getTime()) / 60000);
@@ -251,13 +261,10 @@ function renderEras(rows) {
 async function refresh() {
   try {
     $("banner").innerHTML = "";
+    renderMode(await getJSON("/api/config"));
     const latest = await getJSON("/api/latest");
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
-    else {
-      $("mode").textContent = "no snapshot yet";
-      $("mode").className = "pill";
-    }
     const idx = await getJSON("/api/index");
     const rows = parseLedger(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
     await renderRuns(idx.status, rows);

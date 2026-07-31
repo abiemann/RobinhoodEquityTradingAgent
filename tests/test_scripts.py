@@ -777,6 +777,7 @@ class DashboardServerTests(unittest.TestCase):
         os.makedirs(os.path.join(self.repo, "run-reports"))
         for name, content in (
             ("README.md", "private dashboard test fixture"),
+            ("constants.md", "| `DRY_RUN` | `true` | test mode |"),
             ("trade-ledger.csv", "symbol,price\\nTEST,1.00\\n"),
             (os.path.join("dashboard", "index.html"), "<h1>Dashboard fixture</h1>"),
             (os.path.join("run-reports", "rhmra-status-test.json"), "{}"),
@@ -832,6 +833,26 @@ class DashboardServerTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/trade-ledger.csv")[0], 200)
         self.assertEqual(self.request("GET", "/README.md")[0], 403)
         self.assertEqual(self.request("GET", "/dashboard/index.html", host="example.test")[0], 403)
+
+    def test_config_reports_current_dry_run_setting_and_fails_closed(self):
+        status, body = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"dry_run": True})
+
+        constants_path = os.path.join(self.repo, "constants.md")
+        with open(constants_path, "w", encoding="utf-8") as f:
+            f.write("| `DRY_RUN` | `false` | live mode |")
+        status, body = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"dry_run": False})
+
+        with open(constants_path, "w", encoding="utf-8") as f:
+            f.write("| `DRY_RUN` | `maybe` | malformed |")
+        status, body = self.request("GET", "/api/config")
+        document = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertIsNone(document["dry_run"])
+        self.assertIn("exactly one valid DRY_RUN row", document["error"])
 
 
 class MarketClockTests(unittest.TestCase):

@@ -9,10 +9,11 @@ off-machine. Serves exactly three things and refuses everything else:
   /run-reports/...     telemetry the runs publish (status + gates JSON, reports)
   /trade-ledger.csv    the append-only fill ledger
 
-plus two conveniences so the page never has to guess filenames:
+plus three conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
+  /api/config          {"dry_run": true|false} current constants.md setting
 
 Run:   python3 dashboard/serve.py   (Windows: py -3 dashboard\\serve.py)
        then open http://127.0.0.1:8765/
@@ -27,6 +28,7 @@ import glob
 import json
 import os
 import posixpath
+import re
 import sys
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +43,27 @@ ALLOWED_EXACT = ("/trade-ledger.csv",)
 def _reports(pattern):
     files = glob.glob(os.path.join(REPO, "run-reports", pattern))
     return sorted(os.path.basename(f) for f in files)
+
+
+def _dry_run_config():
+    """Return the current DRY_RUN value without exposing the full config file."""
+    try:
+        with open(os.path.join(REPO, "constants.md"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {"dry_run": None, "error": "constants.md is unreadable"}
+
+    matches = re.findall(
+        r"^\|\s*`DRY_RUN`\s*\|\s*`(true|false)`\s*\|",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if len(matches) != 1:
+        return {
+            "dry_run": None,
+            "error": "constants.md must contain exactly one valid DRY_RUN row",
+        }
+    return {"dry_run": matches[0].lower() == "true"}
 
 
 def _canonical_request_path(request_path):
@@ -123,6 +146,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/index":
             return self._json({"status": _reports("rhmra-status-*.json"),
                                "gates": _reports("rhmra-gates-*.json")})
+        if path == "/api/config":
+            return self._json(_dry_run_config())
         if path == "/api/latest":
             names = _reports("rhmra-status-*.json")
             if not names:
