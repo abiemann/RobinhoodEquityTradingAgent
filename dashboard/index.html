@@ -48,6 +48,12 @@
   .profit-stars { display:inline-block; margin-right:6px; font-size:12px;
                   line-height:0; letter-spacing:-2px; vertical-align:1px;
                   white-space:nowrap; }
+  .show-more-eras { display:block; margin:12px auto 0; padding:5px 12px;
+                    border:1px solid var(--blue); border-radius:6px;
+                    background:transparent; color:var(--text); font:inherit;
+                    cursor:pointer; }
+  .show-more-eras:hover { background:#232a33; }
+  .show-more-eras:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
   .empty { color:var(--dim); font-style:italic; }
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
   .hint { text-transform:none; letter-spacing:0; font-weight:400; }
@@ -101,6 +107,9 @@ const cls = n => n > 0 ? "pos" : n < 0 ? "neg" : "";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const getJSON = u => fetch(u, { cache: "no-store" }).then(r => r.json());
 const sgn$ = n => (n > 0 ? "+" : n < 0 ? "-" : "") + "$" + Math.abs(n).toFixed(2);
+const ERA_ROW_LIMIT = 12;
+let erasExpanded = false;
+let eraDateSignature = null;
 
 function banner(msg) {
   $("banner").innerHTML = `<section class="error">${esc(msg)}</section>`;
@@ -254,6 +263,13 @@ function renderEras(rows) {
   if (!eras.size) return;
   const ordered = [...eras]
     .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first));
+  const dateSignature = JSON.stringify(
+    ordered.map(([version, era]) => [version, era.first, era.last])
+  );
+  if (eraDateSignature !== null && dateSignature !== eraDateSignature) {
+    erasExpanded = false;
+  }
+  eraDateSignature = dateSignature;
   const starCounts = new Map(
     ordered
       .map(([version, era], displayOrder) => ({ version, profit: era.sum, displayOrder }))
@@ -263,7 +279,8 @@ function renderEras(rows) {
       .map((era, rank) => [era.version, 3 - rank])
   );
   const rankLabels = ["Largest", "Second-largest", "Third-largest"];
-  const trs = ordered
+  const visible = erasExpanded ? ordered : ordered.slice(0, ERA_ROW_LIMIT);
+  const trs = visible
     .map(([v, e]) => {
       const dates = e.first === e.last ? e.first : `${e.first} → ${e.last}`;
       const starCount = starCounts.get(v) ?? 0;
@@ -273,7 +290,15 @@ function renderEras(rows) {
         : "";
       return `<tr><td>${esc(v)}</td><td>${dates}</td><td>${e.buys}</td><td>${e.sells}</td><td>${e.stops}</td><td class="${cls(e.sum)}">${stars}${fmt$(e.sum)}</td></tr>`;
     }).join("");
-  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${trs}</table>`;
+  const remaining = ordered.length - visible.length;
+  const showMore = remaining
+    ? `<button id="show-more-eras" class="show-more-eras" type="button">Click to show ${remaining} more...</button>`
+    : "";
+  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${trs}</table>${showMore}`;
+  $("show-more-eras")?.addEventListener("click", () => {
+    erasExpanded = true;
+    renderEras(rows);
+  });
 }
 
 async function refresh() {
