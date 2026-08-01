@@ -3552,6 +3552,26 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("NOT DRY RUN", dry_run)
         self.assertIn("never substitute `true`", dry_run)
 
+    def test_routine_keeps_automation_memory_bounded_and_non_authoritative(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        memory_policy = routine.split(
+            "**AUTOMATION MEMORY IS BOUNDED AND NEVER AUTHORITATIVE:**", 1
+        )[1].split("**Scratch hygiene:**", 1)[0]
+        self.assertIn("every run is stateless with respect to `memory.md`", memory_policy)
+        self.assertIn("Never use its contents for trading decisions", memory_policy)
+        self.assertIn("replace its entire contents; never append", memory_policy)
+        self.assertIn("Write exactly one line", memory_policy)
+        self.assertIn("Store no candidates, scan counts, balances", memory_policy)
+
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("Treat every run as stateless", readme)
+        self.assertIn("never append scan or account details", readme)
     def test_routine_uses_machine_readable_scan_handoff(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()

@@ -167,6 +167,8 @@ A successful setup exposes tools such as `get_accounts`.
 
 Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use **Claude Sonnet 4.6** or **Codex Luna 5.6 (high)**. If neither preferred model is available, let the framework select a medium-strength general-purpose model. The prompt can be:
 
+> Treat every run as stateless: never use automation memory for trading decisions or prior-run state. If the automation framework requires `memory.md`, overwrite it with only the one-line report/status pointer specified by the routine; never append scan or account details.
+>
 > Read `\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 
 For the recurring schedule, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. Keep the computer awake while the task is expected to run. Before enabling live orders, keep `DRY_RUN = true` and leave `place_equity_order` set to **Needs approval**.
