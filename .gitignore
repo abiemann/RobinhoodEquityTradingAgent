@@ -8,3 +8,4 @@ __pycache__/
 ALERTS.md
 HANDOFF.md
 .handoffs/
+.vs/

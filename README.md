@@ -128,6 +128,8 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 
 ### Robinhood MCP connector (CHATGPT/CODEX)
 
+> **ChatGPT users:** switch to **Codex mode** before running this project for the best experience with local project files, tool activity, and generated reports.
+
 In ChatGPT/Codex, open **Settings → Plugins → MCP → Add server** and enter:
 
 | Field | Value |
