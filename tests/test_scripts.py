@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ SCANNER = os.path.join(ROOT, "tools", "price_band_scanner.py")
 FILTER = os.path.join(ROOT, "filter_scan.py")
 CLOCK = os.path.join(ROOT, "market_clock.py")
 RUN_LOCK = os.path.join(ROOT, "run_lock.py")
+ORDER_INTENTS = os.path.join(ROOT, "order_intents.py")
 DAILY_LOSS = os.path.join(ROOT, "daily_loss.py")
 VALIDATE_CONSTANTS = os.path.join(ROOT, "validate_constants.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
@@ -733,6 +735,36 @@ class DailyLossTests(unittest.TestCase):
         )
         self.assertIn("null execution is indeterminate", result.stderr)
 
+    def test_async_cancel_and_partial_rest_cancelled_states_are_reconciled(self):
+        result = self.invoke(
+            positions=[self.page(
+                "positions", [self.position("PART", "2", "2")]
+            )],
+            orders=[self.page("orders", [
+                self.order(
+                    "partial-rest-cancelled",
+                    "PART",
+                    "buy",
+                    [self.execution("partial-fill", "9", "2")],
+                    state="partially_filled_rest_cancelled",
+                ),
+                self.order(
+                    "cancel-pending",
+                    "WAIT",
+                    "buy",
+                    [],
+                    state="pending_cancelled",
+                    cumulative_quantity="0",
+                ),
+            ])],
+            quotes=[{"data": {"results": [
+                self.quote("PART", "10", "8")
+            ]}}],
+        )
+        self.assertEqual(result["daily_pnl"], "2")
+        self.assertEqual(result["reconciliation"]["unique_order_count"], 2)
+        self.assertEqual(result["reconciliation"]["today_execution_count"], 1)
+
     def test_future_and_stale_open_session_quotes_fail_closed(self):
         position = [self.page(
             "positions", [self.position("TIME", "1", "0")]
@@ -1400,6 +1432,1482 @@ class FilterScanTests(unittest.TestCase):
             self.run_filter([row])
 
 
+class OrderIntentTests(unittest.TestCase):
+    RUN_TOKEN = "11111111-1111-4111-8111-111111111111"
+    OTHER_RUN_TOKEN = "22222222-2222-4222-8222-222222222222"
+    BASELINE_ORDER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    def invoke(self, state_file, action, *args, expected_success=True, now=None):
+        command = [
+            sys.executable,
+            ORDER_INTENTS,
+            action,
+            "--state-file",
+            state_file,
+        ]
+        if now is not None:
+            command += ["--now-utc", now]
+        command += list(args)
+        proc = subprocess.run(
+            command, capture_output=True, text=True, cwd=ROOT
+        )
+        try:
+            document = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.fail(
+                f"order_intents.py emitted non-JSON stdout: {proc.stdout!r}; "
+                f"stderr={proc.stderr!r}"
+            )
+        self.assertEqual(proc.stderr, "")
+        if expected_success:
+            self.assertEqual(proc.returncode, 0, document)
+            self.assertTrue(document["ok"])
+        else:
+            self.assertNotEqual(proc.returncode, 0, document)
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["reason"], "order_intent_state_error")
+        return document
+
+    @staticmethod
+    def write_json(directory, name, value):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        return path
+
+    def intent(
+        self,
+        *,
+        purpose="dip-buy",
+        order=None,
+        run_token=None,
+        position_quantity="0",
+        baseline_ids=None,
+        replaces_intent_id=None,
+    ):
+        if order is None:
+            order = {
+                "symbol": "TEST",
+                "side": "buy",
+                "type": "market",
+                "dollar_amount": "100.00",
+                "market_hours": "regular_hours",
+                "time_in_force": "gfd",
+            }
+        return {
+            "schema_version": 1,
+            "account_name": "Agentic",
+            "run_token": run_token or self.RUN_TOKEN,
+            "run_start_utc": "2026-07-31T16:00:00Z",
+            "rules_version": "abcdef1",
+            "constants_sha256": "a" * 64,
+            "purpose": purpose,
+            "replaces_intent_id": replaces_intent_id,
+            "order": order,
+            "baseline": {
+                "observed_at_utc": "2026-07-31T16:00:01Z",
+                "position_quantity": position_quantity,
+                "symbol_order_ids": (
+                    [self.BASELINE_ORDER_ID]
+                    if baseline_ids is None
+                    else baseline_ids
+                ),
+            },
+        }
+
+    @staticmethod
+    def broker_order(
+        *,
+        order_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        symbol="TEST",
+        side="buy",
+        order_type="market",
+        trigger="immediate",
+        state="filled",
+        quantity=None,
+        dollar_amount="100.00",
+        cumulative="5",
+        executions=None,
+        price=None,
+        stop_price=None,
+        market_hours="regular_hours",
+        time_in_force="gfd",
+        created_at="2026-07-31T16:00:02Z",
+    ):
+        if executions is None:
+            executions = [] if Decimal(cumulative) == 0 else [
+                {
+                    "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    "price": "20.00",
+                    "quantity": cumulative,
+                    "timestamp": "2026-07-31T16:00:03.12Z",
+                    "fees": "0.00",
+                }
+            ]
+        return {
+            "id": order_id,
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "trigger": trigger,
+            "state": state,
+            "quantity": quantity,
+            "dollar_based_amount": (
+                None
+                if dollar_amount is None
+                else {"amount": dollar_amount, "currency_code": "USD"}
+            ),
+            "cumulative_quantity": cumulative,
+            "executions": executions,
+            "price": price,
+            "stop_price": stop_price,
+            "market_hours": market_hours,
+            "time_in_force": time_in_force,
+            "placed_agent": "agentic",
+            "created_at": created_at,
+        }
+
+    def prepare(self, td, state, intent=None, name="intent.json"):
+        path = self.write_json(td, name, intent or self.intent())
+        return self.invoke(
+            state,
+            "prepare",
+            "--intent",
+            path,
+            now="2026-07-31T16:00:01Z",
+        )
+
+    def test_same_ref_is_persisted_for_one_immediate_retry_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            ref_id = prepared["ref_id"]
+            self.assertRegex(
+                ref_id,
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            )
+            self.assertEqual(prepared["intent_id"], ref_id)
+            self.assertEqual(prepared["place_order"]["ref_id"], ref_id)
+
+            begun = self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                ref_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            self.assertEqual(begun["attempt"], 1)
+            self.assertEqual(begun["place_order"], prepared["place_order"])
+            self.assertEqual(
+                begun["baseline_sha256"], prepared["baseline_sha256"]
+            )
+            self.assertEqual(begun["intent_sha256"], prepared["intent_sha256"])
+            self.invoke(
+                state,
+                "mark-unknown",
+                "--intent-id",
+                ref_id,
+                "--code",
+                "timeout",
+                now="2026-07-31T16:00:03Z",
+            )
+            premature = self.invoke(
+                state,
+                "retry",
+                "--intent-id",
+                ref_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                expected_success=False,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertIn("no-match reconciliation", premature["detail"])
+            empty_orders = self.write_json(
+                td,
+                "retry-orders.json",
+                {"data": {"orders": [], "next": None}},
+            )
+            empty_positions = self.write_json(
+                td,
+                "retry-positions.json",
+                {"data": {"positions": [], "next": None}},
+            )
+            reconciled = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                ref_id,
+                "--orders",
+                empty_orders,
+                "--positions",
+                empty_positions,
+                "--as-of-utc",
+                "2026-07-31T16:00:05Z",
+                now="2026-07-31T16:00:05Z",
+            )
+            self.assertFalse(reconciled["matched"])
+            self.assertEqual(reconciled["status"], "unknown")
+            pending = self.invoke(
+                state, "pending", "--run-token", self.RUN_TOKEN
+            )
+            self.assertTrue(pending["intents"][0]["same_run_retry_available"])
+            retried = self.invoke(
+                state,
+                "retry",
+                "--intent-id",
+                ref_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:06Z",
+            )
+            self.assertEqual(retried["attempt"], 2)
+            self.assertEqual(retried["place_order"], prepared["place_order"])
+            self.assertEqual(
+                retried["baseline_sha256"], prepared["baseline_sha256"]
+            )
+            self.assertEqual(
+                retried["intent_sha256"], prepared["intent_sha256"]
+            )
+            self.invoke(
+                state,
+                "mark-unknown",
+                "--intent-id",
+                ref_id,
+                "--code",
+                "transport_error",
+                now="2026-07-31T16:00:07Z",
+            )
+            third = self.invoke(
+                state,
+                "retry",
+                "--intent-id",
+                ref_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                expected_success=False,
+                now="2026-07-31T16:00:08Z",
+            )
+            self.assertIn("one same-run", third["detail"])
+            stale = self.invoke(
+                state,
+                "retry",
+                "--intent-id",
+                ref_id,
+                "--run-token",
+                self.OTHER_RUN_TOKEN,
+                expected_success=False,
+                now="2026-07-31T16:30:00Z",
+            )
+            self.assertIn("cross-run replay is forbidden", stale["detail"])
+
+    def test_acknowledgement_tracks_split_fill_and_normalized_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            executions = [
+                {
+                    "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    "price": "1.48",
+                    "quantity": "67",
+                    "timestamp": "2026-07-31T16:00:03.1Z",
+                    "fees": "0",
+                },
+                {
+                    "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    "price": "1.50",
+                    "quantity": "0.344596",
+                    "timestamp": "2026-07-31T16:00:03.22Z",
+                    "fees": "0.01",
+                },
+            ]
+            response = self.write_json(
+                td,
+                "response.json",
+                {
+                    "data": {
+                        "order": self.broker_order(
+                            cumulative="67.344596", executions=executions
+                        )
+                    }
+                },
+            )
+            ack = self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                intent_id,
+                "--response",
+                response,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertEqual(ack["status"], "resolved")
+            self.assertEqual(ack["filled_quantity"], "67.344596")
+            self.assertEqual(ack["whole_filled_quantity"], "67")
+            expected_average = (
+                Decimal("67") * Decimal("1.48")
+                + Decimal("0.344596") * Decimal("1.50")
+            ) / Decimal("67.344596")
+            self.assertEqual(ack["average_fill_price"], format(expected_average, "f"))
+            self.assertEqual(
+                ack["last_execution_at"], "2026-07-31T16:00:03.22Z"
+            )
+            self.assertTrue(ack["requires_stop_audit"])
+            self.assertTrue(ack["ledger_ready"])
+
+            stop_order = {
+                "symbol": "TEST",
+                "side": "sell",
+                "type": "stop_market",
+                "quantity": "67",
+                "stop_price": "1.40",
+                "market_hours": "regular_hours",
+                "time_in_force": "gtc",
+            }
+            stop_intent = self.intent(
+                purpose="initial-stop",
+                order=stop_order,
+                position_quantity="67.344596",
+            )
+            stop_prepared = self.prepare(
+                td, state, stop_intent, "stop-intent.json"
+            )
+            stop_id = stop_prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                stop_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:05Z",
+            )
+            stop_response = self.write_json(
+                td,
+                "stop-response.json",
+                {
+                    "data": {
+                        "order": self.broker_order(
+                            order_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                            side="sell",
+                            order_type="market",
+                            trigger="stop",
+                            state="confirmed",
+                            quantity="67.000000",
+                            dollar_amount=None,
+                            cumulative="0",
+                            stop_price="1.400000",
+                            time_in_force="gtc",
+                        )
+                    }
+                },
+            )
+            stop_ack = self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                stop_id,
+                "--response",
+                stop_response,
+                now="2026-07-31T16:00:06Z",
+            )
+            self.assertEqual(stop_ack["status"], "resolved")
+            self.assertEqual(stop_ack["outcome"], "active_stop")
+            self.assertEqual(stop_ack["stop_coverage_quantity"], "67.000000")
+
+    def test_crash_recovery_can_record_no_match_from_submitting(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            orders = self.write_json(
+                td,
+                "crash-recovery-orders.json",
+                {"data": {"orders": [], "next": None}},
+            )
+            positions = self.write_json(
+                td,
+                "crash-recovery-positions.json",
+                {"data": {"positions": [], "next": None}},
+            )
+            recovered = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                intent_id,
+                "--orders",
+                orders,
+                "--positions",
+                positions,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertFalse(recovered["matched"])
+            self.assertEqual(recovered["status"], "unknown")
+            pending = self.invoke(
+                state, "pending", "--run-token", self.OTHER_RUN_TOKEN
+            )
+            self.assertEqual(
+                pending["intents"][0]["last_error_code"],
+                "recovery_no_match",
+            )
+            self.assertFalse(
+                pending["intents"][0]["same_run_retry_available"]
+            )
+
+    def test_partial_buy_is_cancelled_then_observed_at_final_quantity(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            order = {
+                "symbol": "TEST",
+                "side": "buy",
+                "type": "market",
+                "quantity": "10",
+                "market_hours": "regular_hours",
+                "time_in_force": "gfd",
+            }
+            prepared = self.prepare(td, state, self.intent(order=order))
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            partial = self.broker_order(
+                state="partially_filled",
+                quantity="10.000000",
+                dollar_amount=None,
+                cumulative="3.000000",
+            )
+            partial_response = self.write_json(
+                td, "partial.json", {"data": {"order": partial}}
+            )
+            ack = self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                intent_id,
+                "--response",
+                partial_response,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertEqual(ack["status"], "partially_filled")
+            self.assertEqual(ack["remaining_quantity"], "7.000000")
+            self.assertTrue(ack["cancel_unfilled_remainder"])
+            self.assertFalse(ack["ledger_ready"])
+
+            final_executions = [
+                partial["executions"][0],
+                {
+                    "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    "price": "20.01",
+                    "quantity": "1.000000",
+                    "timestamp": "2026-07-31T16:00:05Z",
+                    "fees": "0",
+                },
+            ]
+            final_order = self.broker_order(
+                state="partially_filled_rest_cancelled",
+                quantity="10.000000",
+                dollar_amount=None,
+                cumulative="4.000000",
+                executions=final_executions,
+            )
+            orders_file = self.write_json(
+                td, "orders.json", {"data": {"orders": [final_order], "next": None}}
+            )
+            positions_file = self.write_json(
+                td,
+                "positions.json",
+                {"data": {"positions": [{"symbol": "TEST", "quantity": "4"}], "next": None}},
+            )
+            observed = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                intent_id,
+                "--orders",
+                orders_file,
+                "--positions",
+                positions_file,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertEqual(observed["status"], "resolved")
+            self.assertEqual(observed["filled_quantity"], "4.000000")
+            self.assertEqual(observed["position_quantity"], "4")
+            self.assertTrue(observed["requires_stop_audit"])
+            self.assertTrue(observed["ledger_ready"])
+
+    def test_unknown_reconciles_only_one_post_baseline_fingerprint(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            self.invoke(
+                state,
+                "mark-unknown",
+                "--intent-id",
+                intent_id,
+                "--code",
+                "transport_error",
+                now="2026-07-31T16:00:03Z",
+            )
+            candidate = self.broker_order()
+            orders_file = self.write_json(
+                td, "orders.json", {"data": {"orders": [candidate], "next": None}}
+            )
+            positions_file = self.write_json(
+                td,
+                "positions.json",
+                {"data": {"positions": [{"symbol": "TEST", "quantity": "5"}], "next": None}},
+            )
+            observed = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                intent_id,
+                "--orders",
+                orders_file,
+                "--positions",
+                positions_file,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertTrue(observed["matched"])
+            self.assertEqual(
+                observed["match_reason"], "unique_post_baseline_fingerprint"
+            )
+
+            second_state = os.path.join(td, "second.sqlite3")
+            second = self.prepare(td, second_state, name="second-intent.json")
+            second_id = second["intent_id"]
+            self.invoke(
+                second_state,
+                "begin",
+                "--intent-id",
+                second_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            duplicate = dict(candidate)
+            duplicate["id"] = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+            duplicate["created_at"] = "2026-07-31T16:00:04Z"
+            duplicate["executions"] = [dict(candidate["executions"][0])]
+            duplicate["executions"][0]["id"] = "99999999-9999-4999-8999-999999999999"
+            ambiguous_orders = self.write_json(
+                td,
+                "ambiguous-orders.json",
+                {"data": {"orders": [candidate, duplicate], "next": None}},
+            )
+            ambiguous = self.invoke(
+                second_state,
+                "observe",
+                "--intent-id",
+                second_id,
+                "--orders",
+                ambiguous_orders,
+                "--positions",
+                positions_file,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertFalse(ambiguous["matched"])
+            self.assertEqual(ambiguous["status"], "indeterminate")
+            self.assertEqual(len(ambiguous["candidate_order_ids"]), 2)
+            empty_orders = self.write_json(
+                td,
+                "no-matches.json",
+                {"data": {"orders": [], "next": None}},
+            )
+            still_indeterminate = self.invoke(
+                second_state,
+                "observe",
+                "--intent-id",
+                second_id,
+                "--orders",
+                empty_orders,
+                "--positions",
+                positions_file,
+                "--as-of-utc",
+                "2026-07-31T16:02:00Z",
+                now="2026-07-31T16:02:00Z",
+            )
+            self.assertEqual(still_indeterminate["status"], "indeterminate")
+            pending = self.invoke(
+                second_state,
+                "pending",
+                "--run-token",
+                self.RUN_TOKEN,
+            )
+            self.assertFalse(pending["intents"][0]["same_run_retry_available"])
+
+    def test_payload_validation_and_corrupt_journal_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            bad = self.intent()
+            bad["order"]["account_number"] = "sensitive-account"
+            bad_path = self.write_json(td, "bad.json", bad)
+            rejected = self.invoke(
+                state,
+                "prepare",
+                "--intent",
+                bad_path,
+                expected_success=False,
+                now="2026-07-31T16:00:01Z",
+            )
+            self.assertIn("account_number", rejected["detail"])
+            self.assertFalse(os.path.exists(state) and b"sensitive-account" in open(state, "rb").read())
+
+            corrupt = os.path.join(td, "corrupt.sqlite3")
+            with open(corrupt, "wb") as handle:
+                handle.write(b"not sqlite")
+            result = self.invoke(
+                corrupt, "check", expected_success=False,
+                now="2026-07-31T16:00:01Z",
+            )
+            self.assertIn("database", result["detail"].lower())
+
+            empty = os.path.join(td, "empty.sqlite3")
+            open(empty, "wb").close()
+            result = self.invoke(
+                empty, "check", expected_success=False,
+                now="2026-07-31T16:00:01Z",
+            )
+            self.assertIn("existing journal is empty", result["detail"])
+
+            truncated = os.path.join(td, "missing-schema.sqlite3")
+            connection = sqlite3.connect(truncated)
+            connection.execute("CREATE TABLE unrelated(value TEXT)")
+            connection.commit()
+            connection.close()
+            result = self.invoke(
+                truncated, "check", expected_success=False,
+                now="2026-07-31T16:00:01Z",
+            )
+            self.assertIn("unsafe schema", result["detail"])
+
+    def test_helper_rejects_order_shapes_the_routine_never_authorizes(self):
+        invalid_intents = {
+            "stop-limit": self.intent(
+                purpose="initial-stop",
+                order={
+                    "symbol": "TEST", "side": "sell", "type": "stop_limit",
+                    "quantity": "5", "limit_price": "8.90",
+                    "stop_price": "9.00", "market_hours": "regular_hours",
+                    "time_in_force": "gtc",
+                },
+            ),
+            "fractional-stop": self.intent(
+                purpose="initial-stop",
+                order={
+                    "symbol": "TEST", "side": "sell", "type": "stop_market",
+                    "quantity": "5.5", "stop_price": "9.00",
+                    "market_hours": "regular_hours", "time_in_force": "gtc",
+                },
+            ),
+            "dollar-sell": self.intent(
+                purpose="profit-take",
+                order={
+                    "symbol": "TEST", "side": "sell", "type": "market",
+                    "dollar_amount": "50", "market_hours": "regular_hours",
+                    "time_in_force": "gfd",
+                },
+            ),
+            "gtc-entry": self.intent(order={
+                "symbol": "TEST", "side": "buy", "type": "market",
+                "dollar_amount": "100", "market_hours": "regular_hours",
+                "time_in_force": "gtc",
+            }),
+            "all-day-entry": self.intent(order={
+                "symbol": "TEST", "side": "buy", "type": "limit",
+                "quantity": "10", "limit_price": "10",
+                "market_hours": "all_day_hours", "time_in_force": "gfd",
+            }),
+            "fractional-extended": self.intent(order={
+                "symbol": "TEST", "side": "buy", "type": "limit",
+                "quantity": "10.5", "limit_price": "10",
+                "market_hours": "extended_hours", "time_in_force": "gfd",
+            }),
+            "regular-limit-entry": self.intent(order={
+                "symbol": "TEST", "side": "buy", "type": "limit",
+                "quantity": "10", "limit_price": "10",
+                "market_hours": "regular_hours", "time_in_force": "gfd",
+            }),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, intent in invalid_intents.items():
+                with self.subTest(name=name):
+                    state = os.path.join(td, f"{name}.sqlite3")
+                    path = self.write_json(td, f"{name}.json", intent)
+                    result = self.invoke(
+                        state,
+                        "prepare",
+                        "--intent",
+                        path,
+                        expected_success=False,
+                        now="2026-07-31T16:00:01Z",
+                    )
+                    self.assertIn("intent.order", result["detail"])
+
+    def test_only_operator_can_resolve_no_submission_and_abandon_is_audited(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            first = self.prepare(td, state)
+            first_id = first["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                first_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            self.invoke(
+                state,
+                "mark-unknown",
+                "--intent-id",
+                first_id,
+                "--code",
+                "unverified_rejection",
+                now="2026-07-31T16:00:03Z",
+            )
+            empty_orders = self.write_json(
+                td,
+                "rejected-orders.json",
+                {"data": {"orders": [], "next": None}},
+            )
+            empty_positions = self.write_json(
+                td,
+                "rejected-positions.json",
+                {"data": {"positions": [], "next": None}},
+            )
+            self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                first_id,
+                "--orders",
+                empty_orders,
+                "--positions",
+                empty_positions,
+                "--as-of-utc",
+                "2026-07-31T16:00:04Z",
+                now="2026-07-31T16:00:04Z",
+            )
+            denied_retry = self.invoke(
+                state,
+                "retry",
+                "--intent-id",
+                first_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                expected_success=False,
+                now="2026-07-31T16:00:05Z",
+            )
+            self.assertIn("explicit rejection", denied_retry["detail"])
+            resolved = self.invoke(
+                state,
+                "operator-resolve-not-submitted",
+                "--intent-id",
+                first_id,
+                "--note",
+                "human verified in Robinhood that no order was created",
+                now="2026-07-31T16:00:06Z",
+            )
+            self.assertEqual(resolved["status"], "resolved")
+            self.assertFalse(resolved["blocking"])
+
+            second = self.prepare(td, state, name="second.json")
+            abandoned = self.invoke(
+                state,
+                "abandon-prepared",
+                "--intent-id",
+                second["intent_id"],
+                "--note",
+                "fresh run revalidated and did not dispatch this intent",
+                now="2026-07-31T16:30:00Z",
+            )
+            self.assertEqual(abandoned["status"], "abandoned")
+            status = self.invoke(state, "check")
+            self.assertEqual(status["pending_count"], 0)
+            self.assertGreaterEqual(status["event_count"], 5)
+
+    def test_persisted_baseline_events_and_fills_fail_closed_on_regression(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+
+            connection = sqlite3.connect(state)
+            connection.execute(
+                "UPDATE intents SET baseline_json = ? WHERE intent_id = ?",
+                ('{"observed_at_utc":"2026-07-31T16:00:01Z",'
+                 '"position_quantity":"99","symbol_order_ids":[]}', intent_id),
+            )
+            connection.commit()
+            connection.close()
+            corrupted = self.invoke(state, "check", expected_success=False)
+            self.assertIn("baseline hash", corrupted["detail"])
+
+            state = os.path.join(td, "monotonic.sqlite3")
+            prepared = self.prepare(td, state, name="monotonic.json")
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            response = self.write_json(
+                td,
+                "partial-response.json",
+                {"data": {"order": self.broker_order(
+                    state="partially_filled", cumulative="5"
+                )}},
+            )
+            self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                intent_id,
+                "--response",
+                response,
+                now="2026-07-31T16:00:03Z",
+            )
+            stale_order = self.broker_order(
+                state="partially_filled", cumulative="4"
+            )
+            orders_file = self.write_json(
+                td,
+                "stale-orders.json",
+                {"data": {"orders": [stale_order], "next": None}},
+            )
+            positions_file = self.write_json(
+                td,
+                "stale-positions.json",
+                {"data": {"positions": [
+                    {"symbol": "TEST", "quantity": "5"}
+                ], "next": None}},
+            )
+            regression = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                intent_id,
+                "--orders",
+                orders_file,
+                "--positions",
+                positions_file,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                expected_success=False,
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertIn("reduce the persisted cumulative fill", regression["detail"])
+
+            connection = sqlite3.connect(state)
+            connection.execute(
+                "UPDATE intent_events SET detail_json = '[]' WHERE sequence = 1"
+            )
+            connection.commit()
+            connection.close()
+            bad_event = self.invoke(state, "check", expected_success=False)
+            self.assertIn("stored event detail", bad_event["detail"])
+
+    def test_never_submitted_intents_cannot_be_observed(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            orders = self.write_json(
+                td, "empty-orders.json", {"data": {"orders": [], "next": None}}
+            )
+            positions = self.write_json(
+                td,
+                "empty-positions.json",
+                {"data": {"positions": [], "next": None}},
+            )
+            result = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                prepared["intent_id"],
+                "--orders",
+                orders,
+                "--positions",
+                positions,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                expected_success=False,
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertIn("never-submitted", result["detail"])
+            checked = self.invoke(state, "check")
+            self.assertEqual(checked["pending_count"], 1)
+
+    def test_terminal_fill_snapshot_is_immutable(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "terminal.sqlite3")
+            order = {
+                "symbol": "TEST",
+                "side": "buy",
+                "type": "market",
+                "quantity": "5",
+                "market_hours": "regular_hours",
+                "time_in_force": "gfd",
+            }
+            prepared = self.prepare(td, state, self.intent(order=order))
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                prepared["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            response = self.write_json(
+                td,
+                "terminal-response.json",
+                {"data": {"order": self.broker_order(
+                    quantity="5",
+                    dollar_amount=None,
+                    cumulative="5",
+                )}},
+            )
+            self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                prepared["intent_id"],
+                "--response",
+                response,
+                now="2026-07-31T16:00:04Z",
+            )
+            changed_execution = [{
+                "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "price": "21.00",
+                "quantity": "5",
+                "timestamp": "2026-07-31T16:00:03.12Z",
+                "fees": "0.00",
+            }]
+            changed_order = self.broker_order(
+                quantity="5",
+                dollar_amount=None,
+                cumulative="5",
+                executions=changed_execution,
+            )
+            orders = self.write_json(
+                td,
+                "changed-terminal-orders.json",
+                {"data": {"orders": [changed_order], "next": None}},
+            )
+            positions = self.write_json(
+                td,
+                "terminal-positions.json",
+                {"data": {"positions": [
+                    {"symbol": "TEST", "quantity": "5"}
+                ], "next": None}},
+            )
+            changed = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                prepared["intent_id"],
+                "--orders",
+                orders,
+                "--positions",
+                positions,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                expected_success=False,
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertIn("terminal order's average fill", changed["detail"])
+
+    def test_broker_lifecycle_contradictions_fail_closed(self):
+        cases = (
+            ("filled-zero", "filled", "0"),
+            ("partial-zero", "partially_filled", "0"),
+            ("partial-full", "partially_filled", "10"),
+            ("rest-cancelled-full", "partially_filled_rest_cancelled", "10"),
+        )
+        quantity_order = {
+            "symbol": "TEST", "side": "buy", "type": "market",
+            "quantity": "10", "market_hours": "regular_hours",
+            "time_in_force": "gfd",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, broker_state, cumulative in cases:
+                with self.subTest(name=name):
+                    state = os.path.join(td, f"{name}.sqlite3")
+                    prepared = self.prepare(
+                        td,
+                        state,
+                        self.intent(order=quantity_order),
+                        f"{name}-intent.json",
+                    )
+                    self.invoke(
+                        state,
+                        "begin",
+                        "--intent-id",
+                        prepared["intent_id"],
+                        "--run-token",
+                        self.RUN_TOKEN,
+                        now="2026-07-31T16:00:02Z",
+                    )
+                    response = self.write_json(
+                        td,
+                        f"{name}-response.json",
+                        {"data": {"order": self.broker_order(
+                            state=broker_state,
+                            quantity="10",
+                            dollar_amount=None,
+                            cumulative=cumulative,
+                        )}},
+                    )
+                    result = self.invoke(
+                        state,
+                        "acknowledge",
+                        "--intent-id",
+                        prepared["intent_id"],
+                        "--response",
+                        response,
+                        expected_success=False,
+                        now="2026-07-31T16:00:04Z",
+                    )
+                    self.assertRegex(result["detail"], r"filled|partial")
+
+    def test_stop_retry_is_linked_to_one_terminal_zero_fill_parent(self):
+        stop_order = {
+            "symbol": "TEST", "side": "sell", "type": "stop_market",
+            "quantity": "5", "stop_price": "9.00",
+            "market_hours": "regular_hours", "time_in_force": "gtc",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            parent = self.prepare(
+                td,
+                state,
+                self.intent(
+                    purpose="initial-stop", order=stop_order,
+                    position_quantity="5",
+                ),
+                "parent.json",
+            )
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                parent["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            response = self.write_json(
+                td,
+                "cancelled-parent.json",
+                {"data": {"order": self.broker_order(
+                    side="sell", order_type="market", trigger="stop",
+                    state="cancelled", quantity="5", dollar_amount=None,
+                    cumulative="0", stop_price="9.000000",
+                    time_in_force="gtc",
+                )}},
+            )
+            self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                parent["intent_id"],
+                "--response",
+                response,
+                now="2026-07-31T16:00:03Z",
+            )
+            retry_intent = self.intent(
+                purpose="stop-retry",
+                order=stop_order,
+                position_quantity="5",
+                replaces_intent_id=parent["intent_id"],
+            )
+            retry = self.prepare(td, state, retry_intent, "retry.json")
+            self.assertEqual(retry["replaces_intent_id"], parent["intent_id"])
+            self.invoke(
+                state,
+                "abandon-prepared",
+                "--intent-id",
+                retry["intent_id"],
+                "--note",
+                "test proves only one child can ever replace the parent",
+                now="2026-07-31T16:00:05Z",
+            )
+            second_path = self.write_json(td, "second-retry.json", retry_intent)
+            second = self.invoke(
+                state,
+                "prepare",
+                "--intent",
+                second_path,
+                expected_success=False,
+                now="2026-07-31T16:00:06Z",
+            )
+            self.assertIn("already has a retry", second["detail"])
+
+            ambiguous_state = os.path.join(td, "ambiguous-stop.sqlite3")
+            unresolved = self.prepare(
+                td,
+                ambiguous_state,
+                self.intent(
+                    purpose="initial-stop", order=stop_order,
+                    position_quantity="5",
+                ),
+                "unresolved-stop.json",
+            )
+            self.invoke(
+                ambiguous_state,
+                "begin",
+                "--intent-id",
+                unresolved["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            self.invoke(
+                ambiguous_state,
+                "mark-unknown",
+                "--intent-id",
+                unresolved["intent_id"],
+                "--code",
+                "timeout",
+                now="2026-07-31T16:00:03Z",
+            )
+            repair_path = self.write_json(
+                td,
+                "repair-over-unknown.json",
+                self.intent(
+                    purpose="stop-repair", order=stop_order,
+                    position_quantity="5",
+                ),
+            )
+            repair = self.invoke(
+                ambiguous_state,
+                "prepare",
+                "--intent",
+                repair_path,
+                expected_success=False,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertIn("ambiguous stop intent", repair["detail"])
+
+            working_state = os.path.join(td, "working-stop.sqlite3")
+            working = self.prepare(
+                td,
+                working_state,
+                self.intent(
+                    purpose="initial-stop",
+                    order=stop_order,
+                    position_quantity="5",
+                ),
+                "working-stop.json",
+            )
+            self.invoke(
+                working_state,
+                "begin",
+                "--intent-id",
+                working["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            working_response = self.write_json(
+                td,
+                "working-stop-response.json",
+                {"data": {"order": self.broker_order(
+                    side="sell",
+                    order_type="market",
+                    trigger="stop",
+                    state="new",
+                    quantity="5",
+                    dollar_amount=None,
+                    cumulative="0",
+                    stop_price="9.000000",
+                    time_in_force="gtc",
+                )}},
+            )
+            acknowledged = self.invoke(
+                working_state,
+                "acknowledge",
+                "--intent-id",
+                working["intent_id"],
+                "--response",
+                working_response,
+                now="2026-07-31T16:00:03Z",
+            )
+            self.assertEqual(acknowledged["status"], "working")
+            working_repair_path = self.write_json(
+                td,
+                "repair-over-working.json",
+                self.intent(
+                    purpose="stop-repair",
+                    order=stop_order,
+                    position_quantity="5",
+                ),
+            )
+            working_repair = self.invoke(
+                working_state,
+                "prepare",
+                "--intent",
+                working_repair_path,
+                expected_success=False,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertIn("ambiguous stop intent", working_repair["detail"])
+
+            chain_state = os.path.join(td, "chained-stop-retry.sqlite3")
+            chain_parent = self.prepare(
+                td,
+                chain_state,
+                self.intent(
+                    purpose="initial-stop",
+                    order=stop_order,
+                    position_quantity="5",
+                ),
+                "chain-parent.json",
+            )
+            self.invoke(
+                chain_state,
+                "begin",
+                "--intent-id",
+                chain_parent["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            chain_parent_response = self.write_json(
+                td,
+                "chain-parent-response.json",
+                {"data": {"order": self.broker_order(
+                    side="sell",
+                    order_type="market",
+                    trigger="stop",
+                    state="cancelled",
+                    quantity="5",
+                    dollar_amount=None,
+                    cumulative="0",
+                    stop_price="9.000000",
+                    time_in_force="gtc",
+                )}},
+            )
+            self.invoke(
+                chain_state,
+                "acknowledge",
+                "--intent-id",
+                chain_parent["intent_id"],
+                "--response",
+                chain_parent_response,
+                now="2026-07-31T16:00:03Z",
+            )
+            chain_child_intent = self.intent(
+                purpose="stop-retry",
+                order=stop_order,
+                position_quantity="5",
+                replaces_intent_id=chain_parent["intent_id"],
+            )
+            chain_child = self.prepare(
+                td,
+                chain_state,
+                chain_child_intent,
+                "chain-child.json",
+            )
+            self.invoke(
+                chain_state,
+                "begin",
+                "--intent-id",
+                chain_child["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:04Z",
+            )
+            chain_child_response = self.write_json(
+                td,
+                "chain-child-response.json",
+                {"data": {"order": self.broker_order(
+                    order_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    side="sell",
+                    order_type="market",
+                    trigger="stop",
+                    state="cancelled",
+                    quantity="5",
+                    dollar_amount=None,
+                    cumulative="0",
+                    stop_price="9.000000",
+                    time_in_force="gtc",
+                    created_at="2026-07-31T16:00:05Z",
+                )}},
+            )
+            self.invoke(
+                chain_state,
+                "acknowledge",
+                "--intent-id",
+                chain_child["intent_id"],
+                "--response",
+                chain_child_response,
+                now="2026-07-31T16:00:06Z",
+            )
+            chained_path = self.write_json(
+                td,
+                "forbidden-chain.json",
+                self.intent(
+                    purpose="stop-retry",
+                    order=stop_order,
+                    position_quantity="5",
+                    replaces_intent_id=chain_child["intent_id"],
+                ),
+            )
+            chained = self.invoke(
+                chain_state,
+                "prepare",
+                "--intent",
+                chained_path,
+                expected_success=False,
+                now="2026-07-31T16:00:07Z",
+            )
+            self.assertIn("terminal zero-fill stop parent", chained["detail"])
+
+    def test_baseline_freshness_and_cursor_chain_are_enforced(self):
+        with tempfile.TemporaryDirectory() as td:
+            stale_state = os.path.join(td, "stale.sqlite3")
+            stale_path = self.write_json(td, "stale.json", self.intent())
+            stale = self.invoke(
+                stale_state,
+                "prepare",
+                "--intent",
+                stale_path,
+                expected_success=False,
+                now="2026-07-31T16:03:00Z",
+            )
+            self.assertIn("baseline is stale", stale["detail"])
+
+            state = os.path.join(td, "cursors.sqlite3")
+            prepared = self.prepare(td, state, name="cursor-intent.json")
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                prepared["intent_id"],
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            self.invoke(
+                state,
+                "mark-unknown",
+                "--intent-id",
+                prepared["intent_id"],
+                "--code",
+                "timeout",
+                now="2026-07-31T16:00:03Z",
+            )
+            first_page = self.write_json(
+                td,
+                "orders-page-1.json",
+                {"structuredContent": {"data": {
+                    "orders": [],
+                    "next": "https://agent.robinhood.com/orders?cursor=cursor-two",
+                }}},
+            )
+            second_page = self.write_json(
+                td,
+                "orders-page-2.json",
+                {"data": {"orders": [self.broker_order()], "next": None}},
+            )
+            positions = self.write_json(
+                td,
+                "cursor-positions.json",
+                {"data": {"positions": [
+                    {"symbol": "TEST", "quantity": "5"}
+                ], "next": None}},
+            )
+            broken = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                prepared["intent_id"],
+                "--orders",
+                first_page,
+                second_page,
+                "--order-request-cursors",
+                "FIRST",
+                "wrong-cursor",
+                "--positions",
+                positions,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                expected_success=False,
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertIn("breaks the chain", broken["detail"])
+            observed = self.invoke(
+                state,
+                "observe",
+                "--intent-id",
+                prepared["intent_id"],
+                "--orders",
+                first_page,
+                second_page,
+                "--order-request-cursors",
+                "FIRST",
+                "cursor-two",
+                "--positions",
+                positions,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertTrue(observed["matched"])
+
+
 class RunLockTests(unittest.TestCase):
     def invoke(self, lock_file, action, token=None, now=None, lease_seconds=60):
         args = [sys.executable, RUN_LOCK, action,
@@ -1995,7 +3503,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("immediately before `place_equity_order`", pre_buy)
         self.assertIn("run the fresh clock check AGAIN", pre_buy)
         self.assertIn("never place a payload reviewed for a different session", pre_buy)
-        self.assertIn("Do not fall back to the START CLOCK", pre_buy)
+        self.assertIn("Do not fall back to START CLOCK", pre_buy)
         self.assertIn("In DRY RUN", pre_buy)
 
     def test_routine_full_halts_when_constants_cannot_be_read(self):
@@ -2067,6 +3575,78 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)
         self.assertIn("Transient JSON handoffs are deliberately different", routine)
 
+    def test_routine_requires_durable_order_intent_reconciliation(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        connector = routine.split("### CONNECTOR FAILURES", 1)[1].split(
+            "### ORDER HANDLING", 1
+        )[0]
+        self.assertIn(
+            "Never apply this generic retry paragraph to "
+            "`place_equity_order` or `cancel_equity_order`",
+            connector,
+        )
+
+        journal = routine.split("### ORDER-INTENT JOURNAL", 1)[1].split(
+            "### WINDOWS / CODEX PYTHON ENVIRONMENT", 1
+        )[0]
+        self.assertIn("order_intents.py check", journal)
+        self.assertIn("order_intents.py pending --run-token <RUN_LOCK_TOKEN>", journal)
+        self.assertIn("before FIRST or any broker mutation", journal)
+        self.assertIn("--order-request-cursors FIRST", journal)
+        self.assertIn("--position-request-cursors FIRST", journal)
+        self.assertIn("the exact cursor used for each later request", journal)
+        self.assertIn('"replaces_intent_id": null', journal)
+        self.assertIn("`baseline_sha256`", journal)
+        self.assertIn("`intent_sha256`", journal)
+        for purpose in (
+            "dip-buy",
+            "profit-take",
+            "dust-sweep",
+            "initial-stop",
+            "stop-repair",
+            "stop-retry",
+            "profit-take-stop-restore",
+        ):
+            self.assertIn(purpose, journal)
+        self.assertIn("BEFORE any retry", journal)
+        self.assertIn('`match_reason: "no_match"`', journal)
+        self.assertIn("`same_run_retry_available: true`", journal)
+        self.assertIn("SAME `ref_id`", journal)
+        self.assertIn("there is no third call", journal)
+        self.assertIn("unverified_rejection", journal)
+        self.assertIn("can never use automatic retry", journal)
+        self.assertIn("A prior-run unresolved entry must NEVER be resubmitted", journal)
+        self.assertIn("A partially filled buy is never submitted again", journal)
+        self.assertIn("explicit human recovery", journal)
+        self.assertNotIn("record-not-submitted", routine)
+
+        dry_run = routine.split("### DRY RUN", 1)[1].split("### CURRENT TIME", 1)[0]
+        self.assertIn("A simulated entry creates NO order-intent row", dry_run)
+
+        profit_take = routine.split("2. If a position is up", 1)[1].split(
+            "**Stop-coverage audit", 1
+        )[0]
+        self.assertIn(
+            "any exit before `begin` is mandatory finally-style cleanup",
+            profit_take,
+        )
+        self.assertIn("abandon the never-begun intent", profit_take)
+        self.assertIn("if cancellation was proven effective", profit_take)
+        self.assertIn("ownership was lost", profit_take)
+        self.assertIn("do not bypass that guard", profit_take)
+        self.assertIn("Once `begin` succeeds, never abandon the intent", profit_take)
+
+        notifications = routine.split("### ORDER HANDLING", 1)[1].split(
+            "### DRY RUN", 1
+        )[0]
+        self.assertIn("terminal reconciliation proves a positive fill", notifications)
+        self.assertIn("verification proves it is active", notifications)
+
     def test_routine_uses_final_evaluator_json_as_sole_entry_authority(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
@@ -2104,7 +3684,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('"stop_price": "<two-decimal price>"', canonical_input)
         self.assertIn('"time_in_force": "gtc"', canonical_input)
         self.assertNotIn('"trigger": "stop"', canonical_input)
-        self.assertIn("Add a fresh `ref_id` only to `place_equity_order`", canonical_input)
+        self.assertIn(
+            "persisted `ref_id` returned by `order_intents.py begin`/`retry`",
+            canonical_input,
+        )
         self.assertIn("`review_equity_order` has no `ref_id` input", canonical_input)
         self.assertNotIn('"type": "stop"', routine)
         self.assertNotIn("dollar_based_amount", routine)
@@ -2119,9 +3702,13 @@ class MarketClockTests(unittest.TestCase):
         audit = routine.split("**Stop-coverage audit", 1)[1].split("**Dust sweep", 1)[0]
         self.assertIn("Canonical stop for a coverage repair", audit)
         self.assertIn("Canonical equity stop-market payload", audit)
-        step_12 = routine.split("12. After a buy fills:", 1)[1].split("### REPORT", 1)[0]
-        self.assertIn("Canonical equity stop-market payload", step_12)
-        whole_share_guard = routine.split("**Whole-share stop guard", 1)[1].split("12. After a buy fills:", 1)[0]
+        step_12 = routine.split(
+            "12. After the buy intent is terminal", 1
+        )[1].split("### REPORT", 1)[0]
+        self.assertIn("canonical regular-hours GTC `stop_market` payload", step_12)
+        whole_share_guard = routine.split(
+            "**Whole-share stop guard", 1
+        )[1].split("12. After the buy intent is terminal", 1)[0]
         self.assertIn("do NOT submit a zero-share stop", whole_share_guard)
         self.assertIn("`confirmed` or `queued` (active/working stops)", schema)
         self.assertIn('`type == "stop_market"`', schema)
@@ -2142,7 +3729,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("covered_stop_qty < required_stop_qty", audit)
         self.assertIn("supplemental stop for exactly `repair_qty`", audit)
         self.assertIn("covered_stop_qty > required_stop_qty", audit)
-        self.assertIn("do not automatically cancel a currently protective stop", audit)
+        self.assertIn("do not automatically cancel protection", audit)
 
     def test_pacific_trading_day_rolls_before_utc_day(self):
         # 2026-07-22 03:00Z is still 2026-07-21 in Pacific — the date used

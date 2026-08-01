@@ -73,11 +73,13 @@ ORDER_STATES = frozenset(
         "confirmed",
         "unconfirmed",
         "partially_filled",
+        "pending_cancelled",
         "filled",
         "cancelled",
         "rejected",
         "failed",
         "voided",
+        "partially_filled_rest_cancelled",
     }
 )
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -617,7 +619,9 @@ def _execution_rows(
                 f"cumulative_quantity {decimal_string(cumulative_quantity)}"
             )
         if (
-            state_value in {"filled", "partially_filled"}
+            state_value in {
+                "filled", "partially_filled", "partially_filled_rest_cancelled"
+            }
             and cumulative_quantity <= 0
         ):
             raise DailyLossError(

@@ -22,6 +22,20 @@ Organised by the routine section the rule lives in.
 the same day (commit `5e2dec6`): that one alert is a routing correction, every other alert stays a
 hard skip.
 
+## ORDER HANDLING — durable placement intent and reconciliation
+
+**2026-07-31, lost acknowledgement could duplicate an order (P1 review finding).** Placement
+retries previously depended on the agent remembering to reuse a `ref_id`, with no durable record
+of the exact payload or whether a timed-out call had reached Robinhood. Current order-query results
+do not expose `ref_id`, so a crash, malformed response, or fresh-UUID retry could create a second
+buy or sell while the first order was already live. No loss was attributed; the safety review
+caught the gap. `order_intents.py` now persists the immutable payload and one UUID before the call,
+reconciles fresh fully paginated orders/positions by broker ID or one exact post-baseline
+fingerprint, and allows one same-run replay only after a proven no-match, always with the same UUID.
+Prior-run replay, explicit-rejection replay, ambiguous matches, partial-fill resubmission, chained
+stop retries, and corrupt journal state fail closed; every fill-bearing order is reconciled to a
+terminal cumulative quantity before notification or ledger append.
+
 ## ORDER HANDLING — stop verification ("placement is not protection")
 
 **2026-07-14, UBXG.** The broker cancelled a freshly placed stop **77 ms** after creation: the
