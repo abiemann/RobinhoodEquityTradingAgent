@@ -28,3 +28,17 @@ Design notes (from 2026-07-12 discussion):
 - **Ledger attribution.** Each fill's `reason` records WHICH pattern matched (e.g. `cup-and-handle`), so `trade-ledger.csv` supports per-pattern win rate and expectancy — with multiple active patterns, comparison becomes measurable, not anecdotal.
 - **Data source: the broker itself — fully hands-off.** Bars come from `get_equity_historicals` (the raw-response → script pipeline Step 8 already uses; schema live-verified, interpolated-bar handling exists). No manual exports ever. Each SKILL.md declares its required lookback (a cup-and-handle needs ~60–90 daily bars; a dip needs ~30) so the platform fetches the right window per active skill.
 - **Two entry points, one code path.** The same skill serves (a) the scheduled pipeline — candidates that survive platform filters get pattern-checked automatically — and (b) an interactive verdict mode: ask "check TICKER for a valid cup-and-handle" and the agent fetches the bars, runs `skills/cup-and-handle/check.py`, weighs the example series, and returns a verdict with reasons. Same checker, same examples, no divergence between what you can ask and what the robot trades.
+
+## 2.0 — Token-light dry-run paper tracking
+
+When `DRY_RUN=true`, keep management of real positions fully live, but optionally track would-be entries in a separate deterministic paper ledger so dry runs can measure hypothetical performance over time without materially increasing AI-token use.
+
+Design requirements:
+
+- **Real safety always comes first.** Profit-taking, stop verification and repair, dust sweeps, and all other protection for actual holdings remain live and run before paper tracking. Paper state must never delay, block, alter, or replace them.
+- **Deterministic and isolated.** A small helper owns the paper lifecycle and ledger. It never places or cancels broker orders, and paper rows never enter `trade-ledger.csv`, `memory.md`, live order intents, or normal decision inputs.
+- **Token-light updates.** Fetch current quotes for all open paper symbols in one batch, pass compact JSON to the helper, and return only a tiny summary. Do not load paper history into AI context or narrate individual updates in routine reports. The existing one-time would-be-entry notification may remain.
+- **Separate source of truth.** Keep hypothetical positions and fills in a dedicated local paper ledger. Stamp each paper trade with `rules_version` so results remain attributable when constants or strategy rules change.
+- **Dashboard-only detail.** The dashboard reads the paper ledger directly and shows hypothetical positions, closed trades, P&L, drawdown, and rules-version attribution in a clearly labeled **PAPER** section, separate from the live account and real positions.
+- **Failure isolation.** Missing, stale, malformed, or locked paper data—or a helper failure—records a concise telemetry warning and skips that paper update. It must never change live-position management or entry eligibility.
+- **Honest simulation assumptions.** Define and version fill timing, spread/slippage, partial-fill, buying-power, and corporate-action assumptions. Label every result hypothetical so paper performance is never mistaken for brokerage performance.
