@@ -182,7 +182,7 @@ function parseLedger(csv) {
   const lines = csv.trim().split(/\r?\n/);
   const head = lines.shift().split(",");
   const i = Object.fromEntries(head.map((h, n) => [h, n]));
-  for (const need of ["timestamp_pt", "side", "reason", "realized_pnl", "rules_version"]) {
+  for (const need of ["timestamp_pt", "symbol", "side", "reason", "realized_pnl", "rules_version"]) {
     if (i[need] === undefined) {
       banner(`trade-ledger.csv is missing the "${need}" column — expected schema has changed.`);
       return null;
@@ -190,7 +190,7 @@ function parseLedger(csv) {
   }
   return lines.map(l => l.split(",")).filter(f => f.length === head.length).map(f => ({
     ts: f[i.timestamp_pt].slice(0, 19), day: f[i.timestamp_pt].slice(0, 10),
-    side: f[i.side], reason: f[i.reason], ver: f[i.rules_version],
+    symbol: f[i.symbol], side: f[i.side], reason: f[i.reason], ver: f[i.rules_version],
     pnl: f[i.realized_pnl] === "" ? null : parseFloat(f[i.realized_pnl]),
   }));
 }
@@ -220,15 +220,95 @@ function tradeLabels(fills) {
   return out;
 }
 
-async function renderRuns(statusNames, rows) {
+function uniqueSymbols(values) {
+  const seen = new Set(), symbols = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const symbol = value.trim();
+    if (!symbol || seen.has(symbol)) continue;
+    seen.add(symbol);
+    symbols.push(symbol);
+  }
+  return symbols;
+}
+
+async function rejectedSymbols(statusName, gateNames) {
+  const gateName = statusName.replace(/^rhmra-status-/, "rhmra-gates-");
+  if (!gateNames.has(gateName)) return [];
+  try {
+    const gate = await getJSON("/run-reports/" + gateName);
+    if (gate.schema_version !== 1 || !Array.isArray(gate.results)) return [];
+    return uniqueSymbols(gate.results
+      .filter(r => r && r.buy_candidate === false)
+      .map(r => r.symbol));
+  } catch { return []; }
+}
+
+function blackoutMinutes(reason, config) {
+  const historical = String(reason || "").match(/first\s+(\d+)\s+min/i);
+  const value = historical ? Number(historical[1]) : config?.no_buy_first_minutes;
+  return Number.isInteger(value) && value >= 0 && value <= 390 ? value : null;
+}
+
+function localBlackoutEnd(runStartPt, minutes) {
+  if (typeof runStartPt !== "string" || minutes === null) return null;
+  const start = new Date(runStartPt);
+  if (!Number.isFinite(start.getTime())) return null;
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", hourCycle: "h23",
+      hour: "2-digit", minute: "2-digit",
+    }).formatToParts(start).map(part => [part.type, part.value]));
+    const easternMinute = Number(parts.hour) * 60 + Number(parts.minute);
+    const deltaMinutes = 9 * 60 + 30 + minutes - easternMinute;
+    if (!Number.isInteger(deltaMinutes) || deltaMinutes < 0 || deltaMinutes > 390) return null;
+    const end = new Date(start.getTime() + deltaMinutes * 60000
+      - start.getUTCSeconds() * 1000 - start.getUTCMilliseconds());
+    return end.toLocaleTimeString([], {
+      hour: "numeric", minute: "2-digit", timeZoneName: "short",
+    });
+  } catch { return null; }
+}
+
+function runTooltip(status, phase, reason, fills, rejected, config) {
+  const bought = uniqueSymbols(fills
+    .filter(f => f.side === "buy" && f.reason === "dip-buy")
+    .map(f => f.symbol));
+  if (bought.length) return `entry phase ran — bought: ${bought.join(", ")}`;
+
+  if (phase === "skipped" && /opening blackout/i.test(reason || "")) {
+    const until = localBlackoutEnd(status.run_start_pt, blackoutMinutes(reason, config));
+    if (until) return `Opening blackout until ${until}`;
+  }
+
+  if (phase === "ran") {
+    const base = "entry phase ran — scan and evaluation performed";
+    return rejected.length ? `${base}; filtered out: ${rejected.join(", ")}` : base;
+  }
+  return reason || "entry phase status unavailable";
+}
+
+function filenameStart(name) {
+  return `${name.slice(13, 23).replace(/_/g, "-")}T${name.slice(24, 29).replace("_", ":")}:00`;
+}
+
+async function renderRuns(statusNames, gateNames, rows, config) {
   if (!statusNames.length) return;
   const today = statusNames[statusNames.length - 1].slice(13, 23); // YYYY_MM_DD of newest
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
-  // a fill belongs to the last run that had started before it
-  const starts = todays.map(n => `${n.slice(13, 23).replace(/_/g, "-")}T${n.slice(24, 29).replace("_", ":")}:00`);
-  const chips = await Promise.all(todays.map(async (n, k) => {
+  const records = await Promise.all(todays.map(async n => {
+    try { return { name: n, status: await getJSON("/run-reports/" + n) }; }
+    catch { return { name: n, status: null }; }
+  }));
+  // A fill belongs to the last run that had started before it. Prefer the
+  // snapshot's second-precise PT timestamp; filenames are minute-precise only.
+  const starts = records.map(({name, status}) =>
+    typeof status?.run_start_pt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(status.run_start_pt)
+      ? status.run_start_pt.slice(0, 19) : filenameStart(name));
+  const availableGates = new Set(gateNames || []);
+  const chips = await Promise.all(records.map(async ({name: n, status: s}, k) => {
     try {
-      const s = await getJSON("/run-reports/" + n);
+      if (!s) throw new Error("unreadable status");
       const phase = s.guards?.entry_phase ?? "?";
       const reason = s.guards?.entry_skip_reason;
       // the last run of the day still needs an upper bound, or it would sweep up
@@ -241,7 +321,8 @@ async function renderRuns(statusNames, rows) {
       if (phase === "skipped") parts.push(skipLabel(reason));
       else if (phase === "halted") parts.push("halted");
       else if (!parts.length) parts.push("scanned");
-      const tip = reason || "entry phase ran — scan and evaluation performed";
+      const rejected = phase === "ran" ? await rejectedSymbols(n, availableGates) : [];
+      const tip = runTooltip(s, phase, reason, fills, rejected, config);
       return `<span class="run ${esc(phase)}" title="${esc(tip)}">` +
              `<span class="t">${starts[k].slice(11, 16)}</span>` +
              `<span class="o">${parts.join(", ")}</span></span>`;
@@ -308,13 +389,14 @@ function renderEras(rows) {
 async function refresh() {
   try {
     $("banner").innerHTML = "";
-    renderMode(await getJSON("/api/config"));
+    const config = await getJSON("/api/config");
+    renderMode(config);
     const latest = await getJSON("/api/latest");
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
     const idx = await getJSON("/api/index");
     const rows = parseLedger(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
-    await renderRuns(idx.status, rows);
+    await renderRuns(idx.status, idx.gates, rows, config);
     renderEras(rows);
     $("updated").textContent = "refreshed " + new Date().toLocaleTimeString();
   } catch (e) { banner("Dashboard failed to load: " + e); }

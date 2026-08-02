@@ -3056,6 +3056,9 @@ class DashboardServerTests(unittest.TestCase):
         self.valid_constants = ConstantsValidatorTests.replace_value(
             constants_text, "DRY_RUN", "true"
         )
+        self.valid_constants = ConstantsValidatorTests.replace_value(
+            self.valid_constants, "NO_BUY_FIRST_MINUTES", "45"
+        )
         for name, content in (
             ("README.md", "private dashboard test fixture"),
             ("constants.md", self.valid_constants),
@@ -3115,10 +3118,10 @@ class DashboardServerTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/README.md")[0], 403)
         self.assertEqual(self.request("GET", "/dashboard/index.html", host="example.test")[0], 403)
 
-    def test_config_reports_current_dry_run_setting_and_fails_closed(self):
+    def test_config_reports_dashboard_settings_and_fails_closed(self):
         status, body = self.request("GET", "/api/config")
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"dry_run": True})
+        self.assertEqual(json.loads(body), {"dry_run": True, "no_buy_first_minutes": 45})
 
         constants_path = os.path.join(self.repo, "constants.md")
         with open(constants_path, "w", encoding="utf-8") as f:
@@ -3129,7 +3132,17 @@ class DashboardServerTests(unittest.TestCase):
             )
         status, body = self.request("GET", "/api/config")
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"dry_run": False})
+        self.assertEqual(json.loads(body), {"dry_run": False, "no_buy_first_minutes": 45})
+
+        with open(constants_path, "w", encoding="utf-8") as f:
+            f.write(
+                ConstantsValidatorTests.replace_value(
+                    self.valid_constants, "NO_BUY_FIRST_MINUTES", "60"
+                )
+            )
+        status, body = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"dry_run": True, "no_buy_first_minutes": 60})
 
         with open(constants_path, "w", encoding="utf-8") as f:
             f.write(
@@ -3141,6 +3154,7 @@ class DashboardServerTests(unittest.TestCase):
         document = json.loads(body)
         self.assertEqual(status, 200)
         self.assertIsNone(document["dry_run"])
+        self.assertIsNone(document["no_buy_first_minutes"])
         self.assertIn("DRY_RUN must be exactly true or false", document["error"])
 
         with open(constants_path, "w", encoding="utf-8") as f:
@@ -3153,6 +3167,7 @@ class DashboardServerTests(unittest.TestCase):
         document = json.loads(body)
         self.assertEqual(status, 200)
         self.assertIsNone(document["dry_run"])
+        self.assertIsNone(document["no_buy_first_minutes"])
         self.assertIn("TOP_N", document["error"])
 
         with open(constants_path, "w", encoding="utf-8") as f:
@@ -3165,8 +3180,42 @@ class DashboardServerTests(unittest.TestCase):
         document = json.loads(body)
         self.assertEqual(status, 200)
         self.assertIsNone(document["dry_run"])
+        self.assertIsNone(document["no_buy_first_minutes"])
         self.assertIn("integer literal exceeds the supported size", document["error"])
 
+class DashboardClientContractTests(unittest.TestCase):
+    def test_run_tooltips_use_structured_symbols_and_local_blackout_time(self):
+        with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
+            dashboard = f.read()
+
+        self.assertIn('"timestamp_pt", "symbol", "side"', dashboard)
+        self.assertIn('statusName.replace(/^rhmra-status-/, "rhmra-gates-")', dashboard)
+        self.assertIn("r.buy_candidate === false", dashboard)
+        self.assertIn('f.side === "buy" && f.reason === "dip-buy"', dashboard)
+        self.assertIn("entry phase ran — bought:", dashboard)
+        self.assertIn("scan and evaluation performed", dashboard)
+        self.assertIn("filtered out:", dashboard)
+        self.assertIn("Opening blackout until", dashboard)
+        self.assertIn('timeZone: "America/New_York"', dashboard)
+        self.assertIn("timeZoneName: \"short\"", dashboard)
+        self.assertIn("esc(tip)", dashboard)
+
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+        blackout = routine.split("**Opening-blackout gate", 1)[1].split(
+            "4. Call `get_scans`", 1
+        )[0]
+        self.assertIn("status snapshot's `entry_skip_reason`", blackout)
+        self.assertIn("first <validated numeric NO_BUY_FIRST_MINUTES value> min", blackout)
+        self.assertIn("never emit the literal constant name inside the reason", blackout)
+        self.assertNotIn(
+            '"scan and entry evaluation skipped: opening blackout '
+            '(first `NO_BUY_FIRST_MINUTES` min of session)"',
+            blackout,
+        )
 
 class MarketClockTests(unittest.TestCase):
     def clock(self, now_utc, blackout=0):

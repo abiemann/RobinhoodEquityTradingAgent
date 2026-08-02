@@ -13,7 +13,7 @@ plus three conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
-  /api/config          {"dry_run": true|false} current constants.md setting
+  /api/config          current DRY_RUN and opening-blackout settings
 
 Run:   python3 dashboard/serve.py   (Windows: py -3 dashboard\\serve.py)
        then open http://127.0.0.1:8765/
@@ -48,16 +48,20 @@ def _reports(pattern):
     return sorted(os.path.basename(f) for f in files)
 
 
-def _dry_run_config():
-    """Return the current DRY_RUN value without exposing the full config file."""
+def _dashboard_config():
+    """Return only dashboard-safe values from the validated configuration."""
     try:
         validated = validate_constants_file(os.path.join(REPO, "constants.md"))
     except ConstantsValidationError as exc:
         return {
             "dry_run": None,
+            "no_buy_first_minutes": None,
             "error": exc.errors[0],
         }
-    return {"dry_run": validated.values["DRY_RUN"]}
+    return {
+        "dry_run": validated.values["DRY_RUN"],
+        "no_buy_first_minutes": validated.values["NO_BUY_FIRST_MINUTES"],
+    }
 
 
 def _canonical_request_path(request_path):
@@ -141,7 +145,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"status": _reports("rhmra-status-*.json"),
                                "gates": _reports("rhmra-gates-*.json")})
         if path == "/api/config":
-            return self._json(_dry_run_config())
+            return self._json(_dashboard_config())
         if path == "/api/latest":
             names = _reports("rhmra-status-*.json")
             if not names:
