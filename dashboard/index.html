@@ -41,6 +41,9 @@
            font-variant-numeric:tabular-nums; white-space:nowrap; }
   th { color:var(--dim); font-weight:500; font-size:12px; }
   th:first-child, td:first-child { text-align:left; }
+  .position-symbol { color:var(--blue); text-decoration:none; }
+  .position-symbol:hover { text-decoration:underline; }
+  .position-symbol:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
   .pos { color:var(--green); } .neg { color:var(--red); }
   .badge { font-size:11px; padding:1px 8px; border-radius:8px; }
   .badge.ok { background:#1c3529; color:var(--green); }
@@ -158,6 +161,11 @@ function renderSnapshot(snap) {
     return;
   }
   const rows = snap.positions.map(p => {
+    const symbol = typeof p.symbol === "string" ? p.symbol.trim() : "";
+    const stockUrl = `https://robinhood.com/stocks/${encodeURIComponent(symbol)}?source=lists_section_position`;
+    const symbolCell = symbol
+      ? `<a class="position-symbol" href="${esc(stockUrl)}" target="_blank" rel="noopener noreferrer">${esc(symbol)}</a>`
+      : "unavailable";
     const pnl = (p.current_price - p.avg_buy_price) * p.quantity;
     const pct = (p.current_price / p.avg_buy_price - 1) * 100;
     const protectedStop = p.stop_price != null && (p.stop_state === "confirmed" || p.stop_state === "queued");
@@ -165,7 +173,7 @@ function renderSnapshot(snap) {
     const stopBadge = protectedStop
       ? `<span class="badge ok">${esc(p.stop_state)} @ $${p.stop_price.toFixed(2)}</span>`
       : `<span class="badge warn">UNPROTECTED</span>`;
-    return `<tr><td>${esc(p.symbol)}</td><td>${p.quantity}</td>
+    return `<tr><td>${symbolCell}</td><td>${p.quantity}</td>
       <td>$${p.avg_buy_price.toFixed(4)}</td><td>$${p.current_price.toFixed(4)}</td>
       <td class="${cls(pnl)}">${fmt$(pnl)} (${pct.toFixed(2)}%)</td>
       <td>${stopBadge}</td><td>${dist}</td></tr>`;

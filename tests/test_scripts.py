@@ -3184,6 +3184,19 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIn("integer literal exceeds the supported size", document["error"])
 
 class DashboardClientContractTests(unittest.TestCase):
+    def test_position_symbols_link_to_robinhood_safely(self):
+        with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
+            dashboard = f.read()
+
+        self.assertIn(
+            "https://robinhood.com/stocks/${encodeURIComponent(symbol)}"
+            "?source=lists_section_position",
+            dashboard,
+        )
+        self.assertIn('class="position-symbol"', dashboard)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', dashboard)
+        self.assertIn("${esc(stockUrl)}", dashboard)
+
     def test_run_tooltips_use_structured_symbols_and_local_blackout_time(self):
         with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
             dashboard = f.read()
