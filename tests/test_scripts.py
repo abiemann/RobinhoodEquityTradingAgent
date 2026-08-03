@@ -3184,6 +3184,41 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIn("integer literal exceeds the supported size", document["error"])
 
 class DashboardClientContractTests(unittest.TestCase):
+    def test_phone_share_wire_and_key_lifecycle_contracts_stay_aligned(self):
+        with open(os.path.join(ROOT, 'dashboard', 'index.html'), encoding='utf-8') as f:
+            dashboard = f.read()
+        viewer_path = os.path.join(ROOT, 'phone-share-worker', 'src', 'viewer.js')
+        with open(viewer_path, encoding='utf-8') as f:
+            viewer = f.read()
+        qr_path = os.path.join(ROOT, 'dashboard', 'vendor', 'qrcode-lite.js')
+        with open(qr_path, encoding='utf-8') as f:
+            qr_encoder = f.read()
+        self.assertIn('PHONE_SHARE_SCHEMA, session.id, sequence, capturedAt, session.expiresAt', dashboard)
+        aad = ('envelope.schema_version, envelope.share_id, envelope.sequence, '
+               'envelope.captured_at, envelope.expires_at')
+        self.assertIn(aad, viewer)
+        self.assertLess(
+            dashboard.index('if (!session.lastUploaded)'),
+            dashboard.index('RhmraQr.render'),
+        )
+        self.assertIn('The QR remains hidden', dashboard)
+        self.assertIn('PHONE_SHARE_WORKER_FRESHNESS_MS = 900 * 1000', dashboard)
+        self.assertIn('body: pendingUpload.body', dashboard)
+        self.assertIn(
+            'session.sequence = Math.max(session.sequence, session.pendingUpload.sequence)',
+            dashboard,
+        )
+        stored_key = viewer.index('sessionStorage.setItem(KEY_KEY, key)')
+        self.assertLess(stored_key, viewer.index('history.replaceState', stored_key))
+        self.assertIn('session storage read-back failed', viewer)
+        self.assertIn('root.RhmraQr = Object.freeze({ matrix, render })', qr_encoder)
+        self.assertIn('dashboard/vendor/qrcode-lite.js', dashboard)
+        self.assertIn('.phone-share-dialog[open] { position:fixed;', dashboard)
+        self.assertIn('inset:50% auto auto 50%; margin:0;', dashboard)
+        self.assertIn('transform:translate(-50%, -50%);', dashboard)
+        self.assertIn('<span>View on Phone</span>', dashboard)
+        self.assertIn('#view-on-phone-setup', dashboard)
+
     def test_position_symbols_link_to_robinhood_safely(self):
         with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
             dashboard = f.read()

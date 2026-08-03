@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rhmra-phone-share",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-03",
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SHARE_SESSION",
+        "class_name": "ShareSession"
+      }
+    ]
+  },
+  "exports": {
+    "ShareSession": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "vars": {
+    "WRITE_AUTH_MODE": "bearer-and-service-token",
+    "VERIFY_ACCESS_JWT": "true",
+    "MAX_BODY_BYTES": "393216",
+    "MAX_CIPHERTEXT_BYTES": "262144",
+    "MAX_TTL_SECONDS": "7200",
+    "MAX_CAPTURE_AGE_SECONDS": "900",
+    "CLOCK_SKEW_SECONDS": "120",
+    "TOMBSTONE_SECONDS": "86400"
+  }
+}
