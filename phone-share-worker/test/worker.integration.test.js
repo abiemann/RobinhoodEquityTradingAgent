@@ -141,3 +141,20 @@ test("SQLite share state machine handles retry, update, cache, revoke, and expir
     assert.equal((await response.json()).error, "share_expired");
   });
 });
+
+test("uploader preflight validates write access without creating a share", async () => {
+  await withMiniflare(async (mf) => {
+    let response = await mf.dispatchFetch("http://localhost/api/preflight", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPLOAD_TOKEN}` },
+    });
+    await assertStatus(response, 204);
+    assert.equal(await response.text(), "");
+
+    response = await mf.dispatchFetch("http://localhost/api/preflight", {
+      method: "POST",
+    });
+    assert.equal(response.status, 401);
+    assert.equal((await response.json()).error, "unauthorized");
+  });
+});

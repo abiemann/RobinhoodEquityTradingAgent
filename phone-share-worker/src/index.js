@@ -374,6 +374,14 @@ export default {
         await requireCloudflareAccess(request, env);
         return responseWithHeaders(new Response(null, { status: 303, headers: { Location: "/view" } }));
       }
+      if (request.method === "POST" && url.pathname === "/api/preflight" && !url.search) {
+        const accessIdentity = await requireCloudflareAccess(request, env);
+        requireWriteAuthorization(request, env, accessIdentity);
+        if (!env.SHARE_SESSION) {
+          throw new ProtocolError(503, "storage_not_configured", "Durable Object storage is not configured.");
+        }
+        return emptyResponse(204);
+      }
 
       const shareId = apiPath(url);
       if (!shareId) return jsonResponse({ error: "not_found", message: "Resource not found." }, 404);
