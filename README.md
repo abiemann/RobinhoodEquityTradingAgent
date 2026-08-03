@@ -165,23 +165,6 @@ A successful setup exposes tools such as `get_accounts`.
 
 ![Claude Robinhood MCP connector configuration](images/claude-robinhood-mcp-connector.png)
 
-### View on Phone setup
-
-Phone sharing is **off by default**. RHMRA does not operate a shared dashboard service: each user deploys a small relay into their own Cloudflare account, so they retain control of the URL, access policy, credentials, and temporary data.
-
-- **Free for normal personal use:** the expected dashboard traffic is far below the [Cloudflare Workers Free](https://developers.cloudflare.com/workers/platform/pricing/) and [Durable Objects Free](https://developers.cloudflare.com/durable-objects/platform/pricing/) limits, and the included `workers.dev` address means no domain purchase is needed. Cloudflare currently requires payment details when activating the Zero Trust Free plan, but [states that the free plan is not charged](https://developers.cloudflare.com/cloudflare-one/setup/). Do not select the paid Workers plan for this feature.
-- **Private by design:** the laptop dashboard remains bound to `127.0.0.1` and accepts no internet connections. It sends only outbound HTTPS requests containing a short-lived, AES-GCM-encrypted, read-only dashboard snapshot. Cloudflare stores ciphertext, while Cloudflare Access restricts the data API to the owner's email and the dedicated local uploader; the locally generated QR link supplies the separate decryption key.
-- **Data-minimized:** account numbers, broker credentials, connector settings, order IDs, raw ledgers, gate records, reports, constants, and local paths are never shared. Phone sharing does not call Robinhood or an AI model.
-- **Temporary and revocable:** a share lasts two hours by default and never more than eight hours. A successful **Stop sharing** request deletes the encrypted dashboard snapshot immediately; if Cloudflare cannot process the request, automatic expiry remains the fallback. Treat the QR code as sensitive: someone who has the link and can sign in with the email allowed by the owner's Cloudflare Access policy can view that share until it is revoked or expires.
-
-The Cloudflare account setup is normally done once per installation. No domain, phone app, tunnel, inbound laptop port, or RHMRA fork is required. Follow the [beginner step-by-step phone-sharing guide](phone-share-worker/README.md); it includes every Cloudflare screen, a private credential worksheet, exact value mappings, a secret-safe uploader preflight, checkpoints, a 5-minute acceptance test, troubleshooting, rotation, and updates.
-
-The four local values—`RHMRA_PHONE_SHARE_URL`, `RHMRA_PHONE_SHARE_UPLOAD_TOKEN`, `RHMRA_PHONE_SHARE_CF_CLIENT_ID`, and `RHMRA_PHONE_SHARE_CF_CLIENT_SECRET`—are process-local in the documented setup. Enter them in the same terminal that starts `dashboard/serve.py`, and enter them again after opening a new terminal. Never put them in `constants.md`, a task prompt, a report, or a committed file.
-
-After setup, click **View on Phone → Create secure QR code**. The QR appears only after the first encrypted upload succeeds. Scan it with the phone's ordinary camera/browser; the first visit intentionally asks you to complete Cloudflare login or an emailed one-time PIN with the address in your viewer policy.
-
-If the dashboard says sharing is not configured, no remote request has been made. If an upload or refresh fails, trading and the local dashboard continue normally, while the phone view clearly shows the last successful upload time.
-
 ### Scheduled Task
 
 Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use **Claude Sonnet 4.6** or **Codex Luna 5.6 (high)**. If neither preferred model is available, let the framework select a medium-strength general-purpose model. The prompt can be:
@@ -197,6 +180,23 @@ Only one instance of the trading agent can operate at a time. If another schedul
 ### Scheduled Task Example
 
 ![Claude scheduled task configured to run the Robinhood trading routine](images/scheduled-task-example.png)
+
+### View on Phone setup (optional)
+
+Phone sharing is **off by default**. RHMRA does not operate a shared dashboard service: each user deploys a small relay into their own Cloudflare account, so they retain control of the URL, access policy, credentials, and temporary data.
+
+- **Free for normal personal use:** the expected dashboard traffic is far below the [Cloudflare Workers Free](https://developers.cloudflare.com/workers/platform/pricing/) and [Durable Objects Free](https://developers.cloudflare.com/durable-objects/platform/pricing/) limits, and the included `workers.dev` address means no domain purchase is needed. Cloudflare currently requires payment details when activating the Zero Trust Free plan, but [states that the free plan is not charged](https://developers.cloudflare.com/cloudflare-one/setup/). Do not select the paid Workers plan for this feature.
+- **Private by design:** the laptop dashboard remains bound to `127.0.0.1` and accepts no internet connections. It sends only outbound HTTPS requests containing a short-lived, AES-GCM-encrypted, read-only dashboard snapshot. Cloudflare stores ciphertext, while Cloudflare Access restricts the data API to the owner's email and the dedicated local uploader; the locally generated QR link supplies the separate decryption key.
+- **Data-minimized:** account numbers, broker credentials, connector settings, order IDs, raw ledgers, gate records, reports, constants, and local paths are never shared. Phone sharing does not call Robinhood or an AI model.
+- **Temporary and revocable:** a share lasts two hours by default and never more than eight hours. A successful **Stop sharing** request deletes the encrypted dashboard snapshot immediately; if Cloudflare cannot process the request, automatic expiry remains the fallback. Treat the QR code as sensitive: someone who has the link and can sign in with the email allowed by the owner's Cloudflare Access policy can view that share until it is revoked or expires.
+
+The Cloudflare account setup is normally done once per installation. No domain, phone app, tunnel, inbound laptop port, or RHMRA fork is required. Follow the [beginner step-by-step phone-sharing guide](phone-share-worker/README.md); it includes every Cloudflare screen, a private credential worksheet, exact value mappings, a secret-safe uploader preflight, checkpoints, a 5-minute acceptance test, troubleshooting, rotation, and updates.
+
+The four local values—`RHMRA_PHONE_SHARE_URL`, `RHMRA_PHONE_SHARE_UPLOAD_TOKEN`, `RHMRA_PHONE_SHARE_CF_CLIENT_ID`, and `RHMRA_PHONE_SHARE_CF_CLIENT_SECRET`—are process-local in the documented setup. Enter them in the same terminal that starts `dashboard/serve.py`, and enter them again after opening a new terminal. Never put them in `constants.md`, a task prompt, a report, or a committed file.
+
+After setup, click **View on Phone → Create secure QR code**. The QR appears only after the first encrypted upload succeeds. Scan it with the phone's ordinary camera/browser; the first visit intentionally asks you to complete Cloudflare login or an emailed one-time PIN with the address in your viewer policy.
+
+If the dashboard says sharing is not configured, no remote request has been made. If an upload or refresh fails, trading and the local dashboard continue normally, while the phone view clearly shows the last successful upload time.
 
 ## Tools
 
