@@ -880,6 +880,81 @@ class DailyLossTests(unittest.TestCase):
             scan_phase,
         )
 
+    def test_routine_status_snapshot_uses_one_post_mutation_generation(self):
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+
+        step_12 = routine.index('12. After the buy intent is terminal')
+        refresh_start = routine.index(
+            '**FINAL STATUS REFRESH — ONE COHERENT POST-MUTATION GENERATION:**'
+        )
+        publish_start = routine.index('**Publish the STATUS SNAPSHOT', refresh_start)
+        self.assertLess(step_12, refresh_start)
+        self.assertLess(refresh_start, publish_start)
+
+        refresh = routine[refresh_start:publish_start]
+        for mutation in (
+            'profit-take',
+            'dust sweep',
+            'stop fill/repair',
+            'entry buy',
+            'partial fill',
+            'cancellation',
+            'replacement order',
+        ):
+            self.assertIn(mutation, refresh)
+        self.assertIn('`confirmed`/`queued` protective stops', refresh)
+        self.assertIn('mandatory and read-only in LIVE and DRY RUN', refresh)
+        self.assertIn('every page of `get_equity_positions` as the BEFORE census', refresh)
+        self.assertIn('`get_portfolio`', refresh)
+        self.assertIn('`get_realized_pnl`', refresh)
+        self.assertIn('every page of `get_equity_orders`', refresh)
+        self.assertIn('with NO state filter', refresh)
+        self.assertIn('`get_equity_positions` again as the AFTER census', refresh)
+        self.assertIn('held-position fingerprint', refresh)
+        self.assertIn('BEFORE and AFTER fingerprints to match exactly', refresh)
+        self.assertIn('`quoted_equity = sum(quantity * current_price)`', refresh)
+        self.assertIn('0.01 * max(abs(equity_value), abs(quoted_equity))', refresh)
+        self.assertIn('require `equity_value == 0` exactly when', refresh.lower())
+        self.assertIn('zero `equity_value` paired with a held position', refresh)
+        self.assertIn('generic immediate one-retry rule', refresh)
+        self.assertIn('new generation must NOT resurrect the twice-failed read', refresh)
+        self.assertIn('zero-equity tiebreak', refresh)
+        self.assertIn('Only when every required read succeeded', refresh)
+        self.assertIn(
+            'discard the ENTIRE generation and perform exactly one new generation',
+            refresh,
+        )
+        self.assertIn('There is no third generation', refresh)
+        self.assertIn('never combine values across generations', refresh)
+        self.assertIn('SOLE source of all four `account` fields', refresh)
+        self.assertIn(
+            'SOLE non-null source of `realized_pnl_today`',
+            refresh,
+        )
+        self.assertIn(
+            'Never splice fields or reuse FIRST, SECOND/DAILY-LOSS, pre-buy, or Step 12',
+            refresh,
+        )
+        self.assertIn('do NOT create a new `rhmra-status-*.json`', refresh)
+        self.assertIn('do NOT call release', refresh)
+        self.assertIn('lease remains valid', refresh)
+        self.assertIn('release normally', refresh)
+        self.assertIn('previous truthful snapshot', refresh)
+
+        snapshot = routine[publish_start : routine.index('The filename is exactly:', publish_start)]
+        self.assertIn(
+            'successful FINAL STATUS REFRESH is the exclusive source for `account` and `positions`',
+            snapshot,
+        )
+        self.assertIn('explicit final-status-unavailable path', snapshot)
+        self.assertIn('figure from the FINAL STATUS REFRESH', snapshot)
+        self.assertNotIn('get_realized_pnl figure from SECOND', snapshot)
+        self.assertNotIn('never make a new API call for the snapshot', snapshot)
+
 
 class EvaluateCandidatesTests(unittest.TestCase):
     def run_eval(self, hist_payload, quotes, extra=None, return_document=False):
