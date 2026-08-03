@@ -80,9 +80,15 @@ async function loadJwks(config, forceRefresh = false) {
     response = await fetch(config.certsUrl, {
       method: "GET",
       headers: { "Accept": "application/json" },
-      redirect: "error",
+      // workerd does not implement the standard Fetch `error` redirect mode.
+      // Use `manual` and reject redirects below so signing keys can never be
+      // fetched from an unexpected origin.
+      redirect: "manual",
     });
   } catch {
+    throw new ProtocolError(503, "access_keys_unavailable", "Cloudflare Access signing keys are unavailable.");
+  }
+  if (response.status >= 300 && response.status < 400) {
     throw new ProtocolError(503, "access_keys_unavailable", "Cloudflare Access signing keys are unavailable.");
   }
   if (!response.ok) {

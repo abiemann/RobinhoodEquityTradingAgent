@@ -172,9 +172,13 @@ test("Access verifier accepts only a correctly signed issuer and audience", asyn
   const signedPart = `${header}.${payload}`;
   const signature = sign("RSA-SHA256", Buffer.from(signedPart), privateKey).toString("base64url");
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ keys: [publicJwk] }), {
-    status: 200, headers: { "Content-Type": "application/json" },
-  });
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, `${issuer}/cdn-cgi/access/certs`);
+    assert.equal(init.redirect, "manual");
+    return new Response(JSON.stringify({ keys: [publicJwk] }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    });
+  };
   try {
     const claims = await requireCloudflareAccess(new Request("https://worker.test/api/auth", {
       headers: { "Cf-Access-Jwt-Assertion": `${signedPart}.${signature}` },

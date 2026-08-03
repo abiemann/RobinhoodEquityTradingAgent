@@ -26,6 +26,7 @@ test('production and local authentication modes remain deliberately separate', (
   const configuration = JSON.parse(read('wrangler.jsonc'));
   assert.equal(configuration.vars.WRITE_AUTH_MODE, 'bearer-and-service-token');
   assert.equal(configuration.vars.VERIFY_ACCESS_JWT, 'true');
+  assert.deepEqual(configuration.compatibility_flags, ['global_fetch_strictly_public']);
 
   const localTemplate = read('local-dev.vars.example');
   assert.match(localTemplate, /^WRITE_AUTH_MODE=bearer$/m);
