@@ -21,22 +21,37 @@ The QR link is still sensitive: anyone who has the link has the decryption key. 
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/abiemann/RobinhoodEquityTradingAgent/tree/main/phone-share-worker)
 
-1. Sign in to a free Cloudflare account and deploy this `phone-share-worker` subdirectory. It is fully self-contained; the deployment does not need the rest of the trading repository.
-2. Note the production URL, such as `https://rhmra-phone-share.your-name.workers.dev`.
-3. In **Zero Trust → Access controls → Service credentials → Service Tokens**, create a token named `RHMRA dashboard uploader`. Save both its Client ID and Client Secret; Cloudflare displays the secret only once.
-4. In **Zero Trust → Access controls → Applications**, create one self-hosted application for exactly:
+1. Sign in to a free Cloudflare account and open the deployment link above. If Cloudflare asks you to connect GitHub, choose **New GitHub connection**. On GitHub's **Install & Authorize Cloudflare Workers and Pages** page:
+
+   - choose **Only select repositories** rather than **All repositories**;
+   - follow GitHub's repository prompt; and
+   - click **Install & Authorize**.
+
+   You do not need to fork RHMRA first. Cloudflare reads the public source during setup, creates a separate deployment repository in your GitHub account, and automatically receives access to that new repository. Only the self-contained `phone-share-worker/` directory is copied, built, and deployed; the trading application and its files are not deployed.
+2. After GitHub returns you to Cloudflare, finish the application form:
+
+   - keep the project name `rhmra-phone-share`, or use another descriptive name;
+   - select **Create private Git repository** if you want Cloudflare's generated deployment repository to be private;
+   - confirm that `WRITE_AUTH_MODE` appears exactly once as `bearer-and-service-token` and `VERIFY_ACCESS_JWT` appears exactly once as `true`;
+   - leave **Build command** blank and **Deploy command** set to `npm run deploy`; and
+   - confirm that `UPLOAD_TOKEN` is a separate random value of at least 32 characters, then save it securely because the local dashboard uploader needs that same value.
+
+   Only `UPLOAD_TOKEN` should be masked. If `WRITE_AUTH_MODE` or `VERIFY_ACCESS_JWT` also appears as a masked duplicate, cancel the deployment and start again from the latest RHMRA revision. **Builds for non-production branches** may remain selected; it only controls preview builds. Click **Deploy**. After deployment, open GitHub **Settings → Applications → Cloudflare Workers and Pages**, keep **Only select repositories**, and leave access only to the new Cloudflare deployment repository.
+3. Note the production URL, such as `https://rhmra-phone-share.your-name.workers.dev`.
+4. In **Zero Trust → Access controls → Service credentials → Service Tokens**, create a token named `RHMRA dashboard uploader`. Save both its Client ID and Client Secret; Cloudflare displays the secret only once.
+5. In **Zero Trust → Access controls → Applications**, create one self-hosted application for exactly:
 
    `rhmra-phone-share.your-name.workers.dev/api/*`
 
    Leave `/view` outside Access. This is intentional: it safely preserves the QR fragment before an authentication redirect.
-5. Add two Access policies to that application:
+6. Add two Access policies to that application:
 
    - an **Allow** policy containing only the email address that may view the phone dashboard; and
    - a **Service Auth** policy containing only the `RHMRA dashboard uploader` service token.
 
    Use Cloudflare's built-in identity provider or enable one-time PIN email login. Do not add a `Bypass` policy.
-6. From the application's settings, copy its **Application Audience (AUD) Tag**. Also note the Zero Trust team domain, such as `https://your-team.cloudflareaccess.com`.
-7. In the Worker's **Settings → Variables and Secrets**, configure:
+7. From the application's settings, copy its **Application Audience (AUD) Tag**. Also note the Zero Trust team domain, such as `https://your-team.cloudflareaccess.com`.
+8. In the Worker's **Settings → Variables and Secrets**, configure:
 
    | Name | Kind | Value |
    |---|---|---|
@@ -45,7 +60,7 @@ The QR link is still sensitive: anyone who has the link has the decryption key. 
    | `ACCESS_SERVICE_CLIENT_ID` | encrypted secret or variable | the uploader service token's Client ID |
    | `UPLOAD_TOKEN` | encrypted secret | a separate random value of at least 32 characters |
 
-   `UPLOAD_TOKEN` is not the Cloudflare Client Secret. Generate a different random value with one of these cryptographically secure commands, then copy the output into the Worker secret and keep it available for the local setup in the next step:
+   `UPLOAD_TOKEN` is not the Cloudflare Client Secret. Use the separate value created on the deployment form. If you still need to generate it, use one of these cryptographically secure commands, copy the output into the Worker secret, and keep it available for the local setup in the next step:
 
    PowerShell:
 
@@ -58,7 +73,7 @@ The QR link is still sensitive: anyone who has the link has the decryption key. 
    ```bash
    python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
    ```
-8. Restart the local dashboard after setting these environment variables:
+9. Restart the local dashboard after setting these environment variables:
 
    | Name | Value |
    |---|---|
@@ -117,7 +132,7 @@ npx wrangler secret put ACCESS_SERVICE_CLIENT_ID
 npx wrangler secret put UPLOAD_TOKEN
 ```
 
-For local-only Worker development, copy `.dev.vars.example` to `.dev.vars`. The example explicitly disables Access JWT verification so `wrangler dev` can run without Cloudflare Access. `.dev.vars` is ignored by Git. These overrides work only when the request hostname is `localhost`, a `*.localhost` name, `127.0.0.1`, or `::1`; the Worker returns a configuration failure if either override is accidentally deployed. The checked-in production configuration always requires both Access and the service-token identity.
+For local-only Worker development, copy `local-dev.vars.example` to `.dev.vars`. The local example explicitly disables Access JWT verification so `wrangler dev` can run without Cloudflare Access. The separate `.dev.vars.example` file intentionally declares only the production `UPLOAD_TOKEN` prompt used by Deploy to Cloudflare. `.dev.vars` is ignored by Git. Local overrides work only when the request hostname is `localhost`, a `*.localhost` name, `127.0.0.1`, or `::1`; the Worker returns a configuration failure if either override is accidentally deployed. The checked-in production configuration always requires both Access and the service-token identity.
 
 ## Wire contract
 

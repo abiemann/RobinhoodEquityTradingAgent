@@ -1,0 +1,4 @@
+# Local development only. Copy to .dev.vars; never commit the real file.
+WRITE_AUTH_MODE=bearer
+VERIFY_ACCESS_JWT=false
+UPLOAD_TOKEN=replace-with-at-least-32-random-characters

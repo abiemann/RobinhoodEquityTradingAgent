@@ -176,7 +176,7 @@ Phone sharing is **off by default**. RHMRA does not operate a shared dashboard s
 
 Set it up once:
 
-1. Use [Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/abiemann/RobinhoodEquityTradingAgent/tree/main/phone-share-worker) to deploy your own relay from the isolated `phone-share-worker/` directory.
+1. Use [Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/abiemann/RobinhoodEquityTradingAgent/tree/main/phone-share-worker) to deploy your own relay from the isolated `phone-share-worker/` directory. You do not need to fork RHMRA: Cloudflare creates a separate deployment repository in your GitHub account. When GitHub opens **Install & Authorize Cloudflare Workers and Pages**, choose **Only select repositories** rather than **All repositories**, follow GitHub's repository prompt, and click **Install & Authorize**. After deployment, review the app under GitHub **Settings → Applications** and leave it access only to the new Cloudflare deployment repository.
 2. Follow the [phone-sharing setup guide](phone-share-worker/README.md) to create the upload secret, protect `/api/*` with Cloudflare Access, allow only your email, and create the uploader service token.
 3. Set `RHMRA_PHONE_SHARE_URL`, `RHMRA_PHONE_SHARE_UPLOAD_TOKEN`, `RHMRA_PHONE_SHARE_CF_CLIENT_ID`, and `RHMRA_PHONE_SHARE_CF_CLIENT_SECRET` in the terminal that starts `dashboard/serve.py`. These are deployment credentials: never put them in `constants.md`, a task prompt, a report, or a committed file.
 4. Restart the dashboard server. Click **View on Phone**, review the security summary, and scan the locally generated QR code. The phone uses its ordinary browser; no phone app is required.
