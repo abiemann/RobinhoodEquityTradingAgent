@@ -3,6 +3,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = (ROOT / 'dashboard' / 'index.html').read_text(encoding='utf-8')
+README = (ROOT / 'README.md').read_text(encoding='utf-8')
+PUBLIC_CONFIG = (ROOT / 'dashboard' / 'phone_share' / 'public_config.py').read_text(encoding='utf-8')
 
 def function_source(name, next_name):
     start = DASHBOARD.index(f'function {name}')
@@ -10,6 +12,15 @@ def function_source(name, next_name):
     return DASHBOARD[start:end]
 
 class PhoneShareDashboardV2ContractTests(unittest.TestCase):
+    def test_phone_viewer_uses_canonical_public_repository_name(self):
+        canonical_repo = 'https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer'
+        canonical_pages = 'https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/'
+        self.assertIn(canonical_repo, README)
+        self.assertIn(canonical_pages, README)
+        self.assertIn(canonical_pages, PUBLIC_CONFIG)
+        self.assertNotIn('github.com/abiemann/RHMRA-Phone', README)
+        self.assertNotIn('abiemann.github.io/RHMRA-Phone', README + PUBLIC_CONFIG)
+
     def test_google_qr_fragment_has_exact_v2_contract(self):
         source = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
         self.assertIn('''PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER = 'gdrive';''', DASHBOARD)
