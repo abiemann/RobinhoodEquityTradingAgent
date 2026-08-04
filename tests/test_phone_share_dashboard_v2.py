@@ -1,0 +1,118 @@
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DASHBOARD = (ROOT / 'dashboard' / 'index.html').read_text(encoding='utf-8')
+
+def function_source(name, next_name):
+    start = DASHBOARD.index(f'function {name}')
+    end = DASHBOARD.index(f'function {next_name}', start)
+    return DASHBOARD[start:end]
+
+class PhoneShareDashboardV2ContractTests(unittest.TestCase):
+    def test_google_qr_fragment_has_exact_v2_contract(self):
+        source = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        self.assertIn('''PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER = 'gdrive';''', DASHBOARD)
+        self.assertIn(
+            '''viewer.hash = `v=2&provider=${PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER}&id=${shareId}&key=${base64Url(keyBytes)}`''',
+            source,
+        )
+        self.assertIn('new Uint8Array(32)', source)
+        self.assertIn('new Uint8Array(16)', source)
+
+    def test_pairing_persists_only_a_nonextractable_crypto_key(self):
+        start = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        record = function_source('googlePhonePairingRecord', 'loadGooglePhonePairing')
+        validation = function_source('validGooglePhonePairing', 'googlePhonePairingRecord')
+        self.assertIn('''{ name: 'AES-GCM' }, false, ['encrypt']''', start)
+        self.assertIn('key: pairing.key', record)
+        self.assertNotIn('keyBytes', record)
+        self.assertNotIn('privateUrl', record)
+        self.assertIn('record.key.extractable === false', validation)
+        self.assertIn('indexedDB.open(PHONE_SHARE_PAIRING_DB, 1)', DASHBOARD)
+        self.assertNotIn('localStorage', DASHBOARD)
+
+    def test_stable_pairing_is_loaded_reused_and_advances_monotonically(self):
+        start = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        reserve = function_source('reservePhoneShareSequence', 'safeShareText')
+        upload = function_source('uploadPhoneShare', 'copyPhoneShareLink')
+        self.assertIn('await loadGooglePhonePairing()', start)
+        self.assertIn('if (!googlePhonePairing)', start)
+        self.assertIn('id: googlePhonePairing.shareId', start)
+        self.assertIn('key: googlePhonePairing.key', start)
+        self.assertIn('sequence: googlePhonePairing.sequence', start)
+        self.assertIn('''db.transaction(PHONE_SHARE_PAIRING_STORE, 'readwrite')''', reserve)
+        self.assertIn('const request = store.get(PHONE_SHARE_GOOGLE_PROVIDER)', reserve)
+        self.assertIn('Math.max(current.sequence, session.sequence) + 1', reserve)
+        self.assertIn('const put = store.put(nextRecord)', reserve)
+        self.assertNotIn('await persistGooglePhonePairing', reserve)
+        marker = 'const sequence = await reservePhoneShareSequence(session)'
+        self.assertIn(marker, upload)
+        self.assertLess(upload.index(marker), upload.index('expires_at: session.expiresAt'))
+
+    def test_stop_retains_presented_pairing_but_forget_rotates_it(self):
+        stop = function_source('stopPhoneShare', 'forgetGooglePhone')
+        forget = function_source('forgetGooglePhone', 'banner')
+        self.assertIn('const pairingWasPresented = Boolean(session.lastUploaded)', stop)
+        self.assertIn(
+            'const incompleteNewPairing = Boolean(session.pairingNeedsPersistence && !pairingWasPresented)',
+            stop,
+        )
+        self.assertIn('your phone remains paired for next time', stop)
+        self.assertIn(
+            'if (google && incompleteNewPairing) await clearStoredGooglePhonePairing()',
+            stop,
+        )
+        self.assertIn('await clearStoredGooglePhonePairing()', forget)
+        self.assertIn('The next share will create a new key and QR code', forget)
+        self.assertIn('''method: 'DELETE',''', stop)
+        self.assertIn('''method: 'DELETE',''', forget)
+
+    def test_google_connection_preopens_popup_then_polls_connected_config(self):
+        source = function_source('connectGoogleDrivePhoneShare', 'revokePreviousPhoneShare')
+        popup = source.index('''window.open('about:blank',''')
+        request = source.index('''phoneShareLocalFetch('/api/phone-share/connect',''')
+        self.assertLess(popup, request)
+        self.assertIn('''X-RHMRA-CSRF': phoneShareConfig.csrf_token''', source)
+        self.assertIn('authorizationWindow.location.replace', source)
+        self.assertIn('config.connected === true', source)
+        self.assertIn('PHONE_SHARE_CONNECT_TIMEOUT_MS', source)
+
+    def test_all_local_phone_share_requests_have_a_bounded_timeout(self):
+        helper = function_source('phoneShareLocalFetch', 'getPhoneShareConfig')
+        self.assertIn('new AbortController()', helper)
+        self.assertIn('PHONE_SHARE_LOCAL_REQUEST_TIMEOUT_MS', helper)
+        self.assertIn('controller.abort()', helper)
+        self.assertIn('clearTimeout(timeout)', helper)
+        self.assertIn("fetch(path, { ...options, signal: controller.signal })", helper)
+        self.assertNotIn("fetch('/api/phone-share", DASHBOARD)
+        for path in ('/api/phone-share/config', '/api/phone-share/connect'):
+            with self.subTest(path=path):
+                self.assertIn("phoneShareLocalFetch('" + path, DASHBOARD)
+        self.assertIn("phoneShareLocalFetch('/api/phone-share', {", DASHBOARD)
+        self.assertGreaterEqual(
+            DASHBOARD.count("phoneShareLocalFetch('/api/phone-share/' +"),
+            3,
+        )
+
+    def test_legacy_cloudflare_branch_and_session_semantics_remain(self):
+        provider = function_source('phoneShareProvider', 'isGoogleDrivePhoneShare')
+        legacy = function_source('startLegacyPhoneShare', 'uploadPhoneShare')
+        self.assertIn('''? PHONE_SHARE_GOOGLE_PROVIDER : 'cloudflare';''', provider)
+        self.assertIn('''provider: 'cloudflare',''', legacy)
+        self.assertIn(
+            '''new URLSearchParams({ id: shareId, key: base64Url(keyBytes) })''',
+            legacy,
+        )
+        self.assertIn('rememberPhoneShare(shareId, phoneShareSession.expiresAt)', legacy)
+        self.assertIn('sessionStorage.setItem(PHONE_SHARE_REVOKE_KEY', DASHBOARD)
+        self.assertIn('One-time Cloudflare setup required', DASHBOARD)
+
+    def test_beginner_copy_explains_private_free_account_owned_storage(self):
+        self.assertIn('your private Google Drive app data', DASHBOARD)
+        self.assertIn('Google Cloud project, bucket, API key, or paid storage service', DASHBOARD)
+        self.assertIn('There is no shared RHMRA server', DASHBOARD)
+
+
+if __name__ == '__main__':
+    unittest.main()

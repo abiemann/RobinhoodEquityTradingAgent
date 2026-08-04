@@ -79,6 +79,7 @@ class PhoneShareServerTests(unittest.TestCase):
 
     def configure(self):
         os.environ.update({
+            SERVER.PHONE_SHARE_PROVIDER_ENV: 'cloudflare',
             SERVER.PHONE_SHARE_URL_ENV: 'https://share.example',
             SERVER.PHONE_SHARE_TOKEN_ENV: 'upload-' + ('t' * 40),
             SERVER.PHONE_SHARE_ACCESS_ID_ENV: 'access-client-id',
@@ -128,7 +129,10 @@ class PhoneShareServerTests(unittest.TestCase):
     def test_disabled_config_is_safe_and_secret_free(self):
         status, headers, body = self.request('GET', '/api/phone-share/config')
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {'configured': False})
+        self.assertEqual(
+            json.loads(body),
+            {'configured': False, 'provider': 'google-drive'},
+        )
         self.assertEqual(headers.get('Cache-Control'), 'no-store')
         self.assertNotIn('Access-Control-Allow-Origin', headers)
 
@@ -150,13 +154,13 @@ class PhoneShareServerTests(unittest.TestCase):
         os.environ[SERVER.PHONE_SHARE_URL_ENV] = 'http://share.example'
         self.assertEqual(
             json.loads(self.request('GET', '/api/phone-share/config')[2]),
-            {'configured': False},
+            {'configured': False, 'provider': 'cloudflare'},
         )
         os.environ[SERVER.PHONE_SHARE_URL_ENV] = 'https://share.example'
         del os.environ[SERVER.PHONE_SHARE_ACCESS_SECRET_ENV]
         self.assertEqual(
             json.loads(self.request('GET', '/api/phone-share/config')[2]),
-            {'configured': False},
+            {'configured': False, 'provider': 'cloudflare'},
         )
         self.configure()
         os.environ[SERVER.PHONE_SHARE_VIEWER_URL_ENV] = (
@@ -164,7 +168,7 @@ class PhoneShareServerTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(self.request('GET', '/api/phone-share/config')[2]),
-            {'configured': False},
+            {'configured': False, 'provider': 'cloudflare'},
         )
         self.configure()
         os.environ[SERVER.PHONE_SHARE_VIEWER_URL_ENV] = (
@@ -184,7 +188,7 @@ class PhoneShareServerTests(unittest.TestCase):
             os.environ[SERVER.PHONE_SHARE_VIEWER_URL_ENV] = invalid_viewer
             self.assertEqual(
                 json.loads(self.request('GET', '/api/phone-share/config')[2]),
-                {'configured': False},
+                {'configured': False, 'provider': 'cloudflare'},
                 invalid_viewer,
             )
 

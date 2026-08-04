@@ -191,11 +191,20 @@ const PHONE_SHARE_SCHEMA = 1;
 const PHONE_SHARE_MAX_SECONDS = 8 * 60 * 60;
 const PHONE_SHARE_WORKER_FRESHNESS_MS = 900 * 1000;
 const PHONE_SHARE_REVOKE_KEY = 'rhmra_phone_share_revoke_v1';
+const PHONE_SHARE_PAIRING_DB = 'rhmra-phone-share-v2';
+const PHONE_SHARE_PAIRING_STORE = 'pairings';
+const PHONE_SHARE_GOOGLE_PROVIDER = 'google-drive';
+const PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER = 'gdrive';
+const PHONE_SHARE_CONNECT_TIMEOUT_MS = 120000;
+const PHONE_SHARE_LOCAL_REQUEST_TIMEOUT_MS = 15000;
 const phoneShareEncoder = new TextEncoder();
 let phoneShareConfig = null;
 let phoneShareSession = null;
 let latestPhoneView = null;
 let previousPhoneShare = readPreviousPhoneShare();
+let googlePhonePairing = null;
+let googlePhonePairingLoaded = false;
+let googlePhonePairingPersistent = false;
 
 function readPreviousPhoneShare() {
   try {
@@ -218,6 +227,231 @@ function rememberPhoneShare(shareId, expiresAt) {
 function forgetPreviousPhoneShare() {
   previousPhoneShare = null;
   try { sessionStorage.removeItem(PHONE_SHARE_REVOKE_KEY); } catch { /* optional */ }
+}
+
+function phoneShareProvider(config = phoneShareConfig) {
+  return config?.provider === PHONE_SHARE_GOOGLE_PROVIDER
+    ? PHONE_SHARE_GOOGLE_PROVIDER : 'cloudflare';
+}
+
+function isGoogleDrivePhoneShare(config = phoneShareConfig) {
+  return phoneShareProvider(config) === PHONE_SHARE_GOOGLE_PROVIDER;
+}
+
+function wipePhoneShareSession(session) {
+  if (!session) return;
+  if (session.keyBytes instanceof Uint8Array) session.keyBytes.fill(0);
+  session.url = null;
+  session.keyBytes = null;
+}
+
+function phoneShareDelay(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function phoneShareLocalFetch(path, options = {}) {
+  if (typeof path !== 'string' || !path.startsWith('/api/phone-share')) {
+    throw new Error('Invalid local phone-sharing request.');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(), PHONE_SHARE_LOCAL_REQUEST_TIMEOUT_MS
+  );
+  try {
+    return await fetch(path, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('The local phone-sharing service timed out.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getPhoneShareConfig() {
+  const response = await phoneShareLocalFetch('/api/phone-share/config', {
+    cache: 'no-store',
+  });
+  const document = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(document.message || `local dashboard returned HTTP ${response.status}`);
+  }
+  return document;
+}
+
+function openPhonePairingDatabase() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) {
+      reject(new Error('IndexedDB is unavailable.'));
+      return;
+    }
+    const request = indexedDB.open(PHONE_SHARE_PAIRING_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(PHONE_SHARE_PAIRING_STORE)) {
+        request.result.createObjectStore(PHONE_SHARE_PAIRING_STORE, { keyPath: 'provider' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Unable to open secure pairing storage.'));
+    request.onblocked = () => reject(new Error('Secure pairing storage is blocked by another tab.'));
+  });
+}
+
+function pairingRequest(mode, action) {
+  return openPhonePairingDatabase().then(db => new Promise((resolve, reject) => {
+    let request;
+    let requestResult = null;
+    let settled = false;
+    const fail = error => {
+      if (settled) return;
+      settled = true;
+      db.close();
+      reject(error);
+    };
+    try {
+      const transaction = db.transaction(PHONE_SHARE_PAIRING_STORE, mode);
+      request = action(transaction.objectStore(PHONE_SHARE_PAIRING_STORE));
+      request.onsuccess = () => { requestResult = request.result ?? null; };
+      request.onerror = () => fail(request.error || new Error('Secure pairing storage failed.'));
+      transaction.onabort = () => fail(transaction.error || new Error('Secure pairing storage was aborted.'));
+      transaction.onerror = () => fail(transaction.error || new Error('Secure pairing storage failed.'));
+      transaction.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        resolve(requestResult);
+      };
+    } catch (error) {
+      fail(error);
+    }
+  }));
+}
+
+function validGooglePhonePairing(record) {
+  const createdAt = new Date(record?.createdAt);
+  const isCryptoKey = typeof CryptoKey === 'function' && record?.key instanceof CryptoKey;
+  return record?.provider === PHONE_SHARE_GOOGLE_PROVIDER &&
+    typeof record.shareId === 'string' && /^[A-Za-z0-9_-]{22,64}$/.test(record.shareId) &&
+    Number.isSafeInteger(record.sequence) && record.sequence >= 0 &&
+    typeof record.createdAt === 'string' && Number.isFinite(createdAt.getTime()) &&
+    createdAt.toISOString() === record.createdAt && isCryptoKey &&
+    record.key.type === 'secret' && record.key.extractable === false &&
+    record.key.algorithm?.name === 'AES-GCM' && record.key.usages.includes('encrypt');
+}
+
+function googlePhonePairingRecord(pairing) {
+  return {
+    provider: PHONE_SHARE_GOOGLE_PROVIDER,
+    shareId: pairing.shareId,
+    key: pairing.key,
+    sequence: pairing.sequence,
+    createdAt: pairing.createdAt,
+  };
+}
+
+async function loadGooglePhonePairing() {
+  if (googlePhonePairingLoaded) return googlePhonePairing;
+  googlePhonePairingLoaded = true;
+  try {
+    const record = await pairingRequest('readonly', store => store.get(PHONE_SHARE_GOOGLE_PROVIDER));
+    if (record && validGooglePhonePairing(record)) {
+      googlePhonePairing = record;
+      googlePhonePairingPersistent = true;
+      return record;
+    }
+    if (record) await pairingRequest('readwrite', store => store.delete(PHONE_SHARE_GOOGLE_PROVIDER));
+  } catch {
+    // A non-extractable CryptoKey is never replaced with persisted raw key material.
+    // The current tab can still create a clearly session-only pairing below.
+  }
+  googlePhonePairing = null;
+  googlePhonePairingPersistent = false;
+  return null;
+}
+
+async function persistGooglePhonePairing(pairing) {
+  try {
+    await pairingRequest('readwrite', store => store.put(googlePhonePairingRecord(pairing)));
+    const roundTrip = await pairingRequest('readonly', store => store.get(PHONE_SHARE_GOOGLE_PROVIDER));
+    if (!validGooglePhonePairing(roundTrip) || roundTrip.shareId !== pairing.shareId ||
+        roundTrip.sequence !== pairing.sequence) {
+      throw new Error('The browser did not preserve the secure key.');
+    }
+    googlePhonePairingPersistent = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function clearStoredGooglePhonePairing() {
+  try { await pairingRequest('readwrite', store => store.delete(PHONE_SHARE_GOOGLE_PROVIDER)); }
+  catch { /* Clearing the in-memory reference below still rotates this tab safely. */ }
+  googlePhonePairing = null;
+  googlePhonePairingLoaded = true;
+  googlePhonePairingPersistent = false;
+}
+
+async function reservePhoneShareSequence(session) {
+  if (session.provider !== PHONE_SHARE_GOOGLE_PROVIDER) return session.sequence + 1;
+  if (!googlePhonePairing || googlePhonePairing.shareId !== session.id) {
+    throw new Error('The saved phone pairing is unavailable. Forget it and pair again.');
+  }
+  if (!googlePhonePairingPersistent) {
+    const next = Math.max(googlePhonePairing.sequence, session.sequence) + 1;
+    if (!Number.isSafeInteger(next)) throw new Error('The secure update counter is exhausted.');
+    googlePhonePairing.sequence = next;
+    return next;
+  }
+
+  // IndexedDB serializes read/write transactions for this object store. Reading
+  // and incrementing inside one transaction prevents two dashboard tabs from
+  // reserving the same authenticated sequence number.
+  return openPhonePairingDatabase().then(db => new Promise((resolve, reject) => {
+    let nextRecord = null;
+    let settled = false;
+    const fail = error => {
+      if (settled) return;
+      settled = true;
+      db.close();
+      reject(error);
+    };
+    try {
+      const transaction = db.transaction(PHONE_SHARE_PAIRING_STORE, 'readwrite');
+      const store = transaction.objectStore(PHONE_SHARE_PAIRING_STORE);
+      const request = store.get(PHONE_SHARE_GOOGLE_PROVIDER);
+      request.onerror = () => fail(request.error || new Error('Secure pairing storage failed.'));
+      request.onsuccess = () => {
+        const current = request.result;
+        if (!validGooglePhonePairing(current) || current.shareId !== session.id) {
+          transaction.abort();
+          return;
+        }
+        const next = Math.max(current.sequence, session.sequence) + 1;
+        if (!Number.isSafeInteger(next)) {
+          transaction.abort();
+          return;
+        }
+        nextRecord = { ...current, sequence: next };
+        const put = store.put(nextRecord);
+        put.onerror = () => fail(put.error || new Error('Secure pairing storage failed.'));
+      };
+      transaction.onabort = () => fail(
+        transaction.error || new Error('The saved phone pairing changed in another tab. Try again.')
+      );
+      transaction.onerror = () => fail(transaction.error || new Error('Secure pairing storage failed.'));
+      transaction.oncomplete = () => {
+        if (settled || !nextRecord) return;
+        settled = true;
+        db.close();
+        googlePhonePairing = nextRecord;
+        resolve(nextRecord.sequence);
+      };
+    } catch (error) {
+      fail(error);
+    }
+  }));
 }
 
 function safeShareText(value, limit = 160) {
@@ -308,6 +542,20 @@ function setShareButtonActive(active) {
   button.setAttribute('aria-label', active ? 'Phone viewing active; open viewing controls' : 'View dashboard on phone');
 }
 
+function phoneShareDurationOptions() {
+  const maximum = Math.min(PHONE_SHARE_MAX_SECONDS,
+    Math.max(60, Number(phoneShareConfig?.ttl_seconds) || 7200));
+  let durations = [3600, 7200, 14400, 28800].filter(seconds => seconds <= maximum);
+  if (!durations.length) durations = [maximum];
+  const preferred = durations.includes(7200) ? 7200 : durations[durations.length - 1];
+  return durations.map(seconds => {
+    const hours = seconds / 3600;
+    const label = Number.isInteger(hours)
+      ? `${hours} hour${hours === 1 ? '' : 's'}` : `${Math.round(seconds / 60)} minutes`;
+    return `<option value='${seconds}'${seconds === preferred ? ' selected' : ''}>${label}</option>`;
+  }).join('');
+}
+
 function renderShareDialog(message = '', isError = false) {
   const content = $('phone-share-content');
   if (phoneShareSession) {
@@ -317,25 +565,35 @@ function renderShareDialog(message = '', isError = false) {
         <p>The first encrypted dashboard snapshot is uploading. The private QR code will appear only after the remote viewer confirms it is ready.</p>
         <dl class='share-meta'><dt>Status</dt><dd>Upload pending</dd>
           <dt>Expires</dt><dd>${esc(shareDateTime(session.expiresAt))}</dd></dl>
-        <div class='share-controls'><button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button></div>
+        <div class='share-controls'><button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button>
+          ${session.provider === PHONE_SHARE_GOOGLE_PROVIDER ? `<button id='phone-share-forget' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Forget paired phone</button>` : ''}</div>
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || session.status || 'Uploading the first encrypted snapshot...')}</p>`;
       $('phone-share-stop').addEventListener('click', stopPhoneShare);
+      $('phone-share-forget')?.addEventListener('click', forgetGooglePhone);
       return;
     }
     const uploaded = session.lastUploaded ? shareDateTime(session.lastUploaded) : 'upload pending';
+    const google = session.provider === PHONE_SHARE_GOOGLE_PROVIDER;
+    const pairingDisplay = session.url
+      ? `<p>Scan this code with your phone camera. The phone dashboard is temporary and read-only.</p>
+         <div id='phone-share-qr' class='share-qr'></div>
+         <p class='share-warning'><strong>Keep this QR code and copied link private.</strong> They contain the decryption key.</p>`
+      : `<div class='share-note'><strong>Your paired phone is ready.</strong> Open the installed RHMRA Phone app. It will find this new encrypted snapshot in your private Google Drive app data automatically.</div>`;
     content.innerHTML = `<h3>Secure phone sharing is active</h3>
-      <p>Scan this code with your phone camera. The phone dashboard is temporary and read-only.</p>
-      <div id='phone-share-qr' class='share-qr'></div>
-      <p class='share-warning'><strong>Keep this QR code and copied link private.</strong> They contain the decryption key.</p>
+      ${pairingDisplay}
       <dl class='share-meta'><dt>Last upload</dt><dd>${esc(uploaded)}</dd>
         <dt>Expires</dt><dd>${esc(shareDateTime(session.expiresAt))}</dd></dl>
-      <div class='share-controls'><button id='phone-share-copy' class='share-action' type='button'>Copy private link</button>
-        <button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button></div>
+      <div class='share-controls'>${session.url ? `<button id='phone-share-copy' class='share-action' type='button'>Copy private link</button>` : ''}
+        <button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button>
+        ${google ? `<button id='phone-share-forget' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Forget paired phone</button>` : ''}</div>
       <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || session.status || '')}</p>`;
-    try { RhmraQr.render($('phone-share-qr'), session.url); }
-    catch (error) { $('phone-share-qr').textContent = 'QR code unavailable: ' + error.message; }
-    $('phone-share-copy').addEventListener('click', copyPhoneShareLink);
+    if (session.url) {
+      try { RhmraQr.render($('phone-share-qr'), session.url); }
+      catch (error) { $('phone-share-qr').textContent = 'QR code unavailable: ' + error.message; }
+      $('phone-share-copy').addEventListener('click', copyPhoneShareLink);
+    }
     $('phone-share-stop').addEventListener('click', stopPhoneShare);
+    $('phone-share-forget')?.addEventListener('click', forgetGooglePhone);
     return;
   }
 
@@ -343,6 +601,41 @@ function renderShareDialog(message = '', isError = false) {
     content.innerHTML = `<p>Checking secure sharing configuration&hellip;</p>`;
     return;
   }
+  if (isGoogleDrivePhoneShare()) {
+    if (!phoneShareConfig.configured) {
+      content.innerHTML = `<h3>Google Drive phone sharing is not available yet</h3>
+        <p>This copy of RHMRA does not have its public Google sign-in identifier configured. No financial data or credentials were sent.</p>
+        <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
+      return;
+    }
+    if (phoneShareConfig.connected !== true) {
+      content.innerHTML = `<h3>Connect your Google Drive</h3>
+        <p>Click once to sign in with Google. RHMRA stores encrypted snapshots only in <strong>your private Google Drive app data</strong>, which is hidden from ordinary Drive files.</p>
+        <div class='share-note'><strong>No developer setup:</strong> you do not need a Google Cloud project, bucket, API key, or paid storage service. Normal use fits in the free storage included with a Google account.</div>
+        <div class='share-controls'><button id='phone-share-connect-google' class='share-action primary' type='button'>Connect Google Drive</button></div>
+        <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
+      $('phone-share-connect-google').addEventListener('click', connectGoogleDrivePhoneShare);
+      return;
+    }
+    const options = phoneShareDurationOptions();
+    const paired = Boolean(googlePhonePairing);
+    const persistenceNote = paired && !googlePhonePairingPersistent
+      ? `<p class='share-warning'>This browser cannot securely save a non-extractable key in IndexedDB. The pairing is session-only and will be forgotten when this tab closes.</p>` : '';
+    content.innerHTML = `<h3>${paired ? 'Paired phone ready' : 'Pair RHMRA Phone'}</h3>
+      <p>Encrypted snapshots go to your private Google Drive app data. The separate RHMRA Phone web app reads and decrypts them only after you pair it.</p>
+      <div class='share-note'><strong>Your data stays yours.</strong> There is no shared RHMRA server, public bucket, API key, or developer account to administer. Google receives only encrypted dashboard data.</div>
+      <div class='share-controls'><label class='share-field'>Share duration
+        <select id='phone-share-duration' class='share-duration'>${options}</select></label>
+        <button id='phone-share-start' class='share-action primary' type='button'${latestPhoneView ? '' : ' disabled'}>${paired ? 'Start sharing with paired phone' : 'Pair phone and create QR code'}</button>
+        ${paired ? `<button id='phone-share-forget' class='share-action danger' type='button'>Forget paired phone</button>` : ''}</div>
+      ${paired ? `<p class='share-warning'>Starting reuses the non-extractable key already paired with your phone. No new QR code is needed.</p>` : `<p class='share-warning'>The one-time QR code contains the decryption key. Scan it only with a phone you trust.</p>`}
+      ${persistenceNote}
+      <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || (latestPhoneView ? '' : 'Waiting for the first dashboard snapshot...'))}</p>`;
+    $('phone-share-start').addEventListener('click', startPhoneShare);
+    $('phone-share-forget')?.addEventListener('click', forgetGooglePhone);
+    return;
+  }
+
   if (!phoneShareConfig.configured) {
     content.innerHTML = `<h3>One-time Cloudflare setup required</h3>
       <p>This feature uses <strong>your own Cloudflare account</strong>, so RHMRA never operates a shared server containing users' financial dashboards.</p>
@@ -352,15 +645,7 @@ function renderShareDialog(message = '', isError = false) {
     return;
   }
 
-  const maximum = Math.min(PHONE_SHARE_MAX_SECONDS, Math.max(60, Number(phoneShareConfig.ttl_seconds) || 7200));
-  let durations = [3600, 7200, 14400, 28800].filter(seconds => seconds <= maximum);
-  if (!durations.length) durations = [maximum];
-  const preferred = durations.includes(7200) ? 7200 : durations[durations.length - 1];
-  const options = durations.map(seconds => {
-    const hours = seconds / 3600;
-    const label = Number.isInteger(hours) ? `${hours} hour${hours === 1 ? '' : 's'}` : `${Math.round(seconds / 60)} minutes`;
-    return `<option value='${seconds}'${seconds === preferred ? ' selected' : ''}>${label}</option>`;
-  }).join('');
+  const options = phoneShareDurationOptions();
   const previousControls = previousPhoneShare
     ? `<div class='share-note share-warning' style='margin-top:12px'>A share created earlier in this tab may still exist until ${esc(shareDateTime(previousPhoneShare.expires_at))}. Its key was discarded, so it cannot resume uploading.
          <button id='phone-share-revoke-previous' class='share-action danger' type='button' style='margin-top:8px'>Stop previous share</button></div>`
@@ -384,20 +669,77 @@ async function openPhoneShareDialog() {
   if (!dialog.open) dialog.showModal();
   renderShareDialog();
   try {
-    const config = await getJSON('/api/phone-share/config');
+    const config = await getPhoneShareConfig();
     if (phoneShareSession && config.csrf_token !== phoneShareSession.csrfToken) {
-      phoneShareSession.keyBytes.fill(0);
+      wipePhoneShareSession(phoneShareSession);
       phoneShareSession = null;
       setShareButtonActive(false);
       phoneShareConfig = config;
+      if (isGoogleDrivePhoneShare(config)) await loadGooglePhonePairing();
       renderShareDialog('Sharing reset because the local dashboard server restarted.', true);
       return;
     }
     phoneShareConfig = config;
+    if (isGoogleDrivePhoneShare(config)) await loadGooglePhonePairing();
     renderShareDialog();
   } catch (error) {
-    phoneShareConfig = { configured: false };
+    phoneShareConfig = {
+      configured: false,
+      provider: PHONE_SHARE_GOOGLE_PROVIDER,
+    };
     renderShareDialog('Unable to check sharing configuration: ' + error.message, true);
+  }
+}
+
+async function connectGoogleDrivePhoneShare() {
+  const button = $('phone-share-connect-google');
+  if (!button || !isGoogleDrivePhoneShare() || !phoneShareConfig?.csrf_token) return;
+
+  // Open synchronously inside the click event so normal popup blockers permit it.
+  const authorizationWindow = window.open('about:blank', 'rhmra-google-drive-connect',
+    'popup,width=520,height=720');
+  if (!authorizationWindow) {
+    renderShareDialog('Your browser blocked the Google sign-in window. Allow popups for this local dashboard, then try again.', true);
+    return;
+  }
+  authorizationWindow.document.title = 'Connecting RHMRA to Google Drive';
+  authorizationWindow.document.body.textContent = 'Preparing secure Google sign-in...';
+  button.disabled = true;
+  $('phone-share-status').textContent = 'Opening Google sign-in...';
+
+  try {
+    const response = await phoneShareLocalFetch('/api/phone-share/connect', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-RHMRA-CSRF': phoneShareConfig.csrf_token },
+      body: '{}',
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.message || `local dashboard returned HTTP ${response.status}`);
+    const authorizationUrl = new URL(result.authorization_url);
+    if (authorizationUrl.protocol !== 'https:' || authorizationUrl.hostname !== 'accounts.google.com') {
+      throw new Error('The local dashboard returned an invalid Google authorization URL.');
+    }
+    authorizationWindow.location.replace(authorizationUrl.toString());
+
+    const deadline = Date.now() + PHONE_SHARE_CONNECT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await phoneShareDelay(1000);
+      const config = await getPhoneShareConfig();
+      if (isGoogleDrivePhoneShare(config) && config.configured && config.connected === true) {
+        phoneShareConfig = config;
+        await loadGooglePhonePairing();
+        renderShareDialog('Google Drive connected. You can pair your phone now.');
+        return;
+      }
+    }
+    throw new Error('Google sign-in did not finish within two minutes. Complete the sign-in tab, then try again.');
+  } catch (error) {
+    try {
+      if (!authorizationWindow.closed && authorizationWindow.location.href === 'about:blank') {
+        authorizationWindow.close();
+      }
+    } catch { /* The popup is cross-origin after navigation, which is expected. */ }
+    renderShareDialog('Unable to connect Google Drive: ' + error.message, true);
   }
 }
 
@@ -407,7 +749,7 @@ async function revokePreviousPhoneShare() {
   button.disabled = true;
   $('phone-share-status').textContent = 'Revoking the previous temporary share...';
   try {
-    const response = await fetch('/api/phone-share/' + encodeURIComponent(previousPhoneShare.share_id), {
+    const response = await phoneShareLocalFetch('/api/phone-share/' + encodeURIComponent(previousPhoneShare.share_id), {
       method: 'DELETE', cache: 'no-store',
       headers: { 'X-RHMRA-CSRF': phoneShareConfig.csrf_token },
     });
@@ -422,6 +764,95 @@ async function revokePreviousPhoneShare() {
 }
 
 async function startPhoneShare() {
+  if (isGoogleDrivePhoneShare()) await startGooglePhoneShare();
+  else await startLegacyPhoneShare();
+}
+
+async function startGooglePhoneShare() {
+  const startButton = $('phone-share-start');
+  if (!phoneShareConfig?.configured || phoneShareConfig.connected !== true ||
+      !latestPhoneView || !startButton || phoneShareSession) return;
+  startButton.disabled = true;
+  $('phone-share-status').textContent = googlePhonePairing
+    ? 'Starting secure updates for your paired phone...' : 'Creating a one-time secure phone pairing...';
+  let keyBytes = null;
+  try {
+    if (!crypto?.subtle) throw new Error('This browser does not provide Web Crypto.');
+    const duration = Number($('phone-share-duration').value);
+    const maximum = Math.min(PHONE_SHARE_MAX_SECONDS, Number(phoneShareConfig.ttl_seconds) || 7200);
+    if (!Number.isInteger(duration) || duration < 60 || duration > maximum) {
+      throw new Error('Invalid sharing duration.');
+    }
+    if (typeof phoneShareConfig.csrf_token !== 'string' ||
+        typeof phoneShareConfig.viewer_url !== 'string') {
+      throw new Error('Sharing configuration is incomplete.');
+    }
+    const viewer = new URL(phoneShareConfig.viewer_url);
+    if (viewer.protocol !== 'https:') throw new Error('The phone viewer URL must use HTTPS.');
+
+    await loadGooglePhonePairing();
+    let privateUrl = null;
+    let pairingNeedsPersistence = false;
+    if (!googlePhonePairing) {
+      keyBytes = crypto.getRandomValues(new Uint8Array(32));
+      const shareId = base64Url(crypto.getRandomValues(new Uint8Array(16)));
+      const key = await crypto.subtle.importKey(
+        'raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']
+      );
+      googlePhonePairing = {
+        provider: PHONE_SHARE_GOOGLE_PROVIDER,
+        shareId,
+        key,
+        sequence: 0,
+        createdAt: new Date().toISOString(),
+      };
+      googlePhonePairingLoaded = true;
+      googlePhonePairingPersistent = false;
+      pairingNeedsPersistence = true;
+      viewer.hash = `v=2&provider=${PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER}&id=${shareId}&key=${base64Url(keyBytes)}`;
+      privateUrl = viewer.toString();
+    }
+    if (!validGooglePhonePairing(googlePhonePairing)) {
+      throw new Error('The saved phone pairing is invalid. Forget it and pair again.');
+    }
+    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+    phoneShareSession = {
+      provider: PHONE_SHARE_GOOGLE_PROVIDER,
+      id: googlePhonePairing.shareId,
+      key: googlePhonePairing.key,
+      keyBytes: null,
+      url: privateUrl,
+      csrfToken: phoneShareConfig.csrf_token,
+      expiresAt,
+      sequence: googlePhonePairing.sequence,
+      lastSignature: null,
+      lastUploaded: null,
+      uploading: false,
+      pending: false,
+      pendingUpload: null,
+      pairingNeedsPersistence,
+      revoking: false,
+      status: privateUrl
+        ? 'Uploading the first encrypted snapshot before showing the QR code...'
+        : 'Uploading a fresh encrypted snapshot for your paired phone...',
+    };
+    setShareButtonActive(true);
+    renderShareDialog();
+    await uploadPhoneShare(true);
+  } catch (error) {
+    if (phoneShareSession) {
+      phoneShareSession.status = 'Share upload failed: ' + error.message;
+      renderShareDialog(phoneShareSession.status, true);
+    } else {
+      renderShareDialog('Unable to start sharing: ' + error.message, true);
+    }
+  } finally {
+    if (keyBytes) keyBytes.fill(0);
+    if ($('phone-share-start')) $('phone-share-start').disabled = !latestPhoneView;
+  }
+}
+
+async function startLegacyPhoneShare() {
   const startButton = $('phone-share-start');
   if (!phoneShareConfig?.configured || !latestPhoneView || !startButton || previousPhoneShare) return;
   startButton.disabled = true;
@@ -442,6 +873,7 @@ async function startPhoneShare() {
     if (viewer.protocol !== 'https:') throw new Error('The phone viewer URL must use HTTPS.');
     viewer.hash = new URLSearchParams({ id: shareId, key: base64Url(keyBytes) }).toString();
     phoneShareSession = {
+      provider: 'cloudflare',
       id: shareId, key, keyBytes, url: viewer.toString(), csrfToken: phoneShareConfig.csrf_token,
       expiresAt: new Date(Date.now() + duration * 1000).toISOString(), sequence: 0,
       lastSignature: null, lastUploaded: null, uploading: false, pending: false,
@@ -466,10 +898,11 @@ async function startPhoneShare() {
 
 async function uploadPhoneShare(force = false) {
   const session = phoneShareSession;
-  if (!session || !latestPhoneView) return;
+  if (!session || !latestPhoneView || session.revoking) return;
   if (Date.now() >= new Date(session.expiresAt).getTime()) {
-    session.keyBytes.fill(0);
-    if (previousPhoneShare?.share_id === session.id) forgetPreviousPhoneShare();
+    wipePhoneShareSession(session);
+    if (session.provider !== PHONE_SHARE_GOOGLE_PROVIDER &&
+        previousPhoneShare?.share_id === session.id) forgetPreviousPhoneShare();
     phoneShareSession = null;
     setShareButtonActive(false);
     if ($('phone-share-dialog').open) renderShareDialog('The previous phone share expired.');
@@ -493,7 +926,7 @@ async function uploadPhoneShare(force = false) {
     }
     if (!session.pendingUpload) {
       const capturedAt = new Date().toISOString();
-      const sequence = session.sequence + 1;
+      const sequence = await reservePhoneShareSequence(session);
       const plaintext = { ...latestPhoneView, captured_at: capturedAt, expires_at: session.expiresAt };
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const aad = phoneShareEncoder.encode(JSON.stringify([
@@ -513,13 +946,13 @@ async function uploadPhoneShare(force = false) {
       };
     }
     const pendingUpload = session.pendingUpload;
-    const response = await fetch('/api/phone-share', {
+    const response = await phoneShareLocalFetch('/api/phone-share', {
       method: 'POST', cache: 'no-store',
       headers: { 'Content-Type': 'application/json', 'X-RHMRA-CSRF': session.csrfToken },
       body: pendingUpload.body,
     });
     if (response.status === 403) {
-      session.keyBytes.fill(0);
+      wipePhoneShareSession(session);
       phoneShareSession = null;
       phoneShareConfig = null;
       setShareButtonActive(false);
@@ -528,12 +961,18 @@ async function uploadPhoneShare(force = false) {
     }
     if (!response.ok) throw new Error(`local relay returned HTTP ${response.status}`);
     if (phoneShareSession !== session) return;
+    if (session.provider === PHONE_SHARE_GOOGLE_PROVIDER && session.pairingNeedsPersistence) {
+      session.pairingSessionOnly = !(await persistGooglePhonePairing(googlePhonePairing));
+      session.pairingNeedsPersistence = false;
+    }
     session.sequence = pendingUpload.sequence;
     session.lastSignature = pendingUpload.signature;
     session.lastUploaded = pendingUpload.capturedAt;
     session.pendingUpload = null;
     if (JSON.stringify(latestPhoneView) !== session.lastSignature) session.pending = true;
-    session.status = 'Encrypted snapshot uploaded. The phone page will update automatically.';
+    session.status = session.pairingSessionOnly
+      ? 'Encrypted snapshot uploaded. This browser could not save the pairing, so it lasts only until this tab closes.'
+      : 'Encrypted snapshot uploaded. The phone page will update automatically.';
     if ($('phone-share-dialog').open) renderShareDialog();
   } catch (error) {
     if (phoneShareSession !== session) return;
@@ -544,7 +983,7 @@ async function uploadPhoneShare(force = false) {
   } finally {
     if (phoneShareSession === session) {
       session.uploading = false;
-      if (session.pending) {
+      if (session.pending && !session.revoking) {
         session.pending = false;
         void uploadPhoneShare(false);
       }
@@ -571,19 +1010,60 @@ async function stopPhoneShare() {
   stopButton.disabled = true;
   $('phone-share-status').textContent = 'Revoking the temporary share...';
   try {
-    const response = await fetch('/api/phone-share/' + encodeURIComponent(session.id), {
+    while (session.uploading) await phoneShareDelay(50);
+    const response = await phoneShareLocalFetch('/api/phone-share/' + encodeURIComponent(session.id), {
       method: 'DELETE', cache: 'no-store', headers: { 'X-RHMRA-CSRF': session.csrfToken },
     });
     if (!response.ok && response.status !== 404) throw new Error(`local relay returned HTTP ${response.status}`);
-    session.keyBytes.fill(0);
-    forgetPreviousPhoneShare();
+    const google = session.provider === PHONE_SHARE_GOOGLE_PROVIDER;
+    const pairingWasPresented = Boolean(session.lastUploaded);
+    const incompleteNewPairing = Boolean(session.pairingNeedsPersistence && !pairingWasPresented);
+    wipePhoneShareSession(session);
+    if (!google) forgetPreviousPhoneShare();
+    if (google && incompleteNewPairing) await clearStoredGooglePhonePairing();
     phoneShareSession = null;
     setShareButtonActive(false);
-    renderShareDialog('Phone sharing stopped and the temporary snapshot was revoked.');
+    renderShareDialog(google && !incompleteNewPairing
+      ? 'Phone sharing stopped. The encrypted snapshot was deleted, and your phone remains paired for next time.'
+      : google
+        ? 'Phone sharing stopped before the QR code was shown, so the incomplete pairing was discarded.'
+        : 'Phone sharing stopped and the temporary snapshot was revoked.');
   } catch (error) {
     session.revoking = false;
     renderShareDialog('Unable to revoke sharing yet: ' + error.message + '. It will still expire automatically.', true);
   }
+}
+
+async function forgetGooglePhone() {
+  if (!googlePhonePairing || !phoneShareConfig?.csrf_token) return;
+  const session = phoneShareSession?.provider === PHONE_SHARE_GOOGLE_PROVIDER
+    ? phoneShareSession : null;
+  if (session) session.revoking = true;
+  const button = $('phone-share-forget');
+  if (button) button.disabled = true;
+  const status = $('phone-share-status');
+  if (status) status.textContent = 'Deleting the encrypted snapshot and forgetting this phone...';
+
+  let deleteWarning = '';
+  try {
+    while (session?.uploading) await phoneShareDelay(50);
+    const response = await phoneShareLocalFetch('/api/phone-share/' + encodeURIComponent(googlePhonePairing.shareId), {
+      method: 'DELETE', cache: 'no-store',
+      headers: { 'X-RHMRA-CSRF': phoneShareConfig.csrf_token },
+    });
+    if (!response.ok && response.status !== 404) {
+      deleteWarning = ` The old encrypted file could not be deleted (HTTP ${response.status}), but it remains unreadable without its discarded key and expires in the viewer.`;
+    }
+  } catch (error) {
+    deleteWarning = ' The old encrypted file could not be deleted: ' + error.message + '. It remains unreadable without its discarded key and expires in the viewer.';
+  }
+
+  wipePhoneShareSession(session);
+  phoneShareSession = null;
+  await clearStoredGooglePhonePairing();
+  setShareButtonActive(false);
+  renderShareDialog('Paired phone forgotten. The next share will create a new key and QR code.' + deleteWarning,
+    Boolean(deleteWarning));
 }
 
 function banner(msg) {

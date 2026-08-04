@@ -38,8 +38,9 @@ import re
 import secrets
 import ssl
 import sys
+import threading
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +50,7 @@ PHONE_SHARE_MAX_BODY_BYTES = 393216
 PHONE_SHARE_TIMEOUT_SECONDS = 10
 PHONE_SHARE_DEFAULT_TTL_SECONDS = 2 * 60 * 60
 PHONE_SHARE_MAX_TTL_SECONDS = 8 * 60 * 60
+PHONE_SHARE_MAX_CLOCK_SKEW_SECONDS = 2 * 60
 
 PHONE_SHARE_URL_ENV = 'RHMRA_PHONE_SHARE_URL'
 PHONE_SHARE_TOKEN_ENV = 'RHMRA_PHONE_SHARE_UPLOAD_TOKEN'
@@ -56,6 +58,13 @@ PHONE_SHARE_VIEWER_URL_ENV = 'RHMRA_PHONE_SHARE_VIEWER_URL'
 PHONE_SHARE_TTL_ENV = 'RHMRA_PHONE_SHARE_TTL_SECONDS'
 PHONE_SHARE_ACCESS_ID_ENV = 'RHMRA_PHONE_SHARE_CF_CLIENT_ID'
 PHONE_SHARE_ACCESS_SECRET_ENV = 'RHMRA_PHONE_SHARE_CF_CLIENT_SECRET'
+PHONE_SHARE_PROVIDER_ENV = 'RHMRA_PHONE_SHARE_PROVIDER'
+PHONE_SHARE_GOOGLE_CLIENT_ID_ENV = 'RHMRA_PHONE_SHARE_GOOGLE_CLIENT_ID'
+PHONE_SHARE_GOOGLE_VIEWER_URL_ENV = 'RHMRA_PHONE_SHARE_GOOGLE_VIEWER_URL'
+
+PHONE_SHARE_PROVIDER_GOOGLE = 'google-drive'
+PHONE_SHARE_PROVIDER_CLOUDFLARE = 'cloudflare'
+PHONE_SHARE_GOOGLE_RUNTIME_LOCK = threading.RLock()
 
 PHONE_SHARE_FIELDS = frozenset({
     'schema_version', 'share_id', 'sequence', 'captured_at',
@@ -70,6 +79,18 @@ PHONE_SHARE_TIMESTAMP_RE = re.compile(
 
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
+from dashboard.phone_share import (
+    GoogleDriveConfig,
+    GoogleDriveProvider,
+    InMemoryOAuthSession,
+    OAuthAuthorizationRequest,
+    PhoneShareProviderError,
+    SecureOAuthCredentialStore,
+)
+from dashboard.phone_share.public_config import (
+    GOOGLE_DESKTOP_CLIENT_ID,
+    GOOGLE_PHONE_VIEWER_URL,
+)
 from validate_constants import ConstantsValidationError, validate_constants_file
 
 ALLOWED_PREFIXES = ("/dashboard/", "/run-reports/")
@@ -164,17 +185,174 @@ def _phone_share_settings():
     }
 
 
-def _phone_share_public_config():
-    '''Expose capability metadata and the ephemeral CSRF token, never secrets.'''
-    settings = _phone_share_settings()
-    if settings is None:
-        return {'configured': False}
+def _phone_share_ttl_seconds():
+    raw_ttl = os.environ.get(
+        PHONE_SHARE_TTL_ENV, str(PHONE_SHARE_DEFAULT_TTL_SECONDS)
+    )
+    try:
+        ttl_seconds = int(raw_ttl)
+    except (TypeError, ValueError):
+        return None
+    if not 300 <= ttl_seconds <= PHONE_SHARE_MAX_TTL_SECONDS:
+        return None
+    return ttl_seconds
+
+
+def _https_google_viewer_url(value):
+    '''Validate a standalone HTTPS viewer without accepting URL capabilities.'''
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme.lower() != 'https' or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or port not in (None, 443)):
+        return None
+    path = parsed.path or '/'
+    authority = parsed.hostname.lower()
+    return urllib.parse.urlunsplit(('https', authority, path, '', ''))
+
+
+def _google_phone_share_settings(server_port):
+    if (isinstance(server_port, bool) or not isinstance(server_port, int)
+            or not 1024 <= server_port <= 65535):
+        return None
+    client_id = os.environ.get(
+        PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, GOOGLE_DESKTOP_CLIENT_ID
+    )
+    viewer_url = _https_google_viewer_url(os.environ.get(
+        PHONE_SHARE_GOOGLE_VIEWER_URL_ENV, GOOGLE_PHONE_VIEWER_URL
+    ))
+    ttl_seconds = _phone_share_ttl_seconds()
+    redirect_uri = (
+        f'http://127.0.0.1:{server_port}/oauth2/callback'
+    )
+    try:
+        config = GoogleDriveConfig(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+        )
+    except PhoneShareProviderError:
+        return None
+    if viewer_url is None or ttl_seconds is None:
+        return None
     return {
+        'provider': PHONE_SHARE_PROVIDER_GOOGLE,
+        'config': config,
+        'client_id': client_id,
+        'redirect_uri': redirect_uri,
+        'viewer_url': viewer_url,
+        'ttl_seconds': ttl_seconds,
+    }
+
+
+def _selected_phone_share_settings(server_port):
+    selector = os.environ.get(PHONE_SHARE_PROVIDER_ENV)
+    if selector is not None:
+        selector = selector.strip().lower()
+        if selector == PHONE_SHARE_PROVIDER_GOOGLE:
+            return _google_phone_share_settings(server_port)
+        if selector == PHONE_SHARE_PROVIDER_CLOUDFLARE:
+            settings = _phone_share_settings()
+            if settings is not None:
+                settings = dict(settings, provider=PHONE_SHARE_PROVIDER_CLOUDFLARE)
+            return settings
+        return None
+    # Google Drive is the beginner-friendly default. Never silently switch to
+    # the legacy Cloudflare relay merely because the public Google client ID is
+    # missing: that advertises the wrong setup path and can select an unrelated
+    # configured relay. Cloudflare requires an explicit provider selection.
+    return _google_phone_share_settings(server_port)
+
+
+def _requested_phone_share_provider():
+    selector = os.environ.get(PHONE_SHARE_PROVIDER_ENV)
+    if isinstance(selector, str):
+        selector = selector.strip().lower()
+        if selector == PHONE_SHARE_PROVIDER_CLOUDFLARE:
+            return PHONE_SHARE_PROVIDER_CLOUDFLARE
+    return PHONE_SHARE_PROVIDER_GOOGLE
+
+
+class _GooglePhoneShareRuntime:
+    def __init__(self, config, *, credential_store=None):
+        self.config = config
+        self.session = InMemoryOAuthSession(config)
+        self.provider = GoogleDriveProvider(config, self.session)
+        self.credential_store = (
+            credential_store
+            if credential_store is not None
+            else SecureOAuthCredentialStore(config.client_id)
+        )
+        self._session_persists_changes = False
+        restored = self.credential_store.load()
+        if restored is not None:
+            try:
+                self.session.set_credentials(restored)
+            except (PhoneShareProviderError, TypeError, ValueError):
+                self.credential_store.clear()
+        observe = getattr(
+            self.session, 'set_credentials_changed_callback', None
+        )
+        if callable(observe):
+            observe(self.credential_store.save)
+            self._session_persists_changes = True
+        observe_clear = getattr(
+            self.session, 'set_credentials_cleared_callback', None
+        )
+        if callable(observe_clear):
+            observe_clear(self.credential_store.clear)
+        self.pending = None
+        self.lock = threading.RLock()
+
+    @property
+    def credential_persistence(self):
+        return self.credential_store.mode
+
+    def persist_completed_credentials(self, credentials):
+        if not self._session_persists_changes:
+            self.credential_store.save(credentials)
+
+
+def _google_runtime_for_server(server, settings):
+    '''Return the OAuth runtime attached to this loopback server process.'''
+    fingerprint = (settings['client_id'], settings['redirect_uri'])
+    with PHONE_SHARE_GOOGLE_RUNTIME_LOCK:
+        runtime = getattr(server, '_rhmra_google_phone_share_runtime', None)
+        current = None
+        if runtime is not None:
+            current = (runtime.config.client_id, runtime.config.redirect_uri)
+        if current != fingerprint:
+            runtime = _GooglePhoneShareRuntime(settings['config'])
+            server._rhmra_google_phone_share_runtime = runtime
+        return runtime
+
+
+def _phone_share_public_config(server=None):
+    '''Expose capability metadata and the ephemeral CSRF token, never secrets.'''
+    server_port = getattr(server, 'server_port', None)
+    settings = _selected_phone_share_settings(server_port)
+    if settings is None:
+        return {
+            'configured': False,
+            'provider': _requested_phone_share_provider(),
+        }
+    result = {
         'configured': True,
+        'provider': settings['provider'],
         'csrf_token': PHONE_SHARE_CSRF_TOKEN,
         'viewer_url': settings['viewer_url'],
         'ttl_seconds': settings['ttl_seconds'],
     }
+    if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+        runtime = _google_runtime_for_server(server, settings)
+        with runtime.lock:
+            result['connected'] = runtime.session.is_authorized
+            result['credential_persistence'] = runtime.credential_persistence
+    return result
 
 
 def _parse_phone_share_timestamp(value):
@@ -187,7 +365,7 @@ def _parse_phone_share_timestamp(value):
     return parsed if parsed.tzinfo == timezone.utc else None
 
 
-def _validate_phone_share_envelope(document, ttl_seconds):
+def _validate_phone_share_envelope(document, ttl_seconds, *, now=None):
     '''Return a safe, exact encrypted envelope or None on any schema error.'''
     if not isinstance(document, dict) or set(document) != PHONE_SHARE_FIELDS:
         return None
@@ -212,6 +390,14 @@ def _validate_phone_share_envelope(document, ttl_seconds):
     if captured_at is None or expires_at is None or expires_at <= captured_at:
         return None
     if (expires_at - captured_at).total_seconds() > ttl_seconds:
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.tzinfo != timezone.utc:
+        return None
+    skew = timedelta(seconds=PHONE_SHARE_MAX_CLOCK_SKEW_SECONDS)
+    if (captured_at > now + skew or expires_at <= now
+            or expires_at > now + timedelta(seconds=ttl_seconds) + skew):
         return None
     return {
         'schema_version': 1,
@@ -323,6 +509,10 @@ class Handler(SimpleHTTPRequestHandler):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Security-Policy',
+                         'default-src \x27none\x27; base-uri \x27none\x27; '
+                         'form-action \x27none\x27; frame-ancestors \x27none\x27')
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -331,6 +521,71 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _api_error(self, status, code):
         self._json({'error': code}, status=status)
+
+    def _oauth_page(self, success):
+        status = 200 if success else 400
+        title = ('Google Drive connected' if success
+                 else 'Google Drive was not connected')
+        message = ('You can close this tab and return to the dashboard.'
+                   if success else
+                   'Close this tab and try Connect Google Drive again.')
+        body = ('<!doctype html><html><head><meta charset=utf-8>'
+                f'<title>{title}</title></head><body><h1>{title}</h1>'
+                f'<p>{message}</p></body></html>').encode('utf-8')
+        self.send_response(status)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Security-Policy',
+                         'default-src \x27none\x27; base-uri \x27none\x27; '
+                         'form-action \x27none\x27; frame-ancestors \x27none\x27')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_connect_request(self):
+        if self.headers.get('Transfer-Encoding'):
+            self._api_error(400, 'invalid connection request')
+            return False
+        lengths = self.headers.get_all('Content-Length') or []
+        if not lengths:
+            return True
+        if len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,3}', lengths[0]):
+            self._api_error(400, 'invalid connection request')
+            return False
+        length = int(lengths[0])
+        if length == 0:
+            return True
+        if length > 64:
+            self._api_error(400, 'invalid connection request')
+            return False
+        content_type = self.headers.get('Content-Type') or ''
+        media_parts = [part.strip().lower() for part in content_type.split(';')]
+        if (not media_parts or media_parts[0] != 'application/json'
+                or len(media_parts) > 2
+                or (len(media_parts) == 2
+                    and media_parts[1] != 'charset=utf-8')):
+            self._api_error(415, 'application/json is required')
+            return False
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self._api_error(400, 'invalid connection request')
+            return False
+        try:
+            document = json.loads(
+                raw.decode('utf-8'),
+                object_pairs_hook=_json_object_no_duplicates,
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, ValueError):
+            self._api_error(400, 'invalid connection request')
+            return False
+        if document != {}:
+            self._api_error(400, 'invalid connection request')
+            return False
+        return True
 
     def _same_origin(self):
         origin = self.headers.get('Origin')
@@ -444,7 +699,40 @@ class Handler(SimpleHTTPRequestHandler):
         if path is None:
             return
         if path == '/api/phone-share/config':
-            return self._json(_phone_share_public_config())
+            return self._json(_phone_share_public_config(self.server))
+        if path == '/oauth2/callback':
+            expected_host = f'127.0.0.1:{self.server.server_port}'
+            if (self.headers.get('Host') or '').strip() != expected_host:
+                return self._oauth_page(False)
+            settings = _selected_phone_share_settings(self.server.server_port)
+            if (settings is None
+                    or settings['provider'] != PHONE_SHARE_PROVIDER_GOOGLE):
+                return self._oauth_page(False)
+            runtime = _google_runtime_for_server(self.server, settings)
+            query = urllib.parse.urlsplit(self.path).query
+            callback_url = settings['redirect_uri']
+            if query:
+                callback_url += '?' + query
+            try:
+                with runtime.lock:
+                    pending = runtime.pending
+                    runtime.pending = None
+                    if not isinstance(pending, OAuthAuthorizationRequest):
+                        raise PhoneShareProviderError(
+                            'oauth_not_pending',
+                            'No Google authorization request is pending.',
+                        )
+                    credentials = runtime.session.complete_authorization(
+                        callback_url, pending
+                    )
+                    runtime.persist_completed_credentials(credentials)
+            except PhoneShareProviderError as exc:
+                self.log_error(
+                    'Google phone-sharing authorization failed: %s',
+                    exc.code,
+                )
+                return self._oauth_page(False)
+            return self._oauth_page(True)
         if path == "/":
             self.send_response(302)
             self.send_header("Location", "/dashboard/index.html")
@@ -473,14 +761,39 @@ class Handler(SimpleHTTPRequestHandler):
         path = self._guard()
         if path is None:
             return
-        if path != '/api/phone-share':
+        if path not in ('/api/phone-share', '/api/phone-share/connect'):
             self.send_error(403, 'not served')
             return
         if not self._authorize_phone_share():
             return
-        settings = _phone_share_settings()
+        settings = _selected_phone_share_settings(self.server.server_port)
         if settings is None:
             self._api_error(503, 'phone sharing is not configured')
+            return
+        if path == '/api/phone-share/connect':
+            if not self._read_connect_request():
+                return
+            if settings['provider'] != PHONE_SHARE_PROVIDER_GOOGLE:
+                self._api_error(409, 'phone sharing is already configured')
+                return
+            runtime = _google_runtime_for_server(self.server, settings)
+            try:
+                with runtime.lock:
+                    pending = runtime.session.begin_authorization()
+                    if not isinstance(pending, OAuthAuthorizationRequest):
+                        raise PhoneShareProviderError(
+                            'invalid_oauth_request',
+                            'Google authorization could not be started.',
+                        )
+                    runtime.pending = pending
+            except PhoneShareProviderError as exc:
+                self.log_error(
+                    'Google phone-sharing authorization failed: %s',
+                    exc.code,
+                )
+                self._api_error(502, 'phone sharing service unavailable')
+                return
+            self._json({'authorization_url': pending.authorization_url})
             return
         ok, document = self._read_phone_share_json()
         if not ok:
@@ -490,6 +803,36 @@ class Handler(SimpleHTTPRequestHandler):
         )
         if envelope is None:
             self._api_error(400, 'invalid encrypted snapshot')
+            return
+        if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+            runtime = _google_runtime_for_server(self.server, settings)
+            try:
+                with runtime.lock:
+                    if not runtime.session.is_authorized:
+                        self._api_error(409, 'Google Drive is not connected')
+                        return
+                    runtime.provider.put_envelope(envelope)
+            except PhoneShareProviderError as exc:
+                self.log_error(
+                    'Google phone-sharing upload failed: %s', exc.code
+                )
+                if exc.code in {
+                    'drive_conflict',
+                    'envelope_conflict',
+                    'stale_envelope',
+                }:
+                    self._api_error(
+                        409, 'encrypted snapshot update conflict; retry'
+                    )
+                elif exc.code in {
+                    'google_authorization_required',
+                    'drive_authorization_failed',
+                }:
+                    self._api_error(409, 'Google Drive is not connected')
+                else:
+                    self._api_error(502, 'phone sharing service unavailable')
+                return
+            self._json({'ok': True})
             return
         try:
             _phone_share_upstream(
@@ -522,9 +865,31 @@ class Handler(SimpleHTTPRequestHandler):
         if lengths and (len(lengths) != 1 or lengths[0] != '0'):
             self._api_error(400, 'DELETE request body is not allowed')
             return
-        settings = _phone_share_settings()
+        settings = _selected_phone_share_settings(self.server.server_port)
         if settings is None:
             self._api_error(503, 'phone sharing is not configured')
+            return
+        if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+            runtime = _google_runtime_for_server(self.server, settings)
+            try:
+                with runtime.lock:
+                    if not runtime.session.is_authorized:
+                        self._api_error(409, 'Google Drive is not connected')
+                        return
+                    runtime.provider.delete_envelope(share_id)
+            except PhoneShareProviderError as exc:
+                self.log_error(
+                    'Google phone-sharing delete failed: %s', exc.code
+                )
+                if exc.code in {
+                    'google_authorization_required',
+                    'drive_authorization_failed',
+                }:
+                    self._api_error(409, 'Google Drive is not connected')
+                else:
+                    self._api_error(502, 'phone sharing service unavailable')
+                return
+            self._json({'ok': True})
             return
         try:
             _phone_share_upstream('DELETE', settings, share_id)

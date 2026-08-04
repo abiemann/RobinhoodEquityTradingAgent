@@ -211,10 +211,11 @@ These browser checks validate the viewer path and email login. The first 5-minut
 
 ### Step 10 — Configure and start the local dashboard
 
-Set these four values in the **same terminal** that starts `dashboard/serve.py`:
+Set these five values in the **same terminal** that starts `dashboard/serve.py`:
 
 | Name | Value |
 |---|---|
+| `RHMRA_PHONE_SHARE_PROVIDER` | exactly `cloudflare` (required because Google Drive is the v2 default) |
 | `RHMRA_PHONE_SHARE_URL` | fixed HTTPS Worker base URL, with no path |
 | `RHMRA_PHONE_SHARE_UPLOAD_TOKEN` | exactly the same value as Worker `UPLOAD_TOKEN` |
 | `RHMRA_PHONE_SHARE_CF_CLIENT_ID` | Access service-token Client ID |
@@ -229,6 +230,7 @@ The examples below keep values only in this terminal process; opening a new term
 PowerShell hides both secret values while you paste them:
 
 ```powershell
+$env:RHMRA_PHONE_SHARE_PROVIDER = 'cloudflare'
 $env:RHMRA_PHONE_SHARE_URL = Read-Host 'Worker base URL (https://...workers.dev)'
 $upload = Read-Host 'Paste UPLOAD_TOKEN' -AsSecureString
 $env:RHMRA_PHONE_SHARE_UPLOAD_TOKEN = [Net.NetworkCredential]::new('', $upload).Password
@@ -242,11 +244,12 @@ py -3 dashboard/serve.py
 Bash:
 
 ```bash
+RHMRA_PHONE_SHARE_PROVIDER=cloudflare
 read -r -p 'Worker base URL (https://...workers.dev): ' RHMRA_PHONE_SHARE_URL
 read -r -p 'Access service-token Client ID: ' RHMRA_PHONE_SHARE_CF_CLIENT_ID
 read -r -s -p 'UPLOAD_TOKEN: ' RHMRA_PHONE_SHARE_UPLOAD_TOKEN; echo
 read -r -s -p 'Access service-token Client Secret: ' RHMRA_PHONE_SHARE_CF_CLIENT_SECRET; echo
-export RHMRA_PHONE_SHARE_URL RHMRA_PHONE_SHARE_UPLOAD_TOKEN
+export RHMRA_PHONE_SHARE_PROVIDER RHMRA_PHONE_SHARE_URL RHMRA_PHONE_SHARE_UPLOAD_TOKEN
 export RHMRA_PHONE_SHARE_CF_CLIENT_ID RHMRA_PHONE_SHARE_CF_CLIENT_SECRET
 python3 dashboard/phone_share_preflight.py
 python3 dashboard/serve.py
