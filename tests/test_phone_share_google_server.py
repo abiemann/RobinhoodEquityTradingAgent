@@ -288,12 +288,12 @@ class GooglePhoneShareServerTests(unittest.TestCase):
 
         del os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV]
         self.configure_cloudflare()
-        unconfigured = json.loads(
+        default_google = json.loads(
             self.request('GET', '/api/phone-share/config')[2]
         )
+        self.assertTrue(default_google['configured'])
         self.assertEqual(
-            unconfigured,
-            {'configured': False, 'provider': 'google-drive'},
+            default_google['provider'], SERVER.PHONE_SHARE_PROVIDER_GOOGLE
         )
 
         os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = 'cloudflare'
@@ -303,9 +303,15 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertTrue(cloudflare['configured'])
         self.assertEqual(cloudflare['provider'], 'cloudflare')
 
-    def test_missing_default_google_config_is_explicit(self):
+    def test_missing_default_google_config_is_explicit_when_bundled_fallback_absent(
+        self,
+    ):
+        with mock.patch.object(SERVER, 'GOOGLE_DESKTOP_CLIENT_ID', ''):
+            response = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
         self.assertEqual(
-            json.loads(self.request('GET', '/api/phone-share/config')[2]),
+            response,
             {'configured': False, 'provider': 'google-drive'},
         )
 
