@@ -24,6 +24,7 @@ from dashboard.phone_share import (  # noqa: E402
     validate_envelope,
 )
 from dashboard.phone_share.google_drive import (  # noqa: E402
+    GOOGLE_DRIVE_DOWNLOAD_ENDPOINT,
     GOOGLE_DRIVE_FILES_ENDPOINT,
     GOOGLE_DRIVE_UPLOAD_ENDPOINT,
     GOOGLE_TOKEN_ENDPOINT,
@@ -681,7 +682,10 @@ class GoogleDriveProviderTests(unittest.TestCase):
         self.assertEqual(result, envelope())
         method, url, unused = self.transport.requests[1]
         self.assertEqual(method, "GET")
-        self.assertEqual(url, GOOGLE_DRIVE_FILES_ENDPOINT + "/" + FILE_ID + "?alt=media")
+        self.assertEqual(
+            url,
+            GOOGLE_DRIVE_DOWNLOAD_ENDPOINT + "/" + FILE_ID + "?alt=media",
+        )
 
         self.transport.requests.clear()
         self.queue_listing([self.metadata()])

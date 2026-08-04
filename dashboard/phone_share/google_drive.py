@@ -26,6 +26,7 @@ DRIVE_APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
+GOOGLE_DRIVE_DOWNLOAD_ENDPOINT = "https://www.googleapis.com/download/drive/v3/files"
 GOOGLE_DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files"
 
 ENVELOPE_KEYS = (
@@ -1104,7 +1105,7 @@ class GoogleDriveProvider:
         self, existing: DriveFile, share_id: str
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         file_id = urllib.parse.quote(existing.file_id, safe="")
-        url = GOOGLE_DRIVE_FILES_ENDPOINT + "/" + file_id + "?alt=media"
+        url = GOOGLE_DRIVE_DOWNLOAD_ENDPOINT + "/" + file_id + "?alt=media"
         response = self._request("GET", url)
         if response.status == 404:
             return None, None
