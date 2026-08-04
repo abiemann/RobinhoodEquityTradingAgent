@@ -545,7 +545,7 @@ function setShareButtonActive(active) {
 function phoneShareDurationOptions() {
   const maximum = Math.min(PHONE_SHARE_MAX_SECONDS,
     Math.max(60, Number(phoneShareConfig?.ttl_seconds) || 7200));
-  let durations = [3600, 7200, 14400, 28800].filter(seconds => seconds <= maximum);
+  let durations = [3600, 7200, 14400, 21600, 28800].filter(seconds => seconds <= maximum);
   if (!durations.length) durations = [maximum];
   const preferred = durations.includes(7200) ? 7200 : durations[durations.length - 1];
   return durations.map(seconds => {
@@ -603,15 +603,24 @@ function renderShareDialog(message = '', isError = false) {
   }
   if (isGoogleDrivePhoneShare()) {
     if (!phoneShareConfig.configured) {
+      const configurationMessage = phoneShareConfig.configuration_error
+        || 'This copy of RHMRA does not have its public Google sign-in identifier configured. No financial data or credentials were sent.';
       content.innerHTML = `<h3>Google Drive phone sharing is not available yet</h3>
-        <p>This copy of RHMRA does not have its public Google sign-in identifier configured. No financial data or credentials were sent.</p>
+        <p>${esc(configurationMessage)}</p>
+        <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
+      return;
+    }
+    if (phoneShareConfig.desktop_credentials_configured !== true) {
+      content.innerHTML = `<h3>Google Desktop credential setup required</h3>
+        <p>This source checkout needs the downloaded <strong>Desktop app OAuth JSON</strong> that matches RHMRA's Google client. Keep that file private and outside this repository.</p>
+        <div class='share-note'>Before starting the dashboard, set <code>RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE</code> to the JSON file's absolute path. Never paste its client secret into the dashboard, a task prompt, or source control.</div>
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
       return;
     }
     if (phoneShareConfig.connected !== true) {
       content.innerHTML = `<h3>Connect your Google Drive</h3>
         <p>Click once to sign in with Google. RHMRA stores encrypted snapshots only in <strong>your private Google Drive app data</strong>, which is hidden from ordinary Drive files.</p>
-        <div class='share-note'><strong>No developer setup:</strong> you do not need a Google Cloud project, bucket, API key, or paid storage service. Normal use fits in the free storage included with a Google account.</div>
+        <div class='share-note'><strong>No storage setup:</strong> you do not need a bucket, API key, paid storage service, or internet-facing server. Normal use fits in the free storage included with a Google account.</div>
         <div class='share-controls'><button id='phone-share-connect-google' class='share-action primary' type='button'>Connect Google Drive</button></div>
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
       $('phone-share-connect-google').addEventListener('click', connectGoogleDrivePhoneShare);
@@ -730,6 +739,10 @@ async function connectGoogleDrivePhoneShare() {
         await loadGooglePhonePairing();
         renderShareDialog('Google Drive connected. You can pair your phone now.');
         return;
+      }
+      if (isGoogleDrivePhoneShare(config) && config.connection_error) {
+        phoneShareConfig = config;
+        throw new Error(config.connection_error);
       }
     }
     throw new Error('Google sign-in did not finish within two minutes. Complete the sign-in tab, then try again.');
@@ -896,6 +909,56 @@ async function startLegacyPhoneShare() {
   }
 }
 
+async function recoverGooglePhoneShareAuthorization(response, session) {
+  if (session.provider !== PHONE_SHARE_GOOGLE_PROVIDER ||
+      ![409, 503].includes(response.status)) return false;
+  const errorDocument = await response.json().catch(() => ({}));
+  const authorizationErrors = new Set([
+    'Google Drive is not connected',
+    'Google Desktop credentials need attention',
+    'Google Desktop credentials are not configured',
+    'phone sharing is not configured',
+  ]);
+  if (!authorizationErrors.has(errorDocument.error)) return false;
+
+  let config = {
+    ...phoneShareConfig,
+    provider: PHONE_SHARE_GOOGLE_PROVIDER,
+    configured: errorDocument.error !== 'phone sharing is not configured',
+    desktop_credentials_configured:
+      errorDocument.error !== 'Google Desktop credentials are not configured',
+    connected: false,
+    connection_error: errorDocument.error,
+  };
+  try { config = await getPhoneShareConfig(); }
+  catch { /* Retire the stale session using the safe local error above. */ }
+  if (isGoogleDrivePhoneShare(config) && config.connected === true) return false;
+  if (phoneShareSession !== session) return true;
+
+  const incompleteNewPairing = Boolean(
+    session.pairingNeedsPersistence && !session.lastUploaded
+  );
+  wipePhoneShareSession(session);
+  phoneShareSession = null;
+  phoneShareConfig = config;
+  setShareButtonActive(false);
+  if (incompleteNewPairing) await clearStoredGooglePhonePairing();
+
+  const guidance = isGoogleDrivePhoneShare(config)
+    ? config.connection_error || config.configuration_error ||
+      (config.desktop_credentials_configured !== true
+        ? 'Configure the Google Desktop credential before sharing again.'
+        : 'Reconnect Google Drive before sharing again.')
+    : 'Phone sharing configuration changed. Start a new share.';
+  const pairingStatus = incompleteNewPairing
+    ? ' The incomplete phone pairing was discarded; pair again after reconnecting.'
+    : ' Local uploads stopped, but your existing phone pairing was kept. Any earlier encrypted snapshot will still expire automatically.';
+  if ($('phone-share-dialog').open) {
+    renderShareDialog(guidance + pairingStatus, true);
+  }
+  return true;
+}
+
 async function uploadPhoneShare(force = false) {
   const session = phoneShareSession;
   if (!session || !latestPhoneView || session.revoking) return;
@@ -959,6 +1022,7 @@ async function uploadPhoneShare(force = false) {
       if ($('phone-share-dialog').open) void openPhoneShareDialog();
       return;
     }
+    if (await recoverGooglePhoneShareAuthorization(response, session)) return;
     if (!response.ok) throw new Error(`local relay returned HTTP ${response.status}`);
     if (phoneShareSession !== session) return;
     if (session.provider === PHONE_SHARE_GOOGLE_PROVIDER && session.pairingNeedsPersistence) {
@@ -1014,6 +1078,7 @@ async function stopPhoneShare() {
     const response = await phoneShareLocalFetch('/api/phone-share/' + encodeURIComponent(session.id), {
       method: 'DELETE', cache: 'no-store', headers: { 'X-RHMRA-CSRF': session.csrfToken },
     });
+    if (await recoverGooglePhoneShareAuthorization(response, session)) return;
     if (!response.ok && response.status !== 404) throw new Error(`local relay returned HTTP ${response.status}`);
     const google = session.provider === PHONE_SHARE_GOOGLE_PROVIDER;
     const pairingWasPresented = Boolean(session.lastUploaded);

@@ -79,6 +79,70 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('''method: 'DELETE',''', stop)
         self.assertIn('''method: 'DELETE',''', forget)
 
+    def test_google_auth_failure_retires_only_the_stale_active_session(self):
+        recovery = function_source(
+            'recoverGooglePhoneShareAuthorization', 'uploadPhoneShare'
+        )
+        upload = function_source('uploadPhoneShare', 'copyPhoneShareLink')
+        stop = function_source('stopPhoneShare', 'forgetGooglePhone')
+
+        self.assertIn('![409, 503].includes(response.status)', recovery)
+        self.assertIn('errorDocument = await response.json()', recovery)
+        for error in (
+            'Google Drive is not connected',
+            'Google Desktop credentials need attention',
+            'Google Desktop credentials are not configured',
+            'phone sharing is not configured',
+        ):
+            with self.subTest(error=error):
+                self.assertIn(error, recovery)
+        self.assertIn(
+            'if (!authorizationErrors.has(errorDocument.error)) return false',
+            recovery,
+        )
+        self.assertIn('config = await getPhoneShareConfig()', recovery)
+        self.assertIn(
+            'Retire the stale session using the safe local error above',
+            recovery,
+        )
+        self.assertIn('config.connected === true', recovery)
+        self.assertIn('wipePhoneShareSession(session)', recovery)
+        self.assertIn('phoneShareSession = null', recovery)
+        self.assertIn('phoneShareConfig = config', recovery)
+        self.assertIn('setShareButtonActive(false)', recovery)
+        self.assertIn(
+            'session.pairingNeedsPersistence && !session.lastUploaded',
+            recovery,
+        )
+        self.assertIn(
+            'if (incompleteNewPairing) await clearStoredGooglePhonePairing()',
+            recovery,
+        )
+        self.assertIn('your existing phone pairing was kept', recovery)
+        self.assertIn('Any earlier encrypted snapshot will still expire', recovery)
+
+        recovery_call = (
+            'await recoverGooglePhoneShareAuthorization(response, session)'
+        )
+        for source in (upload, stop):
+            with self.subTest(source=source[:40]):
+                self.assertIn(recovery_call, source)
+                self.assertLess(
+                    source.index(recovery_call),
+                    source.index('local relay returned HTTP'),
+                )
+
+    def test_share_duration_offers_eight_hours_but_prefers_two(self):
+        source = function_source(
+            'phoneShareDurationOptions', 'renderShareDialog'
+        )
+        self.assertIn(
+            'durations = [3600, 7200, 14400, 21600, 28800]',
+            source,
+        )
+        self.assertIn('Math.min(PHONE_SHARE_MAX_SECONDS', source)
+        self.assertIn('durations.includes(7200) ? 7200', source)
+
     def test_google_connection_preopens_popup_then_polls_connected_config(self):
         source = function_source('connectGoogleDrivePhoneShare', 'revokePreviousPhoneShare')
         popup = source.index('''window.open('about:blank',''')
@@ -87,6 +151,11 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('''X-RHMRA-CSRF': phoneShareConfig.csrf_token''', source)
         self.assertIn('authorizationWindow.location.replace', source)
         self.assertIn('config.connected === true', source)
+        self.assertIn('config.connection_error', source)
+        self.assertLess(
+            source.index('config.connection_error'),
+            source.index('Google sign-in did not finish within two minutes'),
+        )
         self.assertIn('PHONE_SHARE_CONNECT_TIMEOUT_MS', source)
 
     def test_all_local_phone_share_requests_have_a_bounded_timeout(self):
@@ -120,9 +189,18 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('One-time Cloudflare setup required', DASHBOARD)
 
     def test_beginner_copy_explains_private_free_account_owned_storage(self):
+        render = function_source('renderShareDialog', 'openPhoneShareDialog')
         self.assertIn('your private Google Drive app data', DASHBOARD)
-        self.assertIn('Google Cloud project, bucket, API key, or paid storage service', DASHBOARD)
+        self.assertIn('Google Desktop credential setup required', DASHBOARD)
+        self.assertIn('RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE', DASHBOARD)
+        self.assertIn('phoneShareConfig.configuration_error', DASHBOARD)
+        self.assertIn('esc(configurationMessage)', DASHBOARD)
+        self.assertIn('bucket, API key, paid storage service', DASHBOARD)
         self.assertIn('There is no shared RHMRA server', DASHBOARD)
+        self.assertLess(
+            render.index('desktop_credentials_configured'),
+            render.index('phoneShareConfig.connected'),
+        )
 
 
 if __name__ == '__main__':

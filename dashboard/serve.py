@@ -29,6 +29,7 @@ Stop:  Ctrl+C in this terminal. If it was started detached, kill it by port —
 """
 
 import glob
+import hashlib
 import hmac
 import http.client
 import json
@@ -50,6 +51,7 @@ PHONE_SHARE_MAX_BODY_BYTES = 393216
 PHONE_SHARE_TIMEOUT_SECONDS = 10
 PHONE_SHARE_DEFAULT_TTL_SECONDS = 2 * 60 * 60
 PHONE_SHARE_MAX_TTL_SECONDS = 8 * 60 * 60
+PHONE_SHARE_GOOGLE_DEFAULT_TTL_SECONDS = PHONE_SHARE_MAX_TTL_SECONDS
 PHONE_SHARE_MAX_CLOCK_SKEW_SECONDS = 2 * 60
 
 PHONE_SHARE_URL_ENV = 'RHMRA_PHONE_SHARE_URL'
@@ -60,11 +62,26 @@ PHONE_SHARE_ACCESS_ID_ENV = 'RHMRA_PHONE_SHARE_CF_CLIENT_ID'
 PHONE_SHARE_ACCESS_SECRET_ENV = 'RHMRA_PHONE_SHARE_CF_CLIENT_SECRET'
 PHONE_SHARE_PROVIDER_ENV = 'RHMRA_PHONE_SHARE_PROVIDER'
 PHONE_SHARE_GOOGLE_CLIENT_ID_ENV = 'RHMRA_PHONE_SHARE_GOOGLE_CLIENT_ID'
+PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV = (
+    'RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE'
+)
 PHONE_SHARE_GOOGLE_VIEWER_URL_ENV = 'RHMRA_PHONE_SHARE_GOOGLE_VIEWER_URL'
 
 PHONE_SHARE_PROVIDER_GOOGLE = 'google-drive'
 PHONE_SHARE_PROVIDER_CLOUDFLARE = 'cloudflare'
 PHONE_SHARE_GOOGLE_RUNTIME_LOCK = threading.RLock()
+PHONE_SHARE_GOOGLE_CREDENTIALS_MAX_BYTES = 65536
+
+PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR = (
+    'The configured Google Desktop OAuth credential is missing or was '
+    'rejected by Google. Check the external Desktop app JSON and restart the '
+    'dashboard; do not paste a client secret into the dashboard.'
+)
+PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR = (
+    'The Google Desktop OAuth JSON could not be loaded or does not match the '
+    'explicit client ID. Check its absolute path and keep the file outside '
+    'this repository.'
+)
 
 PHONE_SHARE_FIELDS = frozenset({
     'schema_version', 'share_id', 'sequence', 'captured_at',
@@ -187,7 +204,7 @@ def _phone_share_settings():
 
 def _phone_share_ttl_seconds():
     raw_ttl = os.environ.get(
-        PHONE_SHARE_TTL_ENV, str(PHONE_SHARE_DEFAULT_TTL_SECONDS)
+        PHONE_SHARE_TTL_ENV, str(PHONE_SHARE_GOOGLE_DEFAULT_TTL_SECONDS)
     )
     try:
         ttl_seconds = int(raw_ttl)
@@ -216,13 +233,91 @@ def _https_google_viewer_url(value):
     return urllib.parse.urlunsplit(('https', authority, path, '', ''))
 
 
+def _load_google_desktop_credentials(value):
+    '''Load a downloaded Google Desktop client JSON without exposing it.'''
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 4096
+        or not os.path.isabs(value)
+        or chr(0) in value
+    ):
+        return None
+    if os.name == 'nt':
+        normalized_value = value.replace('/', chr(92))
+        device_prefixes = (
+            chr(92) * 2 + '?' + chr(92),
+            chr(92) * 2 + '.' + chr(92),
+            chr(92) + '??' + chr(92),
+        )
+        if normalized_value.startswith(device_prefixes):
+            return None
+    try:
+        if os.path.islink(value):
+            return None
+        resolved = os.path.normcase(os.path.realpath(value))
+        repository = os.path.normcase(os.path.realpath(REPO))
+        try:
+            if os.path.commonpath((repository, resolved)) == repository:
+                return None
+        except ValueError:
+            repository_drive = os.path.normcase(
+                os.path.splitdrive(repository)[0]
+            )
+            resolved_drive = os.path.normcase(
+                os.path.splitdrive(resolved)[0]
+            )
+            if (
+                not repository_drive
+                or not resolved_drive
+                or repository_drive == resolved_drive
+            ):
+                return None
+        with open(resolved, 'rb') as credentials_file:
+            raw = credentials_file.read(
+                PHONE_SHARE_GOOGLE_CREDENTIALS_MAX_BYTES + 1
+            )
+    except OSError:
+        return None
+    if not raw or len(raw) > PHONE_SHARE_GOOGLE_CREDENTIALS_MAX_BYTES:
+        return None
+    try:
+        document = json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(document, dict) or set(document) != {'installed'}:
+        return None
+    installed = document.get('installed')
+    if not isinstance(installed, dict):
+        return None
+    client_id = installed.get('client_id')
+    client_secret = installed.get('client_secret')
+    if not isinstance(client_id, str) or not isinstance(client_secret, str):
+        return None
+    return client_id, client_secret
+
+
 def _google_phone_share_settings(server_port):
     if (isinstance(server_port, bool) or not isinstance(server_port, int)
             or not 1024 <= server_port <= 65535):
         return None
-    client_id = os.environ.get(
-        PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, GOOGLE_DESKTOP_CLIENT_ID
+    explicit_client_id = os.environ.get(PHONE_SHARE_GOOGLE_CLIENT_ID_ENV)
+    client_id = (
+        explicit_client_id
+        if explicit_client_id is not None
+        else GOOGLE_DESKTOP_CLIENT_ID
     )
+    client_secret = None
+    credentials_path = os.environ.get(
+        PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+    )
+    if credentials_path is not None:
+        credentials = _load_google_desktop_credentials(credentials_path)
+        if credentials is None:
+            return None
+        file_client_id, client_secret = credentials
+        if file_client_id != client_id:
+            return None
+        client_id = file_client_id
     viewer_url = _https_google_viewer_url(os.environ.get(
         PHONE_SHARE_GOOGLE_VIEWER_URL_ENV, GOOGLE_PHONE_VIEWER_URL
     ))
@@ -234,6 +329,7 @@ def _google_phone_share_settings(server_port):
         config = GoogleDriveConfig(
             client_id=client_id,
             redirect_uri=redirect_uri,
+            client_secret=client_secret,
         )
     except PhoneShareProviderError:
         return None
@@ -247,6 +343,32 @@ def _google_phone_share_settings(server_port):
         'viewer_url': viewer_url,
         'ttl_seconds': ttl_seconds,
     }
+
+
+def _google_credentials_configuration_error():
+    credentials_path = os.environ.get(
+        PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+    )
+    if credentials_path is None:
+        return None
+    credentials = _load_google_desktop_credentials(credentials_path)
+    if credentials is None:
+        return PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR
+    try:
+        GoogleDriveConfig(
+            client_id=credentials[0],
+            redirect_uri='http://127.0.0.1:8765/oauth2/callback',
+            client_secret=credentials[1],
+        )
+    except PhoneShareProviderError:
+        return PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR
+    selected_client_id = os.environ.get(
+        PHONE_SHARE_GOOGLE_CLIENT_ID_ENV,
+        GOOGLE_DESKTOP_CLIENT_ID,
+    )
+    if credentials[0] != selected_client_id:
+        return PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR
+    return None
 
 
 def _selected_phone_share_settings(server_port):
@@ -288,7 +410,11 @@ class _GooglePhoneShareRuntime:
             else SecureOAuthCredentialStore(config.client_id)
         )
         self._session_persists_changes = False
-        restored = self.credential_store.load()
+        restored = (
+            self.credential_store.load()
+            if config.client_secret is not None
+            else None
+        )
         if restored is not None:
             try:
                 self.session.set_credentials(restored)
@@ -306,6 +432,7 @@ class _GooglePhoneShareRuntime:
         if callable(observe_clear):
             observe_clear(self.credential_store.clear)
         self.pending = None
+        self.connection_error = None
         self.lock = threading.RLock()
 
     @property
@@ -319,12 +446,22 @@ class _GooglePhoneShareRuntime:
 
 def _google_runtime_for_server(server, settings):
     '''Return the OAuth runtime attached to this loopback server process.'''
-    fingerprint = (settings['client_id'], settings['redirect_uri'])
+    config = settings['config']
+    secret_hash = hashlib.sha256(
+        (config.client_secret or '').encode('utf-8')
+    ).digest()
+    fingerprint = (config.client_id, config.redirect_uri, secret_hash)
     with PHONE_SHARE_GOOGLE_RUNTIME_LOCK:
         runtime = getattr(server, '_rhmra_google_phone_share_runtime', None)
         current = None
         if runtime is not None:
-            current = (runtime.config.client_id, runtime.config.redirect_uri)
+            current = (
+                runtime.config.client_id,
+                runtime.config.redirect_uri,
+                hashlib.sha256(
+                    (runtime.config.client_secret or '').encode('utf-8')
+                ).digest(),
+            )
         if current != fingerprint:
             runtime = _GooglePhoneShareRuntime(settings['config'])
             server._rhmra_google_phone_share_runtime = runtime
@@ -336,10 +473,15 @@ def _phone_share_public_config(server=None):
     server_port = getattr(server, 'server_port', None)
     settings = _selected_phone_share_settings(server_port)
     if settings is None:
-        return {
+        result = {
             'configured': False,
             'provider': _requested_phone_share_provider(),
         }
+        if result['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+            configuration_error = _google_credentials_configuration_error()
+            if configuration_error is not None:
+                result['configuration_error'] = configuration_error
+        return result
     result = {
         'configured': True,
         'provider': settings['provider'],
@@ -350,8 +492,17 @@ def _phone_share_public_config(server=None):
     if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
         runtime = _google_runtime_for_server(server, settings)
         with runtime.lock:
-            result['connected'] = runtime.session.is_authorized
+            result['connected'] = (
+                runtime.config.client_secret is not None
+                and runtime.connection_error is None
+                and runtime.session.is_authorized
+            )
             result['credential_persistence'] = runtime.credential_persistence
+            result['desktop_credentials_configured'] = (
+                runtime.config.client_secret is not None
+            )
+            if runtime.connection_error is not None:
+                result['connection_error'] = runtime.connection_error
     return result
 
 
@@ -522,13 +673,16 @@ class Handler(SimpleHTTPRequestHandler):
     def _api_error(self, status, code):
         self._json({'error': code}, status=status)
 
-    def _oauth_page(self, success):
+    def _oauth_page(self, success, error_code=None):
         status = 200 if success else 400
         title = ('Google Drive connected' if success
                  else 'Google Drive was not connected')
-        message = ('You can close this tab and return to the dashboard.'
-                   if success else
-                   'Close this tab and try Connect Google Drive again.')
+        if success:
+            message = 'You can close this tab and return to the dashboard.'
+        elif error_code == 'oauth_client_credentials_rejected':
+            message = PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+        else:
+            message = 'Close this tab and try Connect Google Drive again.'
         body = ('<!doctype html><html><head><meta charset=utf-8>'
                 f'<title>{title}</title></head><body><h1>{title}</h1>'
                 f'<p>{message}</p></body></html>').encode('utf-8')
@@ -726,12 +880,20 @@ class Handler(SimpleHTTPRequestHandler):
                         callback_url, pending
                     )
                     runtime.persist_completed_credentials(credentials)
+                    runtime.connection_error = None
             except PhoneShareProviderError as exc:
+                with runtime.lock:
+                    if not runtime.session.is_authorized:
+                        runtime.connection_error = (
+                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+                            if exc.code == 'oauth_client_credentials_rejected'
+                            else 'Google sign-in was not completed. Try connecting again.'
+                        )
                 self.log_error(
                     'Google phone-sharing authorization failed: %s',
                     exc.code,
                 )
-                return self._oauth_page(False)
+                return self._oauth_page(False, exc.code)
             return self._oauth_page(True)
         if path == "/":
             self.send_response(302)
@@ -776,9 +938,15 @@ class Handler(SimpleHTTPRequestHandler):
             if settings['provider'] != PHONE_SHARE_PROVIDER_GOOGLE:
                 self._api_error(409, 'phone sharing is already configured')
                 return
+            if settings['config'].client_secret is None:
+                self._api_error(
+                    503, 'Google Desktop credentials are not configured'
+                )
+                return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
                 with runtime.lock:
+                    runtime.connection_error = None
                     pending = runtime.session.begin_authorization()
                     if not isinstance(pending, OAuthAuthorizationRequest):
                         raise PhoneShareProviderError(
@@ -805,6 +973,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(400, 'invalid encrypted snapshot')
             return
         if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+            if settings['config'].client_secret is None:
+                self._api_error(
+                    503, 'Google Desktop credentials are not configured'
+                )
+                return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
                 with runtime.lock:
@@ -829,6 +1002,14 @@ class Handler(SimpleHTTPRequestHandler):
                     'drive_authorization_failed',
                 }:
                     self._api_error(409, 'Google Drive is not connected')
+                elif exc.code == 'oauth_client_credentials_rejected':
+                    with runtime.lock:
+                        runtime.connection_error = (
+                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+                        )
+                    self._api_error(
+                        503, 'Google Desktop credentials need attention'
+                    )
                 else:
                     self._api_error(502, 'phone sharing service unavailable')
                 return
@@ -870,6 +1051,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(503, 'phone sharing is not configured')
             return
         if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
+            if settings['config'].client_secret is None:
+                self._api_error(
+                    503, 'Google Desktop credentials are not configured'
+                )
+                return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
                 with runtime.lock:
@@ -886,6 +1072,14 @@ class Handler(SimpleHTTPRequestHandler):
                     'drive_authorization_failed',
                 }:
                     self._api_error(409, 'Google Drive is not connected')
+                elif exc.code == 'oauth_client_credentials_rejected':
+                    with runtime.lock:
+                        runtime.connection_error = (
+                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+                        )
+                    self._api_error(
+                        503, 'Google Desktop credentials need attention'
+                    )
                 else:
                     self._api_error(502, 'phone sharing service unavailable')
                 return

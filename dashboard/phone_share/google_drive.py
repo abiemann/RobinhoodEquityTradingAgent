@@ -192,6 +192,7 @@ class GoogleDriveConfig:
     request_timeout_seconds: float = 10
     max_response_bytes: int = 524288
     refresh_leeway_seconds: int = 60
+    client_secret: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         suffix = ".apps.googleusercontent.com"
@@ -204,6 +205,14 @@ class GoogleDriveConfig:
             raise PhoneShareProviderError(
                 "invalid_google_client_id",
                 "The Google OAuth desktop client ID is invalid.",
+            )
+        if self.client_secret is not None and (
+            not isinstance(self.client_secret, str)
+            or not SAFE_TOKEN_RE.fullmatch(self.client_secret)
+        ):
+            raise PhoneShareProviderError(
+                "invalid_google_client_secret",
+                "The Google OAuth desktop credential is invalid.",
             )
 
         if not isinstance(self.redirect_uri, str):
@@ -434,15 +443,16 @@ class InMemoryOAuthSession:
                 "invalid_oauth_state", "The Google authorization state is invalid."
             )
         code = self._parse_callback(callback_url, pending.state)
-        form = urllib.parse.urlencode(
-            {
-                "client_id": self.config.client_id,
-                "code": code,
-                "code_verifier": verifier,
-                "grant_type": "authorization_code",
-                "redirect_uri": self.config.redirect_uri,
-            }
-        ).encode("ascii")
+        parameters = {
+            "client_id": self.config.client_id,
+            "code": code,
+            "code_verifier": verifier,
+            "grant_type": "authorization_code",
+            "redirect_uri": self.config.redirect_uri,
+        }
+        if self.config.client_secret is not None:
+            parameters["client_secret"] = self.config.client_secret
+        form = urllib.parse.urlencode(parameters).encode("ascii")
         document = self._token_request(form, "oauth_exchange_failed")
         credentials = self._credentials_from_document(document, require_refresh=True)
         self._credentials = credentials
@@ -541,6 +551,9 @@ class InMemoryOAuthSession:
             try:
                 credentials = self._refresh(credentials)
             except PhoneShareProviderError as exc:
+                if exc.code == "oauth_client_credentials_rejected":
+                    self.clear_credentials()
+                    raise
                 if exc.code != "oauth_refresh_revoked":
                     raise
                 self.clear_credentials()
@@ -624,7 +637,8 @@ class InMemoryOAuthSession:
                 error_code, "Google OAuth could not issue a storage credential."
             )
         if response.status != 200:
-            if error_code == "oauth_refresh_failed" and response.status in {400, 401}:
+            document: Mapping[str, Any] = {}
+            if response.status in {400, 401}:
                 try:
                     document = _json_object(
                         response.body,
@@ -633,11 +647,36 @@ class InMemoryOAuthSession:
                     )
                 except PhoneShareProviderError:
                     document = {}
-                if document.get("error") == "invalid_grant":
-                    raise PhoneShareProviderError(
-                        "oauth_refresh_revoked",
-                        "The Google Drive connection has expired; reconnect it.",
-                    )
+            oauth_error = document.get("error")
+            oauth_description = document.get("error_description")
+            missing_client_credential = (
+                isinstance(oauth_error, str)
+                and oauth_error == "invalid_request"
+                and isinstance(oauth_description, str)
+                and oauth_description
+                in {"client_secret is missing", "client_secret is missing."}
+            )
+            rejected_client_credential = (
+                isinstance(oauth_error, str)
+                and oauth_error in {"invalid_client", "unauthorized_client"}
+            )
+            if missing_client_credential or rejected_client_credential:
+                # Some Google Desktop clients require the generated client
+                # credential during token exchange even when PKCE is used.
+                # Classify only Google's exact response; never echo an
+                # upstream body that might contain an authorization code.
+                raise PhoneShareProviderError(
+                    "oauth_client_credentials_rejected",
+                    "The Google OAuth desktop credential is missing or rejected.",
+                )
+            if (
+                error_code == "oauth_refresh_failed"
+                and oauth_error == "invalid_grant"
+            ):
+                raise PhoneShareProviderError(
+                    "oauth_refresh_revoked",
+                    "The Google Drive connection has expired; reconnect it.",
+                )
             raise PhoneShareProviderError(
                 error_code, "Google OAuth could not issue a storage credential."
             )
@@ -696,13 +735,14 @@ class InMemoryOAuthSession:
         )
 
     def _refresh(self, credentials: OAuthCredentials) -> OAuthCredentials:
-        form = urllib.parse.urlencode(
-            {
-                "client_id": self.config.client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": credentials.refresh_token,
-            }
-        ).encode("ascii")
+        parameters = {
+            "client_id": self.config.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": credentials.refresh_token,
+        }
+        if self.config.client_secret is not None:
+            parameters["client_secret"] = self.config.client_secret
+        form = urllib.parse.urlencode(parameters).encode("ascii")
         document = self._token_request(form, "oauth_refresh_failed")
         return self._credentials_from_document(document, previous=credentials)
 

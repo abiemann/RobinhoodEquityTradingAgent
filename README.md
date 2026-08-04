@@ -185,7 +185,18 @@ Only one instance of the trading agent can operate at a time. If another schedul
 
 Phone viewing is **off by default**. The recommended v2 design uses the installable [RHMRA Phone PWA](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/) and the user's own private Google Drive app-data area. There is no RHMRA account server, shared financial-data backend, public bucket, or internet-facing laptop web server.
 
-An end user needs only a free Google account, the laptop dashboard, and an Android phone, iPhone, or iPad with a modern browser. End users do **not** need GitHub, Cloudflare, a Google Cloud project, an API key, an OAuth client secret, a storage bucket, a paid storage plan, a web server, or an Android/iOS developer account. The PWA maintainer configures Google OAuth once for everyone.
+The phone user needs only a free Google account and an Android phone, iPhone, or iPad with a modern browser. A laptop running this source checkout also needs the matching Google **Desktop app OAuth JSON** supplied by the project maintainer. Google requires that file's paired desktop credential during token exchange. The file stays on the laptop; it is never returned by the dashboard API, sent to the phone, or committed to this repository.
+
+#### Configure the laptop credential once
+
+The project maintainer downloads the Desktop app OAuth JSON from Google Cloud. Keep it outside this repository, then set its absolute path in the same terminal before starting the dashboard:
+
+```powershell
+$env:RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE = 'C:\private\rhmra-google-desktop.json'
+py -3 dashboard\serve.py 9000
+```
+
+Do not paste the JSON's `client_secret` into the dashboard, a task prompt, `constants.md`, a report, or source control. RHMRA reads the paired client ID and credential locally, keeps the credential out of logs and public configuration, and sends it only to Google's HTTPS token endpoint. The OAuth authorization code still uses S256 PKCE and a one-time state value.
 
 #### Install and pair once
 
@@ -200,6 +211,10 @@ Install the PWA **before** pairing so its non-extractable decryption key is save
 5. Back in **View on Phone**, choose the duration and click **Pair phone and create QR code**. Wait until the first encrypted snapshot uploads and the QR code appears, then click **Copy private link**.
 6. Transfer that link to the phone through a private method, copy it, and tap **Paste private pairing link** inside the installed RHMRA Phone app.
 7. In the phone app, tap **Connect Google Drive** and sign in with the **same Google account** used on the laptop. Approve the requested private app-data access.
+
+For Google Drive sharing, the duration selector offers **1, 2, 4, 6, or 8
+hours**. Two hours remains the preselected choice; eight hours is the hard
+maximum.
 
 The QR/camera flow is a convenient browser fallback. For an installed app—especially on iPhone or iPad—pasting the private link inside the Home Screen app is more reliable because Safari and the installed PWA keep separate storage. Never post, email broadly, or otherwise share the QR code or private link: it contains the dashboard decryption key.
 
@@ -220,7 +235,7 @@ Pairing normally survives future dashboard sessions. The next time, click **View
 
 #### Project maintainers only: one-time Google OAuth setup
 
-Ordinary users can stop reading this subsection. The maintainer of the public PWA must enable the Google Drive API, configure the consent/branding screen, request only the `https://www.googleapis.com/auth/drive.appdata` scope, and create a **Web application** OAuth client for the hosted PWA plus a **Desktop app** OAuth client for the laptop uploader in the **same Google Cloud project**. The published web and desktop client IDs are public configuration; client secrets, access tokens, refresh tokens, and pairing keys must never be committed. See the [RHMRA Phone maintainer guide](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer#maintainer-setup-one-time-not-for-end-users) for the exact hosting, authorized-origin, consent, and release steps.
+The maintainer of the public PWA must enable the Google Drive API, configure the consent/branding screen, request only the `https://www.googleapis.com/auth/drive.appdata` scope, and create a **Web application** OAuth client for the hosted PWA plus a **Desktop app** OAuth client for the laptop uploader in the **same Google Cloud project**. Download the Desktop app JSON and provision it locally as described above. Client secrets, downloaded OAuth JSON, access tokens, refresh tokens, and pairing keys must never be committed. See the [RHMRA Phone maintainer guide](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer#maintainer-setup-one-time-not-for-end-users) for the exact hosting, authorized-origin, consent, and release steps.
 
 #### Advanced / legacy self-hosted option: Cloudflare
 

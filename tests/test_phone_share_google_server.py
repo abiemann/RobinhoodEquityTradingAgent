@@ -2,6 +2,7 @@ import http.client
 import importlib.util
 import json
 import os
+import tempfile
 import threading
 import unittest
 import urllib.parse
@@ -20,12 +21,14 @@ SPEC.loader.exec_module(SERVER)
 VALID_CLIENT_ID = (
     '1234567890-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com'
 )
+VALID_CLIENT_SECRET = 'test-desktop-client-credential-value'
 
 
 class FakeOAuthSession:
     instances = []
     fail_begin = False
     fail_complete = False
+    failure_code = 'oauth_exchange_failed'
 
     def __init__(self, config):
         self.config = config
@@ -56,7 +59,8 @@ class FakeOAuthSession:
         self.completed_urls.append(callback_url)
         if self.__class__.fail_complete:
             raise SERVER.PhoneShareProviderError(
-                'oauth_exchange_failed', 'sensitive callback detail'
+                self.__class__.failure_code,
+                'sensitive callback detail ' + str(self.config.client_secret),
             )
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(callback_url).query)
         if query.get('state') != [pending.state] or query.get('code') != ['code-token']:
@@ -88,16 +92,19 @@ class FakeOAuthSession:
 
 class FakeCredentialStore:
     instances = []
+    loaded = None
 
     def __init__(self, client_id):
         self.client_id = client_id
         self.mode = 'secure'
         self.saved = []
         self.clear_calls = 0
+        self.load_calls = 0
         self.__class__.instances.append(self)
 
     def load(self):
-        return None
+        self.load_calls += 1
+        return self.__class__.loaded
 
     def save(self, credentials):
         self.saved.append(credentials)
@@ -155,10 +162,16 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         FakeOAuthSession.instances = []
         FakeOAuthSession.fail_begin = False
         FakeOAuthSession.fail_complete = False
+        FakeOAuthSession.failure_code = 'oauth_exchange_failed'
         FakeGoogleDriveProvider.instances = []
         FakeGoogleDriveProvider.fail_operation = False
         FakeGoogleDriveProvider.failure_code = 'drive_unavailable'
         FakeCredentialStore.instances = []
+        FakeCredentialStore.loaded = None
+        self.credentials_directory = tempfile.TemporaryDirectory()
+        self.credentials_path = self.write_google_credentials(
+            self.credentials_directory.name
+        )
         self.session_patch = mock.patch.object(
             SERVER, 'InMemoryOAuthSession', FakeOAuthSession
         )
@@ -189,6 +202,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.provider_patch.stop()
         self.session_patch.stop()
         self.store_patch.stop()
+        self.credentials_directory.cleanup()
         self.environment.stop()
 
     @property
@@ -197,10 +211,36 @@ class GooglePhoneShareServerTests(unittest.TestCase):
 
     def configure_google(self, *, explicit=True):
         os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV] = VALID_CLIENT_ID
+        os.environ.setdefault(
+            SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV,
+            self.credentials_path,
+        )
         if explicit:
             os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = (
                 SERVER.PHONE_SHARE_PROVIDER_GOOGLE
             )
+
+    def write_google_credentials(
+        self,
+        directory,
+        *,
+        client_id=VALID_CLIENT_ID,
+        client_secret=VALID_CLIENT_SECRET,
+    ):
+        path = os.path.join(directory, 'google-desktop-client.json')
+        with open(path, 'w', encoding='utf-8') as credentials_file:
+            json.dump(
+                {
+                    'installed': {
+                        'client_id': client_id,
+                        'client_secret': client_secret,
+                        'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+                        'token_uri': 'https://oauth2.googleapis.com/token',
+                    }
+                },
+                credentials_file,
+            )
+        return path
 
     def configure_cloudflare(self):
         os.environ.update({
@@ -272,11 +312,12 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(document['provider'], 'google-drive')
         self.assertFalse(document['connected'])
+        self.assertTrue(document['desktop_credentials_configured'])
         self.assertEqual(
             document['viewer_url'],
             'https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/'
         )
-        self.assertEqual(document['ttl_seconds'], 7200)
+        self.assertEqual(document['ttl_seconds'], 28800)
         self.assertEqual(document['csrf_token'], SERVER.PHONE_SHARE_CSRF_TOKEN)
         self.assertEqual(headers.get('Cache-Control'), 'no-store')
         self.assertNotIn(VALID_CLIENT_ID, body.decode('utf-8'))
@@ -288,9 +329,12 @@ class GooglePhoneShareServerTests(unittest.TestCase):
 
         del os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV]
         self.configure_cloudflare()
-        default_google = json.loads(
-            self.request('GET', '/api/phone-share/config')[2]
-        )
+        with mock.patch.object(
+            SERVER, 'GOOGLE_DESKTOP_CLIENT_ID', VALID_CLIENT_ID
+        ):
+            default_google = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
         self.assertTrue(default_google['configured'])
         self.assertEqual(
             default_google['provider'], SERVER.PHONE_SHARE_PROVIDER_GOOGLE
@@ -365,6 +409,181 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertTrue(document['authorization_url'].startswith('https://'))
         self.assertEqual(len(FakeOAuthSession.instances), 1)
 
+    def test_connect_fails_before_consent_when_credentials_are_missing(self):
+        self.configure_google()
+        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV]
+
+        status, _, body = self.request(
+            'POST', '/api/phone-share/connect', body=b'{}',
+            headers=self.mutation_headers(json_body=True),
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(body),
+            {'error': 'Google Desktop credentials are not configured'},
+        )
+        self.assertEqual(FakeOAuthSession.instances, [])
+
+    def test_external_desktop_credentials_are_loaded_but_never_published(self):
+        self.configure_google()
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_google_credentials(directory)
+            os.environ[
+                SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+            ] = path
+            status, _, body = self.request('GET', '/api/phone-share/config')
+
+            self.assertEqual(status, 200)
+            document = json.loads(body)
+            self.assertTrue(document['configured'])
+            self.assertNotIn(VALID_CLIENT_SECRET, body.decode('utf-8'))
+            self.assertNotIn(path, body.decode('utf-8'))
+            self.assertEqual(
+                FakeOAuthSession.instances[-1].config.client_secret,
+                VALID_CLIENT_SECRET,
+            )
+            self.assertNotIn(
+                VALID_CLIENT_SECRET,
+                repr(FakeOAuthSession.instances[-1].config),
+            )
+
+            os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV] = (
+                '9999999999-differentclient.apps.googleusercontent.com'
+            )
+            mismatch = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
+            self.assertEqual(
+                mismatch,
+                {
+                    'configured': False,
+                    'provider': 'google-drive',
+                    'configuration_error':
+                        SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR,
+                },
+            )
+            self.assertNotIn(path, json.dumps(mismatch))
+            self.assertNotIn(VALID_CLIENT_SECRET, json.dumps(mismatch))
+
+    def test_desktop_credentials_must_match_the_bundled_client(self):
+        self.configure_google()
+        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV]
+        with mock.patch.object(
+            SERVER,
+            'GOOGLE_DESKTOP_CLIENT_ID',
+            '9999999999-differentclient.apps.googleusercontent.com',
+        ):
+            document = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
+
+        self.assertEqual(
+            document,
+            {
+                'configured': False,
+                'provider': 'google-drive',
+                'configuration_error':
+                    SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR,
+            },
+        )
+        self.assertNotIn(self.credentials_path, json.dumps(document))
+        self.assertNotIn(VALID_CLIENT_SECRET, json.dumps(document))
+
+    def test_repository_contained_desktop_credentials_are_rejected(self):
+        self.configure_google()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_google_credentials(directory)
+            os.environ[
+                SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+            ] = path
+
+            document = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
+            self.assertEqual(document['configured'], False)
+            self.assertEqual(document['provider'], 'google-drive')
+            self.assertEqual(
+                document['configuration_error'],
+                SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR,
+            )
+            self.assertNotIn(path, json.dumps(document))
+            self.assertNotIn(VALID_CLIENT_SECRET, json.dumps(document))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows path syntax only')
+    def test_windows_device_path_cannot_bypass_repository_rejection(self):
+        self.configure_google()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_google_credentials(directory)
+            device_path = (
+                chr(92) * 2 + '?' + chr(92) + os.path.abspath(path)
+            )
+            os.environ[
+                SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+            ] = device_path
+
+            document = json.loads(
+                self.request('GET', '/api/phone-share/config')[2]
+            )
+
+            self.assertFalse(document['configured'])
+            self.assertEqual(
+                document['configuration_error'],
+                SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR,
+            )
+            self.assertNotIn(device_path, json.dumps(document))
+
+    def test_invalid_desktop_credential_fields_report_file_error(self):
+        self.configure_google()
+        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV]
+        cases = (
+            ('not-a-client-id', VALID_CLIENT_SECRET),
+            (VALID_CLIENT_ID, 'bad secret'),
+        )
+        for client_id, client_secret in cases:
+            with self.subTest(
+                client_id=client_id,
+                client_secret=client_secret,
+            ), tempfile.TemporaryDirectory() as directory:
+                path = self.write_google_credentials(
+                    directory,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
+                os.environ[
+                    SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
+                ] = path
+
+                document = json.loads(
+                    self.request('GET', '/api/phone-share/config')[2]
+                )
+
+                self.assertFalse(document['configured'])
+                self.assertEqual(
+                    document['configuration_error'],
+                    SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR,
+                )
+                self.assertNotIn(path, json.dumps(document))
+                self.assertNotIn(client_secret, json.dumps(document))
+
+    def test_saved_tokens_are_not_restored_without_desktop_credentials(self):
+        self.configure_google()
+        FakeCredentialStore.loaded = object()
+        configured = json.loads(
+            self.request('GET', '/api/phone-share/config')[2]
+        )
+        self.assertTrue(configured['connected'])
+        self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 1)
+
+        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV]
+        missing = json.loads(
+            self.request('GET', '/api/phone-share/config')[2]
+        )
+
+        self.assertFalse(missing['connected'])
+        self.assertFalse(missing['desktop_credentials_configured'])
+        self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 0)
+
     def test_callback_is_exact_loopback_one_shot_and_safe(self):
         self.configure_google()
         self.connect()
@@ -388,6 +607,39 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertTrue(config['connected'])
 
         self.assertEqual(self.complete_callback()[0], 400)
+
+    def test_missing_desktop_credential_fails_fast_with_safe_guidance(self):
+        self.configure_google()
+        FakeOAuthSession.fail_complete = True
+        FakeOAuthSession.failure_code = 'oauth_client_credentials_rejected'
+        self.connect()
+
+        status, _, body = self.complete_callback()
+
+        self.assertEqual(status, 400)
+        body_text = body.decode('utf-8')
+        self.assertIn(SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR, body_text)
+        self.assertNotIn('sensitive callback detail', body_text)
+        config = json.loads(self.request('GET', '/api/phone-share/config')[2])
+        self.assertFalse(config['connected'])
+        self.assertEqual(
+            config['connection_error'],
+            SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR,
+        )
+        self.assertNotIn(
+            'sensitive callback detail',
+            body_text + json.dumps(config) + ' '.join(self.logs),
+        )
+        self.assertNotIn(
+            VALID_CLIENT_SECRET,
+            body_text + json.dumps(config) + ' '.join(self.logs),
+        )
+
+        self.connect()
+        refreshed = json.loads(
+            self.request('GET', '/api/phone-share/config')[2]
+        )
+        self.assertNotIn('connection_error', refreshed)
 
     def test_upload_and_delete_dispatch_only_after_connection(self):
         self.configure_google()
@@ -457,6 +709,36 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         exposed = body.decode('utf-8') + ' '.join(self.logs)
         self.assertNotIn('oauth-super-secret', exposed)
         self.assertIn('drive_unavailable', exposed)
+
+    def test_rejected_desktop_credential_downgrades_connected_state(self):
+        self.configure_google()
+        self.connect()
+        self.assertEqual(self.complete_callback()[0], 200)
+        FakeGoogleDriveProvider.fail_operation = True
+        FakeGoogleDriveProvider.failure_code = (
+            'oauth_client_credentials_rejected'
+        )
+        payload = json.dumps(self.envelope()).encode('utf-8')
+
+        status, _, body = self.request(
+            'POST', '/api/phone-share', payload,
+            self.mutation_headers(json_body=True),
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(body),
+            {'error': 'Google Desktop credentials need attention'},
+        )
+        config = json.loads(self.request('GET', '/api/phone-share/config')[2])
+        self.assertFalse(config['connected'])
+        self.assertEqual(
+            config['connection_error'],
+            SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR,
+        )
+        exposed = body.decode('utf-8') + json.dumps(config) + ' '.join(self.logs)
+        self.assertNotIn('oauth-super-secret', exposed)
+        self.assertNotIn(VALID_CLIENT_SECRET, exposed)
 
     def test_server_rejects_expired_and_far_future_envelopes(self):
         now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)

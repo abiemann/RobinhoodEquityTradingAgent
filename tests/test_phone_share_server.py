@@ -53,6 +53,7 @@ class PhoneShareServerTests(unittest.TestCase):
     def setUp(self):
         self.environment = mock.patch.dict(os.environ, {}, clear=True)
         self.environment.start()
+        os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = 'cloudflare'
         self.logs = []
         logs = self.logs
 
@@ -131,7 +132,7 @@ class PhoneShareServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             json.loads(body),
-            {'configured': False, 'provider': 'google-drive'},
+            {'configured': False, 'provider': 'cloudflare'},
         )
         self.assertEqual(headers.get('Cache-Control'), 'no-store')
         self.assertNotIn('Access-Control-Allow-Origin', headers)

@@ -31,6 +31,7 @@ from dashboard.phone_share.google_drive import (  # noqa: E402
 
 
 CLIENT_ID = "1234567890-rhmraphonetest.apps.googleusercontent.com"
+CLIENT_SECRET = "test-desktop-client-credential-value"
 REDIRECT_URI = "http://127.0.0.1:8765/oauth2/callback"
 SHARE_ID = "S" * 22
 FILE_NAME = "rhmra-phone-v2-" + SHARE_ID + ".json"
@@ -73,9 +74,19 @@ class FakeTransport:
 
 class GoogleDriveConfigTests(unittest.TestCase):
     def test_accepts_strict_loopback_desktop_config(self):
-        config = GoogleDriveConfig(CLIENT_ID, REDIRECT_URI)
+        config = GoogleDriveConfig(
+            CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET
+        )
         self.assertEqual(config.client_id, CLIENT_ID)
         self.assertEqual(config.redirect_uri, REDIRECT_URI)
+        self.assertEqual(config.client_secret, CLIENT_SECRET)
+        self.assertNotIn(CLIENT_SECRET, repr(config))
+
+    def test_preserves_legacy_positional_timeout_argument(self):
+        config = GoogleDriveConfig(CLIENT_ID, REDIRECT_URI, 7)
+
+        self.assertEqual(config.request_timeout_seconds, 7)
+        self.assertIsNone(config.client_secret)
 
     def test_rejects_unsafe_or_ambiguous_config(self):
         invalid = [
@@ -93,6 +104,9 @@ class GoogleDriveConfigTests(unittest.TestCase):
                     GoogleDriveConfig(client_id, redirect_uri)
 
         for kwargs in (
+            {"client_secret": ""},
+            {"client_secret": "bad secret"},
+            {"client_secret": "bad\r\nsecret"},
             {"request_timeout_seconds": 0},
             {"request_timeout_seconds": True},
             {"max_response_bytes": 1024},
@@ -105,7 +119,9 @@ class GoogleDriveConfigTests(unittest.TestCase):
 
 class OAuthSessionTests(unittest.TestCase):
     def setUp(self):
-        self.config = GoogleDriveConfig(CLIENT_ID, REDIRECT_URI)
+        self.config = GoogleDriveConfig(
+            CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET
+        )
         self.transport = FakeTransport()
         values = [b"A" * 32, b"B" * 64]
         self.session = InMemoryOAuthSession(
@@ -141,6 +157,7 @@ class OAuthSessionTests(unittest.TestCase):
         self.assertEqual(query["code_challenge"], [expected_challenge])
         self.assertEqual(query["access_type"], ["offline"])
         self.assertEqual(query["prompt"], ["consent"])
+        self.assertNotIn(CLIENT_SECRET, pending.authorization_url)
         self.assertNotIn(pending.state, repr(pending))
         self.assertNotIn(pending.code_verifier, repr(pending))
 
@@ -162,7 +179,7 @@ class OAuthSessionTests(unittest.TestCase):
         self.assertEqual(form["code"], ["authorization-code"])
         self.assertEqual(form["code_verifier"], [pending.code_verifier])
         self.assertEqual(form["client_id"], [CLIENT_ID])
-        self.assertNotIn("client_secret", form)
+        self.assertEqual(form["client_secret"], [CLIENT_SECRET])
 
     def test_state_mismatch_duplicate_state_and_replay_fail_before_network(self):
         pending = self.session.begin_authorization()
@@ -237,6 +254,7 @@ class OAuthSessionTests(unittest.TestCase):
         )
         self.assertEqual(form["refresh_token"], ["kept-refresh-token"])
         self.assertEqual(form["grant_type"], ["refresh_token"])
+        self.assertEqual(form["client_secret"], [CLIENT_SECRET])
 
     def test_revoked_refresh_token_clears_credentials_and_notifies_store(self):
         self.session.set_credentials(
@@ -299,6 +317,115 @@ class OAuthSessionTests(unittest.TestCase):
         rendered = str(caught.exception) + repr(caught.exception)
         self.assertNotIn("authorization-code", rendered)
         self.assertNotIn("access-token-value", rendered)
+
+    def test_malformed_upstream_error_fields_fail_safely(self):
+        documents = (
+            {
+                "error": [],
+                "error_description": "client_secret is missing.",
+            },
+            {
+                "error": "invalid_request",
+                "error_description": [],
+            },
+        )
+        for index, document in enumerate(documents):
+            with self.subTest(document=document):
+                transport = FakeTransport()
+                values = [
+                    bytes([67 + index]) * 32,
+                    bytes([69 + index]) * 64,
+                ]
+                session = InMemoryOAuthSession(
+                    self.config,
+                    transport,
+                    clock=lambda: 1000.0,
+                    random_bytes=lambda length: values.pop(0),
+                )
+                pending = session.begin_authorization()
+                transport.queue(400, document)
+                callback = (
+                    REDIRECT_URI
+                    + "?code=authorization-code&state="
+                    + pending.state
+                )
+
+                with self.assertRaises(PhoneShareProviderError) as caught:
+                    session.complete_authorization(callback, pending)
+
+                self.assertEqual(caught.exception.code, "oauth_exchange_failed")
+                self.assertNotIn(
+                    "client_secret",
+                    str(caught.exception) + repr(caught.exception),
+                )
+
+    def test_missing_desktop_credential_is_classified_without_echoing_body(self):
+        config = GoogleDriveConfig(CLIENT_ID, REDIRECT_URI)
+        values = [b"C" * 32, b"D" * 64]
+        session = InMemoryOAuthSession(
+            config,
+            self.transport,
+            clock=lambda: 1000.0,
+            random_bytes=lambda length: values.pop(0),
+        )
+        pending = session.begin_authorization()
+        self.transport.queue(
+            400,
+            {
+                "error": "invalid_request",
+                "error_description": "client_secret is missing.",
+                "private_detail": "authorization-code access-token-value",
+            },
+        )
+        callback = REDIRECT_URI + "?code=authorization-code&state=" + pending.state
+
+        with self.assertRaises(PhoneShareProviderError) as caught:
+            session.complete_authorization(callback, pending)
+
+        self.assertEqual(
+            caught.exception.code, "oauth_client_credentials_rejected"
+        )
+        rendered = str(caught.exception) + repr(caught.exception)
+        self.assertNotIn("authorization-code", rendered)
+        self.assertNotIn("access-token-value", rendered)
+        form = urllib.parse.parse_qs(
+            self.transport.requests[-1][2]["body"].decode("ascii")
+        )
+        self.assertNotIn("client_secret", form)
+
+    def test_rejected_client_credential_on_refresh_clears_stale_session(self):
+        self.session.set_credentials(
+            OAuthCredentials(
+                access_token="old-access-token",
+                refresh_token="kept-refresh-token",
+                expires_at=1010.0,
+                scopes=(DRIVE_APPDATA_SCOPE,),
+            )
+        )
+        cleared = []
+        self.session.set_credentials_cleared_callback(
+            lambda: cleared.append(True)
+        )
+        self.transport.queue(
+            401,
+            {
+                "error": "invalid_client",
+                "error_description": "private upstream credential detail",
+            },
+        )
+
+        with self.assertRaises(PhoneShareProviderError) as caught:
+            self.session.authorization_header()
+
+        self.assertEqual(
+            caught.exception.code, "oauth_client_credentials_rejected"
+        )
+        self.assertFalse(self.session.is_authorized)
+        self.assertEqual(cleared, [True])
+        self.assertNotIn(
+            "private upstream credential detail",
+            str(caught.exception) + repr(caught.exception),
+        )
 
 
 class EnvelopeTests(unittest.TestCase):
