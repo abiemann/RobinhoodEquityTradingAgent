@@ -1623,8 +1623,8 @@ function renderPnlReconciliation(snap, rows) {
     return;
   }
   if (item.status === "agrees") {
-    root.className = "pnl-reconciliation ok";
-    root.textContent = `Broker and strategy agree to the cent · broker ${fmtCents(item.brokerCents)} · strategy ledger fills ${fmtCents(item.strategyCents)}`;
+    root.hidden = true;
+    root.textContent = "";
     return;
   }
   root.className = "pnl-reconciliation warn";

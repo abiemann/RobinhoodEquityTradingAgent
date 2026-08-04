@@ -145,6 +145,7 @@ test("qualified comparisons never present partial data as agreement", async () =
   unavailable.matched_fill_count = 1;
   unavailable.status = "qualified";
   render({ pnl_reconciliation: unavailable });
+  assert.equal(root.hidden, false);
   assert.match(root.textContent, /^Incomplete available strategy subtotal/);
   assert.doesNotMatch(root.textContent, /agree/i);
 
@@ -152,19 +153,40 @@ test("qualified comparisons never present partial data as agreement", async () =
   estimated.matched_fill_count = 1;
   estimated.status = "qualified";
   render({ pnl_reconciliation: estimated });
+  assert.equal(root.hidden, false);
   assert.match(root.textContent, /^Estimated strategy comparison/);
   assert.doesNotMatch(root.textContent, /agree/i);
+});
+
+test("exact agreement stays quiet while a difference remains visible", async () => {
+  const { render, root } = await embeddedReconciliationRenderer();
+  const agrees = clone(enhancedPayload().pnl_reconciliation);
+  agrees.strategy_realized_pnl_cents = 2129;
+  agrees.difference_cents = 0;
+  agrees.status = "agrees";
+  render({ pnl_reconciliation: agrees });
+  assert.equal(root.hidden, true);
+  assert.equal(root.textContent, "");
+
+  render({ pnl_reconciliation: enhancedPayload().pnl_reconciliation });
+  assert.equal(root.hidden, false);
+  assert.match(root.textContent, /^Broker vs strategy difference/);
 });
 
 test("legacy viewer copy distinguishes broker and ledger-fill strategy values without tax claims", async () => {
   const html = await (viewerResponse()).text();
   assert.match(html, /Broker realized today/);
   assert.match(html, /Strategy P&amp;L by rules era \(ledger fill basis\)/);
-  assert.match(html, /Broker and strategy agree to the cent/);
+  assert.doesNotMatch(html, /Broker and strategy agree to the cent/);
   assert.match(html, /Broker vs strategy difference/);
   assert.match(html, /Incomplete available strategy subtotal/);
   assert.match(html, /Estimated strategy comparison/);
   assert.match(html, /Broker is authoritative/);
   assert.match(html, /rankEligible:[^\n]+pnl_quality[^\n]+matched-ledger-pool/);
+  assert.doesNotMatch(html, /id="rules"/);
+  assert.doesNotMatch(html, /byId\("rules"\)/);
+  assert.doesNotMatch(html, /\["rules_version","Dates"/);
+  assert.doesNotMatch(html, /cell\(row,e\.rules_version\)/);
+  assert.match(html, /var legacyFields = \["rules_version"/);
   assert.doesNotMatch(html, /tax[- ]?(?:basis|lot)/i);
 });

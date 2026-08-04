@@ -84,7 +84,6 @@ const VIEWER_HTML = `<!doctype html>
   <h1>RHMRA Dashboard</h1>
   <span id="mode" class="pill">PHONE</span>
   <span id="freshness" class="pill">loading…</span>
-  <span id="rules" class="pill"></span>
   <span id="sync" class="pill"></span>
 </header>
 <div id="notice" class="notice" hidden></div>
@@ -404,9 +403,8 @@ const VIEWER_HTML = `<!doctype html>
       return;
     }
     if(item.status==="agrees"){
-      root.className="pnl-reconciliation ok";
-      root.textContent="Broker and strategy agree to the cent · "+
-        moneyCents(item.broker_realized_pnl_cents);
+      root.hidden=true;
+      root.textContent="";
       return;
     }
     root.className="pnl-reconciliation warn";
@@ -463,10 +461,10 @@ const VIEWER_HTML = `<!doctype html>
       .filter(function(e){return e.rankEligible&&e.profit>0;}).sort(function(a,b){return b.profit-a.profit||a.index-b.index;}).slice(0,3);
     var stars=new Map(ranked.map(function(e,index){return [e.version,3-index];}));
     var visible=state.erasExpanded?eras:eras.slice(0,12), wrap=node("div","scroll"), table=node("table"), header=node("tr");
-    ["rules_version","Dates","Buys","Sells","STOPs","Strategy P&L"].forEach(function(value){header.appendChild(node("th","",value));});
+    ["Dates","Buys","Sells","STOPs","Strategy P&L"].forEach(function(value){header.appendChild(node("th","",value));});
     table.appendChild(header);
     visible.forEach(function(e){
-      var row=node("tr"); cell(row,e.rules_version); cell(row,e.first===e.last?e.first:e.first+" → "+e.last);
+      var row=node("tr"); cell(row,e.first===e.last?e.first:e.first+" → "+e.last);
       cell(row,String(e.buys)); cell(row,String(e.sells)); cell(row,String(e.stops));
       var cents=Number.isSafeInteger(e.realized_pnl_cents)?e.realized_pnl_cents:null;
       var profit=cell(row,"",pnlClass(cents===null?e.realized_pnl:cents)), count=stars.get(e.rules_version)||0;
@@ -488,7 +486,6 @@ const VIEWER_HTML = `<!doctype html>
   function render(payload) {
     hideNotice(); byId("dashboard").hidden=false;
     var mode=byId("mode"); mode.textContent=payload.mode.dry_run?"DRY":"LIVE"; mode.className="pill "+(payload.mode.dry_run?"dry":"live");
-    byId("rules").textContent="rules "+payload.snapshot.rules_version;
     var age=Math.max(0,Math.round((Date.now()-Date.parse(payload.snapshot.run_start_pt))/60000));
     var freshness=byId("freshness"); freshness.textContent="snapshot "+age+" min old ("+payload.snapshot.session+")";
     freshness.className="pill"+(age>45?" warn":"");

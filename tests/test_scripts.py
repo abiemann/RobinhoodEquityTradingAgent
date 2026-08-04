@@ -3303,7 +3303,7 @@ class DashboardClientContractTests(unittest.TestCase):
         self.assertIn("const LEDGER_ROUNDING_POLICY =", dashboard)
         self.assertIn("row?.realized_pnl_cents", dashboard)
         self.assertIn('dateInTimeZone(snap.run_start_pt, "America/New_York")', dashboard)
-        self.assertIn("Broker and strategy agree to the cent", dashboard)
+        self.assertNotIn("Broker and strategy agree to the cent", dashboard)
         self.assertIn("Broker vs strategy difference", dashboard)
         self.assertIn("Broker vs strategy comparison incomplete", dashboard)
         self.assertIn("available_fill_count", dashboard)
