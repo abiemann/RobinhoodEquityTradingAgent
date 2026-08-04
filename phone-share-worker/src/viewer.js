@@ -32,6 +32,10 @@ const VIEWER_HTML = `<!doctype html>
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(118px,1fr)); gap:14px; }
   .card .value { font-size:20px; font-weight:650; font-variant-numeric:tabular-nums; }
   .card .key { color:var(--dim); font-size:11px; }
+  .pnl-reconciliation { margin-top:12px; padding:9px 10px; color:var(--dim);
+    background:#181b20; border:1px solid var(--line); border-radius:7px; font-size:11px; }
+  .pnl-reconciliation.ok { color:var(--green); border-color:#285b43; }
+  .pnl-reconciliation.warn { color:var(--amber); border-color:#6e5c1d; }
   .positive { color:var(--green); } .negative { color:var(--red); }
   .empty { color:var(--dim); font-style:italic; }
   .scroll { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
@@ -85,13 +89,14 @@ const VIEWER_HTML = `<!doctype html>
 </header>
 <div id="notice" class="notice" hidden></div>
 <main id="dashboard" hidden>
-  <section><h2>Account</h2><div id="account" class="cards"></div></section>
+  <section><h2>Account</h2><div id="account" class="cards"></div>
+    <div id="pnl-reconciliation" class="pnl-reconciliation" hidden></div></section>
   <section><h2>Positions</h2><div id="positions"></div></section>
   <section>
     <h2>Runs today — tap a run for details</h2>
     <div id="runs" class="runs"></div><div id="run-detail" class="run-detail"></div>
   </section>
-  <section><h2>Realized P&amp;L by rules era</h2><div id="eras"></div></section>
+  <section><h2>Strategy P&amp;L by rules era (ledger fill basis)</h2><div id="eras"></div></section>
 </main>
 <footer>Read-only • end-to-end encrypted • the decryption key stays in this browser tab</footer>
 <script nonce="__NONCE__">
@@ -144,6 +149,21 @@ const VIEWER_HTML = `<!doctype html>
     if (!finite(value)) return "unavailable";
     return (value < 0 ? "-$" : "$") + Math.abs(value).toFixed(2);
   }
+  function moneyCents(value, signed) {
+    if (!Number.isSafeInteger(value)) return "unavailable";
+    var absolute=Math.abs(value), prefix=value<0?"-":signed&&value>0?"+":"";
+    return prefix+"$"+Math.floor(absolute/100)+"."+String(absolute%100).padStart(2,"0");
+  }
+  function numberToCents(value) {
+    if (!finite(value)) return null;
+    var absolute=Math.round(Math.abs(value)*100);
+    return Number.isSafeInteger(absolute) ? (value<0?-absolute:absolute) : null;
+  }
+  function validEtDate(value) {
+    if (typeof value!=="string" || !/^\\d{4}-\\d{2}-\\d{2}$/.test(value)) return false;
+    var parsed=Date.parse(value+"T00:00:00Z");
+    return Number.isFinite(parsed) && new Date(parsed).toISOString().slice(0,10)===value;
+  }
   function pnlClass(value) { return value > 0 ? "positive" : value < 0 ? "negative" : ""; }
   function localTime(value) {
     var date = new Date(value);
@@ -168,7 +188,8 @@ const VIEWER_HTML = `<!doctype html>
   function hideNotice() { byId("notice").hidden = true; }
   function clearDashboard() {
     byId("dashboard").hidden=true;
-    ["account","positions","runs","run-detail","eras"].forEach(function(id){clear(byId(id));});
+    ["account","positions","runs","run-detail","eras","pnl-reconciliation"].forEach(function(id){clear(byId(id));});
+    byId("pnl-reconciliation").hidden=true;
   }
   function forgetShare() {
     sessionStorage.removeItem(ID_KEY);
@@ -230,7 +251,10 @@ const VIEWER_HTML = `<!doctype html>
     return { value:value, capturedMs:captured, expiresMs:expires, iv:iv, ciphertext:ciphertext };
   }
   function validatePayload(value, envelope) {
-    var topKeys = ["schema_version","captured_at","expires_at","mode","snapshot","runs","eras"];
+    var legacyTopKeys = ["schema_version","captured_at","expires_at","mode","snapshot","runs","eras"];
+    var enhancedTopKeys = legacyTopKeys.concat(["pnl_reconciliation"]);
+    var enhanced = Object.prototype.hasOwnProperty.call(value || {}, "pnl_reconciliation");
+    var topKeys = enhanced ? enhancedTopKeys : legacyTopKeys;
     if (!exactObject(value, topKeys) || value.schema_version !== 1 ||
         value.captured_at !== envelope.captured_at || value.expires_at !== envelope.expires_at ||
         !exactObject(value.mode, ["dry_run"]) || typeof value.mode.dry_run !== "boolean") {
@@ -265,11 +289,39 @@ const VIEWER_HTML = `<!doctype html>
     });
     if (!Array.isArray(value.eras) || value.eras.length > 500) throw new Error("Rules eras are invalid");
     value.eras.forEach(function (era) {
-      if (!exactObject(era, ["rules_version","first","last","buys","sells","stops","realized_pnl"]) ||
+      var legacyFields = ["rules_version","first","last","buys","sells","stops","realized_pnl"];
+      var enhancedFields = legacyFields.concat(["realized_pnl_cents","pnl_quality"]);
+      if (!exactObject(era, enhanced ? enhancedFields : legacyFields) ||
           !boundedText(era.rules_version, 128) || !boundedText(era.first, 16) || !boundedText(era.last, 16) ||
           ![era.buys,era.sells,era.stops].every(function (n) { return Number.isSafeInteger(n) && n >= 0; }) ||
-          !finite(era.realized_pnl)) throw new Error("Rules-era fields are invalid");
+          !finite(era.realized_pnl) || (enhanced &&
+            (!Number.isSafeInteger(era.realized_pnl_cents) ||
+             numberToCents(era.realized_pnl)!==era.realized_pnl_cents ||
+             ["matched-ledger-pool","estimated","incomplete"].indexOf(era.pnl_quality)===-1))) {
+        throw new Error("Rules-era fields are invalid");
+      }
     });
+    if (enhanced) {
+      var reconciliation=value.pnl_reconciliation;
+      var reconciliationFields=["date_et","broker_realized_pnl_cents","strategy_realized_pnl_cents",
+        "difference_cents","realized_fill_count","available_fill_count","matched_fill_count","status"];
+      if (!exactObject(reconciliation,reconciliationFields) || !validEtDate(reconciliation.date_et) ||
+          ![reconciliation.broker_realized_pnl_cents,reconciliation.strategy_realized_pnl_cents,
+            reconciliation.difference_cents].every(Number.isSafeInteger) ||
+          ![reconciliation.realized_fill_count,reconciliation.available_fill_count,
+            reconciliation.matched_fill_count].every(function(n){
+            return Number.isSafeInteger(n) && n>=0;
+          }) || reconciliation.matched_fill_count>reconciliation.available_fill_count ||
+          reconciliation.available_fill_count>reconciliation.realized_fill_count ||
+          reconciliation.broker_realized_pnl_cents!==numberToCents(snap.realized_pnl_today) ||
+          reconciliation.difference_cents!==reconciliation.broker_realized_pnl_cents-
+            reconciliation.strategy_realized_pnl_cents ||
+          ["agrees","difference","qualified"].indexOf(reconciliation.status)===-1 ||
+          reconciliation.status!==(reconciliation.matched_fill_count<reconciliation.realized_fill_count
+            ? "qualified" : reconciliation.difference_cents===0 ? "agrees" : "difference")) {
+        throw new Error("P&L reconciliation fields are invalid");
+      }
+    }
     return value;
   }
   async function sha256(value) {
@@ -314,6 +366,8 @@ const VIEWER_HTML = `<!doctype html>
   }
   function renderAccount(payload) {
     var snap = payload.snapshot;
+    var brokerCents=payload.pnl_reconciliation &&
+      payload.pnl_reconciliation.broker_realized_pnl_cents;
     var unrealized = snap.positions.reduce(function (sum, p) {
       return sum + (p.current_price - p.avg_buy_price) * p.quantity;
     }, 0);
@@ -321,8 +375,45 @@ const VIEWER_HTML = `<!doctype html>
     appendCard(account, "Total value", money(snap.account.total_value));
     appendCard(account, "Cash", money(snap.account.cash));
     appendCard(account, "Buying power", money(snap.account.buying_power));
-    appendCard(account, "Realized today", money(snap.realized_pnl_today), pnlClass(snap.realized_pnl_today));
+    appendCard(account, "Broker realized today",
+      Number.isSafeInteger(brokerCents)?moneyCents(brokerCents):money(snap.realized_pnl_today),
+      pnlClass(snap.realized_pnl_today));
     appendCard(account, "Unrealized", money(unrealized), pnlClass(unrealized));
+  }
+  function renderPnlReconciliation(payload) {
+    var root=byId("pnl-reconciliation"), item=payload.pnl_reconciliation;
+    clear(root);
+    if(!item){root.hidden=true;return;}
+    root.hidden=false;
+    if(item.status==="qualified"){
+      root.className="pnl-reconciliation warn";
+      if(item.available_fill_count<item.realized_fill_count){
+        root.textContent="Incomplete available strategy subtotal · broker "+
+          moneyCents(item.broker_realized_pnl_cents)+" · available strategy subtotal "+
+          moneyCents(item.strategy_realized_pnl_cents)+" · difference "+
+          moneyCents(item.difference_cents,true)+" · "+item.available_fill_count+" of "+
+          item.realized_fill_count+" realized fills available, "+item.matched_fill_count+
+          " matched. Broker is authoritative.";
+      }else{
+        root.textContent="Estimated strategy comparison · broker "+
+          moneyCents(item.broker_realized_pnl_cents)+" · strategy estimate "+
+          moneyCents(item.strategy_realized_pnl_cents)+" · difference "+
+          moneyCents(item.difference_cents,true)+" · "+item.matched_fill_count+" of "+
+          item.realized_fill_count+" realized fills matched. Broker is authoritative.";
+      }
+      return;
+    }
+    if(item.status==="agrees"){
+      root.className="pnl-reconciliation ok";
+      root.textContent="Broker and strategy agree to the cent · "+
+        moneyCents(item.broker_realized_pnl_cents);
+      return;
+    }
+    root.className="pnl-reconciliation warn";
+    root.textContent="Broker vs strategy difference · broker "+
+      moneyCents(item.broker_realized_pnl_cents)+" · strategy "+
+      moneyCents(item.strategy_realized_pnl_cents)+" · difference "+
+      moneyCents(item.difference_cents,true)+". Broker is authoritative.";
   }
   function cell(row, text, className) { var td=node("td",className||"",text); row.appendChild(td); return td; }
   function renderPositions(positions) {
@@ -366,18 +457,28 @@ const VIEWER_HTML = `<!doctype html>
     if (state.eraSignature !== null && signature !== state.eraSignature) state.erasExpanded=false;
     state.eraSignature=signature; clear(root);
     if (!eras.length) { root.appendChild(node("span","empty","no ledger data")); return; }
-    var ranked=eras.map(function(e,index){return {version:e.rules_version,profit:e.realized_pnl,index:index};})
-      .filter(function(e){return e.profit>0;}).sort(function(a,b){return b.profit-a.profit||a.index-b.index;}).slice(0,3);
+    var ranked=eras.map(function(e,index){return {version:e.rules_version,
+      profit:Number.isSafeInteger(e.realized_pnl_cents)?e.realized_pnl_cents:e.realized_pnl,index:index,
+      rankEligible:!Object.prototype.hasOwnProperty.call(e,"pnl_quality")||e.pnl_quality==="matched-ledger-pool"};})
+      .filter(function(e){return e.rankEligible&&e.profit>0;}).sort(function(a,b){return b.profit-a.profit||a.index-b.index;}).slice(0,3);
     var stars=new Map(ranked.map(function(e,index){return [e.version,3-index];}));
     var visible=state.erasExpanded?eras:eras.slice(0,12), wrap=node("div","scroll"), table=node("table"), header=node("tr");
-    ["rules_version","Dates","Buys","Sells","STOPs","Realized P&L"].forEach(function(value){header.appendChild(node("th","",value));});
+    ["rules_version","Dates","Buys","Sells","STOPs","Strategy P&L"].forEach(function(value){header.appendChild(node("th","",value));});
     table.appendChild(header);
     visible.forEach(function(e){
       var row=node("tr"); cell(row,e.rules_version); cell(row,e.first===e.last?e.first:e.first+" → "+e.last);
       cell(row,String(e.buys)); cell(row,String(e.sells)); cell(row,String(e.stops));
-      var profit=cell(row,"",pnlClass(e.realized_pnl)), count=stars.get(e.rules_version)||0;
-      if(count){var mark=node("span","stars","★".repeat(count)); mark.title=(count===3?"Largest":count===2?"Second-largest":"Third-largest")+" realized profit"; profit.appendChild(mark);}
-      profit.appendChild(document.createTextNode(money(e.realized_pnl))); table.appendChild(row);
+      var cents=Number.isSafeInteger(e.realized_pnl_cents)?e.realized_pnl_cents:null;
+      var profit=cell(row,"",pnlClass(cents===null?e.realized_pnl:cents)), count=stars.get(e.rules_version)||0;
+      if(count){var mark=node("span","stars","★".repeat(count)); mark.title=(count===3?"Largest":count===2?"Second-largest":"Third-largest")+" strategy profit"; profit.appendChild(mark);}
+      var estimate=e.pnl_quality==="estimated"?"~":"";
+      profit.appendChild(document.createTextNode(estimate+(cents===null?money(e.realized_pnl):moneyCents(cents))));
+      if(e.pnl_quality==="incomplete"){
+        var missing=node("span","empty"," + unavailable");
+        missing.title="One or more sells have no matched ledger acquisition pool";
+        profit.appendChild(missing);
+      }
+      table.appendChild(row);
     });
     wrap.appendChild(table); root.appendChild(wrap);
     var remaining=eras.length-visible.length;
@@ -392,7 +493,8 @@ const VIEWER_HTML = `<!doctype html>
     var freshness=byId("freshness"); freshness.textContent="snapshot "+age+" min old ("+payload.snapshot.session+")";
     freshness.className="pill"+(age>45?" warn":"");
     byId("sync").textContent="received "+localTime(payload.captured_at);
-    renderAccount(payload); renderPositions(payload.snapshot.positions); renderRuns(payload.runs); renderEras(payload.eras);
+    renderAccount(payload); renderPnlReconciliation(payload); renderPositions(payload.snapshot.positions);
+    renderRuns(payload.runs); renderEras(payload.eras);
   }
   function schedule(expiresMs) {
     clearTimeout(state.timer);

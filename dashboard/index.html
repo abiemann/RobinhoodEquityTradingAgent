@@ -40,6 +40,14 @@
   .card .v { font-size:22px; font-weight:600; }
   .card .k { font-size:12px; color:var(--dim); }
   table { border-collapse:collapse; width:100%; }
+  .pnl-reconciliation { display:inline-flex; gap:7px; align-items:center; flex-wrap:wrap;
+                        margin-top:12px; padding:6px 9px; border:1px solid var(--line);
+                        border-radius:6px; color:var(--dim); font-size:12px;
+                        font-variant-numeric:tabular-nums; }
+  .pnl-reconciliation[hidden] { display:none; }
+  .pnl-reconciliation.ok { color:var(--green); border-color:#285e46; background:#18271f; }
+  .pnl-reconciliation.warn { color:var(--amber); border-color:#665522; background:#292516; }
+  .pnl-reconciliation strong { color:var(--text); }
   th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--line);
            font-variant-numeric:tabular-nums; white-space:nowrap; }
   th { color:var(--dim); font-weight:500; font-size:12px; }
@@ -154,6 +162,8 @@
 <section>
   <h2>Account</h2>
   <div class="cards" id="account"><span class="empty">no snapshot yet</span></div>
+  <div id="pnl-reconciliation" class="pnl-reconciliation" role="status"
+       aria-live="polite" hidden></div>
 </section>
 
 <section>
@@ -167,7 +177,7 @@
 </section>
 
 <section>
-  <h2>Realized P&amp;L by rules era (from trade ledger)</h2>
+  <h2>Strategy realized P&amp;L by rules era (ledger fill basis)</h2>
   <div id="eras"><span class="empty">no ledger data</span></div>
 </section>
 
@@ -188,6 +198,32 @@ const ERA_ROW_LIMIT = 12;
 let erasExpanded = false;
 let eraDateSignature = null;
 const PHONE_SHARE_SCHEMA = 1;
+const LEDGER_ROUNDING_POLICY = "per-fill-half-away-from-zero-to-cent";
+let latestPnlReconciliation = null;
+
+function numberToCents(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const absolute = BigInt(Math.round(Math.abs(value) * 100));
+  return value < 0 ? -absolute : absolute;
+}
+
+function safeBigIntCents(value) {
+  const limit = BigInt(Number.MAX_SAFE_INTEGER);
+  return typeof value === "bigint" && value >= -limit && value <= limit;
+}
+
+function fmtCents(cents, signed = false) {
+  const negative = cents < 0n;
+  const absolute = negative ? -cents : cents;
+  const dollars = absolute / 100n;
+  const remainder = String(absolute % 100n).padStart(2, "0");
+  const prefix = negative ? "-" : signed && cents > 0n ? "+" : "";
+  return prefix + "$" + dollars + "." + remainder;
+}
+
+function clsCents(cents) {
+  return cents > 0n ? "pos" : cents < 0n ? "neg" : "";
+}
 const PHONE_SHARE_MAX_SECONDS = 8 * 60 * 60;
 const PHONE_SHARE_WORKER_FRESHNESS_MS = 900 * 1000;
 const PHONE_SHARE_REVOKE_KEY = 'rhmra_phone_share_revoke_v1';
@@ -462,13 +498,38 @@ function safeShareNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function buildPhoneView(config, snap, runs, eras) {
+function buildPhoneView(config, snap, runs, eras, reconciliation) {
   if (!snap || snap.schema_version !== 1 || typeof config?.dry_run !== 'boolean') return null;
   if (!Array.isArray(snap.positions) || snap.positions.length > 100 ||
       !Array.isArray(runs) || runs.length > 100 || !Array.isArray(eras) || eras.length > 500) return null;
   const accountValues = [snap.account?.total_value, snap.account?.cash, snap.account?.buying_power,
                          snap.realized_pnl_today];
   if (!accountValues.every(value => safeShareNumber(value) !== null)) return null;
+
+  const enhanced = reconciliation !== null && reconciliation !== undefined;
+  if (enhanced) {
+    const cents = [
+      reconciliation.brokerCents,
+      reconciliation.strategyCents,
+      reconciliation.differenceCents,
+    ];
+    const counts = [reconciliation.realizedFillCount, reconciliation.availableFillCount,
+                    reconciliation.matchedFillCount];
+    const qualified = reconciliation.matchedFillCount < reconciliation.realizedFillCount;
+    const expectedStatus = qualified ? "qualified" :
+      reconciliation.differenceCents === 0n ? "agrees" : "difference";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(reconciliation.dateEt) ||
+        !["agrees", "difference", "qualified"].includes(reconciliation.status) ||
+        !cents.every(safeBigIntCents) ||
+        !counts.every(value => Number.isSafeInteger(value) && value >= 0) ||
+        reconciliation.matchedFillCount > reconciliation.availableFillCount ||
+        reconciliation.availableFillCount > reconciliation.realizedFillCount ||
+        reconciliation.differenceCents !==
+          reconciliation.brokerCents - reconciliation.strategyCents ||
+        reconciliation.status !== expectedStatus ||
+        numberToCents(snap.realized_pnl_today) !== reconciliation.brokerCents) return null;
+  }
+
   const positions = [];
   for (const position of snap.positions) {
     const symbol = safeShareText(position.symbol, 12);
@@ -483,6 +544,7 @@ function buildPhoneView(config, snap, runs, eras) {
     positions.push({ symbol, quantity, avg_buy_price: average, current_price: current,
                      stop_price: stop, stop_state: stopState });
   }
+
   const runView = [];
   for (const run of runs) {
     const time = safeShareText(run.time, 32), label = safeShareText(run.label, 80);
@@ -490,22 +552,33 @@ function buildPhoneView(config, snap, runs, eras) {
     if (time === null || label === null || phase === null || tooltip === null) return null;
     runView.push({ time, label, phase, tooltip });
   }
+
   const eraView = [];
   for (const era of eras) {
     const rulesVersion = safeShareText(era.rules_version, 128);
     const first = safeShareText(era.first, 16), last = safeShareText(era.last, 16);
-    const counts = [era.buys, era.sells, era.stops];
+    const eventCounts = [era.buys, era.sells, era.stops];
     const realized = safeShareNumber(era.realized_pnl);
     if (rulesVersion === null || first === null || last === null || realized === null ||
-        !counts.every(value => Number.isSafeInteger(value) && value >= 0)) return null;
-    eraView.push({ rules_version: rulesVersion, first, last, buys: era.buys,
-                   sells: era.sells, stops: era.stops, realized_pnl: realized });
+        !eventCounts.every(value => Number.isSafeInteger(value) && value >= 0)) return null;
+    const view = { rules_version: rulesVersion, first, last, buys: era.buys,
+                   sells: era.sells, stops: era.stops, realized_pnl: realized };
+    if (enhanced) {
+      const quality = safeShareText(era.pnl_quality, 32);
+      if (!["matched-ledger-pool", "estimated", "incomplete"].includes(quality) ||
+          !Number.isSafeInteger(era.realized_pnl_cents) ||
+          Math.round(realized * 100) !== era.realized_pnl_cents) return null;
+      view.realized_pnl_cents = era.realized_pnl_cents;
+      view.pnl_quality = quality;
+    }
+    eraView.push(view);
   }
+
   const rulesVersion = safeShareText(snap.rules_version, 128);
   const runStart = safeShareText(snap.run_start_pt, 48);
   const session = safeShareText(snap.session, 32);
   if (rulesVersion === null || runStart === null || session === null) return null;
-  return {
+  const view = {
     schema_version: PHONE_SHARE_SCHEMA,
     mode: { dry_run: config.dry_run },
     snapshot: {
@@ -523,8 +596,20 @@ function buildPhoneView(config, snap, runs, eras) {
     runs: runView,
     eras: eraView,
   };
+  if (enhanced) {
+    view.pnl_reconciliation = {
+      date_et: reconciliation.dateEt,
+      broker_realized_pnl_cents: Number(reconciliation.brokerCents),
+      strategy_realized_pnl_cents: Number(reconciliation.strategyCents),
+      difference_cents: Number(reconciliation.differenceCents),
+      realized_fill_count: reconciliation.realizedFillCount,
+      available_fill_count: reconciliation.availableFillCount,
+      matched_fill_count: reconciliation.matchedFillCount,
+      status: reconciliation.status,
+    };
+  }
+  return view;
 }
-
 function base64Url(bytes) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -1165,7 +1250,7 @@ function renderSnapshot(snap) {
     ["Total value", fmt$(a.total_value), ""],
     ["Cash", fmt$(a.cash), ""],
     ["Buying power", fmt$(a.buying_power), ""],
-    ["Realized today", fmt$(snap.realized_pnl_today), cls(snap.realized_pnl_today)],
+    ["Broker realized today", numberToCents(snap.realized_pnl_today) === null ? "unavailable" : fmtCents(numberToCents(snap.realized_pnl_today)), cls(snap.realized_pnl_today)],
     ["Unrealized", fmt$(unreal), cls(unreal)],
   ].map(([k, v, c]) => `<div class="card"><div class="v ${c}">${v}</div><div class="k">${k}</div></div>`).join("");
 
@@ -1199,23 +1284,55 @@ function renderSnapshot(snap) {
 // table. timestamp_pt is ISO with a PT offset; its first 19 chars are PT
 // wall-clock, which sorts and compares chronologically as a plain string --
 // no Date parsing, so no dependence on the viewer's own timezone.
-function parseLedger(csv) {
-  const lines = csv.trim().split(/\r?\n/);
-  const head = lines.shift().split(",");
-  const i = Object.fromEntries(head.map((h, n) => [h, n]));
-  for (const need of ["timestamp_pt", "symbol", "side", "reason", "realized_pnl", "rules_version"]) {
-    if (i[need] === undefined) {
-      banner(`trade-ledger.csv is missing the "${need}" column — expected schema has changed.`);
+function parseLedger(document) {
+  if (!document || document.schema_version !== 1 ||
+      document.rounding_policy !== LEDGER_ROUNDING_POLICY ||
+      !Array.isArray(document.rows)) {
+    banner("The strategy ledger comparison is unavailable or has an unsupported schema.");
+    return null;
+  }
+  const rows = [];
+  const sources = new Set([
+    "matched-ledger-pool", "recorded-estimate", "unavailable", "not-applicable",
+  ]);
+  for (const row of document.rows) {
+    const stringsValid = row && [
+      row.timestamp_pt, row.day, row.day_et, row.symbol, row.side, row.reason,
+      row.rules_version, row.pnl_source,
+    ].every(value => typeof value === "string");
+    const cents = row?.realized_pnl_cents;
+    const centsValid = cents === null || Number.isSafeInteger(cents);
+    const pnlValid = row?.realized_pnl === null || typeof row?.realized_pnl === "string";
+    const buyValid = row?.side !== "buy" ||
+      (cents === null && row?.realized_pnl === null && row?.pnl_source === "not-applicable");
+    const sellValid = row?.side !== "sell" ||
+      (cents === null ? row?.pnl_source === "unavailable" :
+        ["matched-ledger-pool", "recorded-estimate"].includes(row?.pnl_source));
+    if (!stringsValid || !sources.has(row.pnl_source) || !centsValid || !pnlValid ||
+        !/^\d{4}-\d{2}-\d{2}T/.test(row.timestamp_pt) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(row.day) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(row.day_et) ||
+        row.timestamp_pt.slice(0, 10) !== row.day ||
+        !/^[A-Z0-9.-]{1,12}$/.test(row.symbol) ||
+        !["buy", "sell"].includes(row.side) || !buyValid || !sellValid) {
+      banner("The strategy ledger comparison contains an invalid row.");
       return null;
     }
+    rows.push({
+      timestampPt: row.timestamp_pt,
+      ts: row.timestamp_pt.slice(0, 19),
+      day: row.day,
+      dayEt: row.day_et,
+      symbol: row.symbol,
+      side: row.side,
+      reason: row.reason,
+      ver: row.rules_version,
+      pnlCents: cents === null ? null : BigInt(cents),
+      pnlSource: row.pnl_source,
+    });
   }
-  return lines.map(l => l.split(",")).filter(f => f.length === head.length).map(f => ({
-    ts: f[i.timestamp_pt].slice(0, 19), day: f[i.timestamp_pt].slice(0, 10),
-    symbol: f[i.symbol], side: f[i.side], reason: f[i.reason], ver: f[i.rules_version],
-    pnl: f[i.realized_pnl] === "" ? null : parseFloat(f[i.realized_pnl]),
-  }));
+  return rows;
 }
-
 // Compress the gate's own sentence to one token for the chip; the untouched
 // sentence stays in the tooltip.
 function skipLabel(reason) {
@@ -1235,8 +1352,13 @@ function tradeLabels(fills) {
     if (!g.length) continue;
     const n = g.length > 1 ? ` &times;${g.length}` : "";
     if (kind === "dip-buy") { out.push(`buy${n}`); continue; }
-    const sum = g.reduce((s, f) => s + (f.pnl ?? 0), 0);
-    out.push(`${name[kind]}${n} (<span class="${cls(sum)}">${sgn$(sum)}</span>)`);
+    const available = g.filter(fill => fill.pnlCents !== null);
+    const missing = g.length - available.length;
+    if (!available.length) { out.push(`${name[kind]}${n} (P&L unavailable)`); continue; }
+    const sum = available.reduce((total, fill) => total + fill.pnlCents, 0n);
+    const estimated = available.some(fill => fill.pnlSource !== "matched-ledger-pool");
+    const qualifier = missing ? "partial " : estimated ? "~" : "";
+    out.push(`${name[kind]}${n} (<span class="${clsCents(sum)}">${qualifier}${fmtCents(sum, true)}</span>)`);
   }
   return out;
 }
@@ -1362,79 +1484,151 @@ function collectRunView() {
   }));
 }
 
-function buildEraView(rows) {
+function aggregateEras(rows) {
   if (!rows) return [];
   const eras = new Map();
   for (const row of rows) {
-    const era = eras.get(row.ver) ?? { buys: 0, sells: 0, stops: 0, sum: 0, first: row.day, last: row.day };
-    if (row.side === 'buy') era.buys++;
-    if (row.side === 'sell') era.sells++;
-    if (row.reason === 'stop-fill') era.stops++;
-    if (row.pnl !== null && Number.isFinite(row.pnl)) era.sum += row.pnl;
+    const era = eras.get(row.ver) ?? {
+      buys: 0, sells: 0, stops: 0, sumCents: 0n, first: row.day, last: row.day,
+      estimated: false, incomplete: false,
+    };
+    if (row.side === "buy") era.buys++;
+    if (row.side === "sell") {
+      era.sells++;
+      if (row.pnlCents === null) era.incomplete = true;
+      else {
+        era.sumCents += row.pnlCents;
+        if (row.pnlSource !== "matched-ledger-pool") era.estimated = true;
+      }
+    }
+    if (row.reason === "stop-fill") era.stops++;
     if (row.day < era.first) era.first = row.day;
     if (row.day > era.last) era.last = row.day;
     eras.set(row.ver, era);
   }
-  return [...eras]
-    .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first))
-    .map(([rulesVersion, era]) => ({
-      rules_version: rulesVersion, first: era.first, last: era.last,
-      buys: era.buys, sells: era.sells, stops: era.stops, realized_pnl: era.sum,
-    }));
+  return [...eras].sort((a, b) =>
+    b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first));
+}
+
+function buildEraView(rows) {
+  return aggregateEras(rows).map(([rulesVersion, era]) => ({
+    rules_version: rulesVersion, first: era.first, last: era.last,
+    buys: era.buys, sells: era.sells, stops: era.stops,
+    realized_pnl: Number(era.sumCents) / 100,
+    realized_pnl_cents: Number(era.sumCents),
+    pnl_quality: era.incomplete ? "incomplete" : era.estimated ? "estimated" : "matched-ledger-pool",
+  }));
 }
 
 function renderEras(rows) {
-  if (!rows) return;
-  const eras = new Map();
-  for (const r of rows) {
-    const e = eras.get(r.ver) ?? { buys: 0, sells: 0, stops: 0, sum: 0, first: r.day, last: r.day };
-    if (r.side === "buy") e.buys++;
-    if (r.side === "sell") e.sells++;
-    if (r.reason === "stop-fill") e.stops++;
-    if (r.pnl !== null) e.sum += r.pnl;
-    if (r.day < e.first) e.first = r.day;
-    if (r.day > e.last) e.last = r.day;
-    eras.set(r.ver, e);
+  const ordered = aggregateEras(rows);
+  if (!ordered.length) {
+    $("eras").innerHTML = `<span class="empty">${rows ? "no strategy ledger data" : "strategy ledger comparison unavailable"}</span>`;
+    return;
   }
-  if (!eras.size) return;
-  const ordered = [...eras]
-    .sort((a, b) => b[1].last.localeCompare(a[1].last) || b[1].first.localeCompare(a[1].first));
   const dateSignature = JSON.stringify(
     ordered.map(([version, era]) => [version, era.first, era.last])
   );
-  if (eraDateSignature !== null && dateSignature !== eraDateSignature) {
-    erasExpanded = false;
-  }
+  if (eraDateSignature !== null && dateSignature !== eraDateSignature) erasExpanded = false;
   eraDateSignature = dateSignature;
   const starCounts = new Map(
     ordered
-      .map(([version, era], displayOrder) => ({ version, profit: era.sum, displayOrder }))
-      .filter(era => era.profit > 0)
-      .sort((a, b) => b.profit - a.profit || a.displayOrder - b.displayOrder)
+      .map(([version, era], displayOrder) => ({ version, era, displayOrder }))
+      .filter(item => !item.era.estimated && !item.era.incomplete && item.era.sumCents > 0n)
+      .sort((a, b) => a.era.sumCents === b.era.sumCents
+        ? a.displayOrder - b.displayOrder : a.era.sumCents > b.era.sumCents ? -1 : 1)
       .slice(0, 3)
-      .map((era, rank) => [era.version, 3 - rank])
+      .map((item, rank) => [item.version, 3 - rank])
   );
   const rankLabels = ["Largest", "Second-largest", "Third-largest"];
   const visible = erasExpanded ? ordered : ordered.slice(0, ERA_ROW_LIMIT);
-  const trs = visible
-    .map(([v, e]) => {
-      const dates = e.first === e.last ? e.first : `${e.first} → ${e.last}`;
-      const starCount = starCounts.get(v) ?? 0;
-      const rank = starCount ? 3 - starCount : -1;
-      const stars = starCount
-        ? `<span class="profit-stars" role="img" aria-label="${rankLabels[rank]} realized profit" title="${rankLabels[rank]} realized profit">${"⭐".repeat(starCount)}</span>`
-        : "";
-      return `<tr><td>${esc(v)}</td><td>${dates}</td><td>${e.buys}</td><td>${e.sells}</td><td>${e.stops}</td><td class="${cls(e.sum)}">${stars}${fmt$(e.sum)}</td></tr>`;
-    }).join("");
+  const trs = visible.map(([version, era]) => {
+    const dates = era.first === era.last ? era.first : `${era.first} → ${era.last}`;
+    const starCount = starCounts.get(version) ?? 0;
+    const rank = starCount ? 3 - starCount : -1;
+    const stars = starCount
+      ? `<span class="profit-stars" role="img" aria-label="${rankLabels[rank]} ledger-basis strategy profit" title="${rankLabels[rank]} ledger-basis strategy profit">${"⭐".repeat(starCount)}</span>`
+      : "";
+    let amount;
+    if (era.incomplete) {
+      amount = `<span class="empty" title="One or more sells have no usable ledger basis">P&L incomplete</span>`;
+    } else {
+      const estimate = era.estimated ? "~" : "";
+      amount = `${stars}${estimate}${fmtCents(era.sumCents)}`;
+    }
+    return `<tr><td>${esc(version)}</td><td>${dates}</td><td>${era.buys}</td><td>${era.sells}</td><td>${era.stops}</td><td class="${clsCents(era.sumCents)}">${amount}</td></tr>`;
+  }).join("");
   const remaining = ordered.length - visible.length;
   const showMore = remaining
     ? `<button id="show-more-eras" class="show-more-eras" type="button">Click to show ${remaining} more...</button>`
     : "";
-  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Realized P&L</th></tr>${trs}</table>${showMore}`;
+  $("eras").innerHTML = `<table><tr><th>rules_version</th><th>Dates</th><th>Buys</th><th>Sells</th><th>STOPs</th><th>Strategy P&L</th></tr>${trs}</table>${showMore}`;
   $("show-more-eras")?.addEventListener("click", () => {
     erasExpanded = true;
     renderEras(rows);
   });
+}
+function dateInTimeZone(value, timeZone) {
+  if (typeof value !== "string") return null;
+  const instant = new Date(value);
+  if (!Number.isFinite(instant.getTime())) return null;
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+      timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(instant).map(part => [part.type, part.value]));
+    const result = `${parts.year}-${parts.month}-${parts.day}`;
+    return /^\d{4}-\d{2}-\d{2}$/.test(result) ? result : null;
+  } catch { return null; }
+}
+
+function computePnlReconciliation(snap, rows) {
+  if (!snap || !rows) return null;
+  const dateEt = dateInTimeZone(snap.run_start_pt, "America/New_York");
+  const brokerCents = numberToCents(snap.realized_pnl_today);
+  if (dateEt === null || brokerCents === null) return null;
+  const fills = rows.filter(row => row.dayEt === dateEt && row.side === "sell");
+  const available = fills.filter(row => row.pnlCents !== null);
+  const strategyCents = available.reduce((total, row) => total + row.pnlCents, 0n);
+  const matchedFillCount = available.filter(
+    row => row.pnlSource === "matched-ledger-pool"
+  ).length;
+  const differenceCents = brokerCents - strategyCents;
+  const availableFillCount = available.length;
+  const realizedFillCount = fills.length;
+  const qualified = matchedFillCount < realizedFillCount;
+  return {
+    dateEt, brokerCents, strategyCents, differenceCents,
+    realizedFillCount, availableFillCount, matchedFillCount,
+    status: qualified ? "qualified" : differenceCents === 0n ? "agrees" : "difference",
+  };
+}
+
+function renderPnlReconciliation(snap, rows) {
+  const root = $("pnl-reconciliation");
+  latestPnlReconciliation = computePnlReconciliation(snap, rows);
+  if (!latestPnlReconciliation) {
+    root.hidden = true;
+    root.textContent = "";
+    return;
+  }
+  const item = latestPnlReconciliation;
+  root.hidden = false;
+  if (item.status === "qualified") {
+    root.className = "pnl-reconciliation warn";
+    if (item.availableFillCount < item.realizedFillCount) {
+      root.textContent = `Broker vs strategy comparison incomplete · broker ${fmtCents(item.brokerCents)} · available strategy subtotal ${fmtCents(item.strategyCents)} · ${item.availableFillCount}/${item.realizedFillCount} fills have P&L; ${item.matchedFillCount}/${item.realizedFillCount} matched to the ledger pool. No exact comparison is claimed. Broker is authoritative.`;
+    } else {
+      root.textContent = `Broker vs estimated strategy comparison · broker ${fmtCents(item.brokerCents)} · strategy estimate ${fmtCents(item.strategyCents)} · difference ${fmtCents(item.differenceCents, true)} · ${item.matchedFillCount}/${item.realizedFillCount} fills matched to the ledger pool. Broker is authoritative.`;
+    }
+    return;
+  }
+  if (item.status === "agrees") {
+    root.className = "pnl-reconciliation ok";
+    root.textContent = `Broker and strategy agree to the cent · broker ${fmtCents(item.brokerCents)} · strategy ledger fills ${fmtCents(item.strategyCents)}`;
+    return;
+  }
+  root.className = "pnl-reconciliation warn";
+  root.textContent = `Broker vs strategy difference · broker ${fmtCents(item.brokerCents)} · strategy ledger fills ${fmtCents(item.strategyCents)} · difference ${fmtCents(item.differenceCents, true)}. Broker is authoritative.`;
 }
 
 async function refresh() {
@@ -1446,11 +1640,17 @@ async function refresh() {
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
     const idx = await getJSON("/api/index");
-    const rows = parseLedger(await (await fetch("/trade-ledger.csv", { cache: "no-store" })).text());
+    let rows = null;
+    try {
+      rows = parseLedger(await getJSON("/api/ledger"));
+    } catch (error) {
+      banner("Strategy ledger comparison unavailable: " + error);
+    }
     await renderRuns(idx.status, idx.gates, rows, config);
     renderEras(rows);
+    renderPnlReconciliation(latest.data, rows);
     const phoneView = latest.data?.schema_version === 1
-      ? buildPhoneView(config, latest.data, collectRunView(), buildEraView(rows)) : null;
+      ? buildPhoneView(config, latest.data, collectRunView(), buildEraView(rows), latestPnlReconciliation) : null;
     latestPhoneView = phoneView;
     if (phoneView) {
       void uploadPhoneShare(false);

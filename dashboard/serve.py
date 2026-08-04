@@ -9,11 +9,12 @@ off-machine. Serves exactly three things and refuses everything else:
   /run-reports/...     telemetry the runs publish (status + gates JSON, reports)
   /trade-ledger.csv    the append-only fill ledger
 
-plus three conveniences so the page never has to guess filenames or mode:
+plus four conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
   /api/config          current DRY_RUN and opening-blackout settings
+  /api/ledger          sanitized ledger-basis P&L comparison data
 
 Optional phone sharing adds a loopback-only configuration endpoint plus
 same-origin POST/DELETE proxies. The proxy sends encrypted snapshots outbound
@@ -108,6 +109,7 @@ from dashboard.phone_share.public_config import (
     GOOGLE_DESKTOP_CLIENT_ID,
     GOOGLE_PHONE_VIEWER_URL,
 )
+from ledger_pnl import LedgerPnlError, reconcile_ledger
 from validate_constants import ConstantsValidationError, validate_constants_file
 
 ALLOWED_PREFIXES = ("/dashboard/", "/run-reports/")
@@ -905,6 +907,12 @@ class Handler(SimpleHTTPRequestHandler):
                                "gates": _reports("rhmra-gates-*.json")})
         if path == "/api/config":
             return self._json(_dashboard_config())
+        if path == "/api/ledger":
+            try:
+                document = reconcile_ledger(os.path.join(REPO, "trade-ledger.csv"))
+            except LedgerPnlError as exc:
+                return self._json({"error": str(exc)}, status=500)
+            return self._json(document)
         if path == "/api/latest":
             names = _reports("rhmra-status-*.json")
             if not names:

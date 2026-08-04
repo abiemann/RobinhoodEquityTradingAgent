@@ -9,6 +9,7 @@ tested exactly as the agents invoke them. Expected values for FISN/TTRX were
 verified against live API data on 2026-07-07.
 """
 
+import csv
 import http.client
 import importlib.util
 import json
@@ -3258,7 +3259,68 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIsNone(document["no_buy_first_minutes"])
         self.assertIn("integer literal exceeds the supported size", document["error"])
 
+    def test_ledger_api_exposes_matched_pool_cents_and_eastern_day(self):
+        ledger_path = os.path.join(self.repo, "trade-ledger.csv")
+        with open(ledger_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "timestamp_pt", "order_id", "symbol", "side", "quantity", "price",
+                "notional", "reason", "realized_pnl", "rules_version",
+            ])
+            writer.writerow([
+                "2026-08-04T08:45:40.188-07:00", "buy", "THRY", "buy",
+                "113.878854", "2.629900", "299.489998134600", "dip-buy", "", "f8ae9d9",
+            ])
+            writer.writerow([
+                "2026-08-04T10:37:05.098-07:00", "sell", "THRY", "sell",
+                "113.878854", "2.731000", "311.003150274000", "profit-take",
+                "11.501764254000", "f8ae9d9",
+            ])
+
+        status, body = self.request("GET", "/api/ledger")
+        self.assertEqual(status, 200)
+        document = json.loads(body)
+        self.assertEqual(document["schema_version"], 1)
+        sell = document["rows"][1]
+        self.assertEqual(document["rounding_policy"], "per-fill-half-away-from-zero-to-cent")
+        self.assertEqual(sell["pnl_source"], "matched-ledger-pool")
+        self.assertEqual(sell["realized_pnl"], "11.5131521394")
+        self.assertEqual(sell["realized_pnl_cents"], 1151)
+        self.assertEqual(sell["day_et"], "2026-08-04")
+        self.assertEqual(sell["recorded_difference"], "0.0113878854")
+
+
 class DashboardClientContractTests(unittest.TestCase):
+    def test_dashboard_compares_broker_and_strategy_with_server_rounded_cents(self):
+        with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as handle:
+            dashboard = handle.read()
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8"
+        ) as handle:
+            routine = handle.read()
+
+        self.assertIn('getJSON("/api/ledger")', dashboard)
+        self.assertIn("const LEDGER_ROUNDING_POLICY =", dashboard)
+        self.assertIn("row?.realized_pnl_cents", dashboard)
+        self.assertIn('dateInTimeZone(snap.run_start_pt, "America/New_York")', dashboard)
+        self.assertIn("Broker and strategy agree to the cent", dashboard)
+        self.assertIn("Broker vs strategy difference", dashboard)
+        self.assertIn("Broker vs strategy comparison incomplete", dashboard)
+        self.assertIn("available_fill_count", dashboard)
+        self.assertIn('status: qualified ? "qualified"', dashboard)
+        self.assertIn("Broker realized today", dashboard)
+        self.assertIn("Strategy realized P&amp;L by rules era (ledger fill basis)", dashboard)
+        self.assertIn("let rows = null;", dashboard)
+        self.assertNotIn("P&L reconciled", dashboard)
+        self.assertNotIn("unattributed", dashboard)
+        self.assertNotIn("parseFloat(f[i.realized_pnl])", dashboard)
+        self.assertIn("ledger_pnl.py --ledger", routine)
+        self.assertIn('--sale-time "<exact final last-execution timestamp in Pacific>"', routine)
+        self.assertIn('status: "matched-ledger-pool"', routine)
+        self.assertIn("order_intents.py ledger_pnl.py", routine)
+        self.assertIn("NEVER use the rounded `get_equity_positions.average_buy_price`", routine)
+        self.assertNotIn("realized_pnl = (price − average cost) × quantity", routine)
+
     def test_phone_share_wire_and_key_lifecycle_contracts_stay_aligned(self):
         with open(os.path.join(ROOT, 'dashboard', 'index.html'), encoding='utf-8') as f:
             dashboard = f.read()
@@ -3311,7 +3373,10 @@ class DashboardClientContractTests(unittest.TestCase):
         with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
             dashboard = f.read()
 
-        self.assertIn('"timestamp_pt", "symbol", "side"', dashboard)
+        self.assertIn(
+            "row.timestamp_pt, row.day, row.day_et, row.symbol, row.side, row.reason,",
+            dashboard,
+        )
         self.assertIn('statusName.replace(/^rhmra-status-/, "rhmra-gates-")', dashboard)
         self.assertIn("r.buy_candidate === false", dashboard)
         self.assertIn('f.side === "buy" && f.reason === "dip-buy"', dashboard)
