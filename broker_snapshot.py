@@ -358,9 +358,29 @@ def _validate_portfolio(
     if "total_value" not in data:
         raise SnapshotError("portfolio.data.total_value: missing")
     _decimal(data["total_value"], "portfolio.data.total_value", positive=True)
-    for field in ("cash", "buying_power", "equity_value"):
+    for field in ("cash", "equity_value"):
         if field in data and data[field] is not None:
             _decimal(data[field], f"portfolio.data.{field}", nonnegative=True)
+    if "buying_power" not in data:
+        raise SnapshotError("portfolio.data.buying_power: missing")
+    buying_power = data["buying_power"]
+    if isinstance(buying_power, Mapping):
+        if "buying_power" not in buying_power:
+            raise SnapshotError(
+                "portfolio.data.buying_power.buying_power: missing"
+            )
+        _decimal(
+            buying_power["buying_power"],
+            "portfolio.data.buying_power.buying_power",
+            nonnegative=True,
+        )
+    else:
+        # Older connector releases exposed the authoritative amount directly.
+        _decimal(
+            buying_power,
+            "portfolio.data.buying_power",
+            nonnegative=True,
+        )
     return [{"row_count": None, "next_cursor": None}]
 
 

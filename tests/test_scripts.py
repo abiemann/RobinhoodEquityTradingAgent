@@ -971,6 +971,11 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn('0.01 * max(abs(equity_value), abs(quoted_equity))', refresh)
         self.assertIn('require `equity_value == 0` exactly when', refresh.lower())
         self.assertIn('zero `equity_value` paired with a held position', refresh)
+        self.assertIn('normalized authoritative buying-power scalar', refresh)
+        self.assertIn(
+            '`account.buying_power` set to the normalized authoritative scalar',
+            refresh,
+        )
         self.assertIn('generic immediate one-retry rule', refresh)
         self.assertIn('new generation must NOT resurrect the twice-failed read', refresh)
         self.assertIn('zero-equity tiebreak', refresh)
@@ -1005,6 +1010,17 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn('figure from the FINAL STATUS REFRESH', snapshot)
         self.assertNotIn('get_realized_pnl figure from SECOND', snapshot)
         self.assertNotIn('never make a new API call for the snapshot', snapshot)
+
+        normalization = routine.split(
+            '**Portfolio buying-power normalization', 1
+        )[1].split('**PRE-SECOND ENTRY-FEASIBILITY GATES', 1)[0]
+        self.assertIn('`data.buying_power.buying_power`', normalization)
+        self.assertIn('legacy scalar', normalization)
+        self.assertIn(
+            'Never substitute or combine `unleveraged_buying_power`',
+            normalization,
+        )
+        self.assertIn('status `account.buying_power`', normalization)
 
 
 class EvaluateCandidatesTests(unittest.TestCase):
@@ -3133,7 +3149,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             os.mkdir(scratch)
             self.preflight(scratch)
 
-            raw = {'data': {'total_value': '1500.01', 'cash': '100'}}
+            raw = {
+                'data': {
+                    'total_value': '1500.01',
+                    'cash': '100',
+                    'buying_power': '100',
+                }
+            }
             raw_source = self.write_json(td, 'raw.json', raw)
             raw_output = os.path.join(scratch, 'raw-out.json')
             proc, result = self.stage('portfolio', [raw_source], [raw_output])
@@ -3179,6 +3201,112 @@ class BrokerSnapshotTests(unittest.TestCase):
                 with open(output, encoding='utf-8') as handle:
                     self.assertEqual(json.load(handle), expected)
 
+    def test_portfolio_stage_accepts_current_and_legacy_buying_power_shapes(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            shapes = (
+                (
+                    'current',
+                    {
+                        'buying_power': '1508.9700',
+                        'display_currency': 'USD',
+                        'unleveraged_buying_power': '1508.9700',
+                    },
+                ),
+                ('legacy', '1508.9700'),
+            )
+            for label, buying_power in shapes:
+                payload = {
+                    'data': {
+                        'total_value': '1508.97',
+                        'cash': '1508.97',
+                        'buying_power': buying_power,
+                        'equity_value': '0',
+                    }
+                }
+                source = self.write_json(
+                    td,
+                    f'{label}-portfolio.json',
+                    {'structuredContent': payload},
+                )
+                output = os.path.join(scratch, f'{label}-portfolio-out.json')
+                proc, result = self.stage('portfolio', [source], [output])
+                with self.subTest(shape=label):
+                    self.assertEqual(proc.returncode, 0, result)
+                    self.assertEqual(
+                        result['files'][0]['transport'],
+                        'structuredContent',
+                    )
+                    with open(output, encoding='utf-8') as handle:
+                        self.assertEqual(json.load(handle), payload)
+
+    def test_portfolio_stage_rejects_malformed_nested_buying_power(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            malformed = (
+                ('missing', {'display_currency': 'USD'}),
+                ('null', {'buying_power': None}),
+                ('object', {'buying_power': {'amount': '1508.9700'}}),
+                ('nonfinite', {'buying_power': 'NaN'}),
+                ('negative', {'buying_power': '-0.01'}),
+            )
+            for label, buying_power in malformed:
+                source = self.write_json(
+                    td,
+                    f'{label}-buying-power.json',
+                    {
+                        'data': {
+                            'total_value': '1508.97',
+                            'buying_power': buying_power,
+                        }
+                    },
+                )
+                output = os.path.join(scratch, f'{label}-rejected.json')
+                proc, result = self.stage('portfolio', [source], [output])
+                with self.subTest(case=label):
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(result['error']['code'], 'invalid_snapshot')
+                    self.assertIn(
+                        'portfolio.data.buying_power.buying_power',
+                        result['error']['message'],
+                    )
+                    self.assertFalse(os.path.exists(output))
+
+    def test_portfolio_stage_rejects_missing_or_null_outer_buying_power(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            malformed = (
+                ('missing', {}),
+                ('null', {'buying_power': None}),
+            )
+            for label, fields in malformed:
+                source = self.write_json(
+                    td,
+                    f'{label}-outer-buying-power.json',
+                    {
+                        'data': {
+                            'total_value': '1508.97',
+                            **fields,
+                        }
+                    },
+                )
+                output = os.path.join(scratch, f'{label}-outer-rejected.json')
+                proc, result = self.stage('portfolio', [source], [output])
+                with self.subTest(case=label):
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(result['error']['code'], 'invalid_snapshot')
+                    self.assertIn(
+                        'portfolio.data.buying_power',
+                        result['error']['message'],
+                    )
+                    self.assertFalse(os.path.exists(output))
+
     def test_portfolio_stage_rejects_pagination_cursor_flags(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
@@ -3187,7 +3315,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             source = self.write_json(
                 td,
                 'portfolio.json',
-                {'data': {'total_value': '1500.01', 'cash': '100'}},
+                {
+                    'data': {
+                        'total_value': '1500.01',
+                        'cash': '100',
+                        'buying_power': '100',
+                    }
+                },
             )
             output = os.path.join(scratch, 'portfolio-out.json')
             proc, result = self.stage(
@@ -3350,7 +3484,12 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertNotEqual(second.returncode, 0)
             self.assertFalse(second_result['ok'])
 
-            payload = {'data': {'total_value': '1500.01'}}
+            payload = {
+                'data': {
+                    'total_value': '1500.01',
+                    'buying_power': '100',
+                }
+            }
             source = self.write_json(td, 'portfolio.json', payload)
             output = os.path.join(scratch, 'portfolio-staged.json')
             proc, result = self.stage('portfolio', [source], [output])
