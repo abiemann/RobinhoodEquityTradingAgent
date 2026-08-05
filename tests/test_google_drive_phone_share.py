@@ -27,6 +27,7 @@ from dashboard.phone_share.google_drive import (  # noqa: E402
     GOOGLE_DRIVE_DOWNLOAD_ENDPOINT,
     GOOGLE_DRIVE_FILES_ENDPOINT,
     GOOGLE_DRIVE_UPLOAD_ENDPOINT,
+    GOOGLE_REVOCATION_ENDPOINT,
     GOOGLE_TOKEN_ENDPOINT,
 )
 
@@ -34,6 +35,7 @@ from dashboard.phone_share.google_drive import (  # noqa: E402
 CLIENT_ID = "1234567890-rhmraphonetest.apps.googleusercontent.com"
 CLIENT_SECRET = "test-desktop-client-credential-value"
 REDIRECT_URI = "http://127.0.0.1:8765/oauth2/callback"
+BROKER_URL = "https://oauth-broker.example/oauth/token"
 SHARE_ID = "S" * 22
 FILE_NAME = "rhmra-phone-v2-" + SHARE_ID + ".json"
 FILE_ID = "DriveFile_123456789"
@@ -89,6 +91,16 @@ class GoogleDriveConfigTests(unittest.TestCase):
         self.assertEqual(config.request_timeout_seconds, 7)
         self.assertIsNone(config.client_secret)
 
+    def test_accepts_secretless_pinned_broker_config(self):
+        config = GoogleDriveConfig(
+            CLIENT_ID,
+            REDIRECT_URI,
+            oauth_token_endpoint=BROKER_URL,
+        )
+
+        self.assertIsNone(config.client_secret)
+        self.assertEqual(config.oauth_token_endpoint, BROKER_URL)
+
     def test_rejects_unsafe_or_ambiguous_config(self):
         invalid = [
             ("not-a-client", REDIRECT_URI),
@@ -112,6 +124,14 @@ class GoogleDriveConfigTests(unittest.TestCase):
             {"request_timeout_seconds": True},
             {"max_response_bytes": 1024},
             {"refresh_leeway_seconds": 301},
+            {"oauth_token_endpoint": "http://oauth-broker.example/oauth/token"},
+            {"oauth_token_endpoint": BROKER_URL + "?debug=true"},
+            {"oauth_token_endpoint": "https://user@oauth-broker.example/oauth/token"},
+            {"oauth_token_endpoint": "https://oauth-broker.example/other"},
+            {
+                "client_secret": CLIENT_SECRET,
+                "oauth_token_endpoint": BROKER_URL,
+            },
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(PhoneShareProviderError):
@@ -181,6 +201,113 @@ class OAuthSessionTests(unittest.TestCase):
         self.assertEqual(form["code_verifier"], [pending.code_verifier])
         self.assertEqual(form["client_id"], [CLIENT_ID])
         self.assertEqual(form["client_secret"], [CLIENT_SECRET])
+
+    def test_broker_exchange_is_secretless_and_has_exact_fields(self):
+        config = GoogleDriveConfig(
+            CLIENT_ID,
+            REDIRECT_URI,
+            oauth_token_endpoint=BROKER_URL,
+        )
+        values = [b"C" * 32, b"D" * 64]
+        session = InMemoryOAuthSession(
+            config,
+            self.transport,
+            clock=lambda: 1000.0,
+            random_bytes=lambda length: values.pop(0),
+        )
+        pending = session.begin_authorization()
+        self.transport.queue(200, self.token_document())
+        callback = REDIRECT_URI + "?" + urllib.parse.urlencode(
+            {"code": "authorization-code", "state": pending.state}
+        )
+
+        credentials = session.complete_authorization(callback, pending)
+
+        self.assertEqual(credentials.expires_at, 4600.0)
+        method, url, request = self.transport.requests[0]
+        form = urllib.parse.parse_qs(request["body"].decode("ascii"))
+        self.assertEqual((method, url), ("POST", BROKER_URL))
+        self.assertEqual(
+            set(form),
+            {"client_id", "code", "code_verifier", "grant_type", "redirect_uri"},
+        )
+        self.assertEqual(form["client_id"], [CLIENT_ID])
+        self.assertEqual(form["code"], ["authorization-code"])
+        self.assertEqual(form["code_verifier"], [pending.code_verifier])
+        self.assertEqual(form["grant_type"], ["authorization_code"])
+        self.assertEqual(form["redirect_uri"], [REDIRECT_URI])
+        self.assertNotIn("client_secret", form)
+
+    def test_broker_refresh_is_secretless_and_has_exact_fields(self):
+        config = GoogleDriveConfig(
+            CLIENT_ID,
+            REDIRECT_URI,
+            oauth_token_endpoint=BROKER_URL,
+        )
+        session = InMemoryOAuthSession(
+            config,
+            self.transport,
+            clock=lambda: 1000.0,
+        )
+        session.set_credentials(
+            OAuthCredentials(
+                access_token="old-access-token",
+                refresh_token="kept-refresh-token",
+                expires_at=1010.0,
+                scopes=(DRIVE_APPDATA_SCOPE,),
+            )
+        )
+        self.transport.queue(
+            200,
+            {
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+                "scope": DRIVE_APPDATA_SCOPE,
+                "token_type": "Bearer",
+            },
+        )
+
+        self.assertEqual(session.authorization_header(), "Bearer new-access-token")
+
+        method, url, request = self.transport.requests[0]
+        form = urllib.parse.parse_qs(request["body"].decode("ascii"))
+        self.assertEqual((method, url), ("POST", BROKER_URL))
+        self.assertEqual(
+            set(form), {"client_id", "grant_type", "refresh_token"}
+        )
+        self.assertEqual(form["client_id"], [CLIENT_ID])
+        self.assertEqual(form["grant_type"], ["refresh_token"])
+        self.assertEqual(form["refresh_token"], ["kept-refresh-token"])
+        self.assertNotIn("client_secret", form)
+
+    def test_broker_redirect_is_rejected_even_with_valid_token_json(self):
+        config = GoogleDriveConfig(
+            CLIENT_ID,
+            REDIRECT_URI,
+            oauth_token_endpoint=BROKER_URL,
+        )
+        values = [b"E" * 32, b"F" * 64]
+        session = InMemoryOAuthSession(
+            config,
+            self.transport,
+            clock=lambda: 1000.0,
+            random_bytes=lambda length: values.pop(0),
+        )
+        pending = session.begin_authorization()
+        self.transport.queue(
+            200,
+            self.token_document(),
+            url=BROKER_URL + "/redirected",
+        )
+        callback = REDIRECT_URI + "?" + urllib.parse.urlencode(
+            {"code": "authorization-code", "state": pending.state}
+        )
+
+        with self.assertRaises(PhoneShareProviderError) as caught:
+            session.complete_authorization(callback, pending)
+
+        self.assertEqual(caught.exception.code, "oauth_exchange_failed")
+        self.assertFalse(session.is_authorized)
 
     def test_state_mismatch_duplicate_state_and_replay_fail_before_network(self):
         pending = self.session.begin_authorization()
@@ -308,6 +435,115 @@ class OAuthSessionTests(unittest.TestCase):
         self.assertTrue(self.session.is_authorized)
         self.assertEqual(cleared, [])
 
+    def test_broker_service_outages_are_retryable_and_preserve_credentials(self):
+        for status in (429, 502, 503, 504):
+            with self.subTest(status=status):
+                transport = FakeTransport()
+                config = GoogleDriveConfig(
+                    CLIENT_ID,
+                    REDIRECT_URI,
+                    oauth_token_endpoint=BROKER_URL,
+                )
+                session = InMemoryOAuthSession(
+                    config,
+                    transport,
+                    clock=lambda: 1000.0,
+                )
+                session.set_credentials(
+                    OAuthCredentials(
+                        access_token="old-access-token",
+                        refresh_token="kept-refresh-token",
+                        expires_at=1010.0,
+                        scopes=(DRIVE_APPDATA_SCOPE,),
+                    )
+                )
+                cleared = []
+                session.set_credentials_cleared_callback(
+                    lambda: cleared.append(True)
+                )
+                transport.queue(
+                    status,
+                    body=b'{"error":"invalid_grant private-token-detail"}',
+                )
+
+                with self.assertRaises(PhoneShareProviderError) as caught:
+                    session.authorization_header()
+
+                self.assertEqual(
+                    caught.exception.code, "oauth_service_unavailable"
+                )
+                self.assertTrue(session.is_authorized)
+                self.assertEqual(cleared, [])
+                self.assertNotIn(
+                    "private-token-detail",
+                    str(caught.exception) + repr(caught.exception),
+                )
+
+    def test_revoke_posts_only_refresh_token_to_exact_google_endpoint(self):
+        self.session.set_credentials(
+            OAuthCredentials(
+                access_token="access-token-value",
+                refresh_token="refresh-token-value",
+                expires_at=4600.0,
+                scopes=(DRIVE_APPDATA_SCOPE,),
+            )
+        )
+        self.transport.queue(200, body=b'')
+
+        self.assertTrue(self.session.revoke_credentials())
+
+        method, url, request = self.transport.requests[-1]
+        form = urllib.parse.parse_qs(request["body"].decode("ascii"))
+        self.assertEqual((method, url), ("POST", GOOGLE_REVOCATION_ENDPOINT))
+        self.assertEqual(form, {"token": ["refresh-token-value"]})
+        self.assertEqual(
+            request["max_response_bytes"], 4096
+        )
+        self.assertTrue(self.session.is_authorized)
+
+    def test_revoke_falls_back_to_access_token_and_already_invalid_is_safe(self):
+        self.session._credentials = OAuthCredentials(
+            access_token="access-token-value",
+            refresh_token="",
+            expires_at=4600.0,
+            scopes=(DRIVE_APPDATA_SCOPE,),
+        )
+        self.transport.queue(
+            400,
+            body=b'{"error":"access-token-value private detail"}',
+        )
+
+        self.assertFalse(self.session.revoke_credentials())
+
+        form = urllib.parse.parse_qs(
+            self.transport.requests[-1][2]["body"].decode("ascii")
+        )
+        self.assertEqual(form, {"token": ["access-token-value"]})
+        self.assertTrue(self.session.is_authorized)
+
+    def test_revoke_rejects_redirect_and_never_echoes_response(self):
+        self.session.set_credentials(
+            OAuthCredentials(
+                access_token="access-token-value",
+                refresh_token="refresh-token-value",
+                expires_at=4600.0,
+                scopes=(DRIVE_APPDATA_SCOPE,),
+            )
+        )
+        self.transport.queue(
+            200,
+            body=b'refresh-token-value private detail',
+            url="https://redirect.example/revoke",
+        )
+
+        with self.assertRaises(PhoneShareProviderError) as caught:
+            self.session.revoke_credentials()
+
+        self.assertEqual(caught.exception.code, "oauth_revoke_failed")
+        exposed = str(caught.exception) + repr(caught.exception)
+        self.assertNotIn("refresh-token-value", exposed)
+        self.assertNotIn("private detail", exposed)
+
     def test_upstream_error_is_safe_and_does_not_echo_secrets(self):
         pending = self.session.begin_authorization()
         secret_body = b'{"error":"authorization-code access-token-value"}'
@@ -394,8 +630,18 @@ class OAuthSessionTests(unittest.TestCase):
         )
         self.assertNotIn("client_secret", form)
 
-    def test_rejected_client_credential_on_refresh_clears_stale_session(self):
-        self.session.set_credentials(
+    def test_rejected_broker_client_on_refresh_preserves_saved_session(self):
+        config = GoogleDriveConfig(
+            CLIENT_ID,
+            REDIRECT_URI,
+            oauth_token_endpoint=BROKER_URL,
+        )
+        session = InMemoryOAuthSession(
+            config,
+            self.transport,
+            clock=lambda: 1000.0,
+        )
+        session.set_credentials(
             OAuthCredentials(
                 access_token="old-access-token",
                 refresh_token="kept-refresh-token",
@@ -404,7 +650,7 @@ class OAuthSessionTests(unittest.TestCase):
             )
         )
         cleared = []
-        self.session.set_credentials_cleared_callback(
+        session.set_credentials_cleared_callback(
             lambda: cleared.append(True)
         )
         self.transport.queue(
@@ -416,13 +662,16 @@ class OAuthSessionTests(unittest.TestCase):
         )
 
         with self.assertRaises(PhoneShareProviderError) as caught:
-            self.session.authorization_header()
+            session.authorization_header()
 
         self.assertEqual(
             caught.exception.code, "oauth_client_credentials_rejected"
         )
-        self.assertFalse(self.session.is_authorized)
-        self.assertEqual(cleared, [True])
+        self.assertTrue(session.is_authorized)
+        self.assertEqual(cleared, [])
+        restored = session.credentials_snapshot()
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.refresh_token, "kept-refresh-token")
         self.assertNotIn(
             "private upstream credential detail",
             str(caught.exception) + repr(caught.exception),

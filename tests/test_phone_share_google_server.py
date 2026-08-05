@@ -22,6 +22,7 @@ VALID_CLIENT_ID = (
     '1234567890-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com'
 )
 VALID_CLIENT_SECRET = 'test-desktop-client-credential-value'
+VALID_BROKER_URL = 'https://oauth-broker.example/oauth/token'
 
 
 class FakeOAuthSession:
@@ -29,6 +30,8 @@ class FakeOAuthSession:
     fail_begin = False
     fail_complete = False
     failure_code = 'oauth_exchange_failed'
+    fail_revoke = False
+    revoke_result = True
 
     def __init__(self, config):
         self.config = config
@@ -37,6 +40,8 @@ class FakeOAuthSession:
         self.restored_credentials = None
         self.credentials_changed_callback = None
         self.credentials_cleared_callback = None
+        self.revoke_calls = 0
+        self.clear_calls = 0
         self.__class__.instances.append(self)
 
     @property
@@ -84,10 +89,19 @@ class FakeOAuthSession:
         self.credentials_cleared_callback = callback
 
     def clear_credentials(self):
+        self.clear_calls += 1
         was_authorized = self.authorized
         self.authorized = False
         if was_authorized and self.credentials_cleared_callback is not None:
             self.credentials_cleared_callback()
+
+    def revoke_credentials(self):
+        self.revoke_calls += 1
+        if self.__class__.fail_revoke:
+            raise SERVER.PhoneShareProviderError(
+                'oauth_revoke_failed', 'private-revocation-token-detail'
+            )
+        return self.__class__.revoke_result
 
 
 class FakeCredentialStore:
@@ -163,6 +177,8 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         FakeOAuthSession.fail_begin = False
         FakeOAuthSession.fail_complete = False
         FakeOAuthSession.failure_code = 'oauth_exchange_failed'
+        FakeOAuthSession.fail_revoke = False
+        FakeOAuthSession.revoke_result = True
         FakeGoogleDriveProvider.instances = []
         FakeGoogleDriveProvider.fail_operation = False
         FakeGoogleDriveProvider.failure_code = 'drive_unavailable'
@@ -181,9 +197,15 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.store_patch = mock.patch.object(
             SERVER, 'SecureOAuthCredentialStore', FakeCredentialStore
         )
+        self.public_config_patch = mock.patch.multiple(
+            SERVER,
+            GOOGLE_DESKTOP_CLIENT_ID=VALID_CLIENT_ID,
+            GOOGLE_OAUTH_BROKER_URL=VALID_BROKER_URL,
+        )
         self.session_patch.start()
         self.provider_patch.start()
         self.store_patch.start()
+        self.public_config_patch.start()
         self.logs = []
         logs = self.logs
 
@@ -202,6 +224,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.provider_patch.stop()
         self.session_patch.stop()
         self.store_patch.stop()
+        self.public_config_patch.stop()
         self.credentials_directory.cleanup()
         self.environment.stop()
 
@@ -215,6 +238,14 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV,
             self.credentials_path,
         )
+        if explicit:
+            os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = (
+                SERVER.PHONE_SHARE_PROVIDER_GOOGLE
+            )
+
+    def configure_builtin_broker(self, *, explicit=True):
+        os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, None)
+        os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV, None)
         if explicit:
             os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = (
                 SERVER.PHONE_SHARE_PROVIDER_GOOGLE
@@ -306,13 +337,14 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         )
 
     def test_google_is_default_and_cloudflare_requires_explicit_selection(self):
-        self.configure_google(explicit=False)
+        self.configure_builtin_broker(explicit=False)
         status, headers, body = self.request('GET', '/api/phone-share/config')
         document = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(document['provider'], 'google-drive')
         self.assertFalse(document['connected'])
         self.assertTrue(document['desktop_credentials_configured'])
+        self.assertTrue(document['oauth_configured'])
         self.assertEqual(
             document['viewer_url'],
             'https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/'
@@ -326,8 +358,12 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             SERVER._selected_phone_share_settings(self.server.server_port),
         )
         self.assertTrue(hasattr(runtime.session, 'set_credentials'))
+        self.assertIsNone(runtime.config.client_secret)
+        self.assertEqual(
+            runtime.config.oauth_token_endpoint, VALID_BROKER_URL
+        )
 
-        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV]
+        os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, None)
         self.configure_cloudflare()
         with mock.patch.object(
             SERVER, 'GOOGLE_DESKTOP_CLIENT_ID', VALID_CLIENT_ID
@@ -409,21 +445,155 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertTrue(document['authorization_url'].startswith('https://'))
         self.assertEqual(len(FakeOAuthSession.instances), 1)
 
-    def test_connect_fails_before_consent_when_credentials_are_missing(self):
-        self.configure_google()
-        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV]
+    def test_disconnect_requires_same_origin_csrf_and_exact_empty_json(self):
+        self.configure_builtin_broker()
+        path = '/api/phone-share/disconnect-google'
+        self.assertEqual(self.request('POST', path, body=b'{}')[0], 403)
+
+        bad_csrf = self.mutation_headers(json_body=True)
+        bad_csrf['X-RHMRA-CSRF'] = 'wrong'
+        self.assertEqual(
+            self.request('POST', path, body=b'{}', headers=bad_csrf)[0],
+            403,
+        )
+        self.assertEqual(
+            self.request(
+                'POST', path, body=b'{}', headers=self.mutation_headers()
+            )[0],
+            415,
+        )
+        unexpected = json.dumps({'forget_pairing': True}).encode('utf-8')
+        self.assertEqual(
+            self.request(
+                'POST', path, body=unexpected,
+                headers=self.mutation_headers(json_body=True),
+            )[0],
+            400,
+        )
+        self.assertEqual(FakeOAuthSession.instances, [])
+
+    def test_disconnect_revokes_then_clears_local_credentials_without_deleting_share(self):
+        self.configure_builtin_broker()
+        self.connect()
+        self.assertEqual(self.complete_callback()[0], 200)
+        runtime = SERVER._google_runtime_for_server(
+            self.server,
+            SERVER._selected_phone_share_settings(self.server.server_port),
+        )
+        session = runtime.session
+        store = runtime.credential_store
+        provider = runtime.provider
+
+        status, _, body = self.request(
+            'POST', '/api/phone-share/disconnect-google', body=b'{}',
+            headers=self.mutation_headers(json_body=True),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {
+                'ok': True,
+                'connected': False,
+                'remote_revocation_confirmed': True,
+            },
+        )
+        self.assertEqual(session.revoke_calls, 1)
+        self.assertEqual(session.clear_calls, 1)
+        self.assertFalse(session.is_authorized)
+        self.assertGreaterEqual(store.clear_calls, 2)
+        self.assertEqual(provider.delete_calls, [])
+        config = json.loads(self.request('GET', '/api/phone-share/config')[2])
+        self.assertFalse(config['connected'])
+
+    def test_disconnect_remote_failure_is_honest_but_still_clears_local_credentials(self):
+        self.configure_builtin_broker()
+        self.connect()
+        self.assertEqual(self.complete_callback()[0], 200)
+        runtime = SERVER._google_runtime_for_server(
+            self.server,
+            SERVER._selected_phone_share_settings(self.server.server_port),
+        )
+        session = runtime.session
+        store = runtime.credential_store
+        FakeOAuthSession.fail_revoke = True
+
+        status, _, body = self.request(
+            'POST', '/api/phone-share/disconnect-google', body=b'{}',
+            headers=self.mutation_headers(json_body=True),
+        )
+        document = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(document['ok'])
+        self.assertFalse(document['connected'])
+        self.assertFalse(document['remote_revocation_confirmed'])
+        self.assertEqual(
+            document['warning'], SERVER.PHONE_SHARE_GOOGLE_REVOKE_WARNING
+        )
+        self.assertFalse(session.is_authorized)
+        self.assertEqual(session.clear_calls, 1)
+        self.assertGreaterEqual(store.clear_calls, 2)
+        exposed = body.decode('utf-8') + ' '.join(self.logs)
+        self.assertNotIn('private-revocation-token-detail', exposed)
+        self.assertIn('oauth_revoke_failed', exposed)
+
+    def test_disconnect_is_idempotent_when_already_disconnected(self):
+        self.configure_builtin_broker()
+        headers = self.mutation_headers(json_body=True)
+        responses = [
+            self.request(
+                'POST', '/api/phone-share/disconnect-google', body=b'{}',
+                headers=headers,
+            )
+            for _ in range(2)
+        ]
+
+        for status, _, body in responses:
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body),
+                {
+                    'ok': True,
+                    'connected': False,
+                    'remote_revocation_confirmed': True,
+                },
+            )
+        session = FakeOAuthSession.instances[0]
+        store = FakeCredentialStore.instances[0]
+        self.assertEqual(session.revoke_calls, 0)
+        self.assertEqual(session.clear_calls, 2)
+        self.assertEqual(store.clear_calls, 2)
+
+    def test_connect_uses_builtin_broker_without_local_credentials(self):
+        self.configure_builtin_broker()
 
         status, _, body = self.request(
             'POST', '/api/phone-share/connect', body=b'{}',
             headers=self.mutation_headers(json_body=True),
         )
 
-        self.assertEqual(status, 503)
-        self.assertEqual(
-            json.loads(body),
-            {'error': 'Google Desktop credentials are not configured'},
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['authorization_url'].startswith('https://'))
+        self.assertEqual(len(FakeOAuthSession.instances), 1)
+        config = FakeOAuthSession.instances[0].config
+        self.assertIsNone(config.client_secret)
+        self.assertEqual(config.oauth_token_endpoint, VALID_BROKER_URL)
+
+    def test_server_rejects_generic_unpinned_oauth_token_endpoint(self):
+        self.configure_builtin_broker()
+        unpinned_config = mock.Mock(
+            client_secret=None,
+            oauth_token_endpoint='https://unexpected.example/oauth/token',
         )
-        self.assertEqual(FakeOAuthSession.instances, [])
+        with mock.patch.object(
+            SERVER, 'GoogleDriveConfig', return_value=unpinned_config
+        ):
+            settings = SERVER._google_phone_share_settings(
+                self.server.server_port
+            )
+
+        self.assertIsNone(settings)
 
     def test_external_desktop_credentials_are_loaded_but_never_published(self):
         self.configure_google()
@@ -442,6 +612,10 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             self.assertEqual(
                 FakeOAuthSession.instances[-1].config.client_secret,
                 VALID_CLIENT_SECRET,
+            )
+            self.assertEqual(
+                FakeOAuthSession.instances[-1].config.oauth_token_endpoint,
+                'https://oauth2.googleapis.com/token',
             )
             self.assertNotIn(
                 VALID_CLIENT_SECRET,
@@ -566,7 +740,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
                 self.assertNotIn(path, json.dumps(document))
                 self.assertNotIn(client_secret, json.dumps(document))
 
-    def test_saved_tokens_are_not_restored_without_desktop_credentials(self):
+    def test_saved_tokens_are_restored_in_builtin_broker_mode(self):
         self.configure_google()
         FakeCredentialStore.loaded = object()
         configured = json.loads(
@@ -575,14 +749,21 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertTrue(configured['connected'])
         self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 1)
 
-        del os.environ[SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV]
-        missing = json.loads(
+        self.configure_builtin_broker()
+        broker = json.loads(
             self.request('GET', '/api/phone-share/config')[2]
         )
 
-        self.assertFalse(missing['connected'])
-        self.assertFalse(missing['desktop_credentials_configured'])
-        self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 0)
+        self.assertTrue(broker['connected'])
+        self.assertTrue(broker['desktop_credentials_configured'])
+        self.assertTrue(broker['oauth_configured'])
+        self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 1)
+        runtime = SERVER._google_runtime_for_server(
+            self.server,
+            SERVER._selected_phone_share_settings(self.server.server_port),
+        )
+        self.assertIsNone(runtime.config.client_secret)
+        self.assertEqual(runtime.config.oauth_token_endpoint, VALID_BROKER_URL)
 
     def test_callback_is_exact_loopback_one_shot_and_safe(self):
         self.configure_google()
@@ -641,8 +822,29 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         )
         self.assertNotIn('connection_error', refreshed)
 
+    def test_broker_client_failure_uses_safe_update_guidance(self):
+        self.configure_builtin_broker()
+        FakeOAuthSession.fail_complete = True
+        FakeOAuthSession.failure_code = 'oauth_client_credentials_rejected'
+        self.connect()
+
+        status, _, body = self.complete_callback()
+
+        self.assertEqual(status, 400)
+        body_text = body.decode('utf-8')
+        self.assertIn(SERVER.PHONE_SHARE_GOOGLE_BROKER_ERROR, body_text)
+        self.assertNotIn('sensitive callback detail', body_text)
+        config = json.loads(self.request('GET', '/api/phone-share/config')[2])
+        self.assertFalse(config['connected'])
+        self.assertEqual(
+            config['connection_error'], SERVER.PHONE_SHARE_GOOGLE_BROKER_ERROR
+        )
+        exposed = body_text + json.dumps(config) + ' '.join(self.logs)
+        self.assertNotIn('sensitive callback detail', exposed)
+        self.assertNotIn(VALID_CLIENT_SECRET, exposed)
+
     def test_upload_and_delete_dispatch_only_after_connection(self):
-        self.configure_google()
+        self.configure_builtin_broker()
         expected_envelope = self.envelope()
         payload = json.dumps(expected_envelope).encode('utf-8')
         headers = self.mutation_headers(json_body=True)
@@ -710,8 +912,8 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertNotIn('oauth-super-secret', exposed)
         self.assertIn('drive_unavailable', exposed)
 
-    def test_rejected_desktop_credential_downgrades_connected_state(self):
-        self.configure_google()
+    def test_rejected_broker_client_downgrades_connected_state(self):
+        self.configure_builtin_broker()
         self.connect()
         self.assertEqual(self.complete_callback()[0], 200)
         FakeGoogleDriveProvider.fail_operation = True
@@ -728,13 +930,13 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(
             json.loads(body),
-            {'error': 'Google Desktop credentials need attention'},
+            {'error': 'Google sign-in service needs attention'},
         )
         config = json.loads(self.request('GET', '/api/phone-share/config')[2])
         self.assertFalse(config['connected'])
         self.assertEqual(
             config['connection_error'],
-            SERVER.PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR,
+            SERVER.PHONE_SHARE_GOOGLE_BROKER_ERROR,
         )
         exposed = body.decode('utf-8') + json.dumps(config) + ' '.join(self.logs)
         self.assertNotIn('oauth-super-secret', exposed)

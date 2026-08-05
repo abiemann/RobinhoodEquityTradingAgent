@@ -84,6 +84,19 @@ PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR = (
     'explicit client ID. Check its absolute path and keep the file outside '
     'this repository.'
 )
+PHONE_SHARE_GOOGLE_BROKER_ERROR = (
+    'Google sign-in service needs attention. Try connecting again; if the '
+    'problem continues, update RHMRA to the latest release.'
+)
+PHONE_SHARE_GOOGLE_SERVICE_ERROR = (
+    'Google sign-in is temporarily unavailable. Try again shortly; if the '
+    'problem continues, update RHMRA to the latest release.'
+)
+PHONE_SHARE_GOOGLE_REVOKE_WARNING = (
+    'RHMRA removed its local Google credentials, but Google could not confirm '
+    'remote revocation. For immediate assurance, remove RHMRA from your '
+    'Google Account permissions.'
+)
 
 PHONE_SHARE_FIELDS = frozenset({
     'schema_version', 'share_id', 'sequence', 'captured_at',
@@ -106,8 +119,10 @@ from dashboard.phone_share import (
     PhoneShareProviderError,
     SecureOAuthCredentialStore,
 )
+from dashboard.phone_share.google_drive import GOOGLE_TOKEN_ENDPOINT
 from dashboard.phone_share.public_config import (
     GOOGLE_DESKTOP_CLIENT_ID,
+    GOOGLE_OAUTH_BROKER_URL,
     GOOGLE_PHONE_VIEWER_URL,
 )
 from ledger_pnl import LedgerPnlError, reconcile_ledger
@@ -322,6 +337,7 @@ def _google_phone_share_settings(server_port):
     credentials_path = os.environ.get(
         PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV
     )
+    oauth_token_endpoint = GOOGLE_OAUTH_BROKER_URL
     if credentials_path is not None:
         credentials = _load_google_desktop_credentials(credentials_path)
         if credentials is None:
@@ -330,6 +346,13 @@ def _google_phone_share_settings(server_port):
         if file_client_id != client_id:
             return None
         client_id = file_client_id
+        oauth_token_endpoint = None
+    elif client_id != GOOGLE_DESKTOP_CLIENT_ID:
+        # The built-in relay is intentionally bound to exactly the bundled
+        # client. A developer selecting another client must also supply that
+        # client's external Desktop JSON, which continues to exchange tokens
+        # directly with Google.
+        return None
     viewer_url = _https_google_viewer_url(os.environ.get(
         PHONE_SHARE_GOOGLE_VIEWER_URL_ENV, GOOGLE_PHONE_VIEWER_URL
     ))
@@ -338,12 +361,19 @@ def _google_phone_share_settings(server_port):
         f'http://127.0.0.1:{server_port}/oauth2/callback'
     )
     try:
+        config_kwargs = {
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'client_secret': client_secret,
+        }
+        if oauth_token_endpoint is not None:
+            config_kwargs['oauth_token_endpoint'] = oauth_token_endpoint
         config = GoogleDriveConfig(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            client_secret=client_secret,
+            **config_kwargs
         )
     except PhoneShareProviderError:
+        return None
+    if not _google_oauth_endpoint_is_pinned(config):
         return None
     if viewer_url is None or ttl_seconds is None:
         return None
@@ -355,6 +385,13 @@ def _google_phone_share_settings(server_port):
         'viewer_url': viewer_url,
         'ttl_seconds': ttl_seconds,
     }
+
+
+def _google_oauth_endpoint_is_pinned(config):
+    '''Restrict server-created OAuth clients to the two release endpoints.'''
+    if config.client_secret is None:
+        return config.oauth_token_endpoint == GOOGLE_OAUTH_BROKER_URL
+    return config.oauth_token_endpoint == GOOGLE_TOKEN_ENDPOINT
 
 
 def _google_credentials_configuration_error():
@@ -381,6 +418,13 @@ def _google_credentials_configuration_error():
     if credentials[0] != selected_client_id:
         return PHONE_SHARE_GOOGLE_CREDENTIAL_FILE_ERROR
     return None
+
+
+def _google_oauth_client_error(config):
+    '''Return safe guidance for the active Desktop OAuth delivery mode.'''
+    if config.client_secret is not None:
+        return PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+    return PHONE_SHARE_GOOGLE_BROKER_ERROR
 
 
 def _selected_phone_share_settings(server_port):
@@ -422,11 +466,7 @@ class _GooglePhoneShareRuntime:
             else SecureOAuthCredentialStore(config.client_id)
         )
         self._session_persists_changes = False
-        restored = (
-            self.credential_store.load()
-            if config.client_secret is not None
-            else None
-        )
+        restored = self.credential_store.load()
         if restored is not None:
             try:
                 self.session.set_credentials(restored)
@@ -462,7 +502,12 @@ def _google_runtime_for_server(server, settings):
     secret_hash = hashlib.sha256(
         (config.client_secret or '').encode('utf-8')
     ).digest()
-    fingerprint = (config.client_id, config.redirect_uri, secret_hash)
+    fingerprint = (
+        config.client_id,
+        config.redirect_uri,
+        config.oauth_token_endpoint,
+        secret_hash,
+    )
     with PHONE_SHARE_GOOGLE_RUNTIME_LOCK:
         runtime = getattr(server, '_rhmra_google_phone_share_runtime', None)
         current = None
@@ -470,6 +515,7 @@ def _google_runtime_for_server(server, settings):
             current = (
                 runtime.config.client_id,
                 runtime.config.redirect_uri,
+                runtime.config.oauth_token_endpoint,
                 hashlib.sha256(
                     (runtime.config.client_secret or '').encode('utf-8')
                 ).digest(),
@@ -505,14 +551,15 @@ def _phone_share_public_config(server=None):
         runtime = _google_runtime_for_server(server, settings)
         with runtime.lock:
             result['connected'] = (
-                runtime.config.client_secret is not None
-                and runtime.connection_error is None
+                runtime.connection_error is None
                 and runtime.session.is_authorized
             )
             result['credential_persistence'] = runtime.credential_persistence
-            result['desktop_credentials_configured'] = (
-                runtime.config.client_secret is not None
-            )
+            # Retained for older dashboard front ends. In broker mode the
+            # server-side credential is configured at the fixed relay, so no
+            # local Desktop JSON is required.
+            result['desktop_credentials_configured'] = True
+            result['oauth_configured'] = True
             if runtime.connection_error is not None:
                 result['connection_error'] = runtime.connection_error
     return result
@@ -712,14 +759,16 @@ class Handler(SimpleHTTPRequestHandler):
     def _api_error(self, status, code):
         self._json({'error': code}, status=status)
 
-    def _oauth_page(self, success, error_code=None):
+    def _oauth_page(self, success, error_code=None, error_message=None):
         status = 200 if success else 400
         title = ('Google Drive connected' if success
                  else 'Google Drive was not connected')
         if success:
             message = 'You can close this tab and return to the dashboard.'
+        elif error_message is not None:
+            message = error_message
         elif error_code == 'oauth_client_credentials_rejected':
-            message = PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+            message = PHONE_SHARE_GOOGLE_BROKER_ERROR
         else:
             message = 'Close this tab and try Connect Google Drive again.'
         body = ('<!doctype html><html><head><meta charset=utf-8>'
@@ -921,18 +970,27 @@ class Handler(SimpleHTTPRequestHandler):
                     runtime.persist_completed_credentials(credentials)
                     runtime.connection_error = None
             except PhoneShareProviderError as exc:
+                if exc.code == 'oauth_client_credentials_rejected':
+                    oauth_error_message = _google_oauth_client_error(
+                        runtime.config
+                    )
+                elif exc.code == 'oauth_service_unavailable':
+                    oauth_error_message = PHONE_SHARE_GOOGLE_SERVICE_ERROR
+                else:
+                    oauth_error_message = None
                 with runtime.lock:
                     if not runtime.session.is_authorized:
                         runtime.connection_error = (
-                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
-                            if exc.code == 'oauth_client_credentials_rejected'
-                            else 'Google sign-in was not completed. Try connecting again.'
+                            oauth_error_message
+                            or 'Google sign-in was not completed. Try connecting again.'
                         )
                 self.log_error(
                     'Google phone-sharing authorization failed: %s',
                     exc.code,
                 )
-                return self._oauth_page(False, exc.code)
+                return self._oauth_page(
+                    False, exc.code, error_message=oauth_error_message
+                )
             return self._oauth_page(True)
         if path == "/":
             self.send_response(302)
@@ -973,7 +1031,11 @@ class Handler(SimpleHTTPRequestHandler):
         path = self._guard()
         if path is None:
             return
-        if path not in ('/api/phone-share', '/api/phone-share/connect'):
+        if path not in (
+            '/api/phone-share',
+            '/api/phone-share/connect',
+            '/api/phone-share/disconnect-google',
+        ):
             self.send_error(403, 'not served')
             return
         if not self._authorize_phone_share():
@@ -982,16 +1044,63 @@ class Handler(SimpleHTTPRequestHandler):
         if settings is None:
             self._api_error(503, 'phone sharing is not configured')
             return
-        if path == '/api/phone-share/connect':
+        if path in (
+            '/api/phone-share/connect',
+            '/api/phone-share/disconnect-google',
+        ):
             if not self._read_connect_request():
                 return
+        if path == '/api/phone-share/disconnect-google':
+            if settings['provider'] != PHONE_SHARE_PROVIDER_GOOGLE:
+                self._api_error(409, 'Google Drive is not configured')
+                return
+            runtime = _google_runtime_for_server(self.server, settings)
+            revocation_confirmed = True
+            warning = None
+            with runtime.lock:
+                runtime.pending = None
+                try:
+                    if runtime.session.is_authorized:
+                        runtime.session.revoke_credentials()
+                except PhoneShareProviderError as exc:
+                    revocation_confirmed = False
+                    warning = PHONE_SHARE_GOOGLE_REVOKE_WARNING
+                    self.log_error(
+                        'Google Drive revocation could not be confirmed: %s',
+                        exc.code,
+                    )
+                except Exception:
+                    revocation_confirmed = False
+                    warning = PHONE_SHARE_GOOGLE_REVOKE_WARNING
+                    self.log_error(
+                        'Google Drive revocation could not be confirmed: '
+                        'unexpected_failure'
+                    )
+                finally:
+                    # Disconnect is local-first and idempotent. A failed or
+                    # already-invalid remote grant must never leave a usable
+                    # in-memory credential or saved DPAPI credential behind.
+                    runtime.session.clear_credentials()
+                    try:
+                        store_cleared = runtime.credential_store.clear()
+                    except Exception:
+                        store_cleared = False
+                    runtime.connection_error = None
+                if store_cleared is False and runtime.credential_persistence != 'memory-only':
+                    revocation_confirmed = False
+                    warning = PHONE_SHARE_GOOGLE_REVOKE_WARNING
+            result = {
+                'ok': True,
+                'connected': False,
+                'remote_revocation_confirmed': revocation_confirmed,
+            }
+            if warning is not None:
+                result['warning'] = warning
+            self._json(result)
+            return
+        if path == '/api/phone-share/connect':
             if settings['provider'] != PHONE_SHARE_PROVIDER_GOOGLE:
                 self._api_error(409, 'phone sharing is already configured')
-                return
-            if settings['config'].client_secret is None:
-                self._api_error(
-                    503, 'Google Desktop credentials are not configured'
-                )
                 return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
@@ -1023,11 +1132,6 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(400, 'invalid encrypted snapshot')
             return
         if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
-            if settings['config'].client_secret is None:
-                self._api_error(
-                    503, 'Google Desktop credentials are not configured'
-                )
-                return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
                 with runtime.lock:
@@ -1055,10 +1159,13 @@ class Handler(SimpleHTTPRequestHandler):
                 elif exc.code == 'oauth_client_credentials_rejected':
                     with runtime.lock:
                         runtime.connection_error = (
-                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+                            _google_oauth_client_error(runtime.config)
                         )
                     self._api_error(
-                        503, 'Google Desktop credentials need attention'
+                        503,
+                        'Google Desktop credentials need attention'
+                        if runtime.config.client_secret is not None
+                        else 'Google sign-in service needs attention',
                     )
                 else:
                     self._api_error(502, 'phone sharing service unavailable')
@@ -1101,11 +1208,6 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(503, 'phone sharing is not configured')
             return
         if settings['provider'] == PHONE_SHARE_PROVIDER_GOOGLE:
-            if settings['config'].client_secret is None:
-                self._api_error(
-                    503, 'Google Desktop credentials are not configured'
-                )
-                return
             runtime = _google_runtime_for_server(self.server, settings)
             try:
                 with runtime.lock:
@@ -1125,10 +1227,13 @@ class Handler(SimpleHTTPRequestHandler):
                 elif exc.code == 'oauth_client_credentials_rejected':
                     with runtime.lock:
                         runtime.connection_error = (
-                            PHONE_SHARE_GOOGLE_CREDENTIAL_ERROR
+                            _google_oauth_client_error(runtime.config)
                         )
                     self._api_error(
-                        503, 'Google Desktop credentials need attention'
+                        503,
+                        'Google Desktop credentials need attention'
+                        if runtime.config.client_secret is not None
+                        else 'Google sign-in service needs attention',
                     )
                 else:
                     self._api_error(502, 'phone sharing service unavailable')

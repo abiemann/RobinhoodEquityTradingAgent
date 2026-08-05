@@ -1,0 +1,2 @@
+# Local development only. Copy this file to .dev.vars; never commit the real value.
+GOOGLE_DESKTOP_CLIENT_SECRET=replace-with-the-google-desktop-client-secret

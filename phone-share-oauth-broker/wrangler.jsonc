@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rhmra-google-oauth-broker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "logpush": false,
+  "observability": {
+    "enabled": false,
+    "logs": {
+      "invocation_logs": false
+    }
+  },
+  "ratelimits": [
+    {
+      "name": "OAUTH_RATE_LIMITER",
+      "namespace_id": "13490783057",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    }
+  ],
+  "vars": {
+    "GOOGLE_DESKTOP_CLIENT_ID": "13490783057-78kr2v2lluafbeomf9d1f2u24b2mpv1c.apps.googleusercontent.com"
+  }
+}

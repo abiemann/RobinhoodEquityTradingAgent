@@ -1,0 +1,27 @@
+{
+  "name": "rhmra-google-oauth-broker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "description": "Stateless Google OAuth token relay for the RHMRA desktop agent",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --check src/index.js && node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@napi-rs/keyring": "1.3.0",
+    "wrangler": "^4.68.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "GOOGLE_DESKTOP_CLIENT_SECRET": {
+        "description": "The private client secret for the RHMRA Google Desktop OAuth client. Store it only as a Cloudflare Worker secret."
+      }
+    }
+  }
+}

@@ -90,6 +90,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('errorDocument = await response.json()', recovery)
         for error in (
             'Google Drive is not connected',
+            'Google sign-in service is not configured',
+            'Google sign-in service needs attention',
+            'Google sign-in service is unavailable',
             'Google Desktop credentials need attention',
             'Google Desktop credentials are not configured',
             'phone sharing is not configured',
@@ -120,6 +123,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         )
         self.assertIn('your existing phone pairing was kept', recovery)
         self.assertIn('Any earlier encrypted snapshot will still expire', recovery)
+        self.assertIn('Reconnect Google Drive before sharing again', recovery)
+        self.assertIn('Google sign-in is temporarily unavailable', recovery)
+        self.assertNotIn('Configure the Google Desktop credential', recovery)
 
         recovery_call = (
             'await recoverGooglePhoneShareAuthorization(response, session)'
@@ -144,7 +150,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('durations.includes(7200) ? 7200', source)
 
     def test_google_connection_preopens_popup_then_polls_connected_config(self):
-        source = function_source('connectGoogleDrivePhoneShare', 'revokePreviousPhoneShare')
+        source = function_source(
+            'connectGoogleDrivePhoneShare', 'disconnectGoogleDrivePhoneShare'
+        )
         popup = source.index('''window.open('about:blank',''')
         request = source.index('''phoneShareLocalFetch('/api/phone-share/connect',''')
         self.assertLess(popup, request)
@@ -158,6 +166,57 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         )
         self.assertIn('PHONE_SHARE_CONNECT_TIMEOUT_MS', source)
 
+    def test_google_disconnect_is_separated_confirmed_and_preserves_pairing(self):
+        render = function_source('renderShareDialog', 'openPhoneShareDialog')
+        disconnect = function_source(
+            'disconnectGoogleDrivePhoneShare', 'revokePreviousPhoneShare'
+        )
+        self.assertEqual(
+            DASHBOARD.count("id='phone-share-disconnect-google'"), 1
+        )
+        self.assertIn("class='share-account-controls'", render)
+        self.assertIn('Google account connection', render)
+        self.assertIn('saved laptop sign-in', render)
+        self.assertIn('Your paired phone is kept', render)
+        self.assertIn('phone and laptop use the same RHMRA Google permission', render)
+        self.assertGreater(
+            render.index("id='phone-share-disconnect-google'"),
+            render.index("if (phoneShareConfig.connected !== true)"),
+        )
+        self.assertIn('if (phoneShareSession ||', disconnect)
+        self.assertIn('window.confirm(', disconnect)
+        self.assertIn(
+            "phoneShareLocalFetch('/api/phone-share/disconnect-google'",
+            disconnect,
+        )
+        self.assertIn("method: 'POST'", disconnect)
+        self.assertIn(
+            "'X-RHMRA-CSRF': phoneShareConfig.csrf_token", disconnect
+        )
+        self.assertIn("body: '{}'", disconnect)
+        self.assertIn('result.warning', disconnect)
+        self.assertIn('your paired phone was kept', disconnect)
+        self.assertNotIn('clearStoredGooglePhonePairing', disconnect)
+        self.assertNotIn('googlePhonePairing = null', disconnect)
+
+    def test_memory_only_google_credentials_have_prominent_warning(self):
+        warning = function_source(
+            'googleCredentialPersistenceWarning', 'renderShareDialog'
+        )
+        render = function_source('renderShareDialog', 'openPhoneShareDialog')
+        self.assertIn(
+            "config?.credential_persistence === 'memory-only'", warning
+        )
+        self.assertIn("class='share-note share-memory-warning'", warning)
+        self.assertIn('Google sign-in is memory-only', warning)
+        self.assertIn(
+            'Windows protected credential storage is unavailable', warning
+        )
+        self.assertIn('Reconnect Google Drive after restarting it', warning)
+        self.assertGreaterEqual(
+            render.count('googleCredentialPersistenceWarning()'), 3
+        )
+
     def test_all_local_phone_share_requests_have_a_bounded_timeout(self):
         helper = function_source('phoneShareLocalFetch', 'getPhoneShareConfig')
         self.assertIn('new AbortController()', helper)
@@ -166,7 +225,11 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('clearTimeout(timeout)', helper)
         self.assertIn("fetch(path, { ...options, signal: controller.signal })", helper)
         self.assertNotIn("fetch('/api/phone-share", DASHBOARD)
-        for path in ('/api/phone-share/config', '/api/phone-share/connect'):
+        for path in (
+            '/api/phone-share/config',
+            '/api/phone-share/connect',
+            '/api/phone-share/disconnect-google',
+        ):
             with self.subTest(path=path):
                 self.assertIn("phoneShareLocalFetch('" + path, DASHBOARD)
         self.assertIn("phoneShareLocalFetch('/api/phone-share', {", DASHBOARD)
@@ -191,16 +254,34 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
     def test_beginner_copy_explains_private_free_account_owned_storage(self):
         render = function_source('renderShareDialog', 'openPhoneShareDialog')
         self.assertIn('your private Google Drive app data', DASHBOARD)
-        self.assertIn('Google Desktop credential setup required', DASHBOARD)
-        self.assertIn('RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE', DASHBOARD)
+        self.assertNotIn('Google Desktop credential setup required', render)
+        self.assertNotIn('RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE', render)
         self.assertIn('phoneShareConfig.configuration_error', DASHBOARD)
         self.assertIn('esc(configurationMessage)', DASHBOARD)
+        self.assertIn('No setup or paid account', render)
+        self.assertIn('you do not need an OAuth file, Cloudflare account', render)
+        self.assertIn('stores and logs no tokens', render)
+        self.assertIn('never receives dashboard data', render)
         self.assertIn('bucket, API key, paid storage service', DASHBOARD)
-        self.assertIn('There is no shared RHMRA server', DASHBOARD)
-        self.assertLess(
-            render.index('desktop_credentials_configured'),
-            render.index('phoneShareConfig.connected'),
+        self.assertIn('There is no shared RHMRA dashboard server', DASHBOARD)
+        self.assertIn('The OAuth relay never receives dashboard data', DASHBOARD)
+
+    def test_readme_keeps_manual_oauth_file_out_of_end_user_setup(self):
+        end_user_setup, developer_override = README.split(
+            '#### Developers only: direct OAuth override / relay rollback', 1
         )
+        self.assertNotIn('RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE', end_user_setup)
+        self.assertIn('do **not** download an OAuth JSON file', end_user_setup)
+        self.assertIn('same Google account', end_user_setup)
+        self.assertIn('stores and logs no authorization codes or tokens', end_user_setup)
+        self.assertIn('End users do not need a Cloudflare account', end_user_setup)
+        self.assertIn('Google sign-in is memory-only', end_user_setup)
+        self.assertIn('Disconnect Google Drive', end_user_setup)
+        self.assertIn('always removes the Agent', end_user_setup)
+        self.assertIn('does **not** forget the paired phone', end_user_setup)
+        self.assertIn('could not confirm remote revocation', end_user_setup)
+        self.assertIn('RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE', developer_override)
+        self.assertIn('developer recovery tool', developer_override)
 
 
 if __name__ == '__main__':

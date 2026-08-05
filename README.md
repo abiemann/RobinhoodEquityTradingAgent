@@ -124,7 +124,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 - **daily_loss.py** — the circuit-breaker authority. It consumes raw, fully paginated portfolio/position/order responses and raw quote batches, filters individual executions by Eastern broker date, reconciles them against `intraday_quantity`, and calculates mark-to-market P&L with exact decimal arithmetic. Old GTC orders that fill today, partial fills, same-day round trips, execution fees, and overnight holdings are all included; malformed or incomplete input can only block entries.
 - **filter_scan.py** — turns the raw scan response into the ranked working list: price band, relative-volume floor, and minimum absolute day move (including the `% Change` decimal-fraction → percent conversion), sorted by relative volume and capped at `TOP_N`. Its `--json-out` file is the routine's machine-readable handoff; downstream steps consume that JSON's unrounded values, never the human-formatted stdout table. It also documents the scan response's schema in one place so no run has to rediscover it.
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars. Its transient pre-RSI JSON selects which indicators to fetch; only a validated final RSI-enabled JSON result can authorize a buy. Formatted stdout and ad-hoc calculations are never entry authorities.
-- **tests/** — dependency-free regression tests covering the daily-loss calculator, durable order-intent lifecycle, evaluator, scanner, clock/calendar, concurrent run locking and takeover, dashboard path, the Google Drive phone-share uploader/OAuth flow, phone-share guards, and routine contracts. Run the complete Python suite with `python3 -m unittest discover -s tests` (Windows: `py -3 -m unittest discover -s tests`) before committing any script change; expected market values were verified against live API data. The standalone [RHMRA Phone PWA](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer) and the advanced legacy Cloudflare relay under `phone-share-worker/` each have their own `npm test` command.
+- **tests/** — dependency-free regression tests covering the daily-loss calculator, durable order-intent lifecycle, evaluator, scanner, clock/calendar, concurrent run locking and takeover, dashboard path, the Google Drive phone-share uploader/OAuth flow, phone-share guards, and routine contracts. Run the complete Python suite with `python3 -m unittest discover -s tests` (Windows: `py -3 -m unittest discover -s tests`) before committing any script change; expected market values were verified against live API data. The standalone [RHMRA Phone PWA](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer), the OAuth relay under `phone-share-oauth-broker/`, and the advanced legacy Cloudflare relay under `phone-share-worker/` each have their own `npm test` command.
 
 ## First-time app setup
 
@@ -185,20 +185,15 @@ Only one instance of the trading agent can operate at a time. If another schedul
 
 ### View on Phone setup (optional)
 
-Phone viewing is **off by default**. The recommended v2 design uses the installable [RHMRA Phone PWA](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/) and the user's own private Google Drive app-data area. There is no RHMRA account server, shared financial-data backend, public bucket, or internet-facing laptop web server.
+Phone viewing is **off by default**. The recommended v2 design uses the installable [RHMRA Phone PWA](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/) and the user's own private Google Drive app-data area. There is no RHMRA account server, shared financial-data backend, public bucket, or internet-facing laptop web server. A narrowly scoped OAuth relay participates only in Google token exchange; it never receives dashboard snapshots.
 
-The phone user needs only a free Google account and an Android phone, iPhone, or iPad with a modern browser. A laptop running this source checkout also needs the matching Google **Desktop app OAuth JSON** supplied by the project maintainer. Google requires that file's paired desktop credential during token exchange. The file stays on the laptop; it is never returned by the dashboard API, sent to the phone, or committed to this repository.
-
-#### Configure the laptop credential once
-
-The project maintainer downloads the Desktop app OAuth JSON from Google Cloud. Keep it outside this repository, then set its absolute path in the same terminal before starting the dashboard:
+The phone user needs only a free Google account and an Android phone, iPhone, or iPad with a modern browser. The laptop needs the Agent checkout and an internet connection. End users do **not** download an OAuth JSON file, supply a client secret, deploy Cloudflare, create a bucket, or configure an API key. Start the dashboard normally:
 
 ```powershell
-$env:RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE = 'C:\private\rhmra-google-desktop.json'
 py -3 dashboard\serve.py 9000
 ```
 
-Do not paste the JSON's `client_secret` into the dashboard, a task prompt, `constants.md`, a report, or source control. RHMRA reads the paired client ID and credential locally, keeps the credential out of logs and public configuration, and sends it only to Google's HTTPS token endpoint. The OAuth authorization code still uses S256 PKCE and a one-time state value.
+When the user selects **Connect Google Drive**, the Agent opens Google's authorization page with S256 PKCE and a one-time state value. The RHMRA OAuth relay adds the project's protected Desktop client credential only while forwarding the authorization-code exchange or token refresh to Google. The relay implementation stores and logs no authorization codes or tokens, and it never receives encrypted or decrypted dashboard data. Google Drive access and dashboard uploads remain between the Agent and the user's Google account.
 
 #### Install and pair once
 
@@ -222,26 +217,41 @@ The QR/camera flow is a convenient browser fallback. For an installed app—espe
 
 Pairing normally survives future dashboard sessions. The next time, click **View on Phone → Start sharing with paired phone**; no new QR code is required. The phone checks for a fresh snapshot every 30 seconds while the app is visible, stops polling while it is in the background, and refreshes immediately when reopened. The phone's Google access token deliberately remains only in memory, so the phone may occasionally ask you to reconnect after a reload or token expiry.
 
-#### Stop sharing vs. forget the phone
+On Windows, the Agent normally protects the laptop's Google refresh credential with the signed-in user's DPAPI storage. If that protected storage is unavailable or a save fails, **View on Phone** displays a prominent **Google sign-in is memory-only** warning. Sharing still works for the current dashboard-server process, but Google Drive must be reconnected after the server stops or restarts.
+
+#### Stop sharing, disconnect Google Drive, or forget the phone
 
 - **Stop sharing** deletes the current encrypted Drive snapshot and stops laptop uploads, but keeps the laptop and phone paired. Use this for normal daily use; a later **Start sharing with paired phone** resumes without a new link or QR code.
+- **Disconnect Google Drive** is shown separately when no share is active. After confirmation, it asks Google to revoke the laptop grant and always removes the Agent's in-memory and saved laptop credentials. It does **not** forget the paired phone or automatically delete a separate snapshot; stop sharing first when a snapshot is active. Because the phone and laptop use the same RHMRA Google permission, the phone may ask to reconnect. If RHMRA says Google could not confirm remote revocation, remove RHMRA manually from Google Account permissions for immediate assurance.
 - **Forget paired phone** on the laptop deletes the encrypted snapshot when possible and discards that phone's pairing ID and key. Use it if the phone or private link may be compromised, or when permanently replacing the phone. Also choose **Forget this device** in the phone app; pairing again will require a new private link or QR code.
-- **Forget this device** on the phone clears only that phone's local pairing and in-memory Google token. By itself it cannot delete the laptop's Drive snapshot. For a complete reset, forget the pairing on both devices. Revoking the RHMRA Google application is a separate action in the user's Google Account.
+- **Forget this device** on the phone clears only that phone's local pairing and in-memory Google token. By itself it cannot delete the laptop's Drive snapshot or disconnect the laptop. For a complete reset, stop sharing, disconnect Google Drive, and forget the pairing on both devices.
 
 #### Privacy and failure behavior
 
-- The laptop dashboard stays on `127.0.0.1`, opens no inbound port, and sends only outbound HTTPS requests to Google.
+- The laptop dashboard stays on `127.0.0.1`, opens no inbound port, and sends only outbound HTTPS requests to Google and the OAuth relay.
+- The OAuth relay sees an authorization code or refresh token only while forwarding a token request to Google. Its implementation stores and logs no tokens, and it never receives dashboard snapshots, brokerage credentials, or trading data. End users do not need a Cloudflare account or deployment.
 - RHMRA encrypts a strict, read-only display allowlist locally with AES-256-GCM. Google Drive stores ciphertext in the hidden `appDataFolder`; the requested `drive.appdata` scope cannot browse the user's ordinary Drive files. The phone decrypts locally.
 - Account numbers, broker credentials, connector settings, order IDs, raw ledgers, gate records, reports, constants, and local paths are never shared. The phone app never calls Robinhood or an AI model.
 - Each snapshot is temporary and expires. If an upload, refresh, or deletion fails, trading and the local dashboard continue normally, and the phone view shows the last successful update rather than silently presenting new data as current.
 
 #### Project maintainers only: one-time Google OAuth setup
 
-The maintainer of the public PWA must enable the Google Drive API, configure the consent/branding screen, request only the `https://www.googleapis.com/auth/drive.appdata` scope, and create a **Web application** OAuth client for the hosted PWA plus a **Desktop app** OAuth client for the laptop uploader in the **same Google Cloud project**. Download the Desktop app JSON and provision it locally as described above. Client secrets, downloaded OAuth JSON, access tokens, refresh tokens, and pairing keys must never be committed. See the [RHMRA Phone maintainer guide](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer#maintainer-setup-one-time-not-for-end-users) for the exact hosting, authorized-origin, consent, and release steps.
+The maintainer of the public PWA must enable the Google Drive API, configure and publish the consent/branding screen, request only the `https://www.googleapis.com/auth/drive.appdata` scope, and create a **Web application** OAuth client for the hosted PWA plus a **Desktop app** OAuth client for the laptop uploader in the **same Google Cloud project**. The maintainer deploys the project's stateless OAuth relay once and stores the Desktop client secret only as an encrypted deployment secret. Client secrets, downloaded OAuth JSON, authorization codes, access tokens, refresh tokens, and pairing keys must never be committed or logged. Follow the local [OAuth relay deployment guide](phone-share-oauth-broker/README.md) and the [RHMRA Phone maintainer guide](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer#maintainer-setup-one-time-not-for-end-users) for the exact deployment, hosting, authorized-origin, consent, and release steps.
+
+#### Developers only: direct OAuth override / relay rollback
+
+The built-in relay is the normal end-user path. For local protocol debugging or an emergency maintainer rollback, a developer may instead download the matching Desktop app OAuth JSON, keep it outside this repository, and set its absolute path before starting the dashboard:
+
+```powershell
+$env:RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE = 'C:\private\rhmra-google-desktop.json'
+py -3 dashboard\serve.py 9000
+```
+
+This override sends token requests directly to Google's HTTPS endpoint and deliberately bypasses the built-in relay. Never paste the JSON's `client_secret` into the dashboard, a task prompt, `constants.md`, a report, or source control. It is a developer recovery tool, not an installation step for users.
 
 #### Advanced / legacy self-hosted option: Cloudflare
 
-The original Cloudflare relay remains available for advanced users who deliberately want to deploy and administer their own Worker, Durable Object, Zero Trust application, access policies, and credentials. It is **not required** for the recommended Google Drive/PWA flow. Existing Cloudflare users upgrading to v2 must set `RHMRA_PHONE_SHARE_PROVIDER=cloudflare` in the same terminal that starts the dashboard; without that explicit selector, the dashboard safely stays on the new Google Drive setup path. Follow the [legacy self-hosted Cloudflare guide](phone-share-worker/README.md) for deployment, security, troubleshooting, rotation, and updates. Never put its local secrets in `constants.md`, a task prompt, a report, or a committed file.
+The original encrypted-snapshot Cloudflare relay remains available for advanced users who deliberately want to deploy and administer their own Worker, Durable Object, Zero Trust application, access policies, and credentials. It is separate from the maintainer-operated OAuth token relay and is **not required** for the recommended Google Drive/PWA flow. Existing Cloudflare users upgrading to v2 must set `RHMRA_PHONE_SHARE_PROVIDER=cloudflare` in the same terminal that starts the dashboard; without that explicit selector, the dashboard safely stays on the new Google Drive setup path. Follow the [legacy self-hosted Cloudflare guide](phone-share-worker/README.md) for deployment, security, troubleshooting, rotation, and updates. Never put its local secrets in `constants.md`, a task prompt, a report, or a committed file.
 
 ## Tools
 

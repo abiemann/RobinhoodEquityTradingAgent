@@ -127,6 +127,10 @@
   .share-meta dd { min-width:0; font-variant-numeric:tabular-nums; }
   .share-status { min-height:21px; margin-top:10px; color:var(--dim); }
   .share-status.error { padding:0; border:0; background:none; color:var(--red); }
+  .share-memory-warning { margin-top:14px; border-color:#665522; background:#292516;
+                          color:var(--amber); }
+  .share-account-controls { margin-top:20px; padding-top:16px; border-top:1px solid var(--line); }
+  .share-account-controls p { color:var(--dim); }
   @media (max-width:700px) {
     body { padding:14px; }
     .phone-share-button { margin-left:0; }
@@ -641,6 +645,13 @@ function phoneShareDurationOptions() {
   }).join('');
 }
 
+function googleCredentialPersistenceWarning(config = phoneShareConfig) {
+  return isGoogleDrivePhoneShare(config) &&
+    config?.credential_persistence === 'memory-only'
+    ? `<div class='share-note share-memory-warning'><strong>Google sign-in is memory-only.</strong> Windows protected credential storage is unavailable, so this Google connection will be lost when the dashboard server stops. Reconnect Google Drive after restarting it.</div>`
+    : '';
+}
+
 function renderShareDialog(message = '', isError = false) {
   const content = $('phone-share-content');
   if (phoneShareSession) {
@@ -652,6 +663,7 @@ function renderShareDialog(message = '', isError = false) {
           <dt>Expires</dt><dd>${esc(shareDateTime(session.expiresAt))}</dd></dl>
         <div class='share-controls'><button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button>
           ${session.provider === PHONE_SHARE_GOOGLE_PROVIDER ? `<button id='phone-share-forget' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Forget paired phone</button>` : ''}</div>
+        ${session.provider === PHONE_SHARE_GOOGLE_PROVIDER ? googleCredentialPersistenceWarning() : ''}
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || session.status || 'Uploading the first encrypted snapshot...')}</p>`;
       $('phone-share-stop').addEventListener('click', stopPhoneShare);
       $('phone-share-forget')?.addEventListener('click', forgetGooglePhone);
@@ -671,6 +683,7 @@ function renderShareDialog(message = '', isError = false) {
       <div class='share-controls'>${session.url ? `<button id='phone-share-copy' class='share-action' type='button'>Copy private link</button>` : ''}
         <button id='phone-share-stop' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Stop sharing</button>
         ${google ? `<button id='phone-share-forget' class='share-action danger' type='button'${session.revoking ? ' disabled' : ''}>Forget paired phone</button>` : ''}</div>
+      ${google ? googleCredentialPersistenceWarning() : ''}
       <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || session.status || '')}</p>`;
     if (session.url) {
       try { RhmraQr.render($('phone-share-qr'), session.url); }
@@ -695,17 +708,10 @@ function renderShareDialog(message = '', isError = false) {
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
       return;
     }
-    if (phoneShareConfig.desktop_credentials_configured !== true) {
-      content.innerHTML = `<h3>Google Desktop credential setup required</h3>
-        <p>This source checkout needs the downloaded <strong>Desktop app OAuth JSON</strong> that matches RHMRA's Google client. Keep that file private and outside this repository.</p>
-        <div class='share-note'>Before starting the dashboard, set <code>RHMRA_PHONE_SHARE_GOOGLE_CREDENTIALS_FILE</code> to the JSON file's absolute path. Never paste its client secret into the dashboard, a task prompt, or source control.</div>
-        <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
-      return;
-    }
     if (phoneShareConfig.connected !== true) {
       content.innerHTML = `<h3>Connect your Google Drive</h3>
         <p>Click once to sign in with Google. RHMRA stores encrypted snapshots only in <strong>your private Google Drive app data</strong>, which is hidden from ordinary Drive files.</p>
-        <div class='share-note'><strong>No storage setup:</strong> you do not need a bucket, API key, paid storage service, or internet-facing server. Normal use fits in the free storage included with a Google account.</div>
+        <div class='share-note'><strong>No setup or paid account:</strong> you do not need an OAuth file, Cloudflare account, bucket, API key, paid storage service, or internet-facing server. RHMRA's sign-in relay handles only the brief OAuth token exchange; it stores and logs no tokens and never receives dashboard data.</div>
         <div class='share-controls'><button id='phone-share-connect-google' class='share-action primary' type='button'>Connect Google Drive</button></div>
         <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message)}</p>`;
       $('phone-share-connect-google').addEventListener('click', connectGoogleDrivePhoneShare);
@@ -717,16 +723,20 @@ function renderShareDialog(message = '', isError = false) {
       ? `<p class='share-warning'>This browser cannot securely save a non-extractable key in IndexedDB. The pairing is session-only and will be forgotten when this tab closes.</p>` : '';
     content.innerHTML = `<h3>${paired ? 'Paired phone ready' : 'Pair RHMRA Phone'}</h3>
       <p>Encrypted snapshots go to your private Google Drive app data. The separate RHMRA Phone web app reads and decrypts them only after you pair it.</p>
-      <div class='share-note'><strong>Your data stays yours.</strong> There is no shared RHMRA server, public bucket, API key, or developer account to administer. Google receives only encrypted dashboard data.</div>
+      <div class='share-note'><strong>Your data stays yours.</strong> There is no shared RHMRA dashboard server, public bucket, API key, or developer account to administer. The OAuth relay never receives dashboard data; Google Drive receives only the encrypted snapshot.</div>
       <div class='share-controls'><label class='share-field'>Share duration
         <select id='phone-share-duration' class='share-duration'>${options}</select></label>
         <button id='phone-share-start' class='share-action primary' type='button'${latestPhoneView ? '' : ' disabled'}>${paired ? 'Start sharing with paired phone' : 'Pair phone and create QR code'}</button>
         ${paired ? `<button id='phone-share-forget' class='share-action danger' type='button'>Forget paired phone</button>` : ''}</div>
       ${paired ? `<p class='share-warning'>Starting reuses the non-extractable key already paired with your phone. No new QR code is needed.</p>` : `<p class='share-warning'>The one-time QR code contains the decryption key. Scan it only with a phone you trust.</p>`}
       ${persistenceNote}
+      ${googleCredentialPersistenceWarning()}
+      <div class='share-account-controls'><p><strong>Google account connection</strong><br>Disconnecting removes the saved laptop sign-in and revokes its Google Drive permission. Your paired phone is kept, but it may ask you to reconnect because the phone and laptop use the same RHMRA Google permission.</p>
+        <button id='phone-share-disconnect-google' class='share-action danger' type='button'>Disconnect Google Drive</button></div>
       <p id='phone-share-status' class='share-status${isError ? ' error' : ''}' role='status'>${esc(message || (latestPhoneView ? '' : 'Waiting for the first dashboard snapshot...'))}</p>`;
     $('phone-share-start').addEventListener('click', startPhoneShare);
     $('phone-share-forget')?.addEventListener('click', forgetGooglePhone);
+    $('phone-share-disconnect-google').addEventListener('click', disconnectGoogleDrivePhoneShare);
     return;
   }
 
@@ -838,6 +848,42 @@ async function connectGoogleDrivePhoneShare() {
       }
     } catch { /* The popup is cross-origin after navigation, which is expected. */ }
     renderShareDialog('Unable to connect Google Drive: ' + error.message, true);
+  }
+}
+
+async function disconnectGoogleDrivePhoneShare() {
+  if (phoneShareSession || !isGoogleDrivePhoneShare() ||
+      phoneShareConfig?.connected !== true || !phoneShareConfig?.csrf_token) return;
+  const confirmed = window.confirm(
+    'Disconnect Google Drive from this laptop? Saved Google sign-in will be removed. Your phone pairing stays, but the phone may need to reconnect to Google Drive.'
+  );
+  if (!confirmed) return;
+
+  const button = $('phone-share-disconnect-google');
+  if (!button) return;
+  button.disabled = true;
+  $('phone-share-status').textContent = 'Disconnecting Google Drive and removing saved laptop sign-in...';
+  try {
+    const response = await phoneShareLocalFetch('/api/phone-share/disconnect-google', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-RHMRA-CSRF': phoneShareConfig.csrf_token },
+      body: '{}',
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || `local dashboard returned HTTP ${response.status}`);
+    }
+    phoneShareConfig = { ...phoneShareConfig, connected: false };
+    delete phoneShareConfig.connection_error;
+    try { phoneShareConfig = await getPhoneShareConfig(); }
+    catch { /* The successful local disconnect remains authoritative. */ }
+    const message = result.warning ||
+      'Google Drive disconnected. Saved laptop sign-in was removed and your paired phone was kept. The phone may ask you to reconnect because it shares the RHMRA Google permission.';
+    renderShareDialog(message, Boolean(result.warning));
+  } catch (error) {
+    button.disabled = false;
+    $('phone-share-status').className = 'share-status error';
+    $('phone-share-status').textContent = 'Unable to disconnect Google Drive: ' + error.message;
   }
 }
 
@@ -1000,6 +1046,11 @@ async function recoverGooglePhoneShareAuthorization(response, session) {
   const errorDocument = await response.json().catch(() => ({}));
   const authorizationErrors = new Set([
     'Google Drive is not connected',
+    'Google sign-in service is not configured',
+    'Google sign-in service needs attention',
+    'Google sign-in service is unavailable',
+    // Recognize releases that reported the old local-credential wording, but
+    // never send users back to a manual credential-file setup.
     'Google Desktop credentials need attention',
     'Google Desktop credentials are not configured',
     'phone sharing is not configured',
@@ -1010,8 +1061,6 @@ async function recoverGooglePhoneShareAuthorization(response, session) {
     ...phoneShareConfig,
     provider: PHONE_SHARE_GOOGLE_PROVIDER,
     configured: errorDocument.error !== 'phone sharing is not configured',
-    desktop_credentials_configured:
-      errorDocument.error !== 'Google Desktop credentials are not configured',
     connected: false,
     connection_error: errorDocument.error,
   };
@@ -1030,9 +1079,8 @@ async function recoverGooglePhoneShareAuthorization(response, session) {
   if (incompleteNewPairing) await clearStoredGooglePhonePairing();
 
   const guidance = isGoogleDrivePhoneShare(config)
-    ? config.connection_error || config.configuration_error ||
-      (config.desktop_credentials_configured !== true
-        ? 'Configure the Google Desktop credential before sharing again.'
+    ? (config.configured === false
+        ? 'Google sign-in is temporarily unavailable. Update RHMRA or try again later.'
         : 'Reconnect Google Drive before sharing again.')
     : 'Phone sharing configuration changed. Start a new share.';
   const pairingStatus = incompleteNewPairing

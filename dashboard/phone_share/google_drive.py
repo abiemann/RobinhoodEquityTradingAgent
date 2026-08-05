@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 DRIVE_APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 GOOGLE_DRIVE_FILES_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_DRIVE_DOWNLOAD_ENDPOINT = "https://www.googleapis.com/download/drive/v3/files"
 GOOGLE_DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files"
@@ -51,6 +52,7 @@ MAX_ENVELOPE_BYTES = 393216
 MAX_TTL_SECONDS = 8 * 60 * 60
 MAX_CLOCK_SKEW_SECONDS = 2 * 60
 MAX_OAUTH_RESPONSE_BYTES = 65536
+MAX_OAUTH_REVOCATION_RESPONSE_BYTES = 4096
 
 
 class PhoneShareProviderError(RuntimeError):
@@ -194,6 +196,7 @@ class GoogleDriveConfig:
     max_response_bytes: int = 524288
     refresh_leeway_seconds: int = 60
     client_secret: Optional[str] = field(default=None, repr=False)
+    oauth_token_endpoint: str = GOOGLE_TOKEN_ENDPOINT
 
     def __post_init__(self) -> None:
         suffix = ".apps.googleusercontent.com"
@@ -215,6 +218,7 @@ class GoogleDriveConfig:
                 "invalid_google_client_secret",
                 "The Google OAuth desktop credential is invalid.",
             )
+        self._validate_oauth_token_endpoint()
 
         if not isinstance(self.redirect_uri, str):
             raise PhoneShareProviderError(
@@ -267,6 +271,46 @@ class GoogleDriveConfig:
         ):
             raise PhoneShareProviderError(
                 "invalid_refresh_leeway", "The OAuth refresh window is invalid."
+            )
+
+    def _validate_oauth_token_endpoint(self) -> None:
+        endpoint = self.oauth_token_endpoint
+        if not isinstance(endpoint, str):
+            raise PhoneShareProviderError(
+                "invalid_oauth_token_endpoint",
+                "The OAuth credential service address is invalid.",
+            )
+        try:
+            parsed = urllib.parse.urlsplit(endpoint)
+            port = parsed.port
+        except ValueError:
+            parsed = None
+            port = None
+        if (
+            parsed is None
+            or parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 443}
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc != parsed.hostname.lower()
+            or (
+                endpoint != GOOGLE_TOKEN_ENDPOINT
+                and parsed.path != "/oauth/token"
+            )
+        ):
+            raise PhoneShareProviderError(
+                "invalid_oauth_token_endpoint",
+                "The OAuth credential service address is invalid.",
+            )
+        if self.client_secret is not None and endpoint != GOOGLE_TOKEN_ENDPOINT:
+            # Local Desktop credentials may be posted only to Google's fixed
+            # endpoint, never to an OAuth relay supplied by a caller.
+            raise PhoneShareProviderError(
+                "invalid_oauth_token_endpoint",
+                "The OAuth credential service address is invalid.",
             )
 
 
@@ -517,6 +561,53 @@ class InMemoryOAuthSession:
             # A failed cleanup must not resurrect credentials or reveal them.
             return
 
+    def revoke_credentials(self) -> bool:
+        """Revoke the current Google grant without exposing its token.
+
+        The refresh token is preferred because revoking it invalidates the
+        long-lived grant. The access-token fallback is retained for defensive
+        compatibility with credentials that have no refresh token. This
+        method deliberately does not clear local state: the caller must do so
+        in a ``finally`` block so a network failure can never leave a user who
+        selected Disconnect with locally usable credentials.
+
+        ``False`` means there were no credentials or Google reported that the
+        token was already invalid. Both are successful disconnect outcomes.
+        """
+        credentials = self._credentials
+        if credentials is None:
+            return False
+        token_value = credentials.refresh_token or credentials.access_token
+        token = _safe_header_token(token_value, "revocation token")
+        form = urllib.parse.urlencode({"token": token}).encode("ascii")
+        response = self.transport.request(
+            "POST",
+            GOOGLE_REVOCATION_ENDPOINT,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "RHMRA-Dashboard/2",
+            },
+            body=form,
+            timeout=self.config.request_timeout_seconds,
+            max_response_bytes=MAX_OAUTH_REVOCATION_RESPONSE_BYTES,
+        )
+        if response.url != GOOGLE_REVOCATION_ENDPOINT:
+            raise PhoneShareProviderError(
+                "oauth_revoke_failed",
+                "Google could not confirm that the Drive connection was revoked.",
+            )
+        if response.status == 200:
+            return True
+        if response.status == 400:
+            # Google's revocation endpoint may report an invalid or already
+            # revoked token as a bad request. Never inspect or echo its body.
+            return False
+        raise PhoneShareProviderError(
+            "oauth_revoke_failed",
+            "Google could not confirm that the Drive connection was revoked.",
+        )
+
     def set_credentials(self, credentials: OAuthCredentials) -> None:
         if not isinstance(credentials, OAuthCredentials):
             raise PhoneShareProviderError(
@@ -552,9 +643,6 @@ class InMemoryOAuthSession:
             try:
                 credentials = self._refresh(credentials)
             except PhoneShareProviderError as exc:
-                if exc.code == "oauth_client_credentials_rejected":
-                    self.clear_credentials()
-                    raise
                 if exc.code != "oauth_refresh_revoked":
                     raise
                 self.clear_credentials()
@@ -621,9 +709,10 @@ class InMemoryOAuthSession:
         return _safe_header_token(code_values[0], "authorization code")
 
     def _token_request(self, form: bytes, error_code: str) -> Dict[str, Any]:
+        token_endpoint = self.config.oauth_token_endpoint
         response = self.transport.request(
             "POST",
-            GOOGLE_TOKEN_ENDPOINT,
+            token_endpoint,
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -633,11 +722,20 @@ class InMemoryOAuthSession:
             timeout=self.config.request_timeout_seconds,
             max_response_bytes=MAX_OAUTH_RESPONSE_BYTES,
         )
-        if response.url != GOOGLE_TOKEN_ENDPOINT:
+        if response.url != token_endpoint:
             raise PhoneShareProviderError(
                 error_code, "Google OAuth could not issue a storage credential."
             )
         if response.status != 200:
+            if (
+                token_endpoint != GOOGLE_TOKEN_ENDPOINT
+                and response.status in {429, 502, 503, 504}
+            ):
+                raise PhoneShareProviderError(
+                    "oauth_service_unavailable",
+                    "Google sign-in is temporarily unavailable. Try again shortly; "
+                    "if the problem continues, update RHMRA.",
+                )
             document: Mapping[str, Any] = {}
             if response.status in {400, 401}:
                 try:
