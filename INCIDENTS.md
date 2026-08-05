@@ -484,7 +484,55 @@ regardless of who created it.
 
 **2026-07-16.** PowerShell `Get-Content`/`Set-Content` round-trips and shell redirection mis-decode
 UTF-8: em-dashes and ✓/🔔 came out as mojibake across `constants.md`, costing a cleanup commit
-(`fbdc579`). Use the `Write` tool for every file a run creates.
+(`fbdc579`). Use the runner's file-change/edit facility for every human-authored project artifact
+a run creates; the visible tool does not need to be named literally `Write`. This report/status
+rule does not establish provenance for raw broker responses, whose stricter transport limits are
+covered by the daily-loss incidents below.
+
+## DASHBOARD P&L — unexplained one-cent differences
+
+**2026-08-03 through 2026-08-04.** The account card showed broker realized P&L of **$16.55** while
+the strategy table showed **$16.54**; the next day the same disagreement appeared as **$21.29**
+versus **$21.28**. Both displays looked exact, so even a one-cent disagreement made the financial
+dashboard look untrustworthy.
+
+**Root cause:** the strategy side had been derived from rounded position-average values and mixed
+floating/display arithmetic rather than the exact acquisition executions in the local trade
+ledger. For example, a basis rounded from 2.6299 to 2.6300 changes a fractional-share sale by more
+than a cent before display rounding. Robinhood's account-wide realized figure also has a different
+scope and remains authoritative; agreement must be demonstrated, not manufactured.
+
+**Rules produced:** `ledger_pnl.py` is now the sole strategy-P&L calculator. It chronologically
+reconstructs matched acquisition pools from exact base-10 execution quantities/prices, applies one
+documented per-fill half-away-from-zero cent policy, and exposes sanitized integer cents to both
+desktop and phone views. Missing or unmatched basis is visibly incomplete/estimated, never zero.
+Agreement is quiet; only a real broker/strategy difference or incomplete comparison raises a
+warning, and the broker figure remains labeled as authoritative.
+
+## VIEW ON PHONE — OAuth, Drive downloads, and durable local state
+
+**2026-08-03 through 2026-08-04.** The first Google callback ended at **Google Drive was not
+connected** because the selected Desktop OAuth client required its generated client credential
+during token exchange even with PKCE. After authorization worked, the phone could remain at
+“Loading the latest encrypted snapshot” because media downloads used the Drive metadata host
+instead of the dedicated download endpoint. Pull-to-refresh then exposed another rough edge: the
+verified dashboard disappeared behind setup/reconnect UI, and a forget/re-pair cycle could fail
+while replacing local pairing storage.
+
+**Rules produced:** the normal end-user path now uses a maintainer-operated, stateless OAuth relay;
+the Desktop secret stays in the relay's encrypted deployment secret and users need no downloaded
+OAuth JSON, Cloudflare account, API key, or public laptop server. Authorization uses S256 PKCE and
+one-time state, Drive access is limited to the user's hidden `appDataFolder`, and snapshots remain
+AES-256-GCM ciphertext until decrypted on the paired device. The Drive client uses the media
+download endpoint. The installed phone app retains its non-extractable pairing key and last
+verified dashboard across polling refreshes and page reloads, shows a disconnected/reconnect state
+without erasing that dashboard, and requires the same Google account on both sides because each
+account has a separate app-data area. Forget/stop/disconnect actions are separate and explicit.
+
+**Release lesson:** moving Google's audience to **In production** removes the test-user allowlist;
+it does not by itself substitute for any separate branding/scope verification. A release smoke
+test therefore uses an account that was never a test user and exercises connect, pair, download,
+pull-to-refresh, reconnect, stop, disconnect, and forget behavior.
 
 ## DAILY LOSS — broker snapshot persistence and invisible invocations
 
@@ -511,21 +559,45 @@ spots whenever a run stopped before the final refresh.
 **Rules produced:** `broker_snapshot.py` now preflights the real session scratch directory and
 deterministically unwraps, semantically validates, atomically stages, reads back, hashes, and
 cursor-seals every breaker input. The preferred source is the harness's own tool-result file; the
-only fallback is one complete untouched response written by the proven file tool. Any failure
-discards the entire generation and permits one wholly fresh generation—never a page repair or
-cross-generation mix. `run_lifecycle.py` records every invocation before configuration or broker
-access in an append-only journal and publishes a strict safe projection, letting the dashboard
-distinguish real risk halt, snapshot failure, overlap, lease loss, configuration halt, coordination
-halt, and final-status unavailability without exposing account or credential data.
+intended fallback is one complete untouched response carried by the runner's file-change facility.
+Any failure discards the entire generation and permits one wholly fresh generation—never a page
+repair or cross-generation mix. `run_lifecycle.py` records every invocation before configuration
+or broker access in an append-only journal and publishes a strict safe projection, letting the
+dashboard distinguish real risk halt, snapshot failure, overlap, lease loss, configuration halt,
+coordination halt, and final-status unavailability without exposing account or credential data.
+
+**2026-08-04 22:35 follow-up.** A manual closed-session run reproduced `snapshot failure` even
+though every Robinhood read succeeded. The run searched for an automatically mirrored tool-result
+file, invented two nonexistent portfolio source paths, and then passed `--request-cursor FIRST` to
+portfolio staging (a flag valid only for positions/orders). It also performed the entry-only daily
+loss guard despite an already-consulted START CLOCK that said `session: closed` and
+`entry_session_open: false`. At 22:35 Pacific it was 01:35 Eastern the next day; after-hours had
+ended at 20:00 Eastern, so the truthful neutral label was `market closed`.
+
+**Mitigation implemented (unit-tested; live scheduler validation pending):** deterministic
+entry-impossibility gates now run after FIRST's
+position-safety work but before SECOND. A closed-session, regular-hours-policy, blackout,
+low-buying-power, or SPY-blocked run skips the daily-loss and stop-count entry guards, records them
+as not evaluated, and completes normally. Eligible runs preflight a static file-change
+response-source probe, may not guess or search for a result path, and must omit pagination flags
+for portfolio/quotes. That probe proves
+only that the selected external source path can be written, read, and parsed; it cannot prove that
+a later full broker response crossed the harness boundary byte-for-byte. The runner also still
+needs a writable external source area. Semantic staging, hashing, the two-generation retry, and
+tomorrow's end-to-end automation run remain the defenses for that residual tool-surface risk. The
+dashboard maps a completed structured closed session to `market closed` while retaining red
+`snapshot failure` for a genuinely eligible run whose breaker capture fails.
 
 ---
 
 ## The pattern across all of these
 
-Ten of these are the same bug class: **the spec didn't say, so the agent improvised.** One
+Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One
 (`4d374ed`) is rarer and worth distinguishing — two specs said different things. Every single one
-was caught by a human reading run logs; **none were self-reported by the system.** That is a real
-observability gap, and any writeup should state it plainly rather than glossing it.
+needed a human to diagnose from run logs. The invocation lifecycle did self-report the August 4
+`snapshot failure`; it did not diagnose the bad handoff or recognize that the entry-only work was
+irrelevant in a closed session. That remaining observability gap should be stated plainly rather
+than glossed over.
 
 The design conclusion: writing a spec for an LLM agent is closer to API design than to
 documentation. Every unspecified degree of freedom is eventually exercised, usually within days,

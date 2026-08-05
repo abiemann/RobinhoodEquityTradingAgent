@@ -10,6 +10,10 @@ Typical use::
 
     python broker_snapshot.py preflight --scratch C:\\path\\to\\session-scratch
 
+    python broker_snapshot.py source-preflight \
+        --scratch C:\\path\\to\\session-scratch \
+        --source C:\\tool-results\\source-probe.json
+
     python broker_snapshot.py stage --kind portfolio \
         --generation A \
         --source C:\\tool-results\\portfolio.json \
@@ -62,6 +66,7 @@ from urllib.parse import parse_qs, urlsplit
 SCHEMA_VERSION = 1
 SCRATCH_MARKER = '.rhmra-broker-snapshot-scratch.json'
 SNAPSHOT_KINDS = ("portfolio", "positions", "orders", "quotes")
+SOURCE_PROBE_PURPOSE = "rhmra-broker-response-source-probe"
 ORDER_STATES = frozenset(
     {
         "new",
@@ -1108,6 +1113,46 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _source_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    """Verify the harness-owned response-source path before broker capture."""
+
+    if not os.path.isabs(args.scratch):
+        raise SnapshotError("--scratch must be an absolute path")
+    scratch = Path(args.scratch).resolve(strict=True)
+    _scratch, marker = _validated_output_scratch(
+        [str(scratch / ".rhmra-source-preflight-unused.json")]
+    )
+
+    if not os.path.isabs(args.source):
+        raise SnapshotError("--source must be an absolute path")
+    source = Path(args.source).resolve(strict=True)
+    project = Path(__file__).resolve().parent
+    if source == project or project in source.parents:
+        raise SnapshotError("response-source probe must remain outside the project folder")
+    if source == scratch or scratch in source.parents:
+        raise SnapshotError("response-source probe must remain outside the marked scratch directory")
+
+    document, raw = _read_source(str(source))
+    expected = {
+        "schema_version": Decimal(SCHEMA_VERSION),
+        "purpose": SOURCE_PROBE_PURPOSE,
+    }
+    if document != expected:
+        raise SnapshotError(f"{source}: invalid broker-response source probe")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "source-preflight",
+        "ok": True,
+        "scratch": str(scratch),
+        "scratch_id": marker["scratch_id"],
+        "source": str(source),
+        "source_sha256": _sha256(raw),
+        "strict_json": True,
+        "outside_scratch": True,
+    }
+
+
 def _parser() -> JsonArgumentParser:
     parser = JsonArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1116,6 +1161,12 @@ def _parser() -> JsonArgumentParser:
 
     preflight = subparsers.add_parser("preflight", help="verify session scratch I/O")
     preflight.add_argument("--scratch", required=True)
+
+    source_preflight = subparsers.add_parser(
+        "source-preflight", help="verify the harness response-source transport"
+    )
+    source_preflight.add_argument("--scratch", required=True)
+    source_preflight.add_argument("--source", required=True)
 
     stage = subparsers.add_parser("stage", help="unwrap, validate, and stage snapshots")
     stage.add_argument("--kind", choices=SNAPSHOT_KINDS, required=True)
@@ -1154,10 +1205,19 @@ def _print_json(result: Mapping[str, Any]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    action = arguments[0] if arguments and arguments[0] in {"preflight", "stage"} else "unknown"
+    action = (
+        arguments[0]
+        if arguments and arguments[0] in {"preflight", "source-preflight", "stage"}
+        else "unknown"
+    )
     try:
         args = _parser().parse_args(arguments)
-        result = _preflight(args) if args.action == "preflight" else _stage(args)
+        if args.action == "preflight":
+            result = _preflight(args)
+        elif args.action == "source-preflight":
+            result = _source_preflight(args)
+        else:
+            result = _stage(args)
         _print_json(result)
         return 0
     except (SnapshotError, OSError) as exc:

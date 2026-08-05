@@ -871,6 +871,12 @@ class DailyLossTests(unittest.TestCase):
             block,
         )
         self.assertIn("harness-created tool-result file/resource", block)
+        self.assertIn("`fileChange` / file-edit / apply-patch", block)
+        self.assertIn("Do not require a tool literally named `Write`", block)
+        self.assertIn("NEVER invent a filename, guess a temp location", block)
+        self.assertIn("broker_snapshot.py source-preflight", block)
+        self.assertIn("including all `data`, pagination, transport-envelope, and `guide` fields", block)
+        self.assertIn("portfolio and quote stage commands MUST omit both options", block)
         self.assertIn("broker_snapshot.py stage --generation <A|B>", block)
         self.assertGreaterEqual(block.count("--snapshot-generation <A|B>"), 2)
         self.assertIn("shared set ID", block)
@@ -894,7 +900,8 @@ class DailyLossTests(unittest.TestCase):
             "The filename is exactly:", 1
         )[0]
         self.assertIn("or null only when that telemetry call failed twice", snapshot)
-        self.assertIn("<clear|tripped|indeterminate>", snapshot)
+        self.assertIn("<clear|tripped|indeterminate|not-evaluated>", snapshot)
+        self.assertIn("<integer|null>", snapshot)
 
         with open(
             os.path.join(ROOT, "dashboard", "index.html"),
@@ -3072,6 +3079,45 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.assertTrue(document['ok'])
         return document
 
+    def test_source_preflight_proves_external_file_change_transport(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            scratch_result = self.preflight(scratch)
+            source = self.write_json(
+                td,
+                'source-probe.json',
+                {
+                    'schema_version': 1,
+                    'purpose': 'rhmra-broker-response-source-probe',
+                },
+            )
+
+            proc, result = self.invoke(
+                'source-preflight', '--scratch', scratch, '--source', source
+            )
+            self.assertEqual(proc.returncode, 0, (result, proc.stderr))
+            self.assertEqual(result['action'], 'source-preflight')
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['scratch_id'], scratch_result['scratch_id'])
+            self.assertEqual(result['source'], os.path.abspath(source))
+            self.assertTrue(result['strict_json'])
+            self.assertTrue(result['outside_scratch'])
+
+            inside = self.write_json(
+                scratch,
+                'inside-probe.json',
+                {
+                    'schema_version': 1,
+                    'purpose': 'rhmra-broker-response-source-probe',
+                },
+            )
+            rejected, error = self.invoke(
+                'source-preflight', '--scratch', scratch, '--source', inside
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('outside the marked scratch directory', error['error']['message'])
+
     def stage(self, kind, sources, outputs, *extra, generation='A'):
         args = ['stage', '--kind', kind, '--generation', generation]
         for source in sources:
@@ -3132,6 +3178,26 @@ class BrokerSnapshotTests(unittest.TestCase):
             ):
                 with open(output, encoding='utf-8') as handle:
                     self.assertEqual(json.load(handle), expected)
+
+    def test_portfolio_stage_rejects_pagination_cursor_flags(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            source = self.write_json(
+                td,
+                'portfolio.json',
+                {'data': {'total_value': '1500.01', 'cash': '100'}},
+            )
+            output = os.path.join(scratch, 'portfolio-out.json')
+            proc, result = self.stage(
+                'portfolio', [source], [output], '--request-cursor', 'FIRST'
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(
+                '--request-cursor is not valid for portfolio',
+                result['error']['message'],
+            )
 
     def test_strict_json_and_malformed_semantic_shapes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4354,6 +4420,11 @@ class DashboardClientContractTests(unittest.TestCase):
             self.assertIn(label, dashboard)
         self.assertIn('return "skipped";', dashboard)
         self.assertIn('return "halted";', dashboard)
+        self.assertIn('function skipLabel(reason, session)', dashboard)
+        self.assertIn('"closed", "closed-weekend", "closed-holiday", "closed-early"', dashboard)
+        self.assertIn('return "market closed";', dashboard)
+        self.assertIn('skipLabel(reason, s.session)', dashboard)
+        self.assertIn('skipLabel(reason, status.session)', dashboard)
         self.assertIn(
             "every scheduler invocation; the label shows its trade or terminal outcome",
             dashboard,
@@ -4729,6 +4800,15 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("entry_session_open", routine)
         self.assertIn("exactly the JSON boolean `true`", routine)
         self.assertIn("This applies regardless of `REGULAR_HOURS_BUY_ONLY`", routine)
+        run_order = routine.split("### RUN THESE STEPS IN ORDER", 1)[1]
+        feasibility = run_order.index("**PRE-SECOND ENTRY-FEASIBILITY GATES")
+        second = run_order.index("**SECOND — circuit breaker check")
+        self.assertLess(feasibility, second)
+        pre_second = run_order[feasibility:second]
+        self.assertIn("do NOT run SECOND", pre_second)
+        self.assertIn('`circuit_breaker: "not-evaluated"`', pre_second)
+        self.assertIn('`stop_fills_today: null`', pre_second)
+        self.assertIn("finish lifecycle as normal `completed`", pre_second)
 
     def test_routine_fences_overlaps_and_rechecks_time_before_buys(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

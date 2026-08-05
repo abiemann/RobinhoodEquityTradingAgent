@@ -1383,7 +1383,11 @@ function parseLedger(document) {
 }
 // Compress the gate's own sentence to one token for the chip; the untouched
 // sentence stays in the tooltip.
-function skipLabel(reason) {
+function skipLabel(reason, session) {
+  if (["closed", "closed-weekend", "closed-holiday", "closed-early"].includes(session)) {
+    return "market closed";
+  }
+  if (session === "calendar-unknown") return "calendar unavailable";
   for (const [re, label] of [[/blackout/i, "blackout"], [/\bSPY\b/i, "spy-red"],
                              [/pre-market/i, "pre-market"], [/after-hours|extended/i, "after-hours"],
                              [/buying power|MIN_ORDER_DOLLARS/i, "low buying power"]]) {
@@ -1575,7 +1579,7 @@ async function renderLegacyRuns(statusNames, gateNames, rows, config) {
       const parts = tradeLabels(fills);
       // holdings management runs even when the scan does not, so a run can both
       // trade and report a skipped entry phase -- show both.
-      if (phase === "skipped") parts.push(skipLabel(reason));
+      if (phase === "skipped") parts.push(skipLabel(reason, s.session));
       else if (phase === "halted") parts.push("halted");
       else if (!parts.length) parts.push("scanned");
       const rejected = phase === "ran" ? await rejectedSymbols(n, availableGates) : [];
@@ -1673,7 +1677,7 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
         if (statusTip) tip += `; ${statusTip}`;
       }
     } else if (status) {
-      if (statusPhase === "skipped") parts.push(skipLabel(reason));
+      if (statusPhase === "skipped") parts.push(skipLabel(reason, status.session));
       else if (statusPhase === "halted") parts.push("halted");
       else if (!parts.length) parts.push("scanned");
       const rejected = statusPhase === "ran" && record.name
