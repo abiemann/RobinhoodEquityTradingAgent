@@ -2,7 +2,7 @@
 
 A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** account. It screens for liquid, unusually-active stocks in a set price band, takes profits on winners, buys pullbacks, and sets protective stops — placing orders through the Robinhood agentic-trading MCP tools with per-trade notifications.
 
-> ⚠️ **This project is not production ready. Use it at your own risk.** See the [Disclaimer](#disclaimer).
+> ⚠️ **Automated trading can cause rapid and substantial financial loss. Use only money you can afford to lose.** See the [Disclaimer](#disclaimer).
 
 ## What it does
 
@@ -274,4 +274,4 @@ For Windows Python 3 installation and Codex-shell troubleshooting, see [Python 3
 
 ## Disclaimer
 
-**This project is not production ready — use it entirely at your own risk.** It is a personal execution framework for a self-specified strategy, hardened through live iteration but never formally validated: there is no backtesting, and the strategy parameters are untested against historical data (the regression tests in `tests/` cover the deterministic script math, not the strategy). It is **not financial advice** and not a recommendation of any screen, ticker, or parameter. Automated trading of volatile, unusually-active stocks carries real risk of loss, and an autonomous agent acts on your account without asking first. Understand the code, start with the order-approval gate on, and use only money you can afford to lose.
+**Automated trading can cause rapid and substantial financial loss. Use this project entirely at your own financial risk and only with money you can afford to lose.** It is a personal execution framework for a self-specified strategy, hardened through live iteration but never formally validated: there is no backtesting, and the strategy parameters are untested against historical data (the regression tests in `tests/` cover the deterministic script math, not the strategy). It is **not financial advice** and not a recommendation of any screen, ticker, or parameter. Automated trading of volatile, unusually-active stocks carries real risk of loss, and an autonomous agent acts on your account without asking first. Understand the code and start with the order-approval gate on.
