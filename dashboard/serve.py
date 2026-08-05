@@ -575,8 +575,10 @@ def _canonical_request_path(request_path):
 
 
 class Handler(SimpleHTTPRequestHandler):
-    # Largest request body worth consuming purely to close cleanly.
-    _DRAIN_LIMIT = 1 << 16
+    # Drain every body the API itself accepts so an early auth rejection can
+    # still reach the browser cleanly. Larger, unsupported bodies remain
+    # bounded and are deliberately left alone.
+    _DRAIN_LIMIT = PHONE_SHARE_MAX_BODY_BYTES
     # Cap on waiting for a body the client promised but may never send.
     _DRAIN_TIMEOUT_SECONDS = 0.25
 
@@ -585,7 +587,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def handle_one_request(self):
         self._request_body_consumed = False
-        super().handle_one_request()
+        # parse_request() can call send_error() before assigning headers. Also
+        # prevent a malformed keep-alive request from seeing prior headers.
+        self.headers = None
+        return super().handle_one_request()
 
     def _drain_request_body(self):
         """Consume any unread request body before writing a response.
@@ -613,9 +618,13 @@ class Handler(SimpleHTTPRequestHandler):
         if getattr(self, '_request_body_consumed', False):
             return
         self._request_body_consumed = True
-        if self.headers is None or self.headers.get('Transfer-Encoding'):
+        headers = getattr(self, 'headers', None)
+        if headers is None or headers.get('Transfer-Encoding'):
             return
-        lengths = self.headers.get_all('Content-Length') or []
+        get_all = getattr(headers, 'get_all', None)
+        if get_all is None:
+            return
+        lengths = get_all('Content-Length') or []
         if len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,10}', lengths[0]):
             return
         remaining = int(lengths[0])

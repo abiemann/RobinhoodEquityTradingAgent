@@ -2,6 +2,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -553,6 +554,44 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             with self.subTest(attempt=attempt):
                 status, _, _ = self.request('POST', path, body=b'{}')
                 self.assertEqual(status, 403)
+
+    def test_rejected_supported_maximum_body_reliably_returns_its_status(self):
+        """The bounded drain covers every request size the API accepts."""
+        self.configure_builtin_broker()
+        self.assertGreaterEqual(
+            SERVER.Handler._DRAIN_LIMIT,
+            SERVER.PHONE_SHARE_MAX_BODY_BYTES,
+        )
+        path = '/api/phone-share'
+        body = b'x' * SERVER.PHONE_SHARE_MAX_BODY_BYTES
+        for attempt in range(60):
+            with self.subTest(attempt=attempt):
+                status, _, _ = self.request('POST', path, body=body)
+                self.assertEqual(status, 403)
+
+    def test_parser_error_before_headers_exist_returns_http_error(self):
+        """send_error remains safe when parse_request has no headers yet."""
+        malformed = (
+            ('headers-not-created', b'GET / HTTP/9.9\r\n\r\n', 505),
+            ('plain-dict-headers', b'GET /\r\n', 403),
+        )
+        for label, request, expected_status in malformed:
+            with self.subTest(case=label):
+                response = bytearray()
+                with socket.create_connection(
+                    ('127.0.0.1', self.server.server_port), timeout=2
+                ) as client:
+                    client.sendall(request)
+                    client.shutdown(socket.SHUT_WR)
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        response.extend(chunk)
+                self.assertIn(
+                    f'Error code: {expected_status}'.encode('ascii'),
+                    bytes(response),
+                )
 
     def test_disconnect_requires_same_origin_csrf_and_exact_empty_json(self):
         self.configure_builtin_broker()
