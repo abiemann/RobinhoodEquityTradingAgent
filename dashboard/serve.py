@@ -6,13 +6,14 @@ ONLY — the files served include account activity and must never be exposed
 off-machine. Serves exactly three things and refuses everything else:
 
   /dashboard/...       the viewer (index.html and any future assets)
-  /run-reports/...     telemetry the runs publish (status + gates JSON, reports)
+  /run-reports/...     public telemetry only (status + gates JSON, reports)
   /trade-ledger.csv    the append-only fill ledger
 
-plus four conveniences so the page never has to guess filenames or mode:
+plus five conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
+  /api/runs            validated, secret-free invocation lifecycle projection
   /api/config          current DRY_RUN and opening-blackout settings
   /api/ledger          sanitized ledger-basis P&L comparison data
 
@@ -110,10 +111,19 @@ from dashboard.phone_share.public_config import (
     GOOGLE_PHONE_VIEWER_URL,
 )
 from ledger_pnl import LedgerPnlError, reconcile_ledger
+from run_lifecycle import (
+    LifecycleError,
+    PROJECTION_LIMIT,
+    validate_current_projection_read_only,
+)
 from validate_constants import ConstantsValidationError, validate_constants_file
 
-ALLOWED_PREFIXES = ("/dashboard/", "/run-reports/")
+ALLOWED_PREFIXES = ("/dashboard/",)
 ALLOWED_EXACT = ("/trade-ledger.csv",)
+PUBLIC_RUN_REPORT_RE = re.compile(
+    r"/run-reports/rhmra-(?:(?:status|gates)-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json"
+    r"|log-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.md)\Z"
+)
 
 
 def _clean_header_secret(value):
@@ -616,6 +626,33 @@ def _reports(pattern):
     return sorted(os.path.basename(f) for f in files)
 
 
+def _served_static_path(path):
+    return (
+        path.startswith(ALLOWED_PREFIXES)
+        or path in ALLOWED_EXACT
+        or PUBLIC_RUN_REPORT_RE.fullmatch(path) is not None
+    )
+
+
+def _lifecycle_projection():
+    empty = {
+        "schema_version": 1,
+        "record_limit": PROJECTION_LIMIT,
+        "record_count": 0,
+        "source_event_high_watermark": 0,
+        "records": [],
+    }
+    state_file = os.path.join(
+        REPO, "run-reports", "rhmra-run-lifecycle.sqlite3"
+    )
+    projection_file = os.path.join(
+        REPO, "run-reports", "rhmra-run-lifecycle.json"
+    )
+    if not os.path.exists(state_file) and not os.path.exists(projection_file):
+        return empty
+    return validate_current_projection_read_only(state_file, projection_file)
+
+
 def _dashboard_config():
     """Return only dashboard-safe values from the validated configuration."""
     try:
@@ -846,7 +883,7 @@ class Handler(SimpleHTTPRequestHandler):
         path = self._guard()
         if path is None:
             return
-        if path.startswith(ALLOWED_PREFIXES) or path in ALLOWED_EXACT:
+        if _served_static_path(path):
             return super().do_HEAD()
         self.send_error(403, "not served")
 
@@ -905,6 +942,11 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/index":
             return self._json({"status": _reports("rhmra-status-*.json"),
                                "gates": _reports("rhmra-gates-*.json")})
+        if path == "/api/runs":
+            try:
+                return self._json(_lifecycle_projection())
+            except (LifecycleError, OSError, UnicodeError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=500)
         if path == "/api/config":
             return self._json(_dashboard_config())
         if path == "/api/ledger":
@@ -923,7 +965,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._json({"filename": newest, "data": json.load(f)})
             except (OSError, ValueError) as e:
                 return self._json({"filename": newest, "error": str(e)}, status=500)
-        if path.startswith(ALLOWED_PREFIXES) or path in ALLOWED_EXACT:
+        if _served_static_path(path):
             return super().do_GET()
         self.send_error(403, "not served")
 

@@ -486,6 +486,38 @@ regardless of who created it.
 UTF-8: em-dashes and ✓/🔔 came out as mojibake across `constants.md`, costing a cleanup commit
 (`fbdc579`). Use the `Write` tool for every file a run creates.
 
+## DAILY LOSS — broker snapshot persistence and invisible invocations
+
+**2026-08-03 through 2026-08-04.** Seven visible runs showed `halted`, but all seven were
+snapshot/file-handoff failures rather than genuine daily-loss trips. The three examined August 4
+halts were concrete shape/persistence failures: 08:05 supplied a positions page whose `data`
+was not an object; 11:03 could not initialize the scratch writer and had no usable raw snapshots;
+12:02 supplied an orders page whose `data.orders` was not an array. The breaker correctly failed
+closed and placed no new order, but a generic HALTED label made infrastructure trouble look like
+strategy risk.
+
+Two more invocations were invisible: the 07:32 run spent about 42 minutes trying to capture roughly
+130 orders and then lost its lease, and the 09:02 run spent about 32 minutes before losing ownership
+to 09:33. Neither reached the status-snapshot writer, and the dashboard timeline read only status
+filenames. The absence looked like a scheduler gap even though the scheduler had started work.
+The 11:32 run completed at 11:44:59, proving the later 12:02 halt was not caused by overlap.
+
+**Root cause class:** raw MCP responses crossed a fragile context-to-disk boundary. A model-authored
+JSON copy, a session Node writer, or an unverified scratch path could truncate, re-key, wrap, or fail
+to persist a response. Retrying only the visibly bad page would also create a mixed-time breaker
+snapshot. Separately, using an account-state status file as scheduler telemetry guaranteed blind
+spots whenever a run stopped before the final refresh.
+
+**Rules produced:** `broker_snapshot.py` now preflights the real session scratch directory and
+deterministically unwraps, semantically validates, atomically stages, reads back, hashes, and
+cursor-seals every breaker input. The preferred source is the harness's own tool-result file; the
+only fallback is one complete untouched response written by the proven file tool. Any failure
+discards the entire generation and permits one wholly fresh generation—never a page repair or
+cross-generation mix. `run_lifecycle.py` records every invocation before configuration or broker
+access in an append-only journal and publishes a strict safe projection, letting the dashboard
+distinguish real risk halt, snapshot failure, overlap, lease loss, configuration halt, coordination
+halt, and final-status unavailability without exposing account or credential data.
+
 ---
 
 ## The pattern across all of these

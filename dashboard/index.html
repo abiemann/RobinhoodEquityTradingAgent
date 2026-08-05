@@ -172,8 +172,8 @@
 </section>
 
 <section>
-  <h2>Runs today <span class="hint">— every run listed executed; the label is what its <em>entry phase</em> did</span></h2>
-  <div class="runs" id="runs"><span class="empty">no snapshots yet</span></div>
+  <h2>Runs today <span class="hint">— every scheduler invocation; the label shows its trade or terminal outcome</span></h2>
+  <div class="runs" id="runs"><span class="empty">no invocations yet</span></div>
 </section>
 
 <section>
@@ -1435,7 +1435,73 @@ function filenameStart(name) {
   return `${name.slice(13, 23).replace(/_/g, "-")}T${name.slice(24, 29).replace("_", ":")}:00`;
 }
 
-async function renderRuns(statusNames, gateNames, rows, config) {
+function invocationStart(record) {
+  if (typeof record?.run_start_pt === "string" &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(record.run_start_pt)) {
+    return record.run_start_pt.slice(0, 19);
+  }
+  const instant = new Date(record?.started_at_utc);
+  if (!Number.isFinite(instant.getTime())) return null;
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Los_Angeles", hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).formatToParts(instant).map(part => [part.type, part.value]));
+    return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
+  } catch { return null; }
+}
+
+function invocationDay(record) {
+  return invocationStart(record)?.slice(0, 10).replace(/-/g, "_") ?? null;
+}
+
+function lifecycleLabel(classification) {
+  return ({
+    "risk-halt": "risk halt",
+    "snapshot-failure": "snapshot failure",
+    "configuration-halt": "configuration halt",
+    "runtime-budget": "runtime budget skipped",
+    "overlap": "overlap skipped",
+    "coordination-halt": "coordination halt",
+    "lease-lost": "lease lost",
+    "final-status-unavailable": "final status unavailable",
+    "running": "running",
+  })[classification] ?? null;
+}
+
+function lifecycleDisplayPhase(classification, statusPhase) {
+  if (classification === "completed") return statusPhase;
+  if (classification === "overlap" || classification === "runtime-budget" ||
+      classification === "running") return "skipped";
+  return "halted";
+}
+
+function lifecycleTooltip(record) {
+  const label = lifecycleLabel(record?.classification) ?? record?.classification ?? "invocation";
+  const reason = typeof record?.reason_code === "string"
+    ? record.reason_code.replace(/-/g, " ") : null;
+  const phase = typeof record?.latest_phase === "string"
+    ? record.latest_phase.replace(/-/g, " ") : null;
+  return [label, reason, phase].filter(Boolean).join(" — ");
+}
+
+function lifecycleOwnsFillWindow(record) {
+  if (record.status && record.start) return true;
+  if (!record.lifecycle || !record.start) return false;
+  const classification = record.lifecycle.classification;
+  const reason = record.lifecycle.reason_code;
+  if ([
+    "overlap", "configuration-halt", "coordination-halt", "runtime-budget",
+  ].includes(classification)) return false;
+  if (
+    classification === "snapshot-failure" &&
+    reason === "scratch-preflight-failed"
+  ) return false;
+  return true;
+}
+
+async function renderLegacyRuns(statusNames, gateNames, rows, config) {
   if (!statusNames.length) return;
   const today = statusNames[statusNames.length - 1].slice(13, 23); // YYYY_MM_DD of newest
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
@@ -1471,6 +1537,116 @@ async function renderRuns(statusNames, gateNames, rows, config) {
              `<span class="o">${parts.join(", ")}</span></span>`;
     } catch { return `<span class="run" title="unreadable"><span class="t">?</span>` +
                      `<span class="o">${esc(n)}</span></span>`; }
+  }));
+  $("runs").innerHTML = chips.join("");
+}
+
+async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocument) {
+  const lifecycle = Array.isArray(lifecycleDocument?.records)
+    ? lifecycleDocument.records : [];
+  if (!lifecycle.length) {
+    return renderLegacyRuns(statusNames, gateNames, rows, config);
+  }
+
+  const days = [
+    ...statusNames.map(name => name.slice(13, 23)),
+    ...lifecycle.map(invocationDay).filter(Boolean),
+  ].sort();
+  if (!days.length) {
+    $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
+    return;
+  }
+  const today = days[days.length - 1];
+  const names = statusNames.filter(name => name.slice(13, 23) === today);
+  const loaded = await Promise.all(names.map(async name => {
+    try { return { name, status: await getJSON("/run-reports/" + name) }; }
+    catch { return { name, status: null }; }
+  }));
+  const statusByName = new Map(loaded.map(item => [item.name, item.status]));
+  const linked = new Set();
+  const records = lifecycle
+    .filter(record => invocationDay(record) === today)
+    .map(record => {
+      const name = typeof record.status_file === "string" ? record.status_file : null;
+      if (name) linked.add(name);
+      return {
+        lifecycle: record,
+        name,
+        status: name ? statusByName.get(name) ?? null : null,
+        start: invocationStart(record),
+      };
+    });
+  for (const item of loaded) {
+    if (linked.has(item.name)) continue;
+    records.push({
+      lifecycle: null,
+      name: item.name,
+      status: item.status,
+      start: typeof item.status?.run_start_pt === "string"
+        ? item.status.run_start_pt.slice(0, 19) : filenameStart(item.name),
+    });
+  }
+  records.sort((a, b) =>
+    String(a.start).localeCompare(String(b.start)) ||
+    String(a.lifecycle?.invocation_id ?? a.name).localeCompare(
+      String(b.lifecycle?.invocation_id ?? b.name)));
+  // Proven pre-broker lifecycle exits remain visible without splitting a real
+  // owner's fills. Status-less post-broker outcomes (lease loss, final status
+  // failure, or an exhausted breaker snapshot after position management) still
+  // own their ledger window so their fills are not assigned to an earlier run.
+  const fillOwners = records.filter(lifecycleOwnsFillWindow);
+  const nextFillOwner = new Map(fillOwners.map((record, index) => [
+    record,
+    fillOwners[index + 1]?.start ??
+      `${today.replace(/_/g, "-")}T23:59:59`,
+  ]));
+  const availableGates = new Set(gateNames || []);
+  const chips = await Promise.all(records.map(async record => {
+    const start = record.start ?? `${today.replace(/_/g, "-")}T00:00:00`;
+    const next = nextFillOwner.get(record);
+    const fills = next
+      ? (rows || []).filter(row => row.ts >= start && row.ts < next)
+      : [];
+    const parts = tradeLabels(fills);
+    const status = record.status;
+    const statusPhase = status?.guards?.entry_phase ?? "?";
+    const reason = status?.guards?.entry_skip_reason;
+    const classification = record.lifecycle?.classification ?? "legacy";
+    let displayPhase = statusPhase;
+    let tip = "";
+
+    if (record.lifecycle && classification !== "completed") {
+      const label = lifecycleLabel(classification) ?? "invocation outcome unavailable";
+      parts.push(label);
+      displayPhase = lifecycleDisplayPhase(classification, statusPhase);
+      tip = lifecycleTooltip(record.lifecycle);
+      if (status) {
+        const statusTip = runTooltip(status, statusPhase, reason, fills, [], config);
+        if (statusTip) tip += `; ${statusTip}`;
+      }
+    } else if (status) {
+      if (statusPhase === "skipped") parts.push(skipLabel(reason));
+      else if (statusPhase === "halted") parts.push("halted");
+      else if (!parts.length) parts.push("scanned");
+      const rejected = statusPhase === "ran" && record.name
+        ? await rejectedSymbols(record.name, availableGates) : [];
+      tip = runTooltip(status, statusPhase, reason, fills, rejected, config);
+    } else if (record.lifecycle) {
+      parts.push("completed; status unavailable");
+      displayPhase = "halted";
+      tip = lifecycleTooltip(record.lifecycle) || "completed invocation has no linked status";
+    } else {
+      parts.push("unreadable status");
+      displayPhase = "halted";
+      tip = "legacy status snapshot is unreadable";
+    }
+
+    const safePhase = ["ran", "skipped", "halted"].includes(displayPhase)
+      ? displayPhase : "halted";
+    const outcomeClass = record.lifecycle?.classification ?? "legacy";
+    return `<span class="run ${esc(safePhase)} ${esc(outcomeClass)}" title="${esc(tip)}">` +
+      `<span class="t">${start.slice(11, 16)}</span>` +
+      `<span class="o">${parts.join(", ")}</span></span>`;
   }));
   $("runs").innerHTML = chips.join("");
 }
@@ -1640,13 +1816,21 @@ async function refresh() {
     if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
     else if (latest.data) renderSnapshot(latest.data);
     const idx = await getJSON("/api/index");
+    let lifecycle = {records: []};
+    try {
+      lifecycle = await getJSON("/api/runs");
+      if (lifecycle.error) throw new Error(lifecycle.error);
+    } catch (error) {
+      banner("Invocation lifecycle unavailable: " + error);
+      lifecycle = {records: []};
+    }
     let rows = null;
     try {
       rows = parseLedger(await getJSON("/api/ledger"));
     } catch (error) {
       banner("Strategy ledger comparison unavailable: " + error);
     }
-    await renderRuns(idx.status, idx.gates, rows, config);
+    await renderRuns(idx.status, idx.gates, rows, config, lifecycle);
     renderEras(rows);
     renderPnlReconciliation(latest.data, rows);
     const phoneView = latest.data?.schema_version === 1

@@ -204,7 +204,9 @@ def main():
         utc = datetime.now(timezone.utc)
 
     et, et_name, _ = zone_time(utc, EASTERN_STD_OFFSET, "EST", "EDT")
-    pt, pt_name, _ = zone_time(utc, PACIFIC_STD_OFFSET, "PST", "PDT")
+    pt, pt_name, pt_offset = zone_time(
+        utc, PACIFIC_STD_OFFSET, "PST", "PDT"
+    )
     state, since_open, calendar_status, entry_session_open, regular_close = session_state(et)
 
     in_blackout = (state == "regular" and since_open is not None
@@ -214,6 +216,9 @@ def main():
         "utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "et": f"{et:%Y-%m-%d %H:%M:%S} {et_name}",
         "pt": f"{pt:%Y-%m-%d %H:%M:%S} {pt_name}",
+        "pt_iso": pt.replace(
+            tzinfo=timezone(timedelta(hours=pt_offset))
+        ).isoformat(timespec="seconds"),
         "date_et": et.strftime("%Y-%m-%d"),
         "date_pt": pt.strftime("%Y-%m-%d"),
         "constants_sha256": constants_sha256,

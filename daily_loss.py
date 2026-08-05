@@ -59,6 +59,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
+from broker_snapshot import (
+    STAGE_METADATA_SUFFIX,
+    SnapshotError,
+    validate_generation_inputs,
+)
 from market_calendar import core_session_schedule
 from market_clock import EASTERN_STD_OFFSET, session_state, zone_time
 
@@ -1232,6 +1237,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--halt-pct", help="positive daily-loss halt percentage"
     )
+    parser.add_argument(
+        "--snapshot-generation",
+        choices=("A", "B"),
+        help=(
+            "require every staged input to carry matching broker_snapshot "
+            "generation provenance"
+        ),
+    )
     output_group = parser.add_mutually_exclusive_group(required=True)
     output_group.add_argument(
         "--json-out", help="write the final circuit-breaker result here"
@@ -1255,6 +1268,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         _validate_output_not_input(output, inputs)
+        paths_by_kind = {
+            "positions": list(args.positions),
+            "orders": list(args.orders),
+            "quotes": list(args.quotes or []),
+            "portfolio": [args.portfolio] if args.portfolio else [],
+        }
+        has_staging_metadata = any(
+            os.path.exists(path + STAGE_METADATA_SUFFIX) for path in inputs
+        )
+        if args.snapshot_generation is not None:
+            try:
+                validate_generation_inputs(
+                    paths_by_kind, args.snapshot_generation
+                )
+            except SnapshotError as exc:
+                raise DailyLossError(
+                    f"snapshot generation provenance failed: {exc}"
+                ) from exc
+        elif has_staging_metadata:
+            raise DailyLossError(
+                "staged snapshot inputs require --snapshot-generation"
+            )
         position_pages = _load_many(args.positions)
         order_pages = _load_many(args.orders)
 

@@ -10,6 +10,7 @@ verified against live API data on 2026-07-07.
 """
 
 import csv
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -37,9 +38,13 @@ DAILY_LOSS = os.path.join(ROOT, "daily_loss.py")
 VALIDATE_CONSTANTS = os.path.join(ROOT, "validate_constants.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
+BROKER_SNAPSHOT = os.path.join(ROOT, 'broker_snapshot.py')
+RUN_LIFECYCLE = os.path.join(ROOT, 'run_lifecycle.py')
+
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
 import validate_constants as constants_validator
+from broker_snapshot import SnapshotError, validate_generation_inputs
 from market_calendar import (CALENDAR_YEARS, CLOSED_DATES,
                              EARLY_CLOSE_MINUTES_BY_DATE,
                              NORMAL_REGULAR_CLOSE_MINUTE,
@@ -821,6 +826,28 @@ class DailyLossTests(unittest.TestCase):
             encoding="utf-8",
         ) as f:
             routine = f.read()
+        lifecycle = routine.split(
+            "### INVOCATION LIFECYCLE", 1
+        )[1].split("**Mandatory configuration preflight", 1)[0]
+        self.assertLess(
+            routine.index("run_lifecycle.py start"),
+            routine.index("validate_constants.py --json"),
+        )
+        self.assertIn("finish the invocation exactly once", lifecycle.lower())
+        self.assertIn("<START CLOCK pt_iso>", lifecycle)
+        self.assertIn("clock-unavailable", lifecycle)
+        for classification in (
+            "completed",
+            "risk-halt",
+            "snapshot-failure",
+            "overlap",
+            "configuration-halt",
+            "coordination-halt",
+            "lease-lost",
+            "final-status-unavailable",
+        ):
+            self.assertIn(classification, lifecycle)
+        self.assertIn("MUST NOT be emitted", lifecycle)
         block = routine.split("### DAILY-LOSS CIRCUIT BREAKER", 1)[1].split(
             "### RUN THESE STEPS IN ORDER", 1
         )[0]
@@ -835,14 +862,25 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("DAILY-LOSS DISCOVERY", block)
         self.assertIn("DAILY-LOSS FINAL", block)
         self.assertIn(
-            "separate set of FINAL raw files",
+            "separate generation-specific FINAL set",
             block,
         )
         self.assertIn("Never evaluate with the earlier discovery files", block)
         self.assertIn(
-            "--portfolio <FINAL raw portfolio file>",
+            "--portfolio <sealed FINAL portfolio file>",
             block,
         )
+        self.assertIn("harness-created tool-result file/resource", block)
+        self.assertIn("broker_snapshot.py stage --generation <A|B>", block)
+        self.assertGreaterEqual(block.count("--snapshot-generation <A|B>"), 2)
+        self.assertIn("shared set ID", block)
+        self.assertIn("provenance sidecar", block)
+        self.assertIn("aggregate-seal", block)
+        self.assertIn("abandon ALL of A", block)
+        self.assertIn("exactly one whole generation B", block)
+        self.assertIn("never combine generations", block)
+        self.assertIn("never run generation C", block)
+        self.assertIn("`snapshot-failure` / `snapshot-second-attempt-failed`", block)
         self.assertIn("at most 15 minutes old", block)
         self.assertIn(
             "`as_of_utc` exactly DAILY-LOSS FINAL's `utc`",
@@ -869,10 +907,15 @@ class DailyLossTests(unittest.TestCase):
         scratch_creation = routine.index(
             "create one NEW session-scoped scratch directory"
         )
+        scratch_preflight = routine.index(
+            "broker_snapshot.py preflight --scratch <absolute scratch>"
+        )
         self.assertLess(
             scratch_creation,
             routine.index("### DAILY-LOSS CIRCUIT BREAKER"),
         )
+        self.assertLess(scratch_creation, scratch_preflight)
+        self.assertLess(scratch_preflight, routine.index("### DAILY-LOSS CIRCUIT BREAKER"))
         scan_phase = routine.split("6. `run_scan`", 1)[1].split(
             "**FOURTH", 1
         )[0]
@@ -2984,6 +3027,815 @@ class OrderIntentTests(unittest.TestCase):
             self.assertTrue(observed["matched"])
 
 
+class BrokerSnapshotTests(unittest.TestCase):
+    def invoke(self, *args):
+        proc = subprocess.run(
+            [sys.executable, BROKER_SNAPSHOT, *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        try:
+            document = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.fail(
+                f'broker_snapshot.py emitted non-JSON stdout: {proc.stdout!r}; '
+                f'stderr={proc.stderr!r}'
+            )
+        return proc, document
+
+    @staticmethod
+    def write_json(directory, name, document):
+        path = os.path.join(directory, name)
+        with open(path, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(document, handle, separators=(',', ':'), sort_keys=True)
+            handle.write('\n')
+        return path
+
+    @staticmethod
+    def write_text(directory, name, value):
+        path = os.path.join(directory, name)
+        with open(path, 'w', encoding='utf-8', newline='\n') as handle:
+            handle.write(value)
+        return path
+
+    def preflight(self, scratch):
+        proc, document = self.invoke('preflight', '--scratch', scratch)
+        self.assertEqual(proc.returncode, 0, (document, proc.stderr))
+        self.assertEqual(
+            set(document),
+            {
+                'schema_version', 'action', 'ok', 'scratch', 'sentinel_sha256',
+                'scratch_id', 'write_read_parse', 'cleanup_verified',
+            },
+        )
+        self.assertTrue(document['ok'])
+        return document
+
+    def stage(self, kind, sources, outputs, *extra, generation='A'):
+        args = ['stage', '--kind', kind, '--generation', generation]
+        for source in sources:
+            args += ['--source', source]
+        for output in outputs:
+            args += ['--output', output]
+        args += list(extra)
+        return self.invoke(*args)
+
+    def test_strict_transport_envelopes_are_unwrapped_without_rekeying(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+
+            raw = {'data': {'total_value': '1500.01', 'cash': '100'}}
+            raw_source = self.write_json(td, 'raw.json', raw)
+            raw_output = os.path.join(scratch, 'raw-out.json')
+            proc, result = self.stage('portfolio', [raw_source], [raw_output])
+            self.assertEqual(proc.returncode, 0, result)
+            self.assertEqual(result['files'][0]['transport'], 'raw')
+
+            positions = {'data': {'positions': [], 'next': None}}
+            structured_source = self.write_json(
+                td,
+                'structured.json',
+                {'structuredContent': positions},
+            )
+            structured_output = os.path.join(scratch, 'structured-out.json')
+            proc, result = self.stage(
+                'positions', [structured_source], [structured_output]
+            )
+            self.assertEqual(proc.returncode, 0, result)
+            self.assertEqual(result['files'][0]['transport'], 'structuredContent')
+
+            orders = {'data': {'orders': [], 'next': None}}
+            text_source = self.write_json(
+                td,
+                'text.json',
+                {
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': json.dumps(orders, separators=(',', ':')),
+                        }
+                    ]
+                },
+            )
+            text_output = os.path.join(scratch, 'text-out.json')
+            proc, result = self.stage('orders', [text_source], [text_output])
+            self.assertEqual(proc.returncode, 0, result)
+            self.assertEqual(result['files'][0]['transport'], 'content.text')
+
+            for output, expected in (
+                (raw_output, raw),
+                (structured_output, positions),
+                (text_output, orders),
+            ):
+                with open(output, encoding='utf-8') as handle:
+                    self.assertEqual(json.load(handle), expected)
+
+    def test_strict_json_and_malformed_semantic_shapes_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            quote = chr(34)
+            duplicate = (
+                '{' + quote + 'data' + quote + ':{' + quote + 'total_value' +
+                quote + ':' + quote + '1' + quote + '},' + quote + 'data' +
+                quote + ':{' + quote + 'total_value' + quote + ':' + quote +
+                '2' + quote + '}}'
+            )
+            nonfinite = (
+                '{' + quote + 'data' + quote + ':{' + quote + 'total_value' +
+                quote + ':NaN}}'
+            )
+            malformed = '{'
+            cases = [
+                ('portfolio', self.write_text(td, 'duplicate.json', duplicate)),
+                ('portfolio', self.write_text(td, 'nonfinite.json', nonfinite)),
+                ('portfolio', self.write_text(td, 'malformed.json', malformed)),
+                (
+                    'positions',
+                    self.write_json(
+                        td, 'positions-shape.json',
+                        {'data': {'positions': {}, 'next': None}},
+                    ),
+                ),
+                (
+                    'orders',
+                    self.write_json(
+                        td,
+                        'orders-shape.json',
+                        {
+                            'data': {
+                                'orders': [
+                                    {
+                                        'id': 'order-1',
+                                        'state': 'filled',
+                                        'symbol': 'TEST',
+                                        'side': 'sell',
+                                        'cumulative_quantity': '2',
+                                        'executions': [
+                                            {
+                                                'id': 'execution-1',
+                                                'quantity': '1',
+                                                'price': '10',
+                                                'fees': '0',
+                                                'timestamp': '2026-08-04T16:00:00Z',
+                                            }
+                                        ],
+                                    }
+                                ],
+                                'next': None,
+                            }
+                        },
+                    ),
+                ),
+                (
+                    'quotes',
+                    self.write_json(
+                        td, 'quotes-shape.json',
+                        {'data': {'results': [{}] * 21}},
+                    ),
+                ),
+                (
+                    'portfolio',
+                    self.write_json(
+                        td,
+                        'ambiguous-envelope.json',
+                        {
+                            'content': [
+                                {'type': 'text', 'text': '{}'},
+                                {'type': 'text', 'text': '{}'},
+                            ]
+                        },
+                    ),
+                ),
+                (
+                    'portfolio',
+                    self.write_json(
+                        td,
+                        'tool-error.json',
+                        {
+                            'isError': True,
+                            'structuredContent': {
+                                'data': {'total_value': '1500.01'}
+                            },
+                        },
+                    ),
+                ),
+                (
+                    'portfolio',
+                    self.write_json(
+                        td,
+                        'invalid-error-flag.json',
+                        {
+                            'isError': 'false',
+                            'structuredContent': {
+                                'data': {'total_value': '1500.01'}
+                            },
+                        },
+                    ),
+                ),
+            ]
+            for index, (kind, source) in enumerate(cases):
+                output = os.path.join(scratch, f'rejected-{index}.json')
+                with self.subTest(kind=kind, source=os.path.basename(source)):
+                    proc, result = self.stage(kind, [source], [output])
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertFalse(result['ok'])
+                    self.assertEqual(
+                        result['error']['code'], 'invalid_snapshot'
+                    )
+                    self.assertFalse(os.path.exists(output))
+
+    def test_preflight_marker_containment_readback_and_no_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            sibling = os.path.join(td, 'sibling')
+            nested = os.path.join(scratch, 'nested')
+            os.mkdir(scratch)
+            os.mkdir(sibling)
+            os.mkdir(nested)
+            preflight = self.preflight(scratch)
+            self.assertTrue(preflight['write_read_parse'])
+            self.assertTrue(preflight['cleanup_verified'])
+            marker = os.path.join(
+                scratch, '.rhmra-broker-snapshot-scratch.json'
+            )
+            with open(marker, encoding='utf-8') as handle:
+                marker_document = json.load(handle)
+            self.assertEqual(
+                marker_document,
+                {
+                    'schema_version': 1,
+                    'marker': 'rhmra-broker-snapshot-scratch',
+                    'purpose': 'daily-loss-raw-broker-staging',
+                    'scratch_id': preflight['scratch_id'],
+                },
+            )
+            self.assertFalse(
+                any(name.startswith('.rhmra-scratch-preflight-')
+                    for name in os.listdir(scratch))
+            )
+            second, second_result = self.invoke(
+                'preflight', '--scratch', scratch
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertFalse(second_result['ok'])
+
+            payload = {'data': {'total_value': '1500.01'}}
+            source = self.write_json(td, 'portfolio.json', payload)
+            output = os.path.join(scratch, 'portfolio-staged.json')
+            proc, result = self.stage('portfolio', [source], [output])
+            self.assertEqual(proc.returncode, 0, result)
+            with open(output, 'rb') as handle:
+                persisted = handle.read()
+            self.assertEqual(
+                result['files'][0]['payload_sha256'],
+                hashlib.sha256(persisted).hexdigest(),
+            )
+            self.assertEqual(json.loads(persisted), payload)
+
+            proc, rejected = self.stage('portfolio', [source], [output])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(rejected['ok'])
+            with open(output, 'rb') as handle:
+                self.assertEqual(handle.read(), persisted)
+
+            for escaped in (
+                os.path.join(sibling, 'escaped.json'),
+                os.path.join(nested, 'nested.json'),
+            ):
+                proc, rejected = self.stage('portfolio', [source], [escaped])
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(rejected['ok'])
+                self.assertFalse(os.path.exists(escaped))
+
+    def test_cursor_chain_can_be_staged_pagewise_then_sealed_as_a_generation(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            next_url = 'https://agent.robinhood.com/positions?cursor=cursor-two'
+            page_one_source = self.write_json(
+                td,
+                'positions-one.json',
+                {
+                    'data': {
+                        'positions': [
+                            {
+                                'symbol': 'ONE',
+                                'quantity': '1',
+                                'intraday_quantity': '0',
+                                'type': 'long',
+                            }
+                        ],
+                        'next': next_url,
+                    }
+                },
+            )
+            page_two_source = self.write_json(
+                td,
+                'positions-two.json',
+                {
+                    'data': {
+                        'positions': [
+                            {
+                                'symbol': 'TWO',
+                                'quantity': '2',
+                                'intraday_quantity': '1',
+                                'type': 'long',
+                            }
+                        ],
+                        'next': None,
+                    }
+                },
+            )
+            page_one = os.path.join(scratch, 'page-one.json')
+            page_two = os.path.join(scratch, 'page-two.json')
+            proc, first = self.stage(
+                'positions', [page_one_source], [page_one],
+                '--request-cursor', 'FIRST', '--allow-more',
+            )
+            self.assertEqual(proc.returncode, 0, first)
+            self.assertFalse(first['complete'])
+            self.assertEqual(first['files'][0]['next_cursor'], 'cursor-two')
+            proc, second = self.stage(
+                'positions', [page_two_source], [page_two],
+                '--request-cursor', 'cursor-two',
+            )
+            self.assertEqual(proc.returncode, 0, second)
+            self.assertTrue(second['complete'])
+            with self.assertRaisesRegex(
+                SnapshotError, 'one complete aggregate-sealed set'
+            ):
+                validate_generation_inputs(
+                    {'positions': [page_one, page_two]}, 'A'
+                )
+
+            sealed_one = os.path.join(scratch, 'sealed-one.json')
+            sealed_two = os.path.join(scratch, 'sealed-two.json')
+            proc, sealed = self.stage(
+                'positions', [page_one, page_two], [sealed_one, sealed_two],
+                '--request-cursor', 'FIRST',
+                '--request-cursor', 'cursor-two',
+            )
+            self.assertEqual(proc.returncode, 0, sealed)
+            self.assertTrue(sealed['complete'])
+            self.assertEqual(sealed['file_count'], 2)
+            validate_generation_inputs(
+                {'positions': [sealed_one, sealed_two]}, 'A'
+            )
+            self.assertEqual(
+                [item['request_cursor'] for item in sealed['files']],
+                ['FIRST', 'cursor-two'],
+            )
+
+            wrong_one = os.path.join(scratch, 'wrong-one.json')
+            wrong_two = os.path.join(scratch, 'wrong-two.json')
+            proc, rejected = self.stage(
+                'positions', [page_one, page_two], [wrong_one, wrong_two],
+                '--request-cursor', 'FIRST',
+                '--request-cursor', 'wrong-cursor',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(rejected['ok'])
+            self.assertFalse(os.path.exists(wrong_one))
+            self.assertFalse(os.path.exists(wrong_two))
+
+            incomplete = os.path.join(scratch, 'incomplete.json')
+            proc, rejected = self.stage(
+                'positions', [page_one], [incomplete],
+                '--request-cursor', 'FIRST',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(rejected['ok'])
+            self.assertFalse(os.path.exists(incomplete))
+
+    def test_daily_loss_rejects_cross_generation_staged_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            positions_source = self.write_json(
+                td, 'positions.json',
+                {'data': {'positions': [], 'next': None}},
+            )
+            orders_source = self.write_json(
+                td, 'orders.json',
+                {'data': {'orders': [], 'next': None}},
+            )
+            positions_a = os.path.join(scratch, 'positions-a.json')
+            orders_b = os.path.join(scratch, 'orders-b.json')
+            self.assertEqual(
+                self.stage(
+                    'positions', [positions_source], [positions_a],
+                    '--request-cursor', 'FIRST', generation='A',
+                )[0].returncode,
+                0,
+            )
+            self.assertEqual(
+                self.stage(
+                    'orders', [orders_source], [orders_b],
+                    '--request-cursor', 'FIRST', generation='B',
+                )[0].returncode,
+                0,
+            )
+            symbols = os.path.join(scratch, 'symbols.json')
+            proc = subprocess.run(
+                [
+                    sys.executable, DAILY_LOSS,
+                    '--positions', positions_a,
+                    '--orders', orders_b,
+                    '--snapshot-generation', 'A',
+                    '--trading-date', '2026-08-04',
+                    '--as-of-utc', '2026-08-04T19:00:00Z',
+                    '--symbols-out', symbols,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn('generation B does not match A', proc.stderr)
+            self.assertFalse(os.path.exists(symbols))
+
+
+class RunLifecycleTests(unittest.TestCase):
+    TERMINAL_REASONS = {
+        'completed': None,
+        'risk-halt': 'daily-loss-tripped',
+        'snapshot-failure': 'snapshot-retry-exhausted',
+        'configuration-halt': 'configuration-invalid',
+        'runtime-budget': 'runtime-deadline',
+        'overlap': 'scheduler-overlap',
+        'coordination-halt': 'coordination-state',
+        'lease-lost': 'lease-ownership-lost',
+        'final-status-unavailable': 'status-write-failed',
+    }
+
+    def invoke(self, state_file, projection_file, action, *extra, now=None):
+        args = [
+            sys.executable,
+            RUN_LIFECYCLE,
+            action,
+            '--state-file',
+            state_file,
+            '--projection-file',
+            projection_file,
+        ]
+        if now is not None:
+            args += ['--now-utc', now]
+        args += list(extra)
+        proc = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+        try:
+            document = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.fail(
+                f'run_lifecycle.py emitted non-JSON stdout: {proc.stdout!r}; '
+                f'stderr={proc.stderr!r}'
+            )
+        return proc, document
+
+    def start(self, state_file, projection_file, now='2026-08-04T16:00:00Z'):
+        proc, document = self.invoke(
+            state_file, projection_file, 'start', now=now
+        )
+        self.assertEqual(proc.returncode, 0, (document, proc.stderr))
+        self.assertTrue(document['ok'])
+        self.assertEqual(document['classification'], 'running')
+        self.assertEqual(document['phase'], 'scheduled')
+        self.assertIsNone(document['run_start_pt'])
+        return document
+
+    def bind(self, state_file, projection_file, invocation_id):
+        proc, document = self.invoke(
+            state_file,
+            projection_file,
+            'event',
+            '--invocation-id',
+            invocation_id,
+            '--phase',
+            'preflight',
+            '--run-start-pt',
+            '2026-08-04T09:00:01-07:00',
+            now='2026-08-04T16:00:01Z',
+        )
+        self.assertEqual(proc.returncode, 0, (document, proc.stderr))
+        self.assertEqual(document['run_start_pt'], '2026-08-04T09:00:01-07:00')
+        return document
+
+    def test_concurrent_same_second_starts_create_unique_invocations(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+
+            def attempt(_):
+                return self.invoke(
+                    state_file,
+                    projection_file,
+                    'start',
+                    now='2026-08-04T16:00:00Z',
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                attempts = list(pool.map(attempt, range(8)))
+
+            self.assertTrue(
+                all(proc.returncode == 0 for proc, _document in attempts),
+                attempts,
+            )
+            identifiers = [document['invocation_id'] for _proc, document in attempts]
+            self.assertEqual(len(set(identifiers)), 8)
+            self.assertEqual(
+                len({document['sequence'] for _proc, document in attempts}), 8
+            )
+            with open(projection_file, encoding='utf-8') as handle:
+                projection = json.load(handle)
+            self.assertEqual(projection['record_count'], 8)
+            self.assertEqual(
+                {record['invocation_id'] for record in projection['records']},
+                set(identifiers),
+            )
+            self.assertTrue(
+                all(record['run_start_pt'] is None
+                    for record in projection['records'])
+            )
+            proc, validated = self.invoke(
+                state_file, projection_file, 'validate'
+            )
+            self.assertEqual(proc.returncode, 0, validated)
+            self.assertEqual(validated['record_count'], 8)
+
+    def test_terminal_classifications_and_exactly_once_finish(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            finished_ids = {}
+            for classification, reason in self.TERMINAL_REASONS.items():
+                started = self.start(state_file, projection_file)
+                invocation_id = started['invocation_id']
+                self.bind(state_file, projection_file, invocation_id)
+                extra = [
+                    '--invocation-id',
+                    invocation_id,
+                    '--classification',
+                    classification,
+                    '--report-file',
+                    'rhmra-log-2026_08_04-09_00.md',
+                ]
+                if reason is not None:
+                    extra += ['--reason-code', reason]
+                if classification not in {
+                    'overlap', 'lease-lost', 'final-status-unavailable'
+                }:
+                    extra += [
+                        '--status-file',
+                        'rhmra-status-2026_08_04-09_00.json',
+                    ]
+                proc, finished = self.invoke(
+                    state_file,
+                    projection_file,
+                    'finish',
+                    *extra,
+                    now='2026-08-04T16:00:02Z',
+                )
+                self.assertEqual(proc.returncode, 0, finished)
+                self.assertEqual(finished['classification'], classification)
+                self.assertEqual(finished['reason_code'], reason)
+                finished_ids[invocation_id] = classification
+
+                proc, duplicate = self.invoke(
+                    state_file,
+                    projection_file,
+                    'finish',
+                    *extra,
+                    now='2026-08-04T16:00:03Z',
+                )
+                self.assertEqual(proc.returncode, 2)
+                self.assertFalse(duplicate['ok'])
+                self.assertEqual(duplicate['reason'], 'lifecycle_conflict')
+
+            with open(projection_file, encoding='utf-8') as handle:
+                projection = json.load(handle)
+            actual = {
+                record['invocation_id']: record['classification']
+                for record in projection['records']
+            }
+            self.assertEqual(actual, finished_ids)
+            for record in projection['records']:
+                self.assertEqual(record['events'][0]['type'], 'start')
+                self.assertEqual(record['events'][-1]['type'], 'finish')
+                self.assertEqual(record['duration_seconds'], 2)
+
+            started = self.start(state_file, projection_file)
+            proc, rejected = self.invoke(
+                state_file,
+                projection_file,
+                'finish',
+                '--invocation-id',
+                started['invocation_id'],
+                '--classification',
+                'risk-halt',
+                now='2026-08-04T16:00:01Z',
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertFalse(rejected['ok'])
+            self.assertEqual(rejected['reason'], 'lifecycle_state_error')
+
+            proc, wrong_pair = self.invoke(
+                state_file,
+                projection_file,
+                'finish',
+                '--invocation-id',
+                started['invocation_id'],
+                '--classification',
+                'overlap',
+                '--reason-code',
+                'daily-loss-tripped',
+                now='2026-08-04T16:00:01Z',
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn('overlap requires reason code', wrong_pair['detail'])
+
+            proc, completed_reason = self.invoke(
+                state_file,
+                projection_file,
+                'finish',
+                '--invocation-id',
+                started['invocation_id'],
+                '--classification',
+                'completed',
+                '--reason-code',
+                'completed',
+                now='2026-08-04T16:00:01Z',
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(
+                'completed requires reason code none',
+                completed_reason['detail'],
+            )
+
+    def test_clock_binding_rejects_wrong_season_and_noncontemporaneous_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            for timestamp in (
+                '2026-08-04T08:00:01-08:00',
+                '2026-08-04T10:00:01-07:00',
+            ):
+                with self.subTest(timestamp=timestamp):
+                    proc, rejected = self.invoke(
+                        state_file,
+                        projection_file,
+                        'event',
+                        '--invocation-id',
+                        invocation_id,
+                        '--phase',
+                        'preflight',
+                        '--run-start-pt',
+                        timestamp,
+                        now='2026-08-04T17:00:01Z',
+                    )
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertFalse(rejected['ok'])
+
+    def test_projection_is_bounded_to_secret_free_fixed_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            self.bind(state_file, projection_file, invocation_id)
+            proc, event = self.invoke(
+                state_file,
+                projection_file,
+                'event',
+                '--invocation-id',
+                invocation_id,
+                '--phase',
+                'daily-loss',
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, event)
+            proc, finished = self.invoke(
+                state_file,
+                projection_file,
+                'finish',
+                '--invocation-id',
+                invocation_id,
+                '--classification',
+                'completed',
+                '--report-file',
+                'rhmra-log-2026_08_04-09_00.md',
+                '--status-file',
+                'rhmra-status-2026_08_04-09_00.json',
+                now='2026-08-04T16:00:03Z',
+            )
+            self.assertEqual(proc.returncode, 0, finished)
+
+            with open(projection_file, encoding='utf-8') as handle:
+                raw = handle.read()
+            projection = json.loads(raw)
+            self.assertEqual(
+                set(projection),
+                {
+                    'schema_version', 'record_limit', 'record_count',
+                    'source_event_high_watermark', 'records',
+                },
+            )
+            self.assertEqual(projection['record_limit'], 512)
+            self.assertEqual(projection['record_count'], 1)
+            record = projection['records'][0]
+            self.assertEqual(
+                set(record),
+                {
+                    'invocation_id', 'run_start_pt', 'started_at_utc',
+                    'finished_at_utc', 'duration_seconds', 'classification',
+                    'latest_phase', 'reason_code', 'report_file', 'status_file',
+                    'events',
+                },
+            )
+            for event_record in record['events']:
+                self.assertEqual(
+                    set(event_record),
+                    {
+                        'sequence', 'type', 'classification',
+                        'occurred_at_utc', 'phase', 'reason_code',
+                    },
+                )
+            lowered = raw.lower()
+            for forbidden in (
+                'account_number', 'fencing_token', 'access_token',
+                'client_secret', 'credentials', 'broker_response',
+            ):
+                self.assertNotIn(forbidden, lowered)
+
+    def test_validate_rejects_corruption_and_export_repairs_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            self.start(state_file, projection_file)
+            proc, validated = self.invoke(
+                state_file, projection_file, 'validate'
+            )
+            self.assertEqual(proc.returncode, 0, validated)
+
+            with open(projection_file, encoding='utf-8') as handle:
+                stale = json.load(handle)
+            stale['record_count'] = 0
+            with open(
+                projection_file, 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump(stale, handle, separators=(',', ':'))
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'validate'
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertFalse(rejected['ok'])
+            proc, exported = self.invoke(
+                state_file, projection_file, 'export'
+            )
+            self.assertEqual(proc.returncode, 0, exported)
+            proc, validated = self.invoke(
+                state_file, projection_file, 'validate'
+            )
+            self.assertEqual(proc.returncode, 0, validated)
+
+            quote = chr(34)
+            corrupt_documents = (
+                (
+                    '{' + quote + 'schema_version' + quote + ':1,' + quote +
+                    'schema_version' + quote + ':1}'
+                ),
+                '{' + quote + 'schema_version' + quote + ':NaN}',
+                '{',
+            )
+            for corrupt in corrupt_documents:
+                with open(
+                    projection_file, 'w', encoding='utf-8', newline='\n'
+                ) as handle:
+                    handle.write(corrupt)
+                proc, rejected = self.invoke(
+                    state_file, projection_file, 'validate'
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertFalse(rejected['ok'])
+                proc, exported = self.invoke(
+                    state_file, projection_file, 'export'
+                )
+                self.assertEqual(proc.returncode, 0, exported)
+
+            proc, validated = self.invoke(
+                state_file, projection_file, 'validate'
+            )
+            self.assertEqual(proc.returncode, 0, validated)
+            self.assertEqual(validated['record_count'], 1)
+
+
 class RunLockTests(unittest.TestCase):
     def invoke(self, lock_file, action, token=None, now=None, lease_seconds=60):
         args = [sys.executable, RUN_LOCK, action,
@@ -3140,7 +3992,9 @@ class DashboardServerTests(unittest.TestCase):
             ("constants.md", self.valid_constants),
             ("trade-ledger.csv", "symbol,price\\nTEST,1.00\\n"),
             (os.path.join("dashboard", "index.html"), "<h1>Dashboard fixture</h1>"),
-            (os.path.join("run-reports", "rhmra-status-test.json"), "{}"),
+            (os.path.join(
+                "run-reports", "rhmra-status-2026_08_04-12_02.json"
+            ), "{}"),
         ):
             with open(os.path.join(self.repo, name), "w", encoding="utf-8") as f:
                 f.write(content)
@@ -3189,7 +4043,12 @@ class DashboardServerTests(unittest.TestCase):
         status, body = self.request("GET", "/dashboard/index.html")
         self.assertEqual(status, 200)
         self.assertIn(b"Dashboard fixture", body)
-        self.assertEqual(self.request("GET", "/run-reports/rhmra-status-test.json")[0], 200)
+        self.assertEqual(
+            self.request(
+                "GET", "/run-reports/rhmra-status-2026_08_04-12_02.json"
+            )[0],
+            200,
+        )
         self.assertEqual(self.request("GET", "/trade-ledger.csv")[0], 200)
         self.assertEqual(self.request("GET", "/README.md")[0], 403)
         self.assertEqual(self.request("GET", "/dashboard/index.html", host="example.test")[0], 403)
@@ -3258,6 +4117,98 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIsNone(document["dry_run"])
         self.assertIsNone(document["no_buy_first_minutes"])
         self.assertIn("integer literal exceeds the supported size", document["error"])
+
+    def test_lifecycle_api_validates_projection_and_private_state_is_not_static(self):
+        state_file = os.path.join(
+            self.repo, "run-reports", "rhmra-run-lifecycle.sqlite3"
+        )
+        projection_file = os.path.join(
+            self.repo, "run-reports", "rhmra-run-lifecycle.json"
+        )
+
+        def lifecycle(*args):
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    RUN_LIFECYCLE,
+                    *args,
+                    "--state-file",
+                    state_file,
+                    "--projection-file",
+                    projection_file,
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+
+        started = lifecycle(
+            "start", "--now-utc", "2026-08-04T19:02:00Z"
+        )
+        lifecycle(
+            "event",
+            "--invocation-id",
+            started["invocation_id"],
+            "--phase",
+            "preflight",
+            "--run-start-pt",
+            "2026-08-04T12:02:00-07:00",
+            "--now-utc",
+            "2026-08-04T19:02:01Z",
+        )
+        lifecycle(
+            "finish",
+            "--invocation-id",
+            started["invocation_id"],
+            "--classification",
+            "snapshot-failure",
+            "--reason-code",
+            "snapshot-second-attempt-failed",
+            "--report-file",
+            "rhmra-log-2026_08_04-12_02.md",
+            "--status-file",
+            "rhmra-status-2026_08_04-12_02.json",
+            "--now-utc",
+            "2026-08-04T19:03:00Z",
+        )
+
+        status, body = self.request("GET", "/api/runs")
+        self.assertEqual(status, 200)
+        document = json.loads(body)
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["record_count"], 1)
+        self.assertEqual(
+            document["records"][0]["classification"], "snapshot-failure"
+        )
+        self.assertEqual(
+            self.request(
+                "GET", "/run-reports/rhmra-run-lifecycle.json"
+            )[0],
+            403,
+        )
+        self.assertEqual(
+            self.request(
+                "GET", "/run-reports/rhmra-run-lifecycle.sqlite3"
+            )[0],
+            403,
+        )
+
+        current_projection = document
+        lifecycle(
+            "start", "--now-utc", "2026-08-04T19:04:00Z"
+        )
+        with open(projection_file, "w", encoding="utf-8") as handle:
+            json.dump(current_projection, handle)
+        status, body = self.request("GET", "/api/runs")
+        self.assertEqual(status, 500)
+        self.assertIn("stale or inconsistent", json.loads(body)["error"])
+
+        with open(projection_file, "w", encoding="utf-8") as handle:
+            handle.write('{"schema_version":1,"records":[]}')
+        status, body = self.request("GET", "/api/runs")
+        self.assertEqual(status, 500)
+        self.assertIn("error", json.loads(body))
 
     def test_ledger_api_exposes_matched_pool_cents_and_eastern_day(self):
         ledger_path = os.path.join(self.repo, "trade-ledger.csv")
@@ -3356,6 +4307,58 @@ class DashboardClientContractTests(unittest.TestCase):
         self.assertIn('<span>View on Phone</span>', dashboard)
         self.assertIn('#view-on-phone-setup', dashboard)
 
+    def test_dashboard_merges_invocations_and_names_terminal_outcomes(self):
+        with open(
+            os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8"
+        ) as handle:
+            dashboard = handle.read()
+        self.assertIn('getJSON("/api/runs")', dashboard)
+        self.assertIn('typeof record.status_file === "string"', dashboard)
+        self.assertIn("statusByName.get(name)", dashboard)
+        self.assertIn("function lifecycleOwnsFillWindow(record)", dashboard)
+        self.assertIn(
+            '"overlap", "configuration-halt", "coordination-halt", "runtime-budget"',
+            dashboard,
+        )
+        self.assertIn('reason === "scratch-preflight-failed"', dashboard)
+        self.assertIn(
+            "const fillOwners = records.filter(lifecycleOwnsFillWindow)",
+            dashboard,
+        )
+        owner_function = re.search(
+            r"function lifecycleOwnsFillWindow\(record\) \{(.*?)\n\}",
+            dashboard,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(owner_function)
+        excluded = set(re.findall(
+            r'"([a-z-]+)"',
+            owner_function.group(1).split("].includes", 1)[0],
+        ))
+        self.assertIn("overlap", excluded)
+        self.assertIn("coordination-halt", excluded)
+        self.assertNotIn("lease-lost", excluded)
+        self.assertNotIn("final-status-unavailable", excluded)
+        self.assertIn("const nextFillOwner = new Map(", dashboard)
+        self.assertIn("const next = nextFillOwner.get(record)", dashboard)
+        self.assertNotIn("const next = records[index + 1]?.start", dashboard)
+        for label in (
+            "risk halt",
+            "snapshot failure",
+            "configuration halt",
+            "overlap skipped",
+            "coordination halt",
+            "lease lost",
+            "final status unavailable",
+        ):
+            self.assertIn(label, dashboard)
+        self.assertIn('return "skipped";', dashboard)
+        self.assertIn('return "halted";', dashboard)
+        self.assertIn(
+            "every scheduler invocation; the label shows its trade or terminal outcome",
+            dashboard,
+        )
+
     def test_position_symbols_link_to_robinhood_safely(self):
         with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
             dashboard = f.read()
@@ -3417,6 +4420,7 @@ class MarketClockTests(unittest.TestCase):
         c = self.clock("2026-07-21T15:07:00Z")
         self.assertEqual(c["et"], "2026-07-21 11:07:00 EDT")
         self.assertEqual(c["pt"], "2026-07-21 08:07:00 PDT")
+        self.assertEqual(c["pt_iso"], "2026-07-21T08:07:00-07:00")
         self.assertEqual(c["date_et"], "2026-07-21")
         self.assertEqual(c["date_pt"], "2026-07-21")
         self.assertEqual(c["session"], "regular")
@@ -3431,6 +4435,40 @@ class MarketClockTests(unittest.TestCase):
         c = self.clock("2026-01-15T15:07:00Z")
         self.assertEqual(c["et"], "2026-01-15 10:07:00 EST")
         self.assertEqual(c["pt"], "2026-01-15 07:07:00 PST")
+        self.assertEqual(c["pt_iso"], "2026-01-15T07:07:00-08:00")
+
+    def test_clock_pt_iso_binds_directly_to_lifecycle(self):
+        clock = self.clock("2026-07-21T15:07:00Z")
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            start = subprocess.run(
+                [
+                    sys.executable, RUN_LIFECYCLE, 'start',
+                    '--state-file', state_file,
+                    '--projection-file', projection_file,
+                    '--now-utc', clock['utc'],
+                ],
+                cwd=ROOT, capture_output=True, text=True,
+            )
+            self.assertEqual(start.returncode, 0, start.stderr)
+            invocation_id = json.loads(start.stdout)['invocation_id']
+            bind = subprocess.run(
+                [
+                    sys.executable, RUN_LIFECYCLE, 'event',
+                    '--invocation-id', invocation_id,
+                    '--phase', 'preflight',
+                    '--run-start-pt', clock['pt_iso'],
+                    '--state-file', state_file,
+                    '--projection-file', projection_file,
+                    '--now-utc', clock['utc'],
+                ],
+                cwd=ROOT, capture_output=True, text=True,
+            )
+            self.assertEqual(bind.returncode, 0, bind.stdout + bind.stderr)
+            self.assertEqual(
+                json.loads(bind.stdout)['run_start_pt'], clock['pt_iso']
+            )
 
     def test_dst_spring_forward_boundary_eastern(self):
         # 2026 spring-forward: 2nd Sunday of March = Mar 8, 02:00 EST = 07:00Z.
