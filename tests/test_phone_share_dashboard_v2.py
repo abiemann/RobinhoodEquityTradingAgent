@@ -22,7 +22,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertNotIn('abiemann.github.io/RHMRA-Phone', README + PUBLIC_CONFIG)
 
     def test_google_qr_fragment_has_exact_v2_contract(self):
-        source = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        source = function_source(
+            'startGooglePhoneShare', 'recoverGooglePhoneShareAuthorization'
+        )
         self.assertIn('''PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER = 'gdrive';''', DASHBOARD)
         self.assertIn(
             '''viewer.hash = `v=2&provider=${PHONE_SHARE_GOOGLE_FRAGMENT_PROVIDER}&id=${shareId}&key=${base64Url(keyBytes)}`''',
@@ -32,7 +34,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn('new Uint8Array(16)', source)
 
     def test_pairing_persists_only_a_nonextractable_crypto_key(self):
-        start = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        start = function_source(
+            'startGooglePhoneShare', 'recoverGooglePhoneShareAuthorization'
+        )
         record = function_source('googlePhonePairingRecord', 'loadGooglePhonePairing')
         validation = function_source('validGooglePhonePairing', 'googlePhonePairingRecord')
         self.assertIn('''{ name: 'AES-GCM' }, false, ['encrypt']''', start)
@@ -44,7 +48,9 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertNotIn('localStorage', DASHBOARD)
 
     def test_stable_pairing_is_loaded_reused_and_advances_monotonically(self):
-        start = function_source('startGooglePhoneShare', 'startLegacyPhoneShare')
+        start = function_source(
+            'startGooglePhoneShare', 'recoverGooglePhoneShareAuthorization'
+        )
         reserve = function_source('reservePhoneShareSequence', 'safeShareText')
         upload = function_source('uploadPhoneShare', 'copyPhoneShareLink')
         self.assertIn('await loadGooglePhonePairing()', start)
@@ -71,7 +77,7 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         )
         self.assertIn('your phone remains paired for next time', stop)
         self.assertIn(
-            'if (google && incompleteNewPairing) await clearStoredGooglePhonePairing()',
+            'if (incompleteNewPairing) await clearStoredGooglePhonePairing()',
             stop,
         )
         self.assertIn('await clearStoredGooglePhonePairing()', forget)
@@ -169,7 +175,7 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
     def test_google_disconnect_is_separated_confirmed_and_preserves_pairing(self):
         render = function_source('renderShareDialog', 'openPhoneShareDialog')
         disconnect = function_source(
-            'disconnectGoogleDrivePhoneShare', 'revokePreviousPhoneShare'
+            'disconnectGoogleDrivePhoneShare', 'startPhoneShare'
         )
         self.assertEqual(
             DASHBOARD.count("id='phone-share-disconnect-google'"), 1
@@ -235,21 +241,19 @@ class PhoneShareDashboardV2ContractTests(unittest.TestCase):
         self.assertIn("phoneShareLocalFetch('/api/phone-share', {", DASHBOARD)
         self.assertGreaterEqual(
             DASHBOARD.count("phoneShareLocalFetch('/api/phone-share/' +"),
-            3,
+            2,
         )
 
-    def test_legacy_cloudflare_branch_and_session_semantics_remain(self):
-        provider = function_source('phoneShareProvider', 'isGoogleDrivePhoneShare')
-        legacy = function_source('startLegacyPhoneShare', 'uploadPhoneShare')
-        self.assertIn('''? PHONE_SHARE_GOOGLE_PROVIDER : 'cloudflare';''', provider)
-        self.assertIn('''provider: 'cloudflare',''', legacy)
-        self.assertIn(
-            '''new URLSearchParams({ id: shareId, key: base64Url(keyBytes) })''',
-            legacy,
-        )
-        self.assertIn('rememberPhoneShare(shareId, phoneShareSession.expiresAt)', legacy)
-        self.assertIn('sessionStorage.setItem(PHONE_SHARE_REVOKE_KEY', DASHBOARD)
-        self.assertIn('One-time Cloudflare setup required', DASHBOARD)
+    def test_phone_share_is_google_only_without_legacy_cloudflare_session_path(self):
+        for retired_contract in (
+            'startLegacyPhoneShare',
+            'PHONE_SHARE_REVOKE_KEY',
+            'One-time Cloudflare setup required',
+            "provider: 'cloudflare'",
+            'RHMRA_PHONE_SHARE_PROVIDER',
+        ):
+            with self.subTest(contract=retired_contract):
+                self.assertNotIn(retired_contract, DASHBOARD + README)
 
     def test_beginner_copy_explains_private_free_account_owned_storage(self):
         render = function_source('renderShareDialog', 'openPhoneShareDialog')

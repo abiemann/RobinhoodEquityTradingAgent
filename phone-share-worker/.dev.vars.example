@@ -1,3 +1,0 @@
-# Deploy-button secret declaration. For local development, copy
-# local-dev.vars.example to .dev.vars instead.
-UPLOAD_TOKEN=replace-with-at-least-32-random-characters

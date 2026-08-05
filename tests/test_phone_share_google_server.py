@@ -232,24 +232,16 @@ class GooglePhoneShareServerTests(unittest.TestCase):
     def local_origin(self):
         return 'http://127.0.0.1:' + str(self.server.server_port)
 
-    def configure_google(self, *, explicit=True):
+    def configure_google(self):
         os.environ[SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV] = VALID_CLIENT_ID
         os.environ.setdefault(
             SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV,
             self.credentials_path,
         )
-        if explicit:
-            os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = (
-                SERVER.PHONE_SHARE_PROVIDER_GOOGLE
-            )
 
-    def configure_builtin_broker(self, *, explicit=True):
+    def configure_builtin_broker(self):
         os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, None)
         os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CREDENTIALS_FILE_ENV, None)
-        if explicit:
-            os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = (
-                SERVER.PHONE_SHARE_PROVIDER_GOOGLE
-            )
 
     def write_google_credentials(
         self,
@@ -272,14 +264,6 @@ class GooglePhoneShareServerTests(unittest.TestCase):
                 credentials_file,
             )
         return path
-
-    def configure_cloudflare(self):
-        os.environ.update({
-            SERVER.PHONE_SHARE_URL_ENV: 'https://share.example',
-            SERVER.PHONE_SHARE_TOKEN_ENV: 'upload-' + ('t' * 40),
-            SERVER.PHONE_SHARE_ACCESS_ID_ENV: 'access-client-id',
-            SERVER.PHONE_SHARE_ACCESS_SECRET_ENV: 'access-' + ('s' * 40),
-        })
 
     def envelope(self):
         captured = datetime.now(timezone.utc).replace(microsecond=0)
@@ -336,8 +320,8 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             'GET', '/oauth2/callback?code=code-token&state=state-token', host=host
         )
 
-    def test_google_is_default_and_cloudflare_requires_explicit_selection(self):
-        self.configure_builtin_broker(explicit=False)
+    def test_google_drive_is_the_only_phone_share_provider(self):
+        self.configure_builtin_broker()
         status, headers, body = self.request('GET', '/api/phone-share/config')
         document = json.loads(body)
         self.assertEqual(status, 200)
@@ -355,33 +339,13 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertNotIn(VALID_CLIENT_ID, body.decode('utf-8'))
         runtime = SERVER._google_runtime_for_server(
             self.server,
-            SERVER._selected_phone_share_settings(self.server.server_port),
+            SERVER._google_phone_share_settings(self.server.server_port),
         )
         self.assertTrue(hasattr(runtime.session, 'set_credentials'))
         self.assertIsNone(runtime.config.client_secret)
         self.assertEqual(
             runtime.config.oauth_token_endpoint, VALID_BROKER_URL
         )
-
-        os.environ.pop(SERVER.PHONE_SHARE_GOOGLE_CLIENT_ID_ENV, None)
-        self.configure_cloudflare()
-        with mock.patch.object(
-            SERVER, 'GOOGLE_DESKTOP_CLIENT_ID', VALID_CLIENT_ID
-        ):
-            default_google = json.loads(
-                self.request('GET', '/api/phone-share/config')[2]
-            )
-        self.assertTrue(default_google['configured'])
-        self.assertEqual(
-            default_google['provider'], SERVER.PHONE_SHARE_PROVIDER_GOOGLE
-        )
-
-        os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = 'cloudflare'
-        cloudflare = json.loads(
-            self.request('GET', '/api/phone-share/config')[2]
-        )
-        self.assertTrue(cloudflare['configured'])
-        self.assertEqual(cloudflare['provider'], 'cloudflare')
 
     def test_missing_default_google_config_is_explicit_when_bundled_fallback_absent(
         self,
@@ -395,7 +359,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
             {'configured': False, 'provider': 'google-drive'},
         )
 
-    def test_selector_and_google_viewer_override_fail_closed(self):
+    def test_google_viewer_override_fails_closed(self):
         self.configure_google()
         os.environ[SERVER.PHONE_SHARE_GOOGLE_VIEWER_URL_ENV] = (
             'https://viewer.example/app/'
@@ -408,13 +372,6 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         os.environ[SERVER.PHONE_SHARE_GOOGLE_VIEWER_URL_ENV] = (
             'https://viewer.example/app/?secret=bad'
         )
-        self.assertEqual(
-            json.loads(self.request('GET', '/api/phone-share/config')[2]),
-            {'configured': False, 'provider': 'google-drive'},
-        )
-
-        self.configure_cloudflare()
-        os.environ[SERVER.PHONE_SHARE_PROVIDER_ENV] = 'unknown-provider'
         self.assertEqual(
             json.loads(self.request('GET', '/api/phone-share/config')[2]),
             {'configured': False, 'provider': 'google-drive'},
@@ -444,6 +401,134 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         document = self.connect()
         self.assertTrue(document['authorization_url'].startswith('https://'))
         self.assertEqual(len(FakeOAuthSession.instances), 1)
+
+    def test_snapshot_mutations_require_loopback_host_same_origin_and_csrf(self):
+        self.configure_google()
+        headers = self.mutation_headers(json_body=True)
+
+        status = self.request(
+            'POST', '/api/phone-share', None, headers, host='example.test'
+        )[0]
+        self.assertEqual(status, 403)
+
+        bad_origin = dict(headers)
+        bad_origin['Origin'] = 'https://attacker.example'
+        self.assertEqual(
+            self.request('POST', '/api/phone-share', None, bad_origin)[0], 403
+        )
+
+        bad_token = dict(headers)
+        bad_token['X-RHMRA-CSRF'] = 'wrong'
+        self.assertEqual(
+            self.request('POST', '/api/phone-share', None, bad_token)[0], 403
+        )
+        self.assertEqual(FakeGoogleDriveProvider.instances, [])
+
+    def test_snapshot_upload_rejects_content_type_body_size_and_schema(self):
+        self.configure_google()
+        headers = self.mutation_headers(json_body=True)
+
+        wrong_type = dict(headers)
+        wrong_type['Content-Type'] = 'text/plain'
+        self.assertEqual(
+            self.request('POST', '/api/phone-share', None, wrong_type)[0], 415
+        )
+
+        duplicate_charset = dict(headers)
+        duplicate_charset['Content-Type'] = (
+            'application/json; charset=utf-8; charset=utf-8'
+        )
+        self.assertEqual(
+            self.request(
+                'POST', '/api/phone-share', None, duplicate_charset
+            )[0],
+            415,
+        )
+
+        too_large = dict(headers)
+        too_large['Content-Length'] = str(SERVER.PHONE_SHARE_MAX_BODY_BYTES + 1)
+        self.assertEqual(
+            self.request('POST', '/api/phone-share', None, too_large)[0], 413
+        )
+
+        extra = self.envelope()
+        extra['account_number'] = 'must-not-pass'
+        self.assertEqual(
+            self.request(
+                'POST', '/api/phone-share', json.dumps(extra).encode('utf-8'),
+                headers,
+            )[0],
+            400,
+        )
+        self.assertEqual(
+            self.request('POST', '/api/phone-share', b'{', headers)[0], 400
+        )
+        key = json.dumps('schema_version')
+        duplicate = ('{' + key + ':1,' + key + ':1}').encode('utf-8')
+        status, _, response_body = self.request(
+            'POST', '/api/phone-share', duplicate, headers
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(response_body), {'error': 'invalid JSON body'}
+        )
+        self.assertEqual(FakeGoogleDriveProvider.instances, [])
+
+    def test_snapshot_delete_rejects_a_body_before_drive_access(self):
+        self.configure_google()
+        share_id = self.envelope()['share_id']
+        status, _, response_body = self.request(
+            'DELETE', '/api/phone-share/' + share_id, body=None, headers={
+                'Origin': self.local_origin,
+                'X-RHMRA-CSRF': SERVER.PHONE_SHARE_CSRF_TOKEN,
+                'Content-Length': '1',
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(response_body),
+            {'error': 'DELETE request body is not allowed'},
+        )
+        self.assertEqual(FakeGoogleDriveProvider.instances, [])
+
+    def test_envelope_identifier_timestamp_and_ttl_bounds_fail_closed(self):
+        document = self.envelope()
+        document['share_id'] = 'short'
+        self.assertIsNone(
+            SERVER._validate_phone_share_envelope(document, 7200)
+        )
+
+        document = self.envelope()
+        document['captured_at'] = document['captured_at'].replace('.000Z', 'Z')
+        self.assertIsNone(
+            SERVER._validate_phone_share_envelope(document, 7200)
+        )
+
+        document = self.envelope()
+        captured = datetime.now(timezone.utc).replace(microsecond=0)
+        document['captured_at'] = captured.isoformat(
+            timespec='milliseconds'
+        ).replace('+00:00', 'Z')
+        document['expires_at'] = (
+            captured + timedelta(seconds=7201)
+        ).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        self.assertIsNone(
+            SERVER._validate_phone_share_envelope(document, 7200)
+        )
+
+    def test_unconfigured_snapshot_mutation_fails_without_drive_access(self):
+        with mock.patch.object(SERVER, 'GOOGLE_DESKTOP_CLIENT_ID', ''):
+            status, response_headers, response_body = self.request(
+                'POST', '/api/phone-share', None,
+                self.mutation_headers(json_body=True),
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(response_body),
+            {'error': 'phone sharing is not configured'},
+        )
+        self.assertNotIn('Access-Control-Allow-Origin', response_headers)
+        self.assertEqual(FakeGoogleDriveProvider.instances, [])
 
     def test_disconnect_requires_same_origin_csrf_and_exact_empty_json(self):
         self.configure_builtin_broker()
@@ -478,7 +563,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(self.complete_callback()[0], 200)
         runtime = SERVER._google_runtime_for_server(
             self.server,
-            SERVER._selected_phone_share_settings(self.server.server_port),
+            SERVER._google_phone_share_settings(self.server.server_port),
         )
         session = runtime.session
         store = runtime.credential_store
@@ -512,7 +597,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(self.complete_callback()[0], 200)
         runtime = SERVER._google_runtime_for_server(
             self.server,
-            SERVER._selected_phone_share_settings(self.server.server_port),
+            SERVER._google_phone_share_settings(self.server.server_port),
         )
         session = runtime.session
         store = runtime.credential_store
@@ -760,7 +845,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(FakeCredentialStore.instances[-1].load_calls, 1)
         runtime = SERVER._google_runtime_for_server(
             self.server,
-            SERVER._selected_phone_share_settings(self.server.server_port),
+            SERVER._google_phone_share_settings(self.server.server_port),
         )
         self.assertIsNone(runtime.config.client_secret)
         self.assertEqual(runtime.config.oauth_token_endpoint, VALID_BROKER_URL)
@@ -965,7 +1050,7 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertEqual(self.complete_callback()[0], 200)
         runtime = SERVER._google_runtime_for_server(
             self.server,
-            SERVER._selected_phone_share_settings(self.server.server_port),
+            SERVER._google_phone_share_settings(self.server.server_port),
         )
         store = FakeCredentialStore.instances[0]
         self.assertTrue(runtime.session.is_authorized)
