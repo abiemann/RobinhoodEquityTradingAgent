@@ -1,10 +1,20 @@
 import csv
 import os
+import sys
 import tempfile
 import unittest
 from fractions import Fraction
 
-from ledger_pnl import LedgerPnlError, calculate_sale, reconcile_ledger
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from ledger_pnl import (  # noqa: E402
+    LedgerPnlError,
+    calculate_sale,
+    reconcile_ledger,
+)
 
 
 HEADER = [

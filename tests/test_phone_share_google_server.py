@@ -530,6 +530,30 @@ class GooglePhoneShareServerTests(unittest.TestCase):
         self.assertNotIn('Access-Control-Allow-Origin', response_headers)
         self.assertEqual(FakeGoogleDriveProvider.instances, [])
 
+    def test_rejected_post_with_a_body_reliably_returns_its_status(self):
+        """An early rejection must reach the client, not reset the connection.
+
+        The handler answers 403 before reading the request body. Closing a
+        socket with unread bytes still buffered makes the OS send RST instead
+        of FIN, and the client then raises a connection error INSTEAD OF
+        reading the 403 -- on Windows, ConnectionAbortedError (WinError
+        10053). That made this endpoint fail roughly one run in three.
+
+        The loop is deliberate and its length is measured, not guessed. The
+        failure is a race, so one request cannot prove anything: with the
+        drain reverted, a single bodied rejection reproduces it about 8.6% of
+        the time (20 iterations caught it in 5 of 6 runs). 60 iterations put
+        detection near 99.5%, so a regression fails HERE with a clear name
+        rather than resurfacing as an unexplained flake somewhere else.
+        Costs roughly five seconds.
+        """
+        self.configure_builtin_broker()
+        path = '/api/phone-share/disconnect-google'
+        for attempt in range(60):
+            with self.subTest(attempt=attempt):
+                status, _, _ = self.request('POST', path, body=b'{}')
+                self.assertEqual(status, 403)
+
     def test_disconnect_requires_same_origin_csrf_and_exact_empty_json(self):
         self.configure_builtin_broker()
         path = '/api/phone-share/disconnect-google'

@@ -575,10 +575,75 @@ def _canonical_request_path(request_path):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # Largest request body worth consuming purely to close cleanly.
+    _DRAIN_LIMIT = 1 << 16
+    # Cap on waiting for a body the client promised but may never send.
+    _DRAIN_TIMEOUT_SECONDS = 0.25
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=REPO, **kwargs)
 
+    def handle_one_request(self):
+        self._request_body_consumed = False
+        super().handle_one_request()
+
+    def _drain_request_body(self):
+        """Consume any unread request body before writing a response.
+
+        Closing a socket while unread bytes remain in its receive buffer makes
+        the OS reset the connection (RST) instead of closing it cleanly (FIN).
+        The peer then gets a connection error INSTEAD OF the response already
+        written -- on Windows, ConnectionAbortedError (WinError 10053). Every
+        early rejection here (403 same-origin/CSRF, 411, 413, 415) answers
+        before reading the body, so each one could surface to a real client as
+        a dropped connection rather than the status it was sent. Draining
+        first is what makes those answers reliably delivered.
+
+        Idempotent: the body readers mark the body consumed, so a later
+        success response never double-reads. Oversized or chunked bodies are
+        left alone -- a reset is preferable to reading unbounded input.
+
+        Content-Length is a CLAIM, not a fact: a client may declare a body and
+        never send it (one test does exactly that deliberately). Draining on
+        the declared length alone therefore blocks until the socket times out,
+        turning a reset into a hang -- strictly worse. The drain is bounded by
+        a short timeout so an undelivered body costs milliseconds and then
+        closes, while a body already in the buffer drains immediately.
+        """
+        if getattr(self, '_request_body_consumed', False):
+            return
+        self._request_body_consumed = True
+        if self.headers is None or self.headers.get('Transfer-Encoding'):
+            return
+        lengths = self.headers.get_all('Content-Length') or []
+        if len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,10}', lengths[0]):
+            return
+        remaining = int(lengths[0])
+        if remaining <= 0 or remaining > self._DRAIN_LIMIT:
+            return
+        previous_timeout = None
+        try:
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(self._DRAIN_TIMEOUT_SECONDS)
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
+
+    def send_error(self, code, message=None, explain=None):
+        self._drain_request_body()
+        super().send_error(code, message, explain)
+
     def _json(self, obj, status=200):
+        self._drain_request_body()
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header('Cache-Control', 'no-store')
@@ -648,6 +713,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(415, 'application/json is required')
             return False
         raw = self.rfile.read(length)
+        self._request_body_consumed = True
         if len(raw) != length:
             self._api_error(400, 'invalid connection request')
             return False
@@ -724,6 +790,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_error(413, 'encrypted snapshot is too large')
             return False, None
         raw = self.rfile.read(length)
+        self._request_body_consumed = True
         if len(raw) != length:
             self._api_error(400, 'incomplete request body')
             return False, None

@@ -1,7 +1,16 @@
+import os
+import sys
 import unittest
 import urllib.parse
 
-from dashboard.phone_share.public_config import GOOGLE_OAUTH_BROKER_URL
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from dashboard.phone_share.public_config import (  # noqa: E402
+    GOOGLE_OAUTH_BROKER_URL,
+)
 
 
 class PhoneSharePublicConfigTests(unittest.TestCase):

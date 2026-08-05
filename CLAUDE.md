@@ -6,7 +6,15 @@ Rules for any AI agent (or human) editing this repository.
 After editing `validate_constants.py`, `broker_snapshot.py`, `daily_loss.py`, `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `run_lock.py`, `run_lifecycle.py`, `order_intents.py`, `dashboard/serve.py`, `dashboard/index.html`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
 
 ```
-python3 tests/test_scripts.py     # Windows: py -3 tests\test_scripts.py
+python3 -m unittest discover -s tests     # Windows: py -3 -m unittest discover -s tests
+```
+
+Run this from the repository root. It discovers **every** `tests/test_*.py` — the trading scripts plus the phone-share, Drive, credential-store, ledger-P&L and dashboard suites. Do NOT substitute `python3 tests/test_scripts.py`: that file is the largest suite but not the only one, and running it alone silently skips the rest. Any new test file must be importable on its own too — put the repo root on `sys.path` at the top of it, the way the existing files do:
+
+```python
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 ```
 
 All tests must pass (exit 0, "OK") before committing. The suite is stdlib-only — no installs needed. Expected values were verified against live API data; if an intentional behavior change breaks a test, update the expectation deliberately and say so in the commit — never delete or weaken a test to go green.
