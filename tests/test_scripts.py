@@ -1486,12 +1486,22 @@ class PriceBandScannerTests(unittest.TestCase):
 
 
 class FilterScanTests(unittest.TestCase):
-    def run_filter(self, rows, top_n=15):
+    def run_filter(self, rows, top_n=15, mcp_envelope=False, mcp_error=False):
         with tempfile.TemporaryDirectory() as td:
             scan = os.path.join(td, "scan.json")
             out = os.path.join(td, "out.json")
+            document = {
+                "data": {"result": {"results": rows, "total_items": len(rows)}}
+            }
+            if mcp_envelope:
+                document = {
+                    "content": [{"type": "text", "text": "saved tool result"}],
+                    "structuredContent": document,
+                    "isError": mcp_error,
+                }
+
             with open(scan, "w", encoding="utf-8") as f:
-                json.dump({"data": {"result": {"results": rows, "total_items": len(rows)}}}, f)
+                json.dump(document, f)
             run_cli(FILTER, ["--scan-file", scan, "--price-min", "2.50", "--price-max", "5",
                              "--min-rel-volume", "2", "--min-abs-pct-change", "3",
                              "--top-n", str(top_n), "--json-out", out])
@@ -1516,6 +1526,24 @@ class FilterScanTests(unittest.TestCase):
         edge = data["working_list"][2]
         self.assertAlmostEqual(edge["last"], 5.00, delta=0.001)
         self.assertAlmostEqual(edge["day_pct_change"], 3.00, delta=0.001)
+
+    def test_accepts_saved_mcp_structured_content_envelope(self):
+        data = self.run_filter(
+            [scan_row("KEEP", 4.45, 0.1528, 557.75)],
+            mcp_envelope=True,
+        )
+        self.assertEqual(
+            [row["symbol"] for row in data["working_list"]],
+            ["KEEP"],
+        )
+
+    def test_rejects_mcp_error_envelope(self):
+        with self.assertRaises(AssertionError):
+            self.run_filter(
+                [scan_row("KEEP", 4.45, 0.1528, 557.75)],
+                mcp_envelope=True,
+                mcp_error=True,
+            )
 
     def test_top_n_caps_by_relative_volume(self):
         rows = [scan_row(f"S{i}", 3.0, 0.05, 10.0 + i) for i in range(6)]
@@ -5081,6 +5109,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("any schema/value check fails", scan_phase)
         self.assertIn("do NOT fall back to formatted stdout, a stale file, or ad-hoc filtering", scan_phase)
         self.assertIn("empty `working_list: []` is valid", scan_phase)
+        self.assertIn("standard MCP envelope at `structuredContent.data.result`", scan_phase)
+        self.assertIn("never call `run_scan` again", scan_phase)
         prefilter = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split("**The next three bullets", 1)[0]
         self.assertIn("unrounded `volume` × `last`", prefilter)
         self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)

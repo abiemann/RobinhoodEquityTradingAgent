@@ -2,8 +2,8 @@
 """Working-list filter for the Robinhood momentum routine (Step 6 of
 robinhood-momentum-routine-autonomous.md).
 
-Consumes the RAW run_scan JSON result (the file the harness saves when the
-response exceeds the context cap) and applies the routine's client-side
+Consumes the saved run_scan JSON result (either the direct payload or the
+standard MCP structuredContent envelope) and applies the routine's client-side
 screen: price band, relative-volume floor, minimum absolute day move, then
 ranks by relative volume and keeps the top N.
 
@@ -62,6 +62,16 @@ def finite_float_arg(value):
 def load_result(path):
     with open(path, "r", encoding="utf-8") as f:
         doc = json.load(f, parse_constant=_reject_nonfinite_json)
+    if isinstance(doc, dict) and "isError" in doc:
+        if not isinstance(doc["isError"], bool):
+            raise ValueError(f"{path}: isError: expected a boolean")
+        if doc["isError"]:
+            raise ValueError(f"{path}: broker tool result reports an error")
+    if isinstance(doc, dict) and "structuredContent" in doc:
+        structured = doc["structuredContent"]
+        if not isinstance(structured, dict):
+            raise ValueError(f"{path}: structuredContent: expected an object")
+        doc = structured
     if isinstance(doc, dict):
         if "data" in doc and isinstance(doc["data"], dict) and "result" in doc["data"]:
             return doc["data"]["result"]
