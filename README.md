@@ -266,7 +266,7 @@ This override sends token requests directly to Google's HTTPS endpoint and delib
 
   Its run timeline also reads the helper-validated lifecycle projection, so invocations that have no account status file still appear as `snapshot failure`, `overlap skipped`, `lease lost`, `configuration halt`, or `coordination halt`. The private SQLite lifecycle journal and projection file are not served as static files.
 
-  ![RHMRA Dashboard showing account status, positions, runs, and realized P&L](images/dashboard-example.png)
+  ![RHMRA Dashboard showing account totals, the View on Phone control, a flat positions panel, today's run timeline, and strategy realized P&L by rules era](images/dashboard-example.png)
 
 ## Troubleshooting
 
