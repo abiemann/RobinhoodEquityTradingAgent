@@ -1058,6 +1058,30 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertIn("above", ttrx["skip_reason"])
         self.assertLess(ttrx["pct_below_high"], 0)
 
+    def test_historicals_accept_saved_mcp_structured_content_envelope(self):
+        payload = {"data": {"results": [{"symbol": "FISN", "bars": FISN_BARS}]}}
+        wrapped = {
+            "content": [{"type": "text", "text": "saved tool result"}],
+            "structuredContent": payload,
+            "isError": False,
+        }
+        fisn = self.run_eval(wrapped, {"FISN": 9.843})["FISN"]
+        self.assertTrue(fisn["buy_candidate"])
+        self.assertAlmostEqual(fisn["recent_high"], 11.43, delta=0.001)
+
+    def test_historicals_reject_malformed_mcp_envelopes(self):
+        payload = {"data": {"results": [{"symbol": "FISN", "bars": FISN_BARS}]}}
+        bad_envelopes = (
+            {"structuredContent": payload, "isError": True},
+            {"structuredContent": payload, "isError": "false"},
+            {"structuredContent": "not an object", "data": payload["data"]},
+            {"content": [{"type": "text", "text": json.dumps(payload)}]},
+        )
+        for wrapped in bad_envelopes:
+            with self.subTest(wrapper_keys=list(wrapped)):
+                with self.assertRaises(AssertionError):
+                    self.run_eval(wrapped, {"FISN": 9.843})
+
     def test_json_output_identifies_whether_rsi_gate_was_enabled(self):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
                 bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
@@ -5200,6 +5224,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("`schema_version` exactly `1`", phase)
         self.assertIn("`rsi_gate_enabled` exactly the JSON boolean `false`", phase)
         self.assertIn("SOLE authority for the pre-RSI verdicts", phase)
+        self.assertIn("standard MCP envelope at `structuredContent.data.results`", phase)
+        self.assertIn("Never extract `structuredContent`", phase)
+        self.assertIn("call `get_equity_historicals` again", phase)
+        self.assertIn("direct-envelope rule applies only to historical `--bars` files", phase)
         self.assertIn("candidate evaluation handoff failure", phase)
         self.assertIn("Do NOT use formatted stdout, a stale gate file, or ad-hoc calculations", phase)
         self.assertIn("final `buy_candidate` is exactly `true`", phase)

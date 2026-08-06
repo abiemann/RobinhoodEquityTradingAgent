@@ -2,7 +2,7 @@
 """Candidate math for the Robinhood momentum routine (see
 robinhood-momentum-routine-autonomous.md, Step 8).
 
-Consumes RAW get_equity_historicals JSON responses — do not transcribe bars
+Consumes saved get_equity_historicals tool results — do not transcribe bars
 by hand. Computes, per symbol:
   - liquidity floor: median daily dollar volume (volume x close) over the last
     --volume-lookback-days bars; interpolated bars count as $0 days. A symbol
@@ -31,7 +31,8 @@ Usage:
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
       [--max-spread-buy-pct 2.0] [--json-out results.json]
 
---bars files: raw get_equity_historicals responses. Accepted shapes:
+--bars files: saved get_equity_historicals results. Accepted shapes:
+  standard MCP envelope containing structuredContent.data.results
   {"data": {"results": [...]}}   (full tool response)
   {"results": [...]}             (data envelope)
   [...]                          (bare results list)
@@ -96,8 +97,23 @@ def load_json(path):
         return json.load(f, parse_constant=_reject_nonfinite_json)
 
 
+def unwrap_historicals_result(doc, path):
+    """Remove one known MCP envelope without transforming broker data."""
+    if isinstance(doc, dict) and "isError" in doc:
+        if not isinstance(doc["isError"], bool):
+            raise ValueError(f"{path}: isError: expected a boolean")
+        if doc["isError"]:
+            raise ValueError(f"{path}: broker tool result reports an error")
+    if isinstance(doc, dict) and "structuredContent" in doc:
+        structured = doc["structuredContent"]
+        if not isinstance(structured, dict):
+            raise ValueError(f"{path}: structuredContent: expected an object")
+        return structured
+    return doc
+
+
 def load_results(path):
-    doc = load_json(path)
+    doc = unwrap_historicals_result(load_json(path), path)
     if isinstance(doc, list):
         return doc
     if isinstance(doc, dict):

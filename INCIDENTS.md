@@ -268,6 +268,14 @@ transient, validated JSON handoff; only a validated final RSI-enabled JSON resul
 entry or become the persistent gate record. Evaluator or handoff failures skip entries, and fewer
 bars than either configured history window blocks the name before any candidate math runs.
 
+**2026-08-06, evaluator transport-envelope mismatch.** Two valid historicals results were saved
+in the standard MCP `content` + `structuredContent.data.results` envelope, but
+`evaluate_candidates.py` accepted only the inner `data.results` payload. The run called
+`get_equity_historicals` twice again and created corrective `-raw.json` files, adding roughly
+90 seconds; the refetched data happened to match, but a second live snapshot could drift. The
+evaluator now unwraps exactly one object-valued `structuredContent` layer, rejects reported or
+malformed tool errors, and the routine forbids extraction, corrective copies, or refetches.
+
 **2026-07-22, unasked-for judgment** (commit `2b4ffff`). A run remarked *"the bars don't have
 explicit interpolated fields, so I'm treating them as real data points"* — reasoning about a
 decision `evaluate_candidates.py` already owns. **Investigated and there was no bug:** the script
