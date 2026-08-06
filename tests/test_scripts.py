@@ -4561,6 +4561,21 @@ class DashboardClientContractTests(unittest.TestCase):
         self.assertIn('transform:translate(-50%, -50%);', dashboard)
         self.assertIn('<span>View on Phone</span>', dashboard)
 
+    def test_phone_share_preserves_unavailable_realized_pnl(self):
+        with open(os.path.join(ROOT, 'dashboard', 'index.html'), encoding='utf-8') as f:
+            dashboard = f.read()
+
+        self.assertIn('const realizedToday = snap.realized_pnl_today;', dashboard)
+        self.assertIn(
+            'realizedToday !== null && safeShareNumber(realizedToday) === null',
+            dashboard,
+        )
+        self.assertIn('realized_pnl_today: realizedToday,', dashboard)
+        self.assertNotIn(
+            'snap.account?.buying_power,\n                         snap.realized_pnl_today',
+            dashboard,
+        )
+
     def test_dashboard_merges_invocations_and_names_terminal_outcomes(self):
         with open(
             os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8"

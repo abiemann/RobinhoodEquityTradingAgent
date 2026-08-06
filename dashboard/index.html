@@ -475,9 +475,10 @@ function buildPhoneView(config, snap, runs, eras, reconciliation) {
   if (!snap || snap.schema_version !== 1 || typeof config?.dry_run !== 'boolean') return null;
   if (!Array.isArray(snap.positions) || snap.positions.length > 100 ||
       !Array.isArray(runs) || runs.length > 100 || !Array.isArray(eras) || eras.length > 500) return null;
-  const accountValues = [snap.account?.total_value, snap.account?.cash, snap.account?.buying_power,
-                         snap.realized_pnl_today];
+  const accountValues = [snap.account?.total_value, snap.account?.cash, snap.account?.buying_power];
   if (!accountValues.every(value => safeShareNumber(value) !== null)) return null;
+  const realizedToday = snap.realized_pnl_today;
+  if (realizedToday !== null && safeShareNumber(realizedToday) === null) return null;
 
   const enhanced = reconciliation !== null && reconciliation !== undefined;
   if (enhanced) {
@@ -563,7 +564,7 @@ function buildPhoneView(config, snap, runs, eras, reconciliation) {
         cash: safeShareNumber(snap.account?.cash),
         buying_power: safeShareNumber(snap.account?.buying_power),
       },
-      realized_pnl_today: safeShareNumber(snap.realized_pnl_today),
+      realized_pnl_today: realizedToday,
       positions,
     },
     runs: runView,
