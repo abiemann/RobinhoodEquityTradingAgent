@@ -4,7 +4,7 @@ A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** a
 
 > ⚠️ **Automated trading can cause rapid and substantial financial loss. Use only money you can afford to lose.** See the [Disclaimer](#disclaimer).
 
-## New here? Get started with one prompt!
+## New here? Get started with one prompt! 🚀 🌙 ✨
 
 [**Open the one-prompt quick start →**](QUICKSTART.md)<br>
 Your AI assistant handles setup and reaches a safe first test, pausing only for sign-in, a required Robinhood UI step, or a real-money-risk decision.
