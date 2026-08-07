@@ -250,6 +250,19 @@ with the checked-in `filter_scan.py` (commit `224b125`), which documents the sch
 **Windows path in a Linux sandbox.** The harness replies with a `C:\Users\…` path for oversized
 results; past runs corrupted it while retyping. Locate by basename with `find` instead.
 
+**2026-08-07, inline scan transport truncation.** The 11:01 run's broker scan succeeded with 283
+matches and every required visible column, but entry still failed closed as `scan handoff failure`.
+The complete result was roughly 155 KB and remained inline: no scan source file or
+`working-list.json` was ever created. The immediately preceding 10:34 run, under the same rules,
+persisted a 155,220-byte scan envelope and filtered it successfully. This proved the broker,
+saved-scan schema, and deterministic filter were healthy; the missing boundary was transport from
+the successful tool call to disk. The earlier envelope fixes only help after complete JSON reaches
+the filter. Inline scan capture must therefore compose the single `run_scan` call and verbatim
+file-change persistence atomically, before any model-visible text/yield can truncate the result,
+and expose only a compact path/byte-count receipt. Absence of an auto-created file or a visibly
+named Write tool is not evidence of failure; only an attempted persistence/read/filter failure may
+produce `scan handoff failure`. Never rescan to repair this boundary.
+
 ## Step 8 — the script owns the math
 
 **Week 1.** A live run multiplied a share volume by the **date string**, twice, before getting it
