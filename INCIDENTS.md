@@ -82,7 +82,7 @@ placeholder in a command line with suspicion. `filter_scan.py` still has five of
 `python3 market_clock.py  (Windows: py -3 …)`. That parenthetical was meant for humans running
 tests locally, but the routine reads it as an equally valid choice, and the Linux sandbox agent
 picked `py -3` first — exit 127, `bash: py: command not found`, in both the 11:07 and 11:37 runs.
-`py -3` belongs only in CLAUDE.md and README.md.
+`py -3` belongs only in AGENTS.md and README.md.
 
 **2026-07-29, exchange-calendar gap (P1 review finding).** The clock classified every weekday by
 fixed wall-clock hours, so an NYSE holiday could look like a normal regular session. With
