@@ -5083,10 +5083,44 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
 
+        startup = routine.split(
+            '### STARTUP SEQUENCE — complete exactly before normal account or broker access', 1
+        )[1].split('### ACCOUNT SCOPE', 1)[0]
+        startup_markers = (
+            'verified absolute `PYTHON_EXE`',
+            '`run_lifecycle.py start`',
+            '`validate_constants.py --json`',
+            '`market_clock.py --json --expected-constants-sha256',
+            '`run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>`',
+            '`run_lock.py acquire`',
+            '`create one NEW session-scoped scratch directory`',
+            '`broker_snapshot.py preflight --scratch <scratch>`',
+            '`order_intents.py check`',
+            '`order_intents.py pending --run-token <RUN_LOCK_TOKEN>`',
+            'Resolve `rules_version`',
+            'Call `get_accounts`',
+        )
+        startup_positions = [startup.index(marker) for marker in startup_markers]
+        self.assertEqual(startup_positions, sorted(startup_positions))
+        self.assertIn('Do not create or preflight scratch', startup)
+        self.assertIn('touch the order-intent journal', startup)
+        self.assertIn('before successful lease acquisition', startup)
+        self.assertIn('Never invent a placeholder token', startup)
+        self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
+        self.assertIn('Items 1–11 normally succeed before `get_accounts`', startup)
+        self.assertIn('If item 9 or 10 fails', startup)
+        self.assertIn('named read-only positions/orders calls', startup)
+        self.assertIn('is the sole exception', startup)
+        self.assertIn('no broker mutation is permitted', startup)
+
         coordination = routine.split(
             "### RUN COORDINATION — fenced single-flight lease", 1
         )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
-        self.assertIn("before `rules_version`, `get_accounts`, or ANY broker call", coordination)
+        self.assertIn(
+            "before scratch creation or preflight, any order-intent journal command, "
+            "`rules_version`, `get_accounts`, or ANY broker call",
+            coordination,
+        )
         self.assertIn(
             "A configuration validation/hash failure stops the full run "
             "before lease acquisition",
@@ -5106,6 +5140,18 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("ownership is lost: make no further broker calls or order changes", coordination)
         self.assertIn("`python3 run_lock.py release --token <RUN_LOCK_TOKEN>`", coordination)
         self.assertIn("final operational action", coordination)
+
+        self.assertIn('before scratch creation or preflight', coordination)
+        self.assertIn('any order-intent journal command', coordination)
+
+        journal = routine.split('### ORDER-INTENT JOURNAL', 1)[1].split(
+            '### BROKER TIMESTAMPS', 1
+        )[0]
+        self.assertIn('Only after successful lease acquisition', journal)
+        self.assertIn('successful scratch preflight', journal)
+        self.assertIn('exact bound lease-issued token', journal)
+        self.assertIn('Never run either journal command before acquisition', journal)
+        self.assertIn('never use a placeholder', journal)
 
         order_handling = routine.split(
             "### ORDER HANDLING — AUTONOMOUS, WITH NOTIFICATION", 1

@@ -125,6 +125,19 @@ review and immediately before placement; the fresh reading controls only current
 eligibility and routing, while the original clock remains authoritative for filenames, trading
 date, ledger windows, and the report.
 
+**2026-08-07, pre-broker sequencing correction.** The startup requirements were individually
+correct but distributed across sections with competing immediate-next wording. One scheduled run
+created and preflighted scratch, checked the order-intent journal, and called `pending` with a
+placeholder UUID before invoking lease acquisition. The agent caught the omission before
+`get_accounts` or any other broker call, acquired the real lease, reran `pending` with the
+lease-issued token, renewed normally, and completed without an order or financial impact.
+
+The fix defines one numbered startup chain and tests its order: lifecycle, validated constants,
+START CLOCK and lifecycle binding, lease acquisition, scratch creation/preflight, journal
+check/pending with the exact acquired token, rules version, then account resolution. Scratch and
+journal work are explicitly forbidden before acquisition, and placeholder, invocation, remembered,
+or otherwise invented fencing tokens are never authoritative.
+
 ## BROKER TIMESTAMPS
 
 **2026-07-17.** `datetime.fromisoformat()` in the sandbox raised
