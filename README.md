@@ -72,6 +72,7 @@ The preferred models are **Claude Sonnet 4.6** and **Codex Luna 5.6 (high)**. If
 
 ## Guardrails
 
+- **Verified Python bootstrap**: before lifecycle startup, Windows scheduled runs use the checked-in resolver to reject Microsoft Store aliases, launch-probe permitted absolute Python 3 runtimes, and bind one executable for the whole invocation. A stalled workspace-runtime lookup or inaccessible `WindowsApps` stub cannot masquerade as "Python missing" while a real interpreter is available.
 - **Account scope** resolved by name every run; halts if the name matches zero, multiple, or a non-agentic account — never falls back to another account.
 - **Configuration preflight**: an unreadable, malformed, incomplete, duplicated, or ambiguous `constants.md` is a full-run halt, not dry run. It prevents every broker action, including profit-taking, stop repairs, and dust sweeps; the routine never uses a default, cached value, or guess.
 - **Daily-loss circuit breaker** reconstructs true Eastern-broker-day equity P&L from complete broker executions, current positions, and split-adjusted prior closes. On an entry-eligible run, it blocks new buys whenever the configured drawdown is reached and fails closed if pagination, prices, quantities, timestamps, or reconciliation are incomplete. Robinhood's lifetime cost-basis realized P&L is telemetry, never the breaker input.
@@ -139,6 +140,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 - **evaluate_candidates.py** — the entry math: median dollar-volume liquidity floor, recent high from real (non-interpolated) bars, % below high, and the **RSI curl-up gate** that requires a dip to have been oversold *and* to be turning up before it can be bought. Consumes raw API responses; never hand-transcribed bars. Its transient pre-RSI JSON selects which indicators to fetch; only a validated final RSI-enabled JSON result can authorize a buy. Formatted stdout and ad-hoc calculations are never entry authorities.
   Historical `--bars` inputs accept the original saved MCP `structuredContent` envelope directly, eliminating corrective copies or broker refetches; the quote and RSI maps remain intentional derived handoffs.
 - **tests/** — dependency-free regression tests covering the daily-loss calculator, durable order-intent lifecycle, evaluator, scanner, clock/calendar, concurrent run locking and takeover, dashboard path, the Google Drive phone-share uploader/OAuth flow, phone-share guards, and routine contracts. Run the complete Python suite with `python3 -m unittest discover -s tests` (Windows: `py -3 -m unittest discover -s tests`) before committing any script change; expected market values were verified against live API data. The standalone [RHMRA Phone PWA](https://github.com/abiemann/RobinhoodEquityTradingDashboardViewer) and the OAuth relay under `phone-share-oauth-broker/` each have their own `npm test` command.
+- **resolve_python.ps1** — the Windows scheduled-run bootstrap. It emits one strict JSON receipt containing a launch-probed absolute Python 3 path, rejects Microsoft Store aliases, discovers the current Codex-bundled runtime and normal local installations without hardcoding a version, and lets the routine reuse one interpreter instead of trusting whichever `python.exe` appears first on PATH.
 
 ## First-time app setup
 
@@ -277,7 +279,7 @@ This override sends token requests directly to Google's HTTPS endpoint and delib
 
 ## Troubleshooting
 
-For Windows Python 3 installation and Codex-shell troubleshooting, see [Python 3 install (Windows)](PY3-INSTALL-WIN.md).
+For Windows Python 3 installation and Codex-shell troubleshooting, including the checked-in scheduled-run resolver, see [Python 3 install (Windows)](PY3-INSTALL-WIN.md).
 
 ## Disclaimer
 

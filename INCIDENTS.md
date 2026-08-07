@@ -84,6 +84,18 @@ tests locally, but the routine reads it as an equally valid choice, and the Linu
 picked `py -3` first — exit 127, `bash: py: command not found`, in both the 11:07 and 11:37 runs.
 `py -3` belongs only in AGENTS.md and README.md.
 
+**2026-08-07, WindowsApps alias caused a false missing-Python halt.** The 13:01 scheduled run
+never reached its lifecycle start, configuration check, broker connector, or scan. `py -3` failed
+before process startup with `The file cannot be accessed by the system`; the Codex workspace
+dependency lookup then stalled; and `Get-Command python` returned only the zero-byte Microsoft
+Store alias under `Microsoft\WindowsApps`, which failed with the same message. The task halted
+safely, but two real Python 3 runtimes were available. The immediately preceding 12:34 run had
+encountered the same launcher failure, found a real absolute interpreter, and completed normally.
+The fix is the checked-in `resolve_python.ps1`: it rejects Store aliases, probes every permitted
+absolute candidate for Python 3, returns one validated path, and requires the invocation to reuse
+that path for every helper. A Codex ACL/access-denied failure gets one narrow host-capable retry;
+mere PATH resolution is never proof that a runtime works.
+
 **2026-07-29, exchange-calendar gap (P1 review finding).** The clock classified every weekday by
 fixed wall-clock hours, so an NYSE holiday could look like a normal regular session. With
 `REGULAR_HOURS_BUY_ONLY = false`, that gap could also reach the extended-hours entry path. No loss

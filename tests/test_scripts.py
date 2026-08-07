@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -40,6 +41,7 @@ DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 BROKER_SNAPSHOT = os.path.join(ROOT, 'broker_snapshot.py')
 RUN_LIFECYCLE = os.path.join(ROOT, 'run_lifecycle.py')
+RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
@@ -5013,13 +5015,77 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('`stop_fills_today: null`', pre_second)
         self.assertIn("finish lifecycle as normal `completed`", pre_second)
 
+    def test_routine_binds_one_verified_python_before_lifecycle(self):
+        with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
+            routine = f.read()
+
+        bootstrap_start = routine.index("### PYTHON LAUNCHER BOOTSTRAP")
+        lifecycle_start = routine.index("### INVOCATION LIFECYCLE")
+        self.assertLess(bootstrap_start, lifecycle_start)
+        bootstrap = routine[bootstrap_start:lifecycle_start]
+        self.assertIn("ONLY action permitted before invocation lifecycle start", bootstrap)
+        self.assertIn("`load_workspace_dependencies`", bootstrap)
+        self.assertIn("no more than 20 seconds", bootstrap)
+        self.assertIn(".\\resolve_python.ps1", bootstrap)
+        self.assertIn("`-PreferredPath`", bootstrap)
+        self.assertIn("an absolute `python` path outside `Microsoft\\WindowsApps`", bootstrap)
+        self.assertIn("launch-probes every candidate", bootstrap)
+        self.assertIn("Never substitute `Get-Command python` / `where python`", bootstrap)
+        self.assertIn("a bare `python` or `python.exe`", bootstrap)
+        self.assertIn("retry that exact resolver command once", bootstrap)
+        self.assertIn("`sandbox_permissions: require_escalated`", bootstrap)
+        self.assertIn("reuse that exact absolute path", bootstrap)
+
+        lifecycle = routine[lifecycle_start:routine.index("### ACCOUNT SCOPE")]
+        self.assertIn("`& '<PYTHON_EXE>' run_lifecycle.py start`", lifecycle)
+        self.assertIn("already-bound launcher", lifecycle)
+        self.assertIn("already-bound `PYTHON_EXE` is the sole launcher", routine)
+        self.assertIn("verify it parses and persisted by running EXACTLY with the already-bound launcher", routine)
+        self.assertNotIn("verify `py -3 --version`", routine)
+        self.assertNotIn("running EXACTLY: `python3 -c", routine)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"),
+                         "Windows PowerShell resolver contract")
+    def test_windows_python_resolver_returns_verified_absolute_python3(self):
+        proc = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                RESOLVE_PYTHON,
+                "-PreferredPath",
+                sys.executable,
+            ],
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+            timeout=20,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        document = json.loads(proc.stdout)
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["status"], "valid")
+        self.assertTrue(os.path.isabs(document["python"]))
+        self.assertNotIn("microsoft\\windowsapps", document["python"].lower())
+        self.assertEqual(document["version"].split(".", 1)[0], "3")
+
+        with open(RESOLVE_PYTHON, encoding="utf-8-sig") as f:
+            resolver = f.read()
+        self.assertIn("Microsoft[\\\\/]WindowsApps", resolver)
+        self.assertIn(".cache\\codex-runtimes\\*\\dependencies\\python\\python.exe", resolver)
+        self.assertIn("Python\\bin\\python.exe", resolver)
+        self.assertIn("Programs\\Python\\Python*\\python.exe", resolver)
+
     def test_routine_fences_overlaps_and_rechecks_time_before_buys(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
 
         coordination = routine.split(
             "### RUN COORDINATION — fenced single-flight lease", 1
-        )[1].split("### WINDOWS / CODEX PYTHON ENVIRONMENT", 1)[0]
+        )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
         self.assertIn("before `rules_version`, `get_accounts`, or ANY broker call", coordination)
         self.assertIn(
             "A configuration validation/hash failure stops the full run "
@@ -5076,7 +5142,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertLess(preflight_start, clock_command)
         preflight = routine[preflight_start:routine.index("\n\nNote the `DRY_RUN`", preflight_start)]
         self.assertIn("Before `market_clock.py`, `get_accounts`", preflight)
-        self.assertIn("`py -3 validate_constants.py --json`", preflight)
+        self.assertIn("`& '<PYTHON_EXE>' validate_constants.py --json`", preflight)
         self.assertIn("Do not construct a PowerShell, regex, prose, or ad-hoc replacement validator", preflight)
         self.assertIn("`values` as the SOLE configuration authority", preflight)
         self.assertIn('`status` is exactly `"valid"`', preflight)
@@ -5181,7 +5247,7 @@ class MarketClockTests(unittest.TestCase):
         )
 
         journal = routine.split("### ORDER-INTENT JOURNAL", 1)[1].split(
-            "### WINDOWS / CODEX PYTHON ENVIRONMENT", 1
+            "### BROKER TIMESTAMPS", 1
         )[0]
         self.assertIn("order_intents.py check", journal)
         self.assertIn("order_intents.py pending --run-token <RUN_LOCK_TOKEN>", journal)

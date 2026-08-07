@@ -38,8 +38,16 @@ while the same command reports `No installed Python found!` inside a restricted 
 Use the following decision path:
 
 1. Verify `py -3 --version` in the same environment that will run the routine.
-2. If it succeeds, use `py -3` for every Python command in the routine.
-3. If it fails only inside Codex, use the runner's supplied Python 3 runtime for local tests, or run the scheduled routine in a host-capable runner that can see the installation. The routine must still halt if its required `market_clock.py` command cannot run.
-4. If it fails in ordinary PowerShell too, install Python from [python.org/downloads](https://www.python.org/downloads/), keep the `py` launcher enabled, and verify again.
+2. If it succeeds, use `py -3` for manual tests and the dashboard. Scheduled runs still use the checked-in resolver below so every helper shares one verified absolute interpreter.
+3. If it fails only inside Codex, do not try bare `python`, `python.exe`, `where python`, or the first result from `Get-Command python`: Windows commonly returns a zero-byte Microsoft Store alias under `Microsoft\WindowsApps`, and resolving that path does not prove it can launch.
+4. Scheduled Windows runs use the checked-in resolver before lifecycle startup:
+
+   ```powershell
+   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\resolve_python.ps1
+   ```
+
+   It returns one compact JSON object containing a launch-probed absolute Python 3 path. It checks the current Codex runtime and normal local installation locations without hardcoding a Python version, rejects Store aliases, and exhausts its permitted candidates before reporting failure. The routine binds that returned path once and reuses it for every helper.
+5. When Codex's `load_workspace_dependencies` lookup returns promptly, the routine passes its exact Python path to the resolver as `-PreferredPath`. If the lookup stalls, the resolver still discovers the bundled runtime from the current environment/cache. An explicit sandbox ACL/access-denied failure gets one narrowly scoped host-capable retry of this read-only resolver before the run may halt.
+6. If it fails in ordinary PowerShell too, install Python from [python.org/downloads](https://www.python.org/downloads/), keep the `py` launcher enabled, and verify again.
 
 This environment difference is a sandbox boundary, not a project dependency issue. The scripts use Python's standard library only; no `pip install` step is required.
