@@ -4,6 +4,8 @@ A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** a
 
 > ⚠️ **Automated trading can cause rapid and substantial financial loss. Use only money you can afford to lose.** See the [Disclaimer](#disclaimer).
 
+> **New here?** Use the [one-prompt quick start](QUICKSTART.md). Your coding assistant handles setup and reaches a safe first test, pausing only for sign-in, a required Robinhood UI step, or a real-money-risk decision.
+
 ## What it does
 
 Each run, the agent:
@@ -109,7 +111,7 @@ It is a separate file for a practical reason. The routine document is executed b
 
 ## Testing before going live
 
-1. Leave `DRY_RUN = true` and let a few scheduled runs log the entries they *would* have placed — no capital at risk. Do the same after any strategy-constant change.
+1. Leave `DRY_RUN = true` and let a few supervised runs log the **new entries** they *would* have placed. Do the same after any strategy-constant change. Important: dry run does not make an account read-only; if the selected account already holds positions, profit-taking, stop repairs, and residue sweeps remain live.
 2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
 4. In dry run, confirm the broker accepts the documented order flows. The current connector's canonical stop-market payload uses `type: "stop_market"` plus `stop_price`, with no `trigger` input — so do not rediscover or improvise stop fields during a live run; a review alert is a safety failure to report, not a reason to try another schema.
