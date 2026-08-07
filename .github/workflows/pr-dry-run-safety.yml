@@ -1,0 +1,97 @@
+name: Enforce safe committed defaults
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+# This workflow intentionally runs from the trusted base branch and never
+# checks out or executes pull-request code.
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  committed-dry-run:
+    name: safety/committed-dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Inspect proposed constants.md as inert data
+        shell: bash
+        env:
+          BASE_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          status_url="https://api.github.com/repos/${BASE_REPO}/statuses/${HEAD_SHA}"
+          proposed_constants="${RUNNER_TEMP}/proposed-constants.md"
+          final_state="failure"
+          final_description="Unable to verify constants.md; merge is blocked"
+
+          post_status() {
+            local state="$1"
+            local description="$2"
+            jq -n \
+              --arg state "$state" \
+              --arg context "safety/committed-dry-run" \
+              --arg description "$description" \
+              '{state: $state, context: $context, description: $description}' \
+              | curl --silent --show-error --fail-with-body \
+                  --request POST \
+                  --header "Authorization: Bearer ${GH_TOKEN}" \
+                  --header "Accept: application/vnd.github+json" \
+                  --header "X-GitHub-Api-Version: 2022-11-28" \
+                  --data-binary @- \
+                  "$status_url" >/dev/null
+          }
+
+          finish() {
+            post_status "$final_state" "$final_description"
+          }
+          trap finish EXIT
+
+          post_status "pending" "Checking that committed DRY_RUN remains true"
+
+          curl --silent --show-error --fail-with-body \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${HEAD_REPO}/contents/constants.md?ref=${HEAD_SHA}" \
+            | jq -jr '.content' \
+            | base64 --decode >"$proposed_constants"
+
+          python3 - "$proposed_constants" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          try:
+              text = path.read_bytes().decode("utf-8")
+          except UnicodeDecodeError as exc:
+              raise SystemExit(f"constants.md is not valid UTF-8: {exc}")
+
+          values = re.findall(
+              r"^\|\s*`DRY_RUN`\s*\|\s*`([^`]*)`\s*\|",
+              text,
+              flags=re.MULTILINE,
+          )
+          if values != ["true"]:
+              rendered = ", ".join(repr(value) for value in values) or "missing"
+              raise SystemExit(
+                  "constants.md must contain exactly one DRY_RUN table row "
+                  f"whose value is exactly `true`; found: {rendered}"
+              )
+          PY
+
+          final_state="success"
+          final_description="Committed constants.md keeps DRY_RUN=true"
