@@ -649,6 +649,23 @@ tomorrow's end-to-end automation run remain the defenses for that residual tool-
 dashboard maps a completed structured closed session to `market closed` while retaining red
 `snapshot failure` for a genuinely eligible run whose breaker capture fails.
 
+**2026-08-07 15:35 recurrence.** An eligible scheduled run constructed one generic staging
+wrapper that unconditionally appended `--request-cursor FIRST` for every response kind. The
+portfolio helper correctly rejected that pagination flag, so generation A was discarded before
+its final position/order staging. Generation B restarted from fresh broker calls and completed
+successfully; the lifecycle completed, the account remained flat, and there were no orders,
+cancellations, intents, ledger writes, notifications, or financial impact. The mistake still
+wasted generation A and consumed the only whole-generation retry.
+
+Because the prose-only prohibition had now failed twice, the routine no longer describes one
+generic stage command. It provides separate literal templates for portfolio, quotes,
+positions/orders pages, and positions/orders aggregation; defines `FIRST` only as the synthetic
+initial request cursor for positions/orders; requires an argv check before non-paginated staging;
+and forbids a polymorphic cursor-bearing wrapper. Regression tests verify the command matrix and
+that both portfolio and quote staging reject either pagination flag. The deterministic helper
+remains strict; weakening its rejection would hide orchestration mistakes and compromise snapshot
+provenance.
+
 ---
 
 ## The pattern across all of these

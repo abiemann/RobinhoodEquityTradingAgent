@@ -878,8 +878,44 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("NEVER invent a filename, guess a temp location", block)
         self.assertIn("broker_snapshot.py source-preflight", block)
         self.assertIn("including all `data`, pagination, transport-envelope, and `guide` fields", block)
-        self.assertIn("portfolio and quote stage commands MUST omit both options", block)
-        self.assertIn("broker_snapshot.py stage --generation <A|B>", block)
+        matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
+            "For positions and orders, stage each returned page", 1
+        )[0]
+
+        def matrix_command(label):
+            match = re.search(
+                rf"- {re.escape(label)}: `([^`]+)`",
+                matrix,
+            )
+            self.assertIsNotNone(match, label)
+            return match.group(1)
+
+        portfolio_command = matrix_command("Portfolio template")
+        quotes_command = matrix_command("Quotes template (one batch or aggregate)")
+        page_command = matrix_command("Positions/orders page template")
+        aggregate_command = matrix_command("Positions/orders aggregate template")
+        self.assertIn("--kind portfolio", portfolio_command)
+        self.assertIn("--kind quotes", quotes_command)
+        self.assertIn("--kind <positions|orders>", page_command)
+        self.assertIn("--kind <positions|orders>", aggregate_command)
+        for command in (portfolio_command, quotes_command):
+            self.assertNotIn("--request-cursor", command)
+            self.assertNotIn("--allow-more", command)
+            self.assertNotIn("FIRST", command)
+        self.assertIn("--request-cursor <FIRST|exact prior next cursor>", page_command)
+        self.assertIn("[--allow-more]", page_command)
+        self.assertIn("--request-cursor FIRST", aggregate_command)
+        self.assertIn("--request-cursor '<exact later cursor>'", aggregate_command)
+        self.assertNotIn("--allow-more", aggregate_command)
+        self.assertIn(
+            "Never use one generic or polymorphic staging wrapper",
+            matrix,
+        )
+        self.assertIn("inspect the literal argv tokens", matrix)
+        self.assertIn(
+            "not a universal first-call, first-response, or first-file marker",
+            matrix,
+        )
         self.assertGreaterEqual(block.count("--snapshot-generation <A|B>"), 2)
         self.assertIn("shared set ID", block)
         self.assertIn("provenance sidecar", block)
@@ -3361,31 +3397,41 @@ class BrokerSnapshotTests(unittest.TestCase):
                     )
                     self.assertFalse(os.path.exists(output))
 
-    def test_portfolio_stage_rejects_pagination_cursor_flags(self):
+    def test_non_paginated_stage_rejects_pagination_cursor_flags(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
-            source = self.write_json(
-                td,
-                'portfolio.json',
-                {
+            payloads = {
+                'portfolio': {
                     'data': {
                         'total_value': '1500.01',
                         'cash': '100',
                         'buying_power': '100',
                     }
                 },
+                'quotes': {'data': {'results': []}},
+            }
+            pagination_flags = (
+                ('request-cursor', ('--request-cursor', 'FIRST')),
+                ('allow-more', ('--allow-more',)),
             )
-            output = os.path.join(scratch, 'portfolio-out.json')
-            proc, result = self.stage(
-                'portfolio', [source], [output], '--request-cursor', 'FIRST'
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn(
-                '--request-cursor is not valid for portfolio',
-                result['error']['message'],
-            )
+            for kind, payload in payloads.items():
+                source = self.write_json(td, f'{kind}.json', payload)
+                for label, extra in pagination_flags:
+                    output = os.path.join(
+                        scratch, f'{kind}-{label}-rejected.json'
+                    )
+                    proc, result = self.stage(
+                        kind, [source], [output], *extra
+                    )
+                    with self.subTest(kind=kind, flag=label):
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn(
+                            f'{extra[0]} is not valid for {kind}',
+                            result['error']['message'],
+                        )
+                        self.assertFalse(os.path.exists(output))
 
     def test_strict_json_and_malformed_semantic_shapes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
