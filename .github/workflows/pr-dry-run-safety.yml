@@ -1,4 +1,4 @@
-name: Enforce safe committed defaults
+name: Block constants.md changes in pull requests
 
 on:
   pull_request_target:
@@ -9,33 +9,45 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - edited
 
 # This workflow intentionally runs from the trusted base branch and never
-# checks out or executes pull-request code.
+# checks out or executes pull-request code. The status context remains named
+# safety/committed-dry-run because the repository ruleset requires that exact
+# established context.
 permissions:
-  contents: read
+  pull-requests: read
   statuses: write
 
 jobs:
-  committed-dry-run:
+  constants-unchanged:
     name: safety/committed-dry-run
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Inspect proposed constants.md as inert data
+      - name: Reject pull requests that touch constants.md
         shell: bash
         env:
           BASE_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           set -Eeuo pipefail
 
           status_url="https://api.github.com/repos/${BASE_REPO}/statuses/${HEAD_SHA}"
-          proposed_constants="${RUNNER_TEMP}/proposed-constants.md"
+          pr_url="https://api.github.com/repos/${BASE_REPO}/pulls/${PR_NUMBER}"
           final_state="failure"
-          final_description="Unable to verify constants.md; merge is blocked"
+          final_description="Unable to verify PR file list; merge is blocked"
+
+          api_get() {
+            curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
 
           post_status() {
             local state="$1"
@@ -59,39 +71,60 @@ jobs:
           }
           trap finish EXIT
 
-          post_status "pending" "Checking that committed DRY_RUN remains true"
+          post_status "pending" "Checking that the PR does not touch constants.md"
 
-          curl --silent --show-error --fail-with-body \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${HEAD_REPO}/contents/constants.md?ref=${HEAD_SHA}" \
-            | jq -jr '.content' \
-            | base64 --decode >"$proposed_constants"
+          if [[ ! "$EXPECTED_CHANGED_FILES" =~ ^[0-9]+$ ]]; then
+            final_description="PR changed-file count is invalid; merge is blocked"
+            exit 1
+          fi
+          if (( EXPECTED_CHANGED_FILES > 3000 )); then
+            final_description="PR has over 3000 files; constants check cannot prove safety"
+            exit 1
+          fi
 
-          python3 - "$proposed_constants" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
+          initial_pr="$(api_get "$pr_url")"
+          initial_head="$(jq -er '.head.sha | select(type == "string")' <<<"$initial_pr")"
+          initial_count="$(jq -er '.changed_files | select(type == "number" and . >= 0)' <<<"$initial_pr")"
+          if [[ "$initial_head" != "$HEAD_SHA" || "$initial_count" != "$EXPECTED_CHANGED_FILES" ]]; then
+            final_description="PR changed during safety check; rerun is required"
+            exit 1
+          fi
 
-          path = Path(sys.argv[1])
-          try:
-              text = path.read_bytes().decode("utf-8")
-          except UnicodeDecodeError as exc:
-              raise SystemExit(f"constants.md is not valid UTF-8: {exc}")
+          observed=0
+          if (( EXPECTED_CHANGED_FILES > 0 )); then
+            page_count=$(( (EXPECTED_CHANGED_FILES + 99) / 100 ))
+            for (( page=1; page<=page_count; page++ )); do
+              files="$(api_get "${pr_url}/files?per_page=100&page=${page}")"
+              page_items="$(jq -er 'if type == "array" then length else error("expected array") end' <<<"$files")"
+              if (( page_items == 0 )); then
+                final_description="PR file pagination ended early; merge is blocked"
+                exit 1
+              fi
+              observed=$(( observed + page_items ))
 
-          values = re.findall(
-              r"^\|\s*`DRY_RUN`\s*\|\s*`([^`]*)`\s*\|",
-              text,
-              flags=re.MULTILINE,
-          )
-          if values != ["true"]:
-              rendered = ", ".join(repr(value) for value in values) or "missing"
-              raise SystemExit(
-                  "constants.md must contain exactly one DRY_RUN table row "
-                  f"whose value is exactly `true`; found: {rendered}"
-              )
-          PY
+              if jq -e 'any(.[];
+                (.filename == "constants.md") or
+                (.previous_filename == "constants.md")
+              )' <<<"$files" >/dev/null; then
+                final_description="PR changes constants.md; contact the maintainer"
+                echo "::error title=constants.md is maintainer-controlled::Pull requests may not add, modify, delete, or rename constants.md. Contact the maintainer."
+                exit 1
+              fi
+            done
+          fi
+
+          if (( observed != EXPECTED_CHANGED_FILES )); then
+            final_description="PR file count mismatch; merge is blocked"
+            exit 1
+          fi
+
+          final_pr="$(api_get "$pr_url")"
+          final_head="$(jq -er '.head.sha | select(type == "string")' <<<"$final_pr")"
+          final_count="$(jq -er '.changed_files | select(type == "number" and . >= 0)' <<<"$final_pr")"
+          if [[ "$final_head" != "$HEAD_SHA" || "$final_count" != "$EXPECTED_CHANGED_FILES" ]]; then
+            final_description="PR changed during safety check; rerun is required"
+            exit 1
+          fi
 
           final_state="success"
-          final_description="Committed constants.md keeps DRY_RUN=true"
+          final_description="PR does not touch constants.md"
