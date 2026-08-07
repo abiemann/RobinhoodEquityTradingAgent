@@ -5028,6 +5028,13 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("no more than 20 seconds", bootstrap)
         self.assertIn(".\\resolve_python.ps1", bootstrap)
         self.assertIn("`-PreferredPath`", bootstrap)
+        self.assertIn("one-way candidate hint", bootstrap)
+        self.assertIn("displayed escape for one Windows", bootstrap)
+        self.assertIn("A valid resolver receipt ends launcher resolution immediately", bootstrap)
+        self.assertIn("returned `python` field is already launch-probed", bootstrap)
+        self.assertIn("Bind it without comparing it to the hint", bootstrap)
+        self.assertIn("Never rerun a successful resolver", bootstrap)
+        self.assertIn("sole permitted second invocation", bootstrap)
         self.assertIn("an absolute `python` path outside `Microsoft\\WindowsApps`", bootstrap)
         self.assertIn("launch-probes every candidate", bootstrap)
         self.assertIn("Never substitute `Get-Command python` / `where python`", bootstrap)
@@ -5040,7 +5047,23 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("`& '<PYTHON_EXE>' run_lifecycle.py start`", lifecycle)
         self.assertIn("already-bound launcher", lifecycle)
         self.assertIn("already-bound `PYTHON_EXE` is the sole launcher", routine)
-        self.assertIn("verify it parses and persisted by running EXACTLY with the already-bound launcher", routine)
+        self.assertIn(
+            "[json.load(open(p, encoding='utf-8')) for p in sys.argv[1:]]",
+            routine,
+        )
+        self.assertIn("'<file1>' '<file2>'", routine)
+        self.assertIn("each native path as its own quoted argument", routine)
+        self.assertNotIn("<file1> <file2> …", routine)
+
+        status_start = routine.index("**Publish the STATUS SNAPSHOT")
+        status_end = routine.index("The filename is exactly:", status_start)
+        status = routine[status_start:status_end]
+        self.assertIn("verify it parses and persisted by running EXACTLY with the already-bound launcher", status)
+        self.assertIn("json.load(open(sys.argv[1], encoding='utf-8'))", status)
+        self.assertIn("'<absolute native status path>'", status)
+        self.assertIn("The status path is the separate final argument", status)
+        self.assertIn("Never interpolate an absolute path into the `-c` source", status)
+        self.assertNotIn("json.load(open('<absolute path>", routine)
         self.assertNotIn("verify `py -3 --version`", routine)
         self.assertNotIn("running EXACTLY: `python3 -c", routine)
 
@@ -5072,12 +5095,71 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn("microsoft\\windowsapps", document["python"].lower())
         self.assertEqual(document["version"].split(".", 1)[0], "3")
 
+        direct = subprocess.run(
+            [
+                document["python"],
+                "-I",
+                "-c",
+                "import sys; print(sys.version_info.major); print(sys.executable)",
+            ],
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+            timeout=20,
+        )
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        direct_lines = direct.stdout.splitlines()
+        self.assertEqual(direct_lines[0], "3")
+        self.assertEqual(
+            os.path.normcase(os.path.realpath(direct_lines[1])),
+            os.path.normcase(os.path.realpath(document["python"])),
+        )
+
         with open(RESOLVE_PYTHON, encoding="utf-8-sig") as f:
             resolver = f.read()
         self.assertIn("Microsoft[\\\\/]WindowsApps", resolver)
         self.assertIn(".cache\\codex-runtimes\\*\\dependencies\\python\\python.exe", resolver)
         self.assertIn("Python\\bin\\python.exe", resolver)
         self.assertIn("Programs\\Python\\Python*\\python.exe", resolver)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"),
+                         "Windows PowerShell status verifier contract")
+    def test_windows_status_verifier_passes_native_path_as_argv(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = os.path.join(td, "run-reports")
+            os.makedirs(report_dir)
+            status_path = os.path.join(report_dir, "rhmra-status-test.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"schema_version": 1, "status": "ok"}, handle)
+
+            def ps_literal(value):
+                return "'" + value.replace("'", "''") + "'"
+
+            python_source = (
+                "import json,sys; "
+                "json.load(open(sys.argv[1], encoding='utf-8'))"
+            )
+            command = (
+                f"& {ps_literal(sys.executable)} -I -c "
+                f"{chr(34)}{python_source}{chr(34)} "
+                f"{ps_literal(status_path)}"
+            )
+            proc = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command,
+                ],
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                timeout=20,
+            )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
     def test_routine_fences_overlaps_and_rechecks_time_before_buys(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

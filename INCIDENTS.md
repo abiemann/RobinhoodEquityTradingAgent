@@ -96,6 +96,21 @@ absolute candidate for Python 3, returns one validated path, and requires the in
 that path for every helper. A Codex ACL/access-denied failure gets one narrow host-capable retry;
 mere PATH resolution is never proof that a runtime works.
 
+**2026-08-07, valid Windows paths were second-guessed or embedded in Python source.** A later run's
+first resolver call returned a valid, launch-probed Python 3 path, but the orchestration made an
+unnecessary second call to reconcile the optional preferred hint's displayed JSON escapes with
+the resolver's normalized output. Near report completion, the status file was valid on disk, but
+its first parse check embedded the native `D:\...\run-reports\...` path inside `-c` Python source;
+the `\r` sequence was interpreted as a carriage-return escape and produced a false verifier
+failure. The unchanged file passed when the path was retried with forward slashes. Neither event
+affected broker work, persisted data, or trading decisions, but both added noise and latency.
+
+The resolver receipt is now terminal and authoritative: its returned `python` path is used directly
+without comparing, rewriting, or rerunning to "correct" the hint. File paths cross the PowerShell /
+Python boundary as separate argv values, never as interpolated Python source and never through
+manual slash rewriting. Regression tests launch the returned executable and verify a JSON file
+through a native backslash path.
+
 **2026-07-29, exchange-calendar gap (P1 review finding).** The clock classified every weekday by
 fixed wall-clock hours, so an NYSE holiday could look like a normal regular session. With
 `REGULAR_HOURS_BUY_ONLY = false`, that gap could also reach the extended-hours entry path. No loss
