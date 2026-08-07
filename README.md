@@ -201,7 +201,7 @@ Only one instance of the trading agent can operate at a time. If another schedul
 
 ### View on Phone setup (optional)
 
-Phone viewing is **off by default**. The recommended v2 design uses the installable [RHMRA Phone PWA](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/) and the user's own private Google Drive app-data area. There is no RHMRA account server, shared financial-data backend, public bucket, or internet-facing laptop web server. A narrowly scoped OAuth relay participates only in Google token exchange; it never receives dashboard snapshots.
+Phone viewing is **off by default**. **View on Phone** uses the installable [RHMRA Phone PWA](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/) and the user's own private Google Drive app-data area. There is no RHMRA account server, shared financial-data backend, public bucket, or internet-facing laptop web server. A narrowly scoped OAuth relay participates only in Google token exchange; it never receives dashboard snapshots.
 
 The phone user needs only a free Google account and an Android phone, iPhone, or iPad with a modern browser. The laptop needs the Agent checkout and an internet connection. End users do **not** download an OAuth JSON file, supply a client secret, deploy Cloudflare, create a bucket, or configure an API key. Start the dashboard normally:
 
@@ -211,25 +211,29 @@ py -3 dashboard\serve.py 9000
 
 When the user selects **Connect Google Drive**, the Agent opens Google's authorization page with S256 PKCE and a one-time state value. The RHMRA OAuth relay adds the project's protected Desktop client credential only while forwarding the authorization-code exchange or token refresh to Google. The relay implementation stores and logs no authorization codes or tokens, and it never receives encrypted or decrypted dashboard data. Google Drive access and dashboard uploads remain between the Agent and the user's Google account.
 
-#### Install and pair once
+#### Recommended: scan the QR code from the laptop dashboard
 
-Install the PWA **before** pairing so its non-extractable decryption key is saved in the installed app's own browser storage:
+Normal setup starts on the laptop and requires no public URL, copied link, or manual pasting:
 
-1. On the phone, open [RHMRA Phone](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/).
-2. Install it:
-   - **Android / Chrome:** open the browser menu, then choose **Install app** or **Add to Home screen**.
-   - **iPhone or iPad / Safari:** tap **Share → Add to Home Screen**.
-3. Open **RHMRA** from the phone's Home Screen.
-4. On the laptop, start the local dashboard, click **View on Phone → Connect Google Drive**, and complete Google sign-in. Use the Google account that you intend to use on the phone.
-5. Back in **View on Phone**, choose the duration and click **Pair phone and create QR code**. Wait until the first encrypted snapshot uploads and the QR code appears, then click **Copy private link**.
-6. Transfer that link to the phone through a private method, copy it, and tap **Paste private pairing link** inside the installed RHMRA Phone app.
-7. In the phone app, tap **Connect Google Drive** and sign in with the **same Google account** used on the laptop. Approve the requested private app-data access.
+1. Start the local dashboard and select **View on Phone**.
+2. Select **Connect Google Drive** and sign in with the Google account that you intend to use on the phone.
+3. Choose the share duration, then select **Pair phone and create QR code**.
+4. Scan the displayed QR code with the phone's camera.
+5. If Messenger, Instagram, or another app opens the link in its built-in browser, use the RHMRA handoff screen to open it in **Chrome** (Android) or **Safari** (iPhone/iPad). Do not pair inside an embedded browser.
+6. Install RHMRA from Chrome or Safari if it is not already installed, then open it from the phone's Home Screen.
+7. Select **Connect Google Drive** and sign in with the same Google account used on the laptop. The encrypted dashboard appears after the first successful refresh.
+
+On iPhone and iPad, Safari and the installed Home Screen app keep separate private storage. If scanning the QR code opens Safari instead of the installed RHMRA app, use the alternate approach below to paste the private pairing link inside the installed app.
+
+#### Alternate: install first and paste the private link
+
+Use this only when QR scanning is unavailable or does not open the installed RHMRA app. Open and install [RHMRA Phone](https://abiemann.github.io/RobinhoodEquityTradingDashboardViewer/), create the share from laptop **View on Phone**, choose **Copy private link**, transfer it privately, and select **Paste private pairing link** inside the installed app. Then connect Google Drive with the same Google account used on the laptop.
 
 For Google Drive sharing, the duration selector offers **1, 2, 4, 6, or 8
 hours**. Two hours remains the preselected choice; eight hours is the hard
 maximum.
 
-The QR/camera flow is a convenient browser fallback. For an installed app—especially on iPhone or iPad—pasting the private link inside the Home Screen app is more reliable because Safari and the installed PWA keep separate storage. Never post, email broadly, or otherwise share the QR code or private link: it contains the dashboard decryption key.
+The laptop-dashboard QR flow is the primary setup path; the public URL and copied private link are alternate recovery options. Never post, email broadly, or otherwise share the QR code or private link: it contains the dashboard decryption key.
 
 Pairing normally survives future dashboard sessions. The next time, click **View on Phone → Start sharing with paired phone**; no new QR code is required. The phone checks for a fresh snapshot every 30 seconds while the app is visible, stops polling while it is in the background, and refreshes immediately when reopened. Pull-to-refresh or a full reload keeps the last verified dashboard and pairing key visible; because the phone's Google access token deliberately remains only in memory, the app may show a disconnected state and ask for the same Google account again, then resumes without a new QR code. On small screens the dashboard header stays visible while the account area scrolls, and expanded run details remain open across polling refreshes until tapped again.
 
