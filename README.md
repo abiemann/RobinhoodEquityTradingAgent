@@ -149,7 +149,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 
 > **ChatGPT users:** switch to **Codex mode** before running this project for the best experience with local project files, tool activity, and generated reports.
 
-In ChatGPT/Codex, open **Settings → MCP servers → Add server** and enter:
+In ChatGPT/Codex, open **Settings → Plugins → MCPs → Add → Add MCP server** and enter:
 
 | Field | Value |
 |---|---|
@@ -165,7 +165,7 @@ Save the connector, then:
 A successful setup exposes tools such as `get_accounts`.
 
 If a later run reports that the required Robinhood tools are not available in its task tool set,
-open **Settings → MCP servers**, select the Robinhood server, choose **Authenticate**, restart
+open **Settings → Plugins → MCPs**, select the Robinhood server, choose **Authenticate**, restart
 ChatGPT/Codex, and confirm that a fresh task exposes `get_accounts`. If it is still absent in that
 fresh task, remove and re-create the MCP connection, restart ChatGPT/Codex, and test `get_accounts`
 again. Do not run scheduled trading until that fresh-task check succeeds.

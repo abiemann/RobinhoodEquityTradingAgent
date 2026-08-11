@@ -6,7 +6,7 @@
 
 The agent cannot access Robinhood until its MCP connector is added and authorized:
 
-- **ChatGPT or Codex:** open **Settings → Plugins → MCP → Add server**. Choose **Streamable HTTP**.
+- **ChatGPT or Codex:** open **Settings → Plugins → MCPs → Add → Add MCP server**. Choose **Streamable HTTP**.
 - **Claude:** open **Settings → Connectors → Add → Add custom connector**.
 
 Name it `Robinhood Trader` and use this server URL:

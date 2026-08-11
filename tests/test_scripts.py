@@ -5420,7 +5420,7 @@ class MarketClockTests(unittest.TestCase):
             'No Robinhood request was attempted',
             '`coordination-halt` / `account-scope-failed`',
             'release the lease',
-            'Settings → MCP servers',
+            'Settings → Plugins → MCPs',
             '`robinhood-trading`',
             'choose Authenticate',
             'still absent in that fresh task',
@@ -5433,7 +5433,7 @@ class MarketClockTests(unittest.TestCase):
 
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             readme = f.read()
-        self.assertIn('Settings → MCP servers', readme)
+        self.assertIn('Settings → Plugins → MCPs', readme)
         self.assertIn('remove and re-create the MCP connection', readme)
         self.assertIn('fresh task exposes `get_accounts`', readme)
         self.assertIn('still absent in that', readme)
