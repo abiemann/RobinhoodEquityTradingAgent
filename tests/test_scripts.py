@@ -5404,6 +5404,40 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)
         self.assertIn("Transient JSON handoffs are deliberately different", routine)
 
+    def test_routine_surfaces_missing_mcp_tools_with_reconnection_help(self):
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+
+        connector = routine.split('### CONNECTOR FAILURES', 1)[1].split(
+            '### ORDER HANDLING', 1
+        )[0]
+        for required in (
+            'startup sequence reaches item 12 after items 1–11 have succeeded',
+            'not exposed or callable',
+            'No Robinhood request was attempted',
+            '`coordination-halt` / `account-scope-failed`',
+            'release the lease',
+            'Settings → MCP servers',
+            '`robinhood-trading`',
+            'choose Authenticate',
+            'still absent in that fresh task',
+            'remove and re-create',
+            '`get_accounts`',
+            'fresh task',
+            'Do not rerun this automation until that fresh-task check succeeds',
+        ):
+            self.assertIn(required, connector)
+
+        with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        self.assertIn('Settings → MCP servers', readme)
+        self.assertIn('remove and re-create the MCP connection', readme)
+        self.assertIn('fresh task exposes `get_accounts`', readme)
+        self.assertIn('still absent in that', readme)
+
     def test_routine_requires_durable_order_intent_reconciliation(self):
         with open(
             os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),

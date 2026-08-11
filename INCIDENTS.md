@@ -487,6 +487,19 @@ with no mention of the failure. It was safe because the account happened to be f
 `equity_value > 0` and a dead positions call, holdings exist that cannot be audited for stop
 coverage. **Safe by account state, not by spec.**
 
+**2026-08-11, invalid connector authorization omitted every Robinhood tool.** Twelve invocations
+from 06:05 through 11:12 Pacific completed deterministic startup but received none of the required
+Robinhood MCP tools, so even `get_accounts` could not be attempted. Codex's internal logs recorded
+OAuth refresh `invalid_grant`, said reauthorization was required, and omitted the not-ready MCP
+server. The runs safely failed closed before broker activity, but the visible coordination halt
+named only missing tools and gave the operator no recovery action; scheduled attempts repeated
+until the connection was reauthorized.
+
+**Rule produced:** absence of the required Robinhood tool surface is a pre-broker account-scope
+halt, not a retryable connector call or an empty-account result. The visible halt must recommend
+reauthorizing or re-creating the Robinhood MCP connection, restarting Codex, and verifying that a
+fresh task exposes `get_accounts` before scheduled trading resumes.
+
 ## REPORT — halted-run discipline
 
 **2026-07-13.** Identical halted runs ranged 13.5K–50K tokens (~3×) purely from improvised

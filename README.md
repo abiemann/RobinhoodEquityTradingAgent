@@ -91,6 +91,7 @@ The preferred models are **Claude Sonnet 4.6** and **Codex Luna 5.6 (high)**. If
 - **Stop-coverage audit**, run against every held position every run: stops vanish silently — a `gfd` stop expires at that day's close — so a position without enough valid active-stop quantity to cover every whole share gets only the missing quantity placed at a fresh level. Malformed or over-covered stop data halts new entries for the run. This exists because a position once rode to −49% while believed protected.
 - **Re-entry cooldown**: a symbol whose stop filled is untouchable for `REENTRY_COOLDOWN_DAYS`, blocking revenge re-entries.
 - **Connector-failure discipline**: a failed broker read/review is retried exactly once and is never treated as an empty result; placements and cancellations use their stricter reconciliation protocols instead of blind retries. If positions can't be fetched and the portfolio shows nonzero equity, the run places no orders at all. Every failure is reported even when recovery succeeded.
+- **Missing MCP tool surface**: if the task exposes no Robinhood tools at all, it halts before broker access and gives the operator explicit reauthentication/re-creation steps instead of treating the absence as a failed broker request or an empty account.
 - **Validated broker-snapshot staging**: each entry-eligible breaker generation first uses `broker_snapshot.py source-preflight` to prove that a fresh external response-source probe is writable, readable, strict JSON, and outside the marked scratch directory. An explicit harness result resource is preferred; otherwise the runner's file-change facility must carry one complete unchanged response. The run never guesses or searches for tool-result paths. Every staged response is envelope-checked, semantically validated, atomically persisted, read back, and hash-checked. Portfolio/quote staging uses exact non-paginated command shapes; position/order page and aggregate staging uses separate cursor-bearing shapes, and a generic stage wrapper may not own cursor flags. A failed generation is discarded wholesale and rebuilt once from fresh broker calls. The probe proves the response-source path, not a later full-response transfer, so the release checklist still requires an end-to-end scheduled-run smoke test on the target runner.
 - **Broker compliance check** (`review_equity_order`) before every order.
 - **Info notification** on every buy and sell.
@@ -148,7 +149,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 
 > **ChatGPT users:** switch to **Codex mode** before running this project for the best experience with local project files, tool activity, and generated reports.
 
-In ChatGPT/Codex, open **Settings → Plugins → MCP → Add server** and enter:
+In ChatGPT/Codex, open **Settings → MCP servers → Add server** and enter:
 
 | Field | Value |
 |---|---|
@@ -162,6 +163,12 @@ Save the connector, then:
 2. Restart ChatGPT/Codex so the MCP settings take effect.
 
 A successful setup exposes tools such as `get_accounts`.
+
+If a later run reports that the required Robinhood tools are not available in its task tool set,
+open **Settings → MCP servers**, select the Robinhood server, choose **Authenticate**, restart
+ChatGPT/Codex, and confirm that a fresh task exposes `get_accounts`. If it is still absent in that
+fresh task, remove and re-create the MCP connection, restart ChatGPT/Codex, and test `get_accounts`
+again. Do not run scheduled trading until that fresh-task check succeeds.
 
 ![ChatGPT/Codex Robinhood MCP connector configuration](images/codex-robinhood-mcp-connector.png)
 
