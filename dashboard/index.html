@@ -86,6 +86,19 @@
                                                      box-shadow:inset 0 0 0 1px var(--blue); }
   .run-performance-marker { position:absolute; top:2px; right:4px; color:var(--blue);
                             font-size:11px; font-weight:700; line-height:1; }
+  #performance-section { display:grid; grid-template-rows:0fr; min-width:0;
+                         padding:0; margin-bottom:0; border:0; border-radius:0;
+                         background:transparent; opacity:0; overflow:hidden;
+                         pointer-events:none;
+                         transition:grid-template-rows 900ms ease,
+                                    margin-bottom 900ms ease, opacity 300ms ease; }
+  #performance-section.performance-open { grid-template-rows:1fr; margin-bottom:16px;
+                                          opacity:1; pointer-events:auto; }
+  .performance-collapse-track { min-width:0; min-height:0; overflow:hidden; }
+  .performance-panel { min-width:0; padding:16px; border:1px solid var(--line);
+                       border-radius:8px; background:var(--panel);
+                       transform:translateY(-8px); transition:transform 900ms ease; }
+  #performance-section.performance-open .performance-panel { transform:translateY(0); }
   /* the one exception: a tripped guard is an alert, not a routine outcome */
   .run.halted { border-color:var(--red); }
   .run.halted .t { color:var(--red); }
@@ -104,6 +117,9 @@
                            color:var(--dim); font-size:12px; }
   .performance-duration { font-variant-numeric:tabular-nums; }
   .performance-missing { color:var(--dim); font-style:italic; font-weight:400; }
+  @media (prefers-reduced-motion: reduce) {
+    #performance-section, .performance-panel { transition:none; }
+  }
   .phone-share-button { margin-left:auto; display:inline-flex; align-items:center; gap:7px;
                         padding:5px 10px; border:1px solid var(--line); border-radius:7px;
                         background:var(--panel); color:var(--dim); cursor:pointer; }
@@ -217,13 +233,18 @@
   <div class="runs" id="runs"><span class="empty">no invocations yet</span></div>
 </section>
 
-<section id="performance-section">
-  <h2>Run performance <span class="hint">&mdash; local timing by runner and model;
-    <span aria-hidden="true">*</span> timing available &mdash; select a marked run above</span></h2>
-  <div id="performance-notice" class="performance-notice" role="status"
-       aria-live="polite" hidden></div>
-  <div class="performance-scroll">
-    <div id="performance" role="status" aria-live="polite"><span class="empty">Select a starred run above to view its timing details.</span></div>
+<section id="performance-section" role="region" aria-labelledby="performance-heading"
+         aria-hidden="true" inert>
+  <div class="performance-collapse-track">
+    <div class="performance-panel">
+      <h2 id="performance-heading">Run performance <span class="hint">&mdash; local timing by runner and model;
+        <span aria-hidden="true">*</span> timing available &mdash; select a marked run above</span></h2>
+      <div id="performance-notice" class="performance-notice" role="status"
+           aria-live="polite" hidden></div>
+      <div class="performance-scroll">
+        <div id="performance" role="status" aria-live="polite"><span class="empty">Select a starred run above to view its timing details.</span></div>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -254,6 +275,8 @@ const LEDGER_ROUNDING_POLICY = "per-fill-half-away-from-zero-to-cent";
 let latestPnlReconciliation = null;
 let performanceRecordsByInvocation = new Map();
 let selectedPerformanceInvocationId = null;
+let performanceTelemetryUnavailable = false;
+let performanceScrollEpoch = 0;
 
 function numberToCents(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
@@ -1566,9 +1589,36 @@ function performanceDurationCell(milliseconds, detailParts = []) {
   return `<span class="performance-duration${measured ? "" : " performance-missing"}"${title}>${esc(display)}</span>`;
 }
 
+function setPerformanceSectionOpen(open) {
+  const section = $("performance-section");
+  section.classList.toggle("performance-open", open);
+  section.setAttribute("aria-hidden", open ? "false" : "true");
+  if (open) section.removeAttribute("inert");
+  else section.setAttribute("inert", "");
+}
+
+function schedulePerformanceScroll(target) {
+  const epoch = ++performanceScrollEpoch;
+  if (!target || typeof target.scrollIntoView !== "function") return;
+  const reducedMotion = typeof globalThis.matchMedia === "function" &&
+    globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const scroll = () => {
+    if (epoch !== performanceScrollEpoch) return;
+    target.scrollIntoView({
+      behavior: reducedMotion ? "auto" : "smooth",
+      block: "nearest",
+    });
+  };
+  if (reducedMotion || typeof globalThis.requestAnimationFrame !== "function") scroll();
+  else globalThis.requestAnimationFrame(scroll);
+}
+
 function renderPerformanceUnavailable(message) {
   performanceRecordsByInvocation = new Map();
   selectedPerformanceInvocationId = null;
+  performanceTelemetryUnavailable = true;
+  performanceScrollEpoch += 1;
+  setPerformanceSectionOpen(true);
   const notice = $("performance-notice");
   notice.textContent = "Run performance unavailable: " + String(message);
   notice.hidden = false;
@@ -1616,12 +1666,17 @@ function performanceRecordRow(record) {
 }
 
 function renderSelectedPerformance() {
+  if (performanceTelemetryUnavailable) {
+    setPerformanceSectionOpen(true);
+    return;
+  }
   const record = selectedPerformanceInvocationId === null
     ? null : performanceRecordsByInvocation.get(selectedPerformanceInvocationId) ?? null;
   if (!record) {
-    $("performance").innerHTML = '<span class="empty">Select a starred run above to view its timing details.</span>';
+    setPerformanceSectionOpen(false);
     return;
   }
+  setPerformanceSectionOpen(true);
   const row = performanceRecordRow(record);
   $("performance").innerHTML = `<table class="performance-table"><thead><tr>` +
     `<th>Start / session</th><th>Runner / model / configuration</th>` +
@@ -1653,10 +1708,12 @@ function renderPerformance(document) {
     }
     indexed.set(record.invocation_id, record);
   }
+  performanceTelemetryUnavailable = false;
   performanceRecordsByInvocation = indexed;
   if (selectedPerformanceInvocationId !== null &&
       !performanceRecordsByInvocation.has(selectedPerformanceInvocationId)) {
     selectedPerformanceInvocationId = null;
+    performanceScrollEpoch += 1;
   }
   renderSelectedPerformance();
 }
@@ -1667,7 +1724,7 @@ function updatePerformanceChipSelection() {
     const selected = chip.dataset.performanceInvocationId ===
       selectedPerformanceInvocationId;
     chip.classList.toggle("performance-selected", selected);
-    chip.setAttribute("aria-pressed", selected ? "true" : "false");
+    chip.setAttribute("aria-expanded", selected ? "true" : "false");
   }
 }
 
@@ -1675,6 +1732,7 @@ function syncPerformanceSelection(availableInvocationIds) {
   if (selectedPerformanceInvocationId !== null &&
       !availableInvocationIds.has(selectedPerformanceInvocationId)) {
     selectedPerformanceInvocationId = null;
+    performanceScrollEpoch += 1;
   }
   updatePerformanceChipSelection();
   renderSelectedPerformance();
@@ -1688,6 +1746,7 @@ function runOutcomeText(parts) {
 
 async function renderLegacyRuns(statusNames, gateNames, rows, config) {
   if (!statusNames.length) {
+    performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
     syncPerformanceSelection(new Set());
     return;
@@ -1727,6 +1786,7 @@ async function renderLegacyRuns(statusNames, gateNames, rows, config) {
     } catch { return `<span class="run" title="unreadable"><span class="t">?</span>` +
                      `<span class="o">${esc(n)}</span></span>`; }
   }));
+  performanceScrollEpoch += 1;
   $("runs").innerHTML = chips.join("");
   syncPerformanceSelection(new Set());
 }
@@ -1743,6 +1803,7 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
     ...lifecycle.map(invocationDay).filter(Boolean),
   ].sort();
   if (!days.length) {
+    performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
     syncPerformanceSelection(new Set());
     return;
@@ -1851,13 +1912,24 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
     const accessibleLabel = `${start.slice(11, 16)}; ${runOutcomeText(parts)}; timing details available`;
     return `<button type="button" class="run ${esc(safePhase)} ${esc(outcomeClass)} has-performance` +
       `${selected ? " performance-selected" : ""}" title="${esc(tip)}" ` +
-      `data-performance-invocation-id="${esc(invocationId)}" aria-controls="performance" ` +
-      `aria-pressed="${selected ? "true" : "false"}" aria-label="${esc(accessibleLabel)}">` +
+      `data-performance-invocation-id="${esc(invocationId)}" aria-controls="performance-section" ` +
+      `aria-expanded="${selected ? "true" : "false"}" aria-label="${esc(accessibleLabel)}">` +
       `${contents}<span class="run-performance-marker" aria-hidden="true">*</span>` +
       `<span class="sr-only">Timing details available.</span></button>`;
   }));
+  const activeRunChip = document.activeElement;
+  const focusedPerformanceInvocationId = activeRunChip &&
+    $("runs").contains(activeRunChip)
+    ? activeRunChip.dataset?.performanceInvocationId ?? null : null;
+  performanceScrollEpoch += 1;
   $("runs").innerHTML = chips.join("");
   syncPerformanceSelection(availablePerformanceIds);
+  if (focusedPerformanceInvocationId !== null) {
+    const replacement = [...$("runs").querySelectorAll(
+      "button.run[data-performance-invocation-id]")].find(
+        chip => chip.dataset.performanceInvocationId === focusedPerformanceInvocationId);
+    replacement?.focus({ preventScroll: true });
+  }
 }
 
 function collectRunView() {
@@ -2080,9 +2152,11 @@ $('runs').addEventListener('click', event => {
   if (!chip || !$('runs').contains(chip)) return;
   const invocationId = chip.dataset.performanceInvocationId;
   if (!performanceRecordsByInvocation.has(invocationId)) return;
-  selectedPerformanceInvocationId = invocationId;
+  const closing = selectedPerformanceInvocationId === invocationId;
+  selectedPerformanceInvocationId = closing ? null : invocationId;
   updatePerformanceChipSelection();
   renderSelectedPerformance();
+  schedulePerformanceScroll(closing ? chip : $("performance-section"));
 });
 $('phone-share-button').addEventListener('click', openPhoneShareDialog);
 $('phone-share-close').addEventListener('click', () => $('phone-share-dialog').close());

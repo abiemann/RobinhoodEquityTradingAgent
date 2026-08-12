@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -207,10 +208,25 @@ class PerformanceClientContractTests(unittest.TestCase):
     def test_performance_section_is_separate_and_uses_exact_terms(self):
         source = self.source
         runs = source.index('<div class="runs" id="runs">')
-        performance = source.index('<section id="performance-section">')
+        performance = source.index(
+            '<section id="performance-section" role="region"'
+        )
+        performance_open_tag = source[
+            performance:source.index(">", performance) + 1
+        ]
+        self.assertIn('aria-labelledby="performance-heading"', performance_open_tag)
+        self.assertIn('aria-hidden="true"', performance_open_tag)
+        self.assertIn(" inert", performance_open_tag)
         eras = source.index("Strategy realized P&amp;L by rules era")
         self.assertLess(runs, performance)
         self.assertLess(performance, eras)
+        self.assertIn('<div class="performance-collapse-track">', source)
+        self.assertIn('<div class="performance-panel">', source)
+        self.assertLess(
+            source.index('<div class="performance-collapse-track">', performance),
+            source.index('<div class="performance-panel">', performance),
+        )
+        self.assertIn('<h2 id="performance-heading">Run performance', source)
         for term in (
             "Run performance",
             "Select a starred run above to view its timing details.",
@@ -228,6 +244,34 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertNotIn("[...document.records].reverse()", source)
         self.assertNotIn("meat and potatoes", source.lower())
 
+    def test_full_performance_panel_uses_content_sized_reduced_motion_reveal(self):
+        source = self.source
+        closed = source[source.index("#performance-section {"):
+                        source.index("}", source.index("#performance-section {")) + 1]
+        opened = source[source.index("#performance-section.performance-open {"):
+                        source.index(
+                            "}", source.index("#performance-section.performance-open {")
+                        ) + 1]
+        track = source[source.index(".performance-collapse-track {"):
+                       source.index(
+                           "}", source.index(".performance-collapse-track {")
+                       ) + 1]
+
+        self.assertIn("display:grid", closed)
+        self.assertIn("grid-template-rows:0fr", closed)
+        self.assertIn("900ms", closed)
+        self.assertNotIn("max-height", closed)
+        self.assertIn("grid-template-rows:1fr", opened)
+        self.assertNotIn("max-height", opened)
+        self.assertIn("min-height:0", track)
+        self.assertIn("overflow:hidden", track)
+        self.assertNotIn("max-height", track)
+        self.assertRegex(
+            source,
+            r"@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?"
+            r"#performance-section[^{}]*\{[^}]*transition:none;[^}]*\}",
+        )
+
     def test_timing_chips_are_exact_id_accessible_controls(self):
         source = self.source
         runs_start = source.index("async function renderRuns")
@@ -239,8 +283,9 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("availablePerformanceIds.add(invocationId)", runs)
         self.assertIn('<button type="button" class="run ', runs)
         self.assertIn('data-performance-invocation-id="${esc(invocationId)}"', runs)
-        self.assertIn('aria-controls="performance"', runs)
-        self.assertIn('aria-pressed="${selected ? "true" : "false"}"', runs)
+        self.assertIn('aria-controls="performance-section"', runs)
+        self.assertIn('aria-expanded="${selected ? "true" : "false"}"', runs)
+        self.assertNotIn("aria-pressed", runs)
         self.assertIn('aria-label="${esc(accessibleLabel)}"', runs)
         self.assertIn('class="run-performance-marker" aria-hidden="true">*</span>', runs)
         self.assertIn('<span class="sr-only">Timing details available.</span>', runs)
@@ -264,6 +309,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("!availableInvocationIds.has(selectedPerformanceInvocationId)", sync)
         self.assertIn("selectedPerformanceInvocationId = null", sync)
         self.assertIn("renderSelectedPerformance()", sync)
+        self.assertNotIn("schedulePerformanceScroll", sync)
         self.assertIn("syncPerformanceSelection(availablePerformanceIds)", source)
         self.assertIn("syncPerformanceSelection(new Set())", source)
         legacy_start = source.index("async function renderLegacyRuns")
@@ -276,8 +322,113 @@ class PerformanceClientContractTests(unittest.TestCase):
                          source.index("$('phone-share-button').addEventListener")]
         self.assertIn("button.run[data-performance-invocation-id]", handler)
         self.assertIn("performanceRecordsByInvocation.has(invocationId)", handler)
-        self.assertIn("selectedPerformanceInvocationId = invocationId", handler)
-        self.assertNotIn("scrollIntoView", handler)
+        self.assertIn(
+            "const closing = selectedPerformanceInvocationId === invocationId",
+            handler,
+        )
+        self.assertIn(
+            "selectedPerformanceInvocationId = closing ? null : invocationId",
+            handler,
+        )
+        self.assertIn(
+            'schedulePerformanceScroll(closing ? chip : $("performance-section"))',
+            handler,
+        )
+
+    def test_disclosure_state_and_scrolling_follow_selection_without_polling_motion(self):
+        source = self.source
+        state_start = source.index("function setPerformanceSectionOpen")
+        state_end = source.index("function schedulePerformanceScroll", state_start)
+        state = source[state_start:state_end]
+        self.assertIn('classList.toggle("performance-open", open)', state)
+        self.assertIn('setAttribute("aria-hidden", open ? "false" : "true")', state)
+        self.assertIn('if (open) section.removeAttribute("inert")', state)
+        self.assertIn('else section.setAttribute("inert", "")', state)
+
+        scroll_start = source.index("function schedulePerformanceScroll")
+        scroll_end = source.index("function renderPerformanceUnavailable", scroll_start)
+        scroll = source[scroll_start:scroll_end]
+        self.assertIn("const epoch = ++performanceScrollEpoch", scroll)
+        self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', scroll)
+        self.assertIn('behavior: reducedMotion ? "auto" : "smooth"', scroll)
+        self.assertIn('block: "nearest"', scroll)
+        self.assertIn("epoch !== performanceScrollEpoch", scroll)
+        self.assertIn("requestAnimationFrame", scroll)
+        self.assertIn("scrollIntoView", scroll)
+        self.assertEqual(source.count("schedulePerformanceScroll("), 2)
+
+        update_start = source.index("function updatePerformanceChipSelection")
+        update_end = source.index("function syncPerformanceSelection", update_start)
+        update = source[update_start:update_end]
+        self.assertIn(
+            'setAttribute("aria-expanded", selected ? "true" : "false")',
+            update,
+        )
+        self.assertNotIn("aria-pressed", update)
+
+        selected_start = source.index("function renderSelectedPerformance")
+        selected_end = source.index("function renderPerformance(document)", selected_start)
+        selected = source[selected_start:selected_end]
+        self.assertIn("setPerformanceSectionOpen(false)", selected)
+        self.assertGreaterEqual(selected.count("setPerformanceSectionOpen(true)"), 2)
+
+        refresh_start = source.index("async function refresh()")
+        refresh_end = source.index("// runs land every", refresh_start)
+        self.assertNotIn("schedulePerformanceScroll", source[refresh_start:refresh_end])
+
+    def test_panel_opens_before_live_region_content_is_updated(self):
+        source = self.source
+        unavailable_start = source.index("function renderPerformanceUnavailable")
+        unavailable_end = source.index("function performanceRecordRow", unavailable_start)
+        unavailable = source[unavailable_start:unavailable_end]
+        opened = unavailable.index("setPerformanceSectionOpen(true)")
+        self.assertLess(opened, unavailable.index("notice.textContent"))
+        self.assertLess(opened, unavailable.index('$("performance").innerHTML'))
+
+        selected_start = source.index("function renderSelectedPerformance")
+        selected_end = source.index("function renderPerformance(document)", selected_start)
+        selected = source[selected_start:selected_end]
+        success_start = selected.index(
+            "setPerformanceSectionOpen(true)", selected.index("if (!record)")
+        )
+        self.assertLess(success_start, selected.index("const row", success_start))
+        self.assertLess(
+            success_start,
+            selected.index('$("performance").innerHTML = `<table', success_start),
+        )
+
+    def test_every_runs_dom_replacement_cancels_pending_scroll_first(self):
+        source = self.source
+        replacements = list(re.finditer(r'(?m)^(\s*)\$\("runs"\)\.innerHTML\s*=', source))
+        self.assertEqual(len(replacements), 4)
+        for replacement in replacements:
+            previous_line = source[:replacement.start()].splitlines()[-1]
+            self.assertEqual(
+                previous_line,
+                replacement.group(1) + "performanceScrollEpoch += 1;",
+            )
+
+        normal_start = source.index("const activeRunChip", source.index("async function renderRuns"))
+        normal_end = source.index("syncPerformanceSelection(availablePerformanceIds)", normal_start)
+        normal = source[normal_start:normal_end]
+        self.assertLess(
+            normal.index("performanceScrollEpoch += 1"),
+            normal.index('$("runs").innerHTML = chips.join("")'),
+        )
+
+    def test_run_refresh_preserves_exact_chip_focus_without_scrolling(self):
+        source = self.source
+        runs_start = source.index("async function renderRuns")
+        runs_end = source.index("function collectRunView", runs_start)
+        runs = source[runs_start:runs_end]
+        self.assertIn("focusedPerformanceInvocationId", runs)
+        self.assertIn(
+            'chip.dataset.performanceInvocationId === focusedPerformanceInvocationId',
+            runs,
+        )
+        self.assertIn("replacement?.focus({ preventScroll: true })", runs)
+        self.assertNotIn("querySelector(" + chr(96), runs)
+        self.assertNotIn("schedulePerformanceScroll", runs)
 
     def test_marker_styling_is_compact_touchable_and_distinguishes_selection(self):
         source = self.source
@@ -322,6 +473,8 @@ class PerformanceClientContractTests(unittest.TestCase):
         unavailable = self.source[unavailable_start:unavailable_end]
         self.assertIn("performanceRecordsByInvocation = new Map()", unavailable)
         self.assertIn("selectedPerformanceInvocationId = null", unavailable)
+        self.assertIn("performanceTelemetryUnavailable = true", unavailable)
+        self.assertIn("setPerformanceSectionOpen(true)", unavailable)
 
     def test_phone_timing_summary_is_bounded_display_only_and_schema_compatible(self):
         summary_start = self.source.index("function phoneTimingSummary")
