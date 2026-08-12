@@ -55,9 +55,9 @@ def performance_record(**overrides):
     return record
 
 
-def performance_document(records):
+def performance_document(records, *, schema_version=2):
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "record_limit": 512,
         "record_count": len(records),
         "source_event_high_watermark": len(records),
@@ -127,7 +127,7 @@ class PerformanceEndpointTests(unittest.TestCase):
         self.assertEqual(
             document,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "record_limit": DASHBOARD.run_performance.PROJECTION_LIMIT,
                 "record_count": 0,
                 "source_event_high_watermark": 0,
@@ -178,6 +178,28 @@ class PerformanceEndpointTests(unittest.TestCase):
         self.assertEqual(timing["routine_total_ms"], 256000)
         self.assertEqual(timing["strategy_execution_ms"], 120000)
         self.assertEqual(timing["routine_overhead_ms"], 136000)
+
+    def test_legacy_v1_reference_projection_passes_through(self):
+        self.create_private_placeholders()
+        expected = performance_document(
+            [
+                performance_record(
+                    task_duration_ms=363000,
+                    task_clock_source="codex-worked-for",
+                    task_observed_at_utc="2026-08-11T23:43:48Z",
+                    outside_lifecycle_ms=107000,
+                )
+            ],
+            schema_version=1,
+        )
+        with mock.patch.object(
+            DASHBOARD.run_performance,
+            "validate_current_projection_read_only",
+            return_value=expected,
+        ):
+            status, document = self.request_json("/api/performance")
+        self.assertEqual(status, 200)
+        self.assertEqual(document, expected)
 
     def test_corrupt_performance_is_isolated_from_lifecycle_endpoint(self):
         self.create_private_placeholders()
@@ -232,7 +254,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         for term in (
             "Run performance",
             "Select a starred run above to view its timing details.",
-            "End-to-end task",
+            "Reference run duration",
             "Routine total",
             "Strategy execution",
             "Routine overhead",
@@ -475,6 +497,94 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertNotIn('if (!milliseconds)', formatter)
         self.assertIn('milliseconds >= 0', self.source)
 
+    def test_run_duration_measurements_have_source_aware_labels_and_safe_shape(self):
+        validator_start = self.source.index("const PERFORMANCE_TASK_CLOCK_SOURCES")
+        validator_end = self.source.index("function formatPerformanceDuration", validator_start)
+        validator = self.source[validator_start:validator_end]
+        self.assertIn('"final-summary-boundary"', validator)
+        self.assertIn(
+            "record.task_clock_source === PERFORMANCE_COMPARABLE_CLOCK_SOURCE",
+            validator,
+        )
+        self.assertIn("record.outside_lifecycle_ms !== null", validator)
+        self.assertIn("record.total_overhead_ms !== null", validator)
+        self.assertIn(
+            "const taskMissing = taskValues.every(value => value === null)",
+            validator,
+        )
+        self.assertIn(
+            "const taskComplete = taskValues.every(value => value !== null)",
+            validator,
+        )
+        self.assertIn("if (!taskMissing && !taskComplete) return false", validator)
+        self.assertIn("record.task_duration_ms <= 0", validator)
+        self.assertIn(
+            "record.task_duration_ms < record.routine_total_ms", validator
+        )
+        self.assertIn("!record.task_observed_at_utc", validator)
+        self.assertIn("record.outside_lifecycle_ms === null", validator)
+        self.assertIn("record.total_overhead_ms === null", validator)
+        self.assertIn("const PERFORMANCE_SCHEMA_VERSION = 2", validator)
+        self.assertIn(
+            "const PERFORMANCE_LEGACY_SCHEMA_VERSION = 1", validator
+        )
+        self.assertIn(
+            "schemaVersion === PERFORMANCE_LEGACY_SCHEMA_VERSION", validator
+        )
+
+        label_start = self.source.index("function performanceTaskLabel")
+        label_end = self.source.index("function phoneTimingSummary", label_start)
+        label = self.source[label_start:label_end]
+        self.assertIn('"Comparable run duration"', label)
+        self.assertIn('"Reference run duration"', label)
+        self.assertNotIn("End-to-end", label)
+
+        row_start = self.source.index("function performanceRecordRow")
+        row_end = self.source.index("function renderSelectedPerformance", row_start)
+        row = self.source[row_start:row_end]
+        self.assertIn('data-label="${esc(taskLabel)}"', row)
+        self.assertIn(
+            'comparableTask ? "Comparable boundary" : "Reference source"', row
+        )
+        self.assertIn('`Recorded: ${record.task_observed_at_utc}`', row)
+        self.assertNotIn("estimatedTask", row)
+        self.assertNotIn("Task clock", row)
+
+        selected_start = self.source.index("function renderSelectedPerformance")
+        selected_end = self.source.index("function renderPerformance(document)", selected_start)
+        selected = self.source[selected_start:selected_end]
+        self.assertIn("const taskLabel = performanceTaskLabel(record)", selected)
+        self.assertIn("<th>${esc(taskLabel)}</th>", selected)
+
+        render_start = self.source.index("function renderPerformance(document)")
+        render_end = self.source.index(
+            "function updatePerformanceChipSelection", render_start
+        )
+        render = self.source[render_start:render_end]
+        self.assertIn(
+            "[PERFORMANCE_LEGACY_SCHEMA_VERSION, PERFORMANCE_SCHEMA_VERSION]",
+            render,
+        )
+        self.assertIn(
+            "record => validPerformanceRecord(record, document.schema_version)",
+            render,
+        )
+
+    def test_legacy_v1_is_reference_only_and_v2_owns_comparable_timing(self):
+        validator_start = self.source.index("function validPerformanceRecord")
+        validator_end = self.source.index(
+            "function formatPerformanceDuration", validator_start
+        )
+        validator = self.source[validator_start:validator_end]
+        self.assertIn(
+            "schemaVersion = PERFORMANCE_SCHEMA_VERSION", validator
+        )
+        self.assertIn(
+            "if (schemaVersion === PERFORMANCE_LEGACY_SCHEMA_VERSION) "
+            "return false",
+            validator,
+        )
+
     def test_every_dynamic_identity_and_detail_reaches_an_escape_boundary(self):
         source = self.source
         self.assertIn("identity.slice(1).map(esc)", source)
@@ -524,10 +634,14 @@ class PerformanceClientContractTests(unittest.TestCase):
             "combined.length <= PHONE_SHARE_TOOLTIP_LIMIT ? combined : baseTooltip",
             append,
         )
+        self.assertIn("const taskLabel = performanceTaskLabel(record)", summary)
+        self.assertIn(
+            "`${taskLabel}: ${formatPerformanceDuration(record.task_duration_ms)}`",
+            summary,
+        )
         for label in (
             "session:",
             "runner / model / configuration:",
-            "End-to-end task:",
             "Routine total:",
             "Strategy execution:",
             "Routine overhead:",
@@ -582,12 +696,12 @@ class PerformanceClientContractTests(unittest.TestCase):
         for label in (
             "Start / session",
             "Runner / model / configuration",
-            "End-to-end task",
             "Routine total",
             "Strategy execution",
             "Routine overhead",
         ):
             self.assertIn(f'data-label="{label}"', self.source)
+        self.assertIn('data-label="${esc(taskLabel)}"', self.source)
 
 
 if __name__ == "__main__":

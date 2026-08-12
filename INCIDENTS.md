@@ -821,6 +821,51 @@ before lease release; and strategy timing remains the FIRST renewal through REPO
 The dashboard quarantines otherwise valid snapshots that cannot be linked to the lifecycle
 invocation, preserving the newest truthful linked account state and showing an orphan warning.
 
+**2026-08-12 15:10 follow-up, Sonnet 4.6 auto-compaction omitted retained execution state.**
+During a native Claude Code Local market-hours run, automatic context compaction reduced the
+working context from 167,326 tokens to 7,025 and took 2m04. The resulting summary omitted the exact
+resolver-bound `PYTHON_EXE`. After compaction, Claude switched to literal `py -3`, invented an
+unsupported daily-loss CLI action, mistyped one character in an already-valid scratch-file path,
+and used `--help` probes to rediscover documented helper syntax. Those probes failed before making
+any broker or durable-state mutation, and the correct daily-loss artifact was subsequently read.
+
+Finalization also drifted from the prescribed order. Claude supplied START CLOCK instead of the
+FIRST renewal as the strategy-start boundary, published status before writing the report, skipped
+the mandatory report read-back, and called performance telemetry before reading and appending to
+automation memory. The lifecycle, status, and performance stores remained structurally healthy,
+the lease was released, the account remained flat, and there was no order review, placement,
+cancellation, or other broker mutation. The incident affected instruction adherence, artifact
+presentation, and benchmark timing quality rather than trading or state integrity.
+
+**Rules confirmed:** compaction summaries are not invocation-state authorities. The existing
+runtime rules already require the exact bound launcher and phase timestamps to survive compaction
+unchanged (or the run to stop), limit lifecycle recovery to the invocation-scoped read-only
+`status` command, require report write/read-back before status publication, require replacement
+rather than append for automation memory, and make `record-internal` the final tool call. This run
+is therefore excluded from fair runner/model comparisons; adding another overlapping prose rule
+would not make these already-explicit contracts more deterministic.
+
+## PERFORMANCE TELEMETRY — completed run without an external run-duration observation
+
+**2026-08-12 13:27, Claude completed normally but the dashboard showed its external reference
+duration as `not measured`.** The run's internal performance record was healthy: Routine
+total was 21:36, Strategy execution was 21:19, and Routine overhead was 0:17. The external
+duration remained null because no human or runner callback submitted a source-specific
+observation after the run. Successful lifecycle completion therefore guaranteed internal timing
+but did not guarantee any user-visible approximation of the whole run.
+
+**Rules produced:** `record-internal` now reuses its single append-time host-clock reading as the
+end of a source-labelled `final-summary-boundary` measurement beginning at lifecycle-bound START
+CLOCK. The helper returns the exact Pacific Run start and Run end plus Comparable run duration, and
+the agent copies those values into the final on-screen Run Summary immediately after telemetry.
+This measurement is observability only: it adds no clock call, broker call, lease action, lifecycle
+event, saved-report rewrite, or status-snapshot field. A later explicit Codex, Claude,
+runner-metadata, or manual observation is displayed as Reference run duration and remains
+fallback/context while the automatic Comparable run duration is available. Fair model-performance
+comparisons use the same automatic boundaries, session class, workload path, configuration cohort,
+and preferably rules version, with runner/model identity as the explicit comparison dimension.
+Neither label claims scheduler-start or task-completion boundaries.
+
 ---
 
 ## The pattern across all of these

@@ -45,13 +45,15 @@ Read ./robinhood-momentum-routine-autonomous.md and execute the trading routine 
 
 Select the exact repository folder, **Current branch**, Sonnet 4.6 with effort high (`claude-sonnet-4-6`, `effort=high`), and **Worktree off**. Keep exactly one `TIMING_IDENTITY` line in each task and keep it synchronized with the model and effort actually selected in that task's settings. If either selection changes, update the line before the next run; the declaration records the selection and does not switch it.
 
-The routine records Routine total, Strategy execution, and Routine overhead after lifecycle finish. End-to-end task is different: the current task cannot observe its own final framework completion, so record that value only after the run from an explicit source such as Claude's recorded run duration. After the task is complete, resolve and bind the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>`, and copy this PowerShell command exactly:
+The routine records Routine total, Strategy execution, and Routine overhead after lifecycle finish. Its same `record-internal` host-clock reading automatically records **Comparable run duration** from lifecycle-bound START CLOCK through `final-summary-boundary`, then the on-screen Run Summary prints exact Run start/Run end timestamps and the helper-formatted duration. Those boundaries are identical on Claude and Codex. It does not rewrite the saved report or add a field to the status snapshot. An optional source-specific **Reference run duration** can be recorded after the run from an explicit source such as Claude's recorded run duration. After the task is complete, resolve and bind the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>`, and copy this PowerShell command exactly:
 
 ```powershell
 & '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-4-6' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
 ```
 
-This template is only for a human reading Claude's recorded duration and confirming the selected task settings; do not use `manual-ui` or `claude-run-duration` for framework runner metadata. The formulas, other source rules, and comparison dashboard are documented in [README Tested On](README.md#tested-on).
+This template is only for a human reading Claude's recorded duration and confirming the selected task settings; do not use `manual-ui` or `claude-run-duration` for runner metadata. The value is displayed as **Reference run duration** and remains secondary to the automatic **Comparable run duration**. Fair Claude-versus-Codex and future-model comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version; keep runner/model identity explicit as the comparison dimension. The formulas, other source rules, and comparison dashboard are documented in [README Tested On](README.md#tested-on).
+
+Enable either replacement schedule only after both supervised Manual **Run now** proofs succeed.
 
 ## 3. Create two Manual tasks first
 

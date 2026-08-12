@@ -63,9 +63,9 @@ When you later create a scheduled task, copy exactly one matching declaration in
 - Codex: `TIMING_IDENTITY: runner=codex model=gpt-5.6-luna config=reasoning=high`
 - Claude Desktop Code Local: `TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 config=effort=high`
 
-Keep that one line synchronized with the runner, model, and configuration actually selected in the task settings; if a selection changes, update the line before the next run. It records what ran and does not select or switch the model. The routine records Routine total, Strategy execution, and Routine overhead. End-to-end task must be added only after the run from an explicit framework source because the current task cannot observe its own final completion.
+Keep that one line synchronized with the runner, model, and configuration actually selected in the task settings; if a selection changes, update the line before the next run. It records what ran and does not select or switch the model. The routine records Routine total, Strategy execution, and Routine overhead. Immediately before its final on-screen Run Summary, the same `record-internal` host-clock reading also records **Comparable run duration** from lifecycle-bound START CLOCK through `final-summary-boundary` and prints exact Run start/Run end timestamps plus the helper-formatted duration. Those automatic boundaries are identical on Claude and Codex and do not change the saved report or status schema. A source-specific **Reference run duration** can still be attached with the optional post-run observation below.
 
-After the framework marks the run complete, resolve and bind the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>`, and copy exactly one matching PowerShell command. For Codex's displayed **Worked for** duration:
+After the run is complete, resolve and bind the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>`, and copy exactly one matching PowerShell command. For Codex's displayed **Worked for** duration:
 
 ```powershell
 & '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner codex --model 'gpt-5.6-luna' --configuration 'reasoning=high' --identity-source manual-ui --clock-source codex-worked-for
@@ -77,4 +77,4 @@ For Claude's recorded run duration:
 & '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-4-6' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
 ```
 
-Use these `manual-ui` templates only for the named human-observed source; do not relabel real runner metadata. See [README Tested On](README.md#tested-on) for the formulas, source rules, POSIX-shell form, and local comparison dashboard.
+Use these `manual-ui` templates only for the named human-observed source; do not relabel runner metadata. The attached value is displayed as **Reference run duration** and remains secondary to the automatic **Comparable run duration**; it is fallback/context for historical or incomplete runs. Fair performance comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version. Keep runner/model identity explicit as the comparison dimension. See [README Tested On](README.md#tested-on) for the formulas, source rules, POSIX-shell form, and local comparison dashboard.

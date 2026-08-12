@@ -6075,12 +6075,18 @@ class MarketClockTests(unittest.TestCase):
         telemetry_start = routine.index(
             '### PERFORMANCE TELEMETRY — after lifecycle finish'
         )
+        summary_start = routine.index(
+            '### FINAL ON-SCREEN RUN SUMMARY — immediately after '
+            'performance telemetry'
+        )
         self.assertLess(lifecycle_finish, report_readback)
         self.assertLess(report_readback, telemetry_start)
+        self.assertLess(telemetry_start, summary_start)
+        self.assertLess(
+            routine.index('run_performance.py record-internal'), summary_start
+        )
 
-        telemetry = routine[telemetry_start:routine.index(
-            'The filename is exactly:', telemetry_start
-        )]
+        telemetry = routine[telemetry_start:summary_start]
         self.assertEqual(
             routine.count('run_performance.py record-internal'), 1
         )
@@ -6112,16 +6118,62 @@ class MarketClockTests(unittest.TestCase):
             'Never pass a partially known identity with '
             '`--identity-source unknown`',
             'do not retry or call another timing command',
+            'final tool call of a normally reported run',
+            'reuse its one internal-record host-clock reading',
+            'never make a second clock call',
+            '`estimated_run_start_pt`',
+            '`estimated_run_end_pt`',
+            '`estimated_run_total_ms`',
+            '`estimated_run_total_display`',
+            '`estimate_clock_source`',
+            '`estimate_clock_source` to equal `final-summary-boundary`',
+            'all five estimate fields to be null',
+            'Never invent, repair, round, reformat, or calculate an estimate',
             'observational and non-authoritative',
-            'must never change trading, broker calls, report/status '
+            'must never change trading, broker calls, saved report/status '
             'contents, lease handling, lifecycle classification/reason, '
             'or the run result',
             'Timing unavailable: <diagnostic>',
             'before the mandatory last output-file line',
-            'cannot observe its own final framework completion',
-            'separate post-run observation with an explicit source',
+            'The helper value is **Comparable run duration**',
+            'later `observe-task` value from an explicit external or '
+            'manual source',
+            '**Reference run duration** only',
+            'never let it displace an available Comparable run duration',
+            'same automatic boundary, session class, workload path, '
+            'configuration cohort, and preferably rules version',
+            'runner/model identity is the explicit comparison dimension',
+            'Neither label claims scheduler-start or task-completion '
+            'boundaries',
         ):
             self.assertIn(required, telemetry)
+
+        final_summary = routine[summary_start:routine.index(
+            'The filename is exactly:', summary_start
+        )]
+        for required in (
+            'Immediately after validating the `record-internal` receipt, '
+            'make no further tool call',
+            'inside a `<run-summary>` tag',
+            'Run start: <estimated_run_start_pt>',
+            'Run end: <estimated_run_end_pt>',
+            'Comparable run duration: <estimated_run_total_display>',
+            'helper-formatted duration byte-for-byte',
+            'final transcript summary',
+            'Never add them by rewriting the saved report after release',
+            'never add `run_end_pt` or any estimate field to the status '
+            'snapshot',
+            'omit all three lines rather than filling them with guesses',
+            'must be the **LAST** line',
+            'the run-summary goes BEFORE it',
+        ):
+            self.assertIn(required, final_summary)
+        self.assertNotIn(
+            '"run_end_pt"',
+            routine.split('**Publish the STATUS SNAPSHOT', 1)[1].split(
+                '### PERFORMANCE TELEMETRY', 1
+            )[0],
+        )
 
     def test_timing_identity_and_metric_names_do_not_guess(self):
         documents = {}
@@ -6130,11 +6182,25 @@ class MarketClockTests(unittest.TestCase):
             'README.md',
             'QUICKSTART.md',
             'CLAUDE-LOCAL-SCHEDULING.md',
+            'INCIDENTS.md',
         ):
             with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
                 documents[filename] = f.read()
             self.assertNotIn(
                 'meat and potatoes', documents[filename].lower(), filename
+            )
+            self.assertNotIn('End-to-end task', documents[filename], filename)
+            self.assertNotIn(
+                'Run total (estimated)', documents[filename], filename
+            )
+            self.assertNotIn(
+                'Observed run duration', documents[filename], filename
+            )
+            self.assertNotIn(
+                'Run duration (estimated)', documents[filename], filename
+            )
+            self.assertNotIn(
+                'Run duration (observed)', documents[filename], filename
             )
 
         routine = documents['robinhood-momentum-routine-autonomous.md']
@@ -6179,23 +6245,34 @@ class MarketClockTests(unittest.TestCase):
             '## Guardrails', 1
         )[0]
         for required in (
-            '**End-to-end task**',
+            '**Comparable run duration**',
+            '**Reference run duration**',
             '**Routine total**',
             '**Strategy execution**',
             '**Routine overhead**',
             '`lifecycle finished_at_utc - lifecycle started_at_utc`',
             '`REPORT renewal renewed_at - first FIRST renewal renewed_at`',
             '`Routine total - Strategy execution`',
-            '`End-to-end task - Routine total`',
-            'current task cannot know its own completion timestamp',
-            'observation with an explicit source',
+            '`Reference run duration - Routine total`',
+            'single host-clock reading reused by `record-internal`',
+            'exact Run start, Run end, and helper-formatted duration',
+            'does not alter the saved report, status schema, lease, '
+            'lifecycle outcome, or trading behavior',
+            'optional duration supplied after the run by an explicit '
+            'external source',
+            'not the canonical Claude-versus-Codex metric',
             'unavailable rather than zero',
-            'Keep after-hours and market-hours observations separate',
-            'a later observer—not the completed task itself',
+            'keep after-hours and market-hours samples separate',
+            'a later observer can attach a source-specific Reference run '
+            'duration',
             '`run_performance.py observe-task`',
             '`codex-worked-for` only for Codex',
             '`claude-run-duration` only for Claude',
             'preserves the source alongside the value',
+            'remains secondary when Comparable run duration exists',
+            'same session class, workload path, and configuration cohort',
+            'preferably rules version',
+            'runner/model identity explicit as the comparison dimension',
         ):
             self.assertIn(required, tested_on)
 
@@ -6234,14 +6311,32 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn(
             codex_observe, documents['CLAUDE-LOCAL-SCHEDULING.md']
         )
+        for filename in documents:
+            for required in (
+                'Comparable run duration',
+                'final-summary-boundary',
+                'secondary',
+                'Reference run duration',
+            ):
+                self.assertIn(required, documents[filename], filename)
+        self.assertIn(
+            'same `record-internal` host-clock reading',
+            documents['QUICKSTART.md'],
+        )
+        self.assertIn(
+            'same `record-internal` host-clock reading',
+            documents['CLAUDE-LOCAL-SCHEDULING.md'],
+        )
 
         readme = documents['README.md']
         self.assertIn(
-            '17m41 End-to-end task (Codex runner metadata)', readme
+            '17m41 Reference run duration (Codex runner metadata)', readme
         )
-        self.assertNotIn('17m41 End-to-end task (Codex app UI)', readme)
+        self.assertNotIn(
+            '17m41 Reference run duration (Codex app UI)', readme
+        )
         self.assertIn(
-            'A real framework-provided observation must retain '
+            'An observation supplied by runner metadata must retain '
             '`--identity-source run-metadata` and '
             '`--clock-source runner-metadata`',
             readme,
@@ -6298,7 +6393,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(codex_declaration, quickstart)
         self.assertIn(claude_declaration, quickstart)
         self.assertIn(
-            'current task cannot observe its own final completion',
+            'source-specific **Reference run duration** can still be '
+            'attached',
             quickstart,
         )
 
@@ -6645,28 +6741,28 @@ class MarketClockTests(unittest.TestCase):
         )
         for required in (
             '## Tested On',
-            '| Runner | Model / configuration | After-hours observed runtime | Market-hours observed runtime | Status |',
-            '4m40 End-to-end task (Claude transcript observation); '
+            '| Runner | Model / configuration | After-hours timing record | Market-hours timing record | Status |',
+            '4m40 Reference run duration (Claude transcript); '
             '4m05 Routine total (lifecycle)',
             'Pending — measure during a market-hours run',
-            '6m03 End-to-end task (Codex app UI); '
+            '6m03 Reference run duration (Codex app UI); '
             '4m16 Routine total (lifecycle)',
-            '17m41 End-to-end task (Codex runner metadata); '
+            '17m41 Reference run duration (Codex runner metadata); '
             '14m24 Routine total (lifecycle)',
-            'observed wall-clock times on this installation',
+            'historical wall-clock records from this installation',
             'not controlled benchmarks',
-            'after-hours End-to-end task comparison is about 4m40 for '
-            'Claude versus 6m03',
-            'workloads are comparable',
-            'flat account and skipped the entry path',
-            'End-to-end task sources are not identical',
-            'Routine total durations were 4m05 for Claude and 4m16 for '
-            'Codex',
-            'Codex market-hours End-to-end task took 17m41',
+            'different reference sources',
+            'useful context but not the canonical fair comparison',
+            'supporting Routine total durations were 4m05 and 4m16',
+            "Codex's market-hours reference was 17m41",
             '2026-08-10 full market-hours Routine total',
-            '15-candidate scan recorded 14m24',
-            'compare each session class separately',
+            '15-candidate scan was 14m24',
             'market-hours timing has not yet been measured',
+            'Future Claude-versus-Codex and model-version comparisons use '
+            '**Comparable run duration**',
+            'boundaries are identical on both runners',
+            'same session class, workload path, and configuration cohort',
+            'Repeated samples are preferable to a single run',
         ):
             self.assertIn(required, readme)
         self.assertNotIn('## Models and runner support', readme)

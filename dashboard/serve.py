@@ -692,7 +692,7 @@ def _lifecycle_projection():
 def _performance_projection():
     """Return validated timing telemetry without exposing its private files."""
     empty = {
-        "schema_version": 1,
+        "schema_version": run_performance.PROJECTION_SCHEMA_VERSION,
         "record_limit": run_performance.PROJECTION_LIMIT,
         "record_count": 0,
         "source_event_high_watermark": 0,

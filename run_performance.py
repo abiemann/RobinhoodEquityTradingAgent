@@ -27,10 +27,14 @@ Commands (successful commands emit exactly one JSON object):
 
 ``record-internal`` validates the lifecycle database and projection read-only,
 requires a finished invocation, and records lifecycle boundaries plus the
-optional both-or-neither FIRST/REPORT renewal boundaries.  ``observe-task``
-attaches a positive external task duration to an existing internal record.
-Different clock sources may coexist; a fixed priority selects one for the
-projection, while a duplicate source is rejected.
+optional both-or-neither FIRST/REPORT renewal boundaries.  When the lifecycle
+has an authoritative Pacific run start, that same command's single observation
+clock also records the canonical final-summary-boundary run duration used for
+fair runner/model comparisons.  ``observe-task`` attaches a positive external
+reference duration to an existing internal record.  The canonical automatic
+duration remains selected whenever it exists; legacy records without one fall
+back to the highest-priority external reference.  Different external clock
+sources may coexist, while a duplicate source is rejected.
 
 Only fixed enums and short, restricted identity labels are accepted.  There is
 no notes, account, symbol, credential, token, broker response, or arbitrary
@@ -54,13 +58,19 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 import run_lifecycle
 
 
-SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 1
+LEGACY_PROJECTION_SCHEMA_VERSION = 1
+PROJECTION_SCHEMA_VERSION = 2
+# Backward-compatible public name: command receipts remain schema version 1.
+SCHEMA_VERSION = RECEIPT_SCHEMA_VERSION
+JOURNAL_SCHEMA_VERSION = 2
+LEGACY_JOURNAL_SCHEMA_VERSION = 1
 PROJECTION_LIMIT = 512
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE_FILE = os.path.join(
@@ -100,6 +110,7 @@ CLOCK_SOURCES = (
     "unknown",
 )
 CLOCK_SOURCE_PRIORITY = {value: index for index, value in enumerate(CLOCK_SOURCES)}
+ESTIMATE_CLOCK_SOURCE = "final-summary-boundary"
 
 _UTC_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
@@ -150,6 +161,15 @@ _EVENT_COLUMNS = {
     "model",
     "configuration",
     "identity_source",
+    "clock_source",
+}
+_ESTIMATE_COLUMNS = {
+    "invocation_id",
+    "internal_sequence",
+    "occurred_at_utc",
+    "run_start_pt",
+    "run_end_pt",
+    "estimated_run_total_ms",
     "clock_source",
 }
 
@@ -258,6 +278,50 @@ def _now_utc(value: str | None) -> str:
             .replace("+00:00", "Z")
         )
     return _canonical_utc(value, "--now-utc")
+
+
+def _canonical_run_start_pt(value: Any, context: str) -> str:
+    try:
+        return run_lifecycle._canonical_run_start_pt(value, context)
+    except run_lifecycle.LifecycleError as exc:
+        raise PerformanceError(str(exc)) from exc
+
+
+def _utc_to_pacific(value: str) -> str:
+    utc_value = _utc_datetime(_canonical_utc(value, "UTC-to-Pacific source"))
+    local, _name, offset = run_lifecycle.zone_time(
+        utc_value, run_lifecycle.PACIFIC_STD_OFFSET, "PST", "PDT"
+    )
+    rendered = local.replace(
+        tzinfo=timezone(timedelta(hours=offset))
+    ).isoformat()
+    return _canonical_run_start_pt(rendered, "derived Pacific timestamp")
+
+
+def _elapsed_pt_ms(start_pt: str, end_pt: str, context: str) -> int:
+    start = datetime.fromisoformat(
+        _canonical_run_start_pt(start_pt, f"{context}.start")
+    )
+    end = datetime.fromisoformat(
+        _canonical_run_start_pt(end_pt, f"{context}.end")
+    )
+    delta = end - start
+    microseconds = (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    )
+    if microseconds < 0:
+        raise PerformanceError(f"{context}: end precedes start")
+    return microseconds // 1000
+
+
+def _duration_display(milliseconds: int) -> str:
+    milliseconds = _nonnegative_int(milliseconds, "duration display")
+    total_seconds = (milliseconds + 500) // 1000
+    seconds = total_seconds % 60
+    total_minutes = total_seconds // 60
+    if total_minutes < 60:
+        return f"{total_minutes}:{seconds:02d}"
+    return f"{total_minutes // 60}:{total_minutes % 60:02d}:{seconds:02d}"
 
 
 def _enum(value: Any, allowed: Sequence[str], context: str) -> str:
@@ -383,9 +447,15 @@ def _finished_lifecycle_record(
         record["finished_at_utc"], "lifecycle.finished_at_utc"
     )
     _elapsed_ms(lifecycle_start, lifecycle_finish, "lifecycle")
+    run_start_pt = record["run_start_pt"]
+    if run_start_pt is not None:
+        run_start_pt = _canonical_run_start_pt(
+            run_start_pt, "lifecycle.run_start_pt"
+        )
     return {
         "started_at_utc": lifecycle_start,
         "finished_at_utc": lifecycle_finish,
+        "run_start_pt": run_start_pt,
     }
 
 
@@ -413,6 +483,48 @@ def _reject_path_aliases(**paths: Any) -> None:
                 f"{name} aliases {previous}; timing paths must be distinct"
             )
         seen[key] = name
+
+
+def _create_estimate_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        f"""
+        CREATE TABLE performance_estimates (
+            invocation_id TEXT PRIMARY KEY,
+            internal_sequence INTEGER NOT NULL,
+            occurred_at_utc TEXT NOT NULL,
+            run_start_pt TEXT NOT NULL,
+            run_end_pt TEXT NOT NULL,
+            estimated_run_total_ms INTEGER NOT NULL
+                CHECK (estimated_run_total_ms >= 0),
+            clock_source TEXT NOT NULL
+                CHECK (clock_source = {ESTIMATE_CLOCK_SOURCE!r}),
+            FOREIGN KEY (internal_sequence)
+                REFERENCES performance_events(sequence)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX performance_one_estimate_internal "
+        "ON performance_estimates(internal_sequence)"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER performance_estimates_no_update
+        BEFORE UPDATE ON performance_estimates
+        BEGIN
+            SELECT RAISE(ABORT, 'performance estimates are append-only');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER performance_estimates_no_delete
+        BEFORE DELETE ON performance_estimates
+        BEGIN
+            SELECT RAISE(ABORT, 'performance estimates are append-only');
+        END
+        """
+    )
 
 
 def _connect(state_file: str) -> sqlite3.Connection:
@@ -521,9 +633,20 @@ def _connect(state_file: str) -> sqlite3.Connection:
         if row is None:
             connection.execute(
                 "INSERT INTO performance_metadata(key, value) VALUES (?, ?)",
-                ("schema_version", str(SCHEMA_VERSION)),
+                ("schema_version", str(JOURNAL_SCHEMA_VERSION)),
             )
-        elif row["value"] != str(SCHEMA_VERSION):
+            _create_estimate_schema(connection)
+        elif row["value"] == str(LEGACY_JOURNAL_SCHEMA_VERSION):
+            _validate_schema(connection, allow_legacy=True)
+            _create_estimate_schema(connection)
+            connection.execute(
+                "UPDATE performance_metadata SET value = ? "
+                "WHERE key = 'schema_version'",
+                (str(JOURNAL_SCHEMA_VERSION),),
+            )
+        elif row["value"] == str(JOURNAL_SCHEMA_VERSION):
+            _validate_schema(connection, allow_legacy=False)
+        else:
             raise PerformanceError("unsupported performance journal schema version")
         connection.commit()
     except Exception:
@@ -538,14 +661,16 @@ def _connect(state_file: str) -> sqlite3.Connection:
     except OSError:
         pass
     try:
-        _validate_schema(connection)
+        _validate_schema(connection, allow_legacy=False)
     except Exception:
         connection.close()
         raise
     return connection
 
 
-def _validate_schema(connection: sqlite3.Connection) -> None:
+def _validate_schema(
+    connection: sqlite3.Connection, *, allow_legacy: bool = True
+) -> int:
     info = connection.execute("PRAGMA table_info(performance_events)").fetchall()
     if {row["name"] for row in info} != _EVENT_COLUMNS:
         raise PerformanceError("performance event journal has an unsafe schema")
@@ -560,10 +685,17 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     metadata = connection.execute(
         "SELECT key, value FROM performance_metadata"
     ).fetchall()
-    if [(row["key"], row["value"]) for row in metadata] != [
-        ("schema_version", str(SCHEMA_VERSION))
-    ]:
+    metadata_pairs = [(row["key"], row["value"]) for row in metadata]
+    if len(metadata_pairs) != 1 or metadata_pairs[0][0] != "schema_version":
         raise PerformanceError("unsupported performance journal metadata")
+    try:
+        version = int(metadata_pairs[0][1])
+    except (TypeError, ValueError) as exc:
+        raise PerformanceError("unsupported performance journal metadata") from exc
+    if version not in (LEGACY_JOURNAL_SCHEMA_VERSION, JOURNAL_SCHEMA_VERSION):
+        raise PerformanceError("unsupported performance journal metadata")
+    if version == LEGACY_JOURNAL_SCHEMA_VERSION and not allow_legacy:
+        raise PerformanceError("legacy performance journal requires migration")
     triggers = {
         row["name"]
         for row in connection.execute(
@@ -584,6 +716,58 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         "performance_one_task_source"
     ) is not True:
         raise PerformanceError("performance event journal lacks uniqueness guards")
+
+    estimate_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'performance_estimates'"
+    ).fetchone()
+    if version == LEGACY_JOURNAL_SCHEMA_VERSION:
+        if estimate_table is not None:
+            raise PerformanceError(
+                "legacy performance journal has unexpected estimate state"
+            )
+        return version
+    if estimate_table is None:
+        raise PerformanceError("performance estimate journal is missing")
+    estimate_info = connection.execute(
+        "PRAGMA table_info(performance_estimates)"
+    ).fetchall()
+    if {row["name"] for row in estimate_info} != _ESTIMATE_COLUMNS:
+        raise PerformanceError("performance estimate journal has an unsafe schema")
+    estimate_primary = {row["name"] for row in estimate_info if row["pk"]}
+    if estimate_primary != {"invocation_id"}:
+        raise PerformanceError(
+            "performance estimate journal has an unsafe primary key"
+        )
+    estimate_triggers = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'performance_estimates'"
+        )
+    }
+    if not {
+        "performance_estimates_no_update",
+        "performance_estimates_no_delete",
+    }.issubset(estimate_triggers):
+        raise PerformanceError("performance estimate journal lacks append-only guards")
+    estimate_indexes = {
+        row["name"]: bool(row["unique"])
+        for row in connection.execute("PRAGMA index_list(performance_estimates)")
+    }
+    if estimate_indexes.get("performance_one_estimate_internal") is not True:
+        raise PerformanceError("performance estimate journal lacks uniqueness guards")
+    foreign_keys = connection.execute(
+        "PRAGMA foreign_key_list(performance_estimates)"
+    ).fetchall()
+    if not any(
+        row["table"] == "performance_events"
+        and row["from"] == "internal_sequence"
+        and row["to"] == "sequence"
+        for row in foreign_keys
+    ):
+        raise PerformanceError("performance estimate journal lacks event binding")
+    return version
 
 
 def _validate_event_identity(row: Mapping[str, Any], context: str) -> None:
@@ -691,6 +875,46 @@ def _validate_task_row(
     }
 
 
+def _validate_estimate_row(
+    row: Mapping[str, Any], internal: Mapping[str, Any], context: str
+) -> dict[str, Any]:
+    invocation_id = _canonical_uuid(row["invocation_id"], f"{context}.invocation_id")
+    if invocation_id != internal["invocation_id"]:
+        raise PerformanceError(f"{context}: estimate/internal invocation mismatch")
+    internal_sequence = _positive_int(
+        row["internal_sequence"], f"{context}.internal_sequence"
+    )
+    if internal_sequence != internal["sequence"]:
+        raise PerformanceError(f"{context}: estimate/internal sequence mismatch")
+    occurred = _canonical_utc(row["occurred_at_utc"], f"{context}.occurred_at_utc")
+    if occurred != internal["occurred_at_utc"]:
+        raise PerformanceError(f"{context}: estimate/internal clock mismatch")
+    run_start_pt = _canonical_run_start_pt(
+        row["run_start_pt"], f"{context}.run_start_pt"
+    )
+    run_end_pt = _canonical_run_start_pt(
+        row["run_end_pt"], f"{context}.run_end_pt"
+    )
+    if run_end_pt != _utc_to_pacific(occurred):
+        raise PerformanceError(f"{context}: run end does not match observed clock")
+    duration = _nonnegative_int(
+        row["estimated_run_total_ms"], f"{context}.estimated_run_total_ms"
+    )
+    if duration != _elapsed_pt_ms(run_start_pt, run_end_pt, context):
+        raise PerformanceError(f"{context}: estimated duration is inconsistent")
+    if row["clock_source"] != ESTIMATE_CLOCK_SOURCE:
+        raise PerformanceError(f"{context}: invalid estimate clock source")
+    return {
+        "invocation_id": invocation_id,
+        "internal_sequence": internal_sequence,
+        "occurred_at_utc": occurred,
+        "run_start_pt": run_start_pt,
+        "run_end_pt": run_end_pt,
+        "estimated_run_total_ms": duration,
+        "clock_source": ESTIMATE_CLOCK_SOURCE,
+    }
+
+
 def _rows_for_projection(
     connection: sqlite3.Connection, limit: int = PROJECTION_LIMIT
 ) -> list[sqlite3.Row]:
@@ -754,10 +978,37 @@ def _build_projection(
         else:
             raise PerformanceError(f"journal row {sequence}: invalid event type")
 
+    estimate_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'performance_estimates'"
+    ).fetchone()
+    if estimate_table is not None and order:
+        placeholders = ", ".join("?" for _ in order)
+        estimate_rows = connection.execute(
+            "SELECT * FROM performance_estimates WHERE invocation_id IN ("
+            + placeholders
+            + ")",
+            order,
+        ).fetchall()
+        for row in estimate_rows:
+            invocation_id = _canonical_uuid(
+                row["invocation_id"], "estimate.invocation_id"
+            )
+            if invocation_id not in grouped:
+                raise PerformanceError("estimate has no projected internal record")
+            if "estimate" in grouped[invocation_id]:
+                raise PerformanceError("duplicate performance estimate")
+            grouped[invocation_id]["estimate"] = _validate_estimate_row(
+                row,
+                grouped[invocation_id]["internal"],
+                f"estimate for {invocation_id}",
+            )
+
     records: list[dict[str, Any]] = []
     for invocation_id in order:
         internal = grouped[invocation_id]["internal"]
         tasks = grouped[invocation_id]["tasks"]
+        estimate = grouped[invocation_id].get("estimate")
         known_task_identities = {
             (task["runner"], task["model"], task["configuration"])
             for task in tasks
@@ -765,7 +1016,7 @@ def _build_projection(
         }
         if internal["identity_source"] == "unknown" and len(known_task_identities) > 1:
             raise PerformanceError("task identity conflicts with prior task observation")
-        selected = (
+        selected_external = (
             None
             if not tasks
             else min(
@@ -780,15 +1031,33 @@ def _build_projection(
         routine_overhead = (
             None if strategy_ms is None else routine_total - strategy_ms
         )
-        task_duration = None if selected is None else selected["task_duration_ms"]
-        outside = None if task_duration is None else task_duration - routine_total
+        if estimate is not None:
+            task_duration = estimate["estimated_run_total_ms"]
+            task_clock_source = estimate["clock_source"]
+            task_observed_at = estimate["occurred_at_utc"]
+            outside = None
+        elif selected_external is not None:
+            task_duration = selected_external["task_duration_ms"]
+            task_clock_source = selected_external["clock_source"]
+            task_observed_at = selected_external["occurred_at_utc"]
+            outside = task_duration - routine_total
+        else:
+            task_duration = None
+            task_clock_source = None
+            task_observed_at = None
+            outside = None
         total_overhead = (
             None
-            if task_duration is None or strategy_ms is None
+            if estimate is not None
+            or selected_external is None
+            or strategy_ms is None
             else task_duration - strategy_ms
         )
-        if selected is not None and selected["identity_source"] != "unknown":
-            identity = selected
+        if (
+            selected_external is not None
+            and selected_external["identity_source"] != "unknown"
+        ):
+            identity = selected_external
         elif internal["identity_source"] != "unknown":
             identity = internal
         else:
@@ -809,8 +1078,8 @@ def _build_projection(
             "identity_source": identity["identity_source"],
             "internal_recorded_at_utc": internal["occurred_at_utc"],
             "task_duration_ms": task_duration,
-            "task_clock_source": None if selected is None else selected["clock_source"],
-            "task_observed_at_utc": None if selected is None else selected["occurred_at_utc"],
+            "task_clock_source": task_clock_source,
+            "task_observed_at_utc": task_observed_at,
             "routine_total_ms": routine_total,
             "strategy_execution_ms": strategy_ms,
             "routine_overhead_ms": routine_overhead,
@@ -822,24 +1091,29 @@ def _build_projection(
         "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM performance_events"
     ).fetchone()
     document = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": PROJECTION_SCHEMA_VERSION,
         "record_limit": limit,
         "record_count": len(records),
         "source_event_high_watermark": watermark_row["sequence"],
         "records": records,
     }
-    validate_projection(document)
+    validate_projection(document, allow_legacy=False)
     return document
 
 
-def validate_projection(document: Any) -> dict[str, Any]:
+def validate_projection(
+    document: Any, *, allow_legacy: bool = True
+) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise PerformanceError("projection: expected an object")
     _exact_keys(document, _TOP_LEVEL_KEYS, "projection")
     schema_version = _nonnegative_int(
         document["schema_version"], "projection.schema_version"
     )
-    if schema_version != SCHEMA_VERSION:
+    allowed_versions = {PROJECTION_SCHEMA_VERSION}
+    if allow_legacy:
+        allowed_versions.add(LEGACY_PROJECTION_SCHEMA_VERSION)
+    if schema_version not in allowed_versions:
         raise PerformanceError("projection.schema_version: unsupported value")
     record_limit = _nonnegative_int(document["record_limit"], "projection.record_limit")
     if record_limit != PROJECTION_LIMIT:
@@ -936,36 +1210,77 @@ def validate_projection(document: Any) -> dict[str, Any]:
         elif any(value is None for value in task_values):
             raise PerformanceError(f"{context}: task observation fields are all-or-none")
         else:
-            task_duration = _positive_int(
-                record["task_duration_ms"], f"{context}.task_duration_ms"
+            task_clock_source = record["task_clock_source"]
+            is_estimate = task_clock_source == ESTIMATE_CLOCK_SOURCE
+            if (
+                is_estimate
+                and schema_version == LEGACY_PROJECTION_SCHEMA_VERSION
+            ):
+                raise PerformanceError(
+                    f"{context}: legacy projection cannot contain canonical "
+                    "run-duration timing"
+                )
+            task_duration = (
+                _nonnegative_int(
+                    record["task_duration_ms"], f"{context}.task_duration_ms"
+                )
+                if is_estimate
+                else _positive_int(
+                    record["task_duration_ms"], f"{context}.task_duration_ms"
+                )
             )
-            if task_duration < routine_total:
-                raise PerformanceError(f"{context}: task duration is shorter than lifecycle")
-            _enum(
-                record["task_clock_source"],
-                CLOCK_SOURCES,
-                f"{context}.task_clock_source",
-            )
+            if not is_estimate:
+                if task_duration < routine_total:
+                    raise PerformanceError(
+                        f"{context}: task duration is shorter than lifecycle"
+                    )
+                _enum(
+                    task_clock_source,
+                    CLOCK_SOURCES,
+                    f"{context}.task_clock_source",
+                )
             task_observed = _canonical_utc(
                 record["task_observed_at_utc"], f"{context}.task_observed_at_utc"
             )
-            if _utc_datetime(task_observed) < _utc_datetime(internal_recorded):
-                raise PerformanceError(f"{context}: task observation predates internal record")
-            if _nonnegative_int(
-                record["outside_lifecycle_ms"], f"{context}.outside_lifecycle_ms"
-            ) != task_duration - routine_total:
-                raise PerformanceError(f"{context}.outside_lifecycle_ms: inconsistent value")
-            if strategy_start is not None:
-                expected_total = task_duration - record["strategy_execution_ms"]
+            if is_estimate:
+                if task_observed != internal_recorded:
+                    raise PerformanceError(
+                        f"{context}: estimated task clock must equal internal boundary"
+                    )
+                if record["outside_lifecycle_ms"] is not None:
+                    raise PerformanceError(
+                        f"{context}: estimated task must retain null outside metric"
+                    )
+                if record["total_overhead_ms"] is not None:
+                    raise PerformanceError(
+                        f"{context}: estimated task must retain null total metric"
+                    )
+            else:
+                if _utc_datetime(task_observed) < _utc_datetime(internal_recorded):
+                    raise PerformanceError(
+                        f"{context}: task observation predates internal record"
+                    )
                 if _nonnegative_int(
-                    record["total_overhead_ms"], f"{context}.total_overhead_ms"
-                ) != expected_total:
-                    raise PerformanceError(f"{context}.total_overhead_ms: inconsistent value")
+                    record["outside_lifecycle_ms"],
+                    f"{context}.outside_lifecycle_ms",
+                ) != task_duration - routine_total:
+                    raise PerformanceError(
+                        f"{context}.outside_lifecycle_ms: inconsistent value"
+                    )
+                if strategy_start is not None:
+                    expected_total = task_duration - record["strategy_execution_ms"]
+                    if _nonnegative_int(
+                        record["total_overhead_ms"],
+                        f"{context}.total_overhead_ms",
+                    ) != expected_total:
+                        raise PerformanceError(
+                            f"{context}.total_overhead_ms: inconsistent value"
+                        )
     return document
 
 
 def _atomic_write_projection(path: str, document: Mapping[str, Any]) -> None:
-    validate_projection(document)
+    validate_projection(document, allow_legacy=False)
     absolute = os.path.abspath(path)
     directory = os.path.dirname(absolute)
     if not directory:
@@ -998,7 +1313,7 @@ def _atomic_write_projection(path: str, document: Mapping[str, Any]) -> None:
             os.fsync(handle.fileno())
         descriptor = -1
         readback = _load_json(temporary)
-        validate_projection(readback)
+        validate_projection(readback, allow_legacy=False)
         if readback != document:
             raise PerformanceError("projection readback did not match serialized data")
         os.replace(temporary, absolute)
@@ -1085,8 +1400,12 @@ def validate_current_projection_read_only(
         connection.execute("BEGIN")
         expected = _build_projection(connection)
         actual = _load_json(projection_file)
-        validate_projection(actual)
-        if actual != expected:
+        validate_projection(actual, allow_legacy=True)
+        comparable = actual
+        if actual["schema_version"] == LEGACY_PROJECTION_SCHEMA_VERSION:
+            comparable = dict(actual)
+            comparable["schema_version"] = PROJECTION_SCHEMA_VERSION
+        if comparable != expected:
             raise PerformanceError("projection is valid JSON but stale or inconsistent")
         connection.rollback()
         return actual
@@ -1160,6 +1479,21 @@ def record_internal(
     occurred = _now_utc(now_utc)
     if _utc_datetime(occurred) < _utc_datetime(lifecycle_finish):
         raise PerformanceError("record-internal time precedes lifecycle finish")
+    estimated_run_start_pt = lifecycle["run_start_pt"]
+    if estimated_run_start_pt is None:
+        estimated_run_end_pt = None
+        estimated_run_total_ms = None
+        estimate_clock_source = None
+        estimated_run_total_display = None
+    else:
+        estimated_run_end_pt = _utc_to_pacific(occurred)
+        estimated_run_total_ms = _elapsed_pt_ms(
+            estimated_run_start_pt,
+            estimated_run_end_pt,
+            "final-summary-boundary",
+        )
+        estimate_clock_source = ESTIMATE_CLOCK_SOURCE
+        estimated_run_total_display = _duration_display(estimated_run_total_ms)
 
     connection = _connect(state_file)
     try:
@@ -1195,6 +1529,25 @@ def record_internal(
             ),
         )
         sequence = int(cursor.lastrowid)
+        if estimated_run_start_pt is not None:
+            connection.execute(
+                """
+                INSERT INTO performance_estimates (
+                    invocation_id, internal_sequence, occurred_at_utc,
+                    run_start_pt, run_end_pt, estimated_run_total_ms,
+                    clock_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invocation_id,
+                    sequence,
+                    occurred,
+                    estimated_run_start_pt,
+                    estimated_run_end_pt,
+                    estimated_run_total_ms,
+                    estimate_clock_source,
+                ),
+            )
         connection.commit()
     except Exception:
         if connection.in_transaction:
@@ -1217,6 +1570,11 @@ def record_internal(
         "routine_total_ms": record["routine_total_ms"],
         "strategy_execution_ms": record["strategy_execution_ms"],
         "routine_overhead_ms": record["routine_overhead_ms"],
+        "estimated_run_start_pt": estimated_run_start_pt,
+        "estimated_run_end_pt": estimated_run_end_pt,
+        "estimated_run_total_ms": estimated_run_total_ms,
+        "estimated_run_total_display": estimated_run_total_display,
+        "estimate_clock_source": estimate_clock_source,
         "projection_record_count": document["record_count"],
     }
 
@@ -1342,14 +1700,18 @@ def observe_task(
             "identity_source": identity_source,
             "occurred_at_utc": occurred,
         }
-        selected = min(
+        selected_external = min(
             existing_tasks + [candidate],
             key=lambda task: (
                 CLOCK_SOURCE_PRIORITY[task["clock_source"]], task["sequence"]
             ),
         )
-        selected_clock_source = selected["clock_source"]
-        selected_duration = selected["task_duration_ms"]
+        # Receipt schema v1 reports selection among external observations.  The
+        # projection's schema-v2 canonical automatic duration is independent;
+        # preserving the receipt contract lets existing callers attach and
+        # audit a reference without silently changing its returned meaning.
+        selected_clock_source = selected_external["clock_source"]
+        selected_duration = selected_external["task_duration_ms"]
         selected_outside = selected_duration - routine_total
         selected_total_overhead = (
             None

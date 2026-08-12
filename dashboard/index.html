@@ -1711,16 +1711,50 @@ const PERFORMANCE_TEXT_FIELDS = [
   "model", "configuration", "identity_source", "internal_recorded_at_utc",
   "task_clock_source", "task_observed_at_utc",
 ];
+const PERFORMANCE_TASK_CLOCK_SOURCES = new Set([
+  "runner-metadata", "codex-worked-for", "claude-run-duration",
+  "manual-stopwatch", "manual-observation", "final-summary-boundary", "unknown",
+]);
+const PERFORMANCE_LEGACY_SCHEMA_VERSION = 1;
+const PERFORMANCE_SCHEMA_VERSION = 2;
+const PERFORMANCE_COMPARABLE_CLOCK_SOURCE = "final-summary-boundary";
 
-function validPerformanceRecord(record) {
+function validPerformanceRecord(record, schemaVersion = PERFORMANCE_SCHEMA_VERSION) {
   if (!record || typeof record !== "object" || Array.isArray(record)) return false;
   if (typeof record.invocation_id !== "string" || !record.invocation_id) return false;
   if (!PERFORMANCE_TEXT_FIELDS.every(field =>
     record[field] === null ||
     (typeof record[field] === "string" && record[field].length <= 160))) return false;
-  return PERFORMANCE_DURATION_FIELDS.every(field =>
+  if (!PERFORMANCE_DURATION_FIELDS.every(field =>
     record[field] === null ||
-    (Number.isSafeInteger(record[field]) && record[field] >= 0));
+    (Number.isSafeInteger(record[field]) && record[field] >= 0))) return false;
+  if (!Number.isSafeInteger(record.routine_total_ms) ||
+      record.routine_total_ms < 0) return false;
+  const taskValues = [
+    record.task_duration_ms,
+    record.task_clock_source,
+    record.task_observed_at_utc,
+  ];
+  const taskMissing = taskValues.every(value => value === null);
+  const taskComplete = taskValues.every(value => value !== null);
+  if (!taskMissing && !taskComplete) return false;
+  if (taskMissing) {
+    return record.outside_lifecycle_ms === null &&
+      record.total_overhead_ms === null;
+  }
+  if (record.task_clock_source !== null &&
+      !PERFORMANCE_TASK_CLOCK_SOURCES.has(record.task_clock_source)) return false;
+  if (typeof record.task_observed_at_utc !== "string" ||
+      !record.task_observed_at_utc) return false;
+  if (record.task_clock_source === PERFORMANCE_COMPARABLE_CLOCK_SOURCE) {
+    if (schemaVersion === PERFORMANCE_LEGACY_SCHEMA_VERSION) return false;
+    if (record.outside_lifecycle_ms !== null ||
+        record.total_overhead_ms !== null) return false;
+  } else if (record.task_duration_ms <= 0 ||
+             record.task_duration_ms < record.routine_total_ms) {
+    return false;
+  }
+  return true;
 }
 
 function formatPerformanceDuration(milliseconds) {
@@ -1762,13 +1796,19 @@ function performanceIdentity(record) {
   return parts.length ? parts : null;
 }
 
+function performanceTaskLabel(record) {
+  return record.task_clock_source === PERFORMANCE_COMPARABLE_CLOCK_SOURCE
+    ? "Comparable run duration" : "Reference run duration";
+}
+
 function phoneTimingSummary(record) {
   if (!validPerformanceRecord(record)) return null;
   const identity = performanceIdentity(record)?.join(' / ') ?? 'not measured';
+  const taskLabel = performanceTaskLabel(record);
   const summary = [
     `Timing — session: ${performanceSessionLabel(record.session)}`,
     `runner / model / configuration: ${identity}`,
-    `End-to-end task: ${formatPerformanceDuration(record.task_duration_ms)}`,
+    `${taskLabel}: ${formatPerformanceDuration(record.task_duration_ms)}`,
     `Routine total: ${formatPerformanceDuration(record.routine_total_ms)}`,
     `Strategy execution: ${formatPerformanceDuration(record.strategy_execution_ms)}`,
     `Routine overhead: ${formatPerformanceDuration(record.routine_overhead_ms)}`,
@@ -1829,6 +1869,8 @@ function renderPerformanceUnavailable(message) {
 
 function performanceRecordRow(record) {
     const identity = performanceIdentity(record);
+    const taskLabel = performanceTaskLabel(record);
+    const comparableTask = record.task_clock_source === PERFORMANCE_COMPARABLE_CLOCK_SOURCE;
     const identityHtml = identity
       ? `<span class="performance-primary">${esc(identity[0])}</span>` +
         (identity.length > 1
@@ -1838,8 +1880,12 @@ function performanceRecordRow(record) {
     const identityTitle = record.identity_source
       ? ` title="${esc("Identity source: " + record.identity_source)}"` : "";
     const taskDetails = [
-      record.task_clock_source ? `Task clock: ${record.task_clock_source}` : null,
-      record.task_observed_at_utc ? `Observed: ${record.task_observed_at_utc}` : null,
+      record.task_clock_source
+        ? `${comparableTask ? "Comparable boundary" : "Reference source"}: ${record.task_clock_source}`
+        : null,
+      record.task_observed_at_utc
+        ? `Recorded: ${record.task_observed_at_utc}`
+        : null,
       record.outside_lifecycle_ms === null ? null :
         `Outside lifecycle: ${formatPerformanceDuration(record.outside_lifecycle_ms)}`,
       record.total_overhead_ms === null ? null :
@@ -1860,7 +1906,7 @@ function performanceRecordRow(record) {
         `<span class="performance-primary">${esc(performanceStartLabel(record.lifecycle_started_at_utc))}</span>` +
         `<span class="performance-secondary">${esc(performanceSessionLabel(record.session))}</span></td>` +
       `<td class="performance-identity" data-label="Runner / model / configuration"${identityTitle}>${identityHtml}</td>` +
-      `<td data-label="End-to-end task">${performanceDurationCell(record.task_duration_ms, taskDetails)}</td>` +
+      `<td data-label="${esc(taskLabel)}">${performanceDurationCell(record.task_duration_ms, taskDetails)}</td>` +
       `<td data-label="Routine total">${performanceDurationCell(record.routine_total_ms, routineDetails)}</td>` +
       `<td data-label="Strategy execution">${performanceDurationCell(record.strategy_execution_ms, strategyDetails)}</td>` +
       `<td data-label="Routine overhead">${performanceDurationCell(record.routine_overhead_ms)}</td>` +
@@ -1879,10 +1925,11 @@ function renderSelectedPerformance() {
     return;
   }
   setPerformanceSectionOpen(true);
+  const taskLabel = performanceTaskLabel(record);
   const row = performanceRecordRow(record);
   $("performance").innerHTML = `<table class="performance-table"><thead><tr>` +
     `<th>Start / session</th><th>Runner / model / configuration</th>` +
-    `<th>End-to-end task</th><th>Routine total</th>` +
+    `<th>${esc(taskLabel)}</th><th>Routine total</th>` +
     `<th>Strategy execution</th><th>Routine overhead</th>` +
     `</tr></thead><tbody>${row}</tbody></table>`;
 }
@@ -1891,14 +1938,17 @@ function renderPerformance(document) {
   const notice = $("performance-notice");
   notice.hidden = true;
   notice.textContent = "";
-  if (!document || document.schema_version !== 1 ||
+  if (!document ||
+      ![PERFORMANCE_LEGACY_SCHEMA_VERSION, PERFORMANCE_SCHEMA_VERSION]
+        .includes(document.schema_version) ||
       !Number.isSafeInteger(document.record_limit) || document.record_limit <= 0 ||
       !Number.isSafeInteger(document.source_event_high_watermark) ||
       document.source_event_high_watermark < 0 ||
       !Array.isArray(document.records) || document.records.length > document.record_limit ||
       !Number.isSafeInteger(document.record_count) ||
       document.record_count !== document.records.length ||
-      !document.records.every(validPerformanceRecord)) {
+      !document.records.every(
+        record => validPerformanceRecord(record, document.schema_version))) {
     renderPerformanceUnavailable("unsupported or invalid performance schema");
     return;
   }
