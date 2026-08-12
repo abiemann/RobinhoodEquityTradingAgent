@@ -16,6 +16,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import broker_snapshot
+import run_lifecycle
 import status_snapshot
 
 
@@ -414,6 +415,28 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
             json.dumps(document, allow_nan=False), encoding="utf-8"
         )
         output = reports / "rhmra-status-2026_01_02-10_13.json"
+        state = base / "lifecycle.sqlite3"
+        projection = base / "lifecycle.json"
+        invocation_id = "11111111-1111-4111-8111-111111111111"
+        run_lifecycle.start_invocation(
+            invocation_id=invocation_id,
+            state_file=str(state),
+            projection_file=str(projection),
+            now_utc="2026-01-02T18:13:26Z",
+        )
+        run_lifecycle.record_event(
+            invocation_id=invocation_id,
+            phase="preflight",
+            run_start_pt="2026-01-02T10:13:27-08:00",
+            state_file=str(state),
+            projection_file=str(projection),
+            now_utc="2026-01-02T18:13:27Z",
+        )
+        self.lifecycle_binding = {
+            "invocation_id": invocation_id,
+            "lifecycle_state_file": state,
+            "lifecycle_projection_file": projection,
+        }
         return scratch, reports, candidate, output
 
     def test_publish_preserves_candidate_bytes_and_validates_final_readback(self):
@@ -421,7 +444,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
             scratch, reports, candidate, output = self.paths(td)
             candidate_bytes = candidate.read_bytes()
             result = status_snapshot.publish_status_snapshot(
-                candidate, output, scratch=scratch, report_dir=reports
+                candidate, output, scratch=scratch, report_dir=reports,
+                **self.lifecycle_binding
             )
             self.assertEqual(
                 result,
@@ -449,7 +473,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
 
             with self.assertRaises(status_snapshot.StatusSnapshotError):
                 status_snapshot.publish_status_snapshot(
-                    candidate, output, scratch=scratch, report_dir=reports
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
 
             self.assertFalse(output.exists())
@@ -467,7 +492,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 previous.write_bytes(previous_bytes)
                 with self.assertRaises(status_snapshot.StatusSnapshotError):
                     status_snapshot.publish_status_snapshot(
-                        candidate, output, scratch=scratch, report_dir=reports
+                        candidate, output, scratch=scratch, report_dir=reports,
+                        **self.lifecycle_binding
                     )
                 self.assertFalse(output.exists())
                 self.assertEqual(previous.read_bytes(), previous_bytes)
@@ -485,7 +511,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     "not a preflighted broker-snapshot directory",
                 ):
                     status_snapshot.publish_status_snapshot(
-                        candidate, output, scratch=scratch, report_dir=reports
+                        candidate, output, scratch=scratch, report_dir=reports,
+                        **self.lifecycle_binding
                     )
                 self.assertFalse(output.exists())
 
@@ -498,7 +525,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 status_snapshot.StatusSnapshotError, "refusing to replace"
             ):
                 status_snapshot.publish_status_snapshot(
-                    candidate, output, scratch=scratch, report_dir=reports
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
             self.assertEqual(output.read_bytes(), existing)
 
@@ -513,7 +541,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 status_snapshot.StatusSnapshotError, "directly inside scratch"
             ):
                 status_snapshot.publish_status_snapshot(
-                    nested_candidate, output, scratch=scratch, report_dir=reports
+                    nested_candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
 
     def test_candidate_symbolic_link_is_rejected(self):
@@ -525,7 +554,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     "symbolic links are not allowed",
                 ):
                     status_snapshot.publish_status_snapshot(
-                        candidate, output, scratch=scratch, report_dir=reports
+                        candidate, output, scratch=scratch, report_dir=reports,
+                        **self.lifecycle_binding
                     )
 
     def test_oversized_candidate_is_rejected_without_publication(self):
@@ -536,7 +566,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 status_snapshot.StatusSnapshotError, "exceeds 1000000 bytes"
             ):
                 status_snapshot.publish_status_snapshot(
-                    candidate, output, scratch=scratch, report_dir=reports
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
             self.assertFalse(output.exists())
 
@@ -548,14 +579,86 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 status_snapshot.StatusSnapshotError, "filename must match"
             ):
                 status_snapshot.publish_status_snapshot(
-                    candidate, wrong, scratch=scratch, report_dir=reports
+                    candidate, wrong, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
+
+    def test_lifecycle_rejects_observed_11_45_artifacts_for_11_43_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch, reports, candidate, _output = self.paths(td)
+            wrong = valid_snapshot('2026-01-02T10:15:27-08:00')
+            candidate.write_text(json.dumps(wrong), encoding='utf-8')
+            output = reports / 'rhmra-status-2026_01_02-10_15.json'
+            with self.assertRaisesRegex(
+                status_snapshot.StatusSnapshotError,
+                'must exactly match lifecycle binding',
+            ):
+                status_snapshot.publish_status_snapshot(
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
+                )
+            self.assertFalse(output.exists())
+
+    def test_lifecycle_rejects_same_minute_rounded_candidate_without_clobber(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch, reports, candidate, output = self.paths(td)
+            rounded = valid_snapshot('2026-01-02T10:13:00-08:00')
+            candidate.write_text(json.dumps(rounded), encoding='utf-8')
+            previous = reports / 'rhmra-status-2026_01_02-09_59.json'
+            previous_bytes = b'previous truthful status bytes'
+            previous.write_bytes(previous_bytes)
+            with self.assertRaisesRegex(
+                status_snapshot.StatusSnapshotError,
+                r'10:13:27-08:00',
+            ):
+                status_snapshot.publish_status_snapshot(
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
+                )
+            self.assertFalse(output.exists())
+            self.assertEqual(previous.read_bytes(), previous_bytes)
+
+    def test_publish_rejects_unknown_and_finished_invocations(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch, reports, candidate, output = self.paths(td)
+            unknown = dict(self.lifecycle_binding)
+            unknown['invocation_id'] = str(uuid.uuid4())
+            with self.assertRaisesRegex(
+                status_snapshot.StatusSnapshotError, 'has not been started'
+            ):
+                status_snapshot.publish_status_snapshot(
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **unknown
+                )
+            self.assertFalse(output.exists())
+
+            run_lifecycle.finish_invocation(
+                invocation_id=self.lifecycle_binding['invocation_id'],
+                classification='final-status-unavailable',
+                reason_code='status-write-failed',
+                report_file='rhmra-log-2026_01_02-10_13.md',
+                state_file=str(self.lifecycle_binding['lifecycle_state_file']),
+                projection_file=str(
+                    self.lifecycle_binding['lifecycle_projection_file']
+                ),
+                report_dir=str(reports),
+                now_utc='2026-01-02T18:13:28Z',
+            )
+            with self.assertRaisesRegex(
+                status_snapshot.StatusSnapshotError, 'already finished'
+            ):
+                status_snapshot.publish_status_snapshot(
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
+                )
+            self.assertFalse(output.exists())
 
     def test_read_only_verify_recovers_a_lost_publish_receipt_without_rewrite(self):
         with tempfile.TemporaryDirectory() as td:
             scratch, reports, candidate, output = self.paths(td)
             publish = status_snapshot.publish_status_snapshot(
-                candidate, output, scratch=scratch, report_dir=reports
+                candidate, output, scratch=scratch, report_dir=reports,
+                **self.lifecycle_binding
             )
             original = output.read_bytes()
 
@@ -564,6 +667,7 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 candidate=candidate,
                 scratch=scratch,
                 report_dir=reports,
+                **self.lifecycle_binding,
             )
             self.assertEqual(recovered["action"], "verify")
             self.assertEqual(
@@ -574,9 +678,37 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                 status_snapshot.StatusSnapshotError, "refusing to replace"
             ):
                 status_snapshot.publish_status_snapshot(
-                    candidate, output, scratch=scratch, report_dir=reports
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
             self.assertEqual(output.read_bytes(), original)
+
+    def test_candidate_bound_verify_rejects_finished_invocation(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch, reports, candidate, output = self.paths(td)
+            status_snapshot.publish_status_snapshot(
+                candidate, output, scratch=scratch, report_dir=reports,
+                **self.lifecycle_binding
+            )
+            run_lifecycle.finish_invocation(
+                invocation_id=self.lifecycle_binding['invocation_id'],
+                classification='completed',
+                report_file='rhmra-log-2026_01_02-10_13.md',
+                status_file=output.name,
+                state_file=str(self.lifecycle_binding['lifecycle_state_file']),
+                projection_file=str(
+                    self.lifecycle_binding['lifecycle_projection_file']
+                ),
+                report_dir=str(reports),
+                now_utc='2026-01-02T18:13:28Z',
+            )
+            with self.assertRaisesRegex(
+                status_snapshot.StatusSnapshotError, 'already finished'
+            ):
+                status_snapshot.verify_published_status_snapshot(
+                    output, candidate=candidate, scratch=scratch,
+                    report_dir=reports, **self.lifecycle_binding
+                )
 
     def test_read_only_verify_distinguishes_absent_output_without_creating_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -587,6 +719,7 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     candidate=_candidate,
                     scratch=_scratch,
                     report_dir=reports,
+                    **self.lifecycle_binding,
                 )
             self.assertFalse(output.exists())
 
@@ -604,6 +737,7 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     candidate=candidate,
                     scratch=scratch,
                     report_dir=reports,
+                    **self.lifecycle_binding,
                 )
 
     def test_published_loader_rejects_filename_timestamp_mismatch(self):
@@ -658,11 +792,56 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
 
             with mock.patch("status_snapshot.os.unlink", side_effect=fail_hidden_temp):
                 result = status_snapshot.publish_status_snapshot(
-                    candidate, output, scratch=scratch, report_dir=reports
+                    candidate, output, scratch=scratch, report_dir=reports,
+                    **self.lifecycle_binding
                 )
             self.assertIs(result["ok"], True)
             self.assertTrue(output.exists())
             status_snapshot.load_published_status_snapshot(output, reports)
+
+    def test_lifecycle_finish_racing_staging_blocks_atomic_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch, reports, candidate, output = self.paths(td)
+            real_validate = status_snapshot._validate_lifecycle_binding
+            calls = 0
+
+            def finish_before_commit(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    run_lifecycle.finish_invocation(
+                        invocation_id=self.lifecycle_binding['invocation_id'],
+                        classification='final-status-unavailable',
+                        reason_code='status-write-failed',
+                        report_file='rhmra-log-2026_01_02-10_13.md',
+                        state_file=str(
+                            self.lifecycle_binding['lifecycle_state_file']
+                        ),
+                        projection_file=str(
+                            self.lifecycle_binding['lifecycle_projection_file']
+                        ),
+                        now_utc='2026-01-02T18:13:28Z',
+                    )
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                status_snapshot,
+                '_validate_lifecycle_binding',
+                side_effect=finish_before_commit,
+            ):
+                with self.assertRaisesRegex(
+                    status_snapshot.StatusSnapshotError, 'already finished'
+                ):
+                    status_snapshot.publish_status_snapshot(
+                        candidate, output, scratch=scratch, report_dir=reports,
+                        **self.lifecycle_binding
+                    )
+            self.assertEqual(calls, 2)
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                [path.name for path in reports.iterdir()],
+                [],
+            )
 
     def test_cli_emits_one_valid_success_envelope(self):
         with tempfile.TemporaryDirectory() as td:
@@ -672,6 +851,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     sys.executable,
                     SCRIPT,
                     "publish",
+                    "--invocation-id",
+                    self.lifecycle_binding["invocation_id"],
                     "--scratch",
                     str(scratch),
                     "--candidate",
@@ -680,6 +861,10 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     str(output),
                     "--report-dir",
                     str(reports),
+                    "--lifecycle-state-file",
+                    str(self.lifecycle_binding["lifecycle_state_file"]),
+                    "--lifecycle-projection-file",
+                    str(self.lifecycle_binding["lifecycle_projection_file"]),
                 ],
                 cwd=ROOT,
                 text=True,
@@ -707,6 +892,8 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     sys.executable,
                     SCRIPT,
                     "publish",
+                    "--invocation-id",
+                    self.lifecycle_binding["invocation_id"],
                     "--scratch",
                     str(scratch),
                     "--candidate",
@@ -715,6 +902,10 @@ class StatusSnapshotPublicationTests(unittest.TestCase):
                     str(output),
                     "--report-dir",
                     str(reports),
+                    "--lifecycle-state-file",
+                    str(self.lifecycle_binding["lifecycle_state_file"]),
+                    "--lifecycle-projection-file",
+                    str(self.lifecycle_binding["lifecycle_projection_file"]),
                 ],
                 cwd=ROOT,
                 text=True,
@@ -753,8 +944,16 @@ class StatusSnapshotRoutineContractTests(unittest.TestCase):
         )
         self.assertIn("existing, marked, broker-preflighted", block)
         self.assertIn("Never use the file-writing tool", block)
-        self.assertIn("status_snapshot.py publish --scratch", block)
-        self.assertIn("status_snapshot.py verify --scratch", block)
+        self.assertIn(
+            "status_snapshot.py publish --invocation-id '<INVOCATION_ID>' "
+            "--scratch",
+            block,
+        )
+        self.assertIn(
+            "status_snapshot.py verify --invocation-id '<INVOCATION_ID>' "
+            "--scratch",
+            block,
+        )
         self.assertIn("--candidate '<absolute scratch>", block)
         self.assertIn("the already-bound `PYTHON_EXE`", block)
         self.assertIn("exactly one initial publication command", block)
@@ -783,9 +982,11 @@ class StatusSnapshotRoutineContractTests(unittest.TestCase):
             for line in routine.splitlines()
             if line.startswith("**rules_version**")
         )
-        self.assertIn(
-            "broker_snapshot.py status_snapshot.py run_lifecycle.py", rules_line
-        )
+        helper = Path(ROOT, "rules_version.py").read_text(encoding="utf-8")
+        self.assertIn("rules_version.py", rules_line)
+        self.assertIn("canonical rule-set file list", rules_line)
+        self.assertIn('"status_snapshot.py"', helper)
+        self.assertIn('"run_lifecycle.py"', helper)
 
 
 if __name__ == "__main__":

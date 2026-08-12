@@ -3,7 +3,7 @@
 Rules for any AI agent (or human) editing this repository.
 
 ## Tests are mandatory for script changes
-After editing `resolve_python.ps1`, `validate_constants.py`, `broker_snapshot.py`, `daily_loss.py`, `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `run_lock.py`, `run_lifecycle.py`, `run_performance.py`, `status_snapshot.py`, `order_intents.py`, `dashboard/serve.py`, `dashboard/index.html`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
+After editing `resolve_python.ps1`, `validate_constants.py`, `broker_snapshot.py`, `daily_loss.py`, `evaluate_candidates.py`, `filter_scan.py`, `market_clock.py`, `market_calendar.py`, `run_lock.py`, `run_lifecycle.py`, `run_performance.py`, `rules_version.py`, `status_snapshot.py`, `order_intents.py`, `dashboard/serve.py`, `dashboard/index.html`, `robinhood-momentum-routine-autonomous.md`, or `tools/price_band_scanner.py`, run:
 
 ```
 python3 -m unittest discover -s tests     # Windows: py -3 -m unittest discover -s tests

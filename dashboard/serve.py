@@ -11,9 +11,9 @@ off-machine. Serves exactly three things and refuses everything else:
 
 plus six conveniences so the page never has to guess filenames or mode:
 
-  /api/index           {"status": [...], "gates": [...]} sorted filename lists
-  /api/latest          newest strictly valid status snapshot, plus a warning
-                       when malformed newer files were rejected
+  /api/index           strict status/rejected/orphaned and gate filename lists
+  /api/latest          newest strictly valid lifecycle-associated snapshot,
+                       plus safe malformed/orphaned/unavailable warnings
   /api/runs            validated, secret-free invocation lifecycle projection
   /api/performance     validated, secret-free run performance projection
   /api/config          current DRY_RUN and opening-blackout settings
@@ -523,24 +523,86 @@ def _status_reports():
     ]
 
 
-def _status_snapshot_index():
-    """Partition published status names through the shared strict loader."""
+def _status_name_for_run_start(run_start_pt):
+    parsed = datetime.fromisoformat(run_start_pt)
+    return parsed.strftime("rhmra-status-%Y_%m_%d-%H_%M.json")
+
+
+def _lifecycle_status_policy(lifecycle_document):
+    """Return authorized name/timestamp pairs and the legacy boundary."""
+    records = lifecycle_document.get("records", [])
+    if not records:
+        return {}, None, False
+
+    allowed = {}
+    bound_names = []
+    event_sequences = []
+    for record in records:
+        for event in record.get("events", []):
+            sequence = event.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                event_sequences.append(sequence)
+        run_start_pt = record.get("run_start_pt")
+        expected_name = None
+        if isinstance(run_start_pt, str):
+            expected_name = _status_name_for_run_start(run_start_pt)
+            bound_names.append(expected_name)
+        if record.get("classification") == "running" and expected_name:
+            allowed.setdefault(expected_name, set()).add(run_start_pt)
+        status_file = record.get("status_file")
+        if (record.get("finished_at_utc") is not None
+                and isinstance(status_file, str)
+                and isinstance(run_start_pt, str)):
+            allowed.setdefault(status_file, set()).add(run_start_pt)
+
+    # A capped projection may no longer contain lifecycle sequence 1. In that
+    # case no unlinked historical file can be proven to predate lifecycle, so
+    # fail closed instead of silently reclassifying an old orphan as legacy.
+    history_complete = bool(event_sequences) and min(event_sequences) == 1
+    legacy_boundary = (
+        min(bound_names) if history_complete and bound_names else None
+    )
+    return allowed, legacy_boundary, True
+
+
+def _status_snapshot_index(lifecycle_document=None):
+    """Partition status names by strict schema and lifecycle authority."""
+    if lifecycle_document is None:
+        lifecycle_document = _lifecycle_projection()
+    allowed, legacy_boundary, lifecycle_exists = _lifecycle_status_policy(
+        lifecycle_document
+    )
     valid = []
     rejected = []
+    orphaned = []
     report_dir = os.path.join(REPO, "run-reports")
     for name in _status_reports():
         try:
-            load_published_status_snapshot(
+            document = load_published_status_snapshot(
                 os.path.join(report_dir, name), report_dir
             )
         except (StatusSnapshotError, OSError, UnicodeError, ValueError):
             rejected.append(name)
         else:
-            valid.append(name)
-    return {"status": valid, "rejected_status": rejected}
+            is_legacy = (
+                not lifecycle_exists
+                or (legacy_boundary is not None and name < legacy_boundary)
+            )
+            is_associated = (
+                document.get("run_start_pt") in allowed.get(name, set())
+            )
+            if is_legacy or is_associated:
+                valid.append(name)
+            else:
+                orphaned.append(name)
+    return {
+        "status": valid,
+        "rejected_status": rejected,
+        "orphaned_status": orphaned,
+    }
 
 
-def _latest_status_snapshot():
+def _latest_status_snapshot(lifecycle_document=None):
     """Return the newest strictly valid snapshot and safe fallback metadata.
 
     Status filenames sort chronologically. A malformed newest file must not
@@ -554,31 +616,50 @@ def _latest_status_snapshot():
     if not names:
         return {"filename": None, "data": None}
 
+    index = _status_snapshot_index(lifecycle_document)
+    accepted_names = index["status"]
     newest = names[-1]
     report_dir = os.path.join(REPO, "run-reports")
-    rejected_count = 0
-    selected_name = None
-    selected_document = None
-    for name in reversed(names):
-        try:
-            selected_document = load_published_status_snapshot(
-                os.path.join(report_dir, name), report_dir
-            )
-        except (StatusSnapshotError, OSError, UnicodeError, ValueError):
-            rejected_count += 1
-            continue
-        selected_name = name
-        break
+    selected_name = accepted_names[-1] if accepted_names else None
+    selected_document = (
+        None if selected_name is None else load_published_status_snapshot(
+            os.path.join(report_dir, selected_name), report_dir
+        )
+    )
 
     result = {"filename": selected_name, "data": selected_document}
     if newest != selected_name:
-        result["warning"] = {
-            "code": "newest_snapshot_rejected",
-            "rejected_filename": newest,
-            "fallback_filename": selected_name,
-            "rejected_count": rejected_count,
-        }
+        newer_names = (
+            names if selected_name is None
+            else [name for name in names if name > selected_name]
+        )
+        newer_rejected = [
+            name for name in newer_names if name in index["rejected_status"]
+        ]
+        newer_orphaned = [
+            name for name in newer_names if name in index["orphaned_status"]
+        ]
+        if newer_orphaned:
+            result["warning"] = {
+                "code": "newer_snapshot_orphaned",
+                "orphaned_filename": newer_orphaned[-1],
+                "fallback_filename": selected_name,
+                "orphaned_count": len(newer_orphaned),
+                "rejected_count": len(newer_rejected),
+            }
+        else:
+            result["warning"] = {
+                "code": "newest_snapshot_rejected",
+                "rejected_filename": newest,
+                "fallback_filename": selected_name,
+                "rejected_count": len(newer_rejected),
+            }
     return result
+
+
+def _lifecycle_unavailable_warning():
+    """Return a fixed, secret-free warning for fail-closed status selection."""
+    return {"code": "lifecycle_unavailable"}
 
 
 def _served_static_path(path):
@@ -1023,10 +1104,20 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/index":
-            status_index = _status_snapshot_index()
+            try:
+                status_index = _status_snapshot_index()
+            except (LifecycleError, OSError, UnicodeError, ValueError):
+                return self._json({
+                    "status": [],
+                    "rejected_status": [],
+                    "orphaned_status": [],
+                    "gates": _reports("rhmra-gates-*.json"),
+                    "warning": _lifecycle_unavailable_warning(),
+                })
             return self._json({
                 "status": status_index["status"],
                 "rejected_status": status_index["rejected_status"],
+                "orphaned_status": status_index["orphaned_status"],
                 "gates": _reports("rhmra-gates-*.json"),
             })
         if path == "/api/runs":
@@ -1048,7 +1139,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"error": str(exc)}, status=500)
             return self._json(document)
         if path == "/api/latest":
-            return self._json(_latest_status_snapshot())
+            try:
+                return self._json(_latest_status_snapshot())
+            except (LifecycleError, OSError, UnicodeError, ValueError):
+                return self._json({
+                    "filename": None,
+                    "data": None,
+                    "warning": _lifecycle_unavailable_warning(),
+                })
         if _served_static_path(path):
             return super().do_GET()
         self.send_error(403, "not served")

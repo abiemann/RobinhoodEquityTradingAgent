@@ -790,6 +790,37 @@ linked status is rejected remains visible with a neutral
 `status rejected` / `status unavailable` outcome; malformed account data never invents a risk-halt
 label. Rejected files remain local and readable for incident review, but are never display data.
 
+**2026-08-12 11:43 follow-up, Claude lost bound invocation state across context compaction.**
+A native Claude Code Local run started lifecycle at 11:43:22 Pacific and bound START CLOCK at
+11:43:42, but after automatic context compaction it began constructing report, gate, and status
+artifacts with an 11:45 timestamp. It attempted unsupported lifecycle `status`/`export`
+invocations to rediscover the start minute, switched from the resolver-bound Python 3.12
+executable to `py -3` (Python 3.14), skipped the SECOND phase renewal, and issued parts of the
+ordered final refresh in parallel. Its two `get_realized_pnl` calls omitted `asset_classes:
+["equity"]`, so the connector rejected both. It first used a `git describe` string as
+`rules_version`, then truncated that to a commit-like value that described the wrong rule era.
+
+The deterministic lifecycle correctly rejected the 11:45 report/status names. Claude eventually
+wrote corrected 11:43 files and finished the invocation, but only after it had released the lease;
+the structurally valid 11:45 status remained as an unlinked orphan and was new enough to displace
+the lifecycle-linked snapshot in the dashboard. Performance telemetry also used lifecycle finish
+as the strategy end, recording 28:53 instead of the required FIRST-to-REPORT interval of 20:57.
+The account was flat and the run made no order review, placement, cancellation, or other broker
+mutation, so the incident affected coordination, observability, and timing telemetry rather than
+account state.
+
+**Rules produced:** lifecycle preflight now returns and binds the exact seconds-bearing run start,
+artifact stamp, and expected report/gate/status names; a strict read-only
+`run_lifecycle.py status --invocation-id` call is the sole recovery path after compaction.
+`status_snapshot.py publish` and `verify` bind the candidate, timestamp, and expected filename
+to that still-running invocation. The runner may neither round the run start nor switch away from
+the resolver-bound interpreter. `rules_version.py` owns rule-era Git interpretation. Every phase
+repeats its lease-renewal requirement locally; final broker reads are sequential; realized-P&L
+uses one explicit equity/day/timezone payload and an identical retry; artifact corrections finish
+before lease release; and strategy timing remains the FIRST renewal through REPORT renewal only.
+The dashboard quarantines otherwise valid snapshots that cannot be linked to the lifecycle
+invocation, preserving the newest truthful linked account state and showing an orphan warning.
+
 ---
 
 ## The pattern across all of these

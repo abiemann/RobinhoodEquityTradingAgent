@@ -27,6 +27,7 @@ Commands (all successful commands emit one JSON object):
       --classification snapshot-failure --reason-code orders-page-shape \
       --report-file rhmra-log-2026_08_04-12_02.md \
       --status-file rhmra-status-2026_08_04-12_02.json
+  py -3 run_lifecycle.py status --invocation-id UUID
   py -3 run_lifecycle.py export
   py -3 run_lifecycle.py validate
 
@@ -75,6 +76,7 @@ DEFAULT_STATE_FILE = os.path.join(
 DEFAULT_PROJECTION_FILE = os.path.join(
     ROOT, "run-reports", "rhmra-run-lifecycle.json"
 )
+DEFAULT_REPORT_DIR = os.path.join(ROOT, "run-reports")
 
 CLASSIFICATIONS = (
     "running",
@@ -1219,6 +1221,38 @@ def validate_current_projection(
     return validate_current_projection_read_only(state_file, projection_file)
 
 
+def invocation_status(
+    *, invocation_id: str, state_file: str = DEFAULT_STATE_FILE,
+    projection_file: str = DEFAULT_PROJECTION_FILE,
+) -> dict[str, Any]:
+    '''Return the authoritative artifact binding for one run.'''
+    invocation_id = _canonical_uuid(invocation_id, 'invocation_id')
+    document = validate_current_projection_read_only(state_file, projection_file)
+    record = next(
+        (item for item in document['records']
+         if item['invocation_id'] == invocation_id),
+        None,
+    )
+    if record is None:
+        raise LifecycleConflict('invocation has not been started')
+    run_start_pt = record['run_start_pt']
+    if run_start_pt is None:
+        raise LifecycleConflict('invocation has no Pacific time binding')
+    if record['classification'] != 'running':
+        raise LifecycleConflict('invocation is already finished')
+    artifact_stamp = _run_stamp(run_start_pt)
+    return {
+        'schema_version': SCHEMA_VERSION, 'action': 'status', 'ok': True,
+        'invocation_id': invocation_id,
+        'classification': record['classification'],
+        'phase': record['latest_phase'], 'run_start_pt': run_start_pt,
+        'artifact_stamp': artifact_stamp,
+        'expected_report_file': f'rhmra-log-{artifact_stamp}.md',
+        'expected_gate_file': f'rhmra-gates-{artifact_stamp}.json',
+        'expected_status_file': f'rhmra-status-{artifact_stamp}.json',
+    }
+
+
 def _invocation_rows(
     connection: sqlite3.Connection, invocation_id: str
 ) -> list[sqlite3.Row]:
@@ -1416,6 +1450,7 @@ def record_event(
         run_start_pt=run_start_pt,
     )
     _publish_after_append("event", invocation_id, state_file, projection_file)
+    artifact_stamp = None if run_start_pt is None else _run_stamp(run_start_pt)
     return {
         "schema_version": SCHEMA_VERSION,
         "action": "event",
@@ -1426,6 +1461,18 @@ def record_event(
         "phase": phase,
         "reason_code": reason_code,
         "run_start_pt": run_start_pt,
+        "artifact_stamp": artifact_stamp,
+        "expected_report_file": (
+            None if artifact_stamp is None else f"rhmra-log-{artifact_stamp}.md"
+        ),
+        "expected_gate_file": (
+            None if artifact_stamp is None else f"rhmra-gates-{artifact_stamp}.json"
+        ),
+        "expected_status_file": (
+            None
+            if artifact_stamp is None
+            else f"rhmra-status-{artifact_stamp}.json"
+        ),
         "occurred_at_utc": occurred_at,
     }
 
@@ -1440,6 +1487,7 @@ def finish_invocation(
     status_file: str | None = None,
     state_file: str = DEFAULT_STATE_FILE,
     projection_file: str = DEFAULT_PROJECTION_FILE,
+    report_dir: str = DEFAULT_REPORT_DIR,
     now_utc: str | None = None,
 ) -> dict[str, Any]:
     invocation_id = _canonical_uuid(invocation_id, "invocation_id")
@@ -1482,6 +1530,30 @@ def finish_invocation(
         raise LifecycleError(
             f"{classification} must not reference an account status snapshot"
         )
+    if status_file is not None:
+        # Local import avoids a module-level cycle: status_snapshot uses this
+        # module's read-only invocation binding during publication.
+        import status_snapshot as status_snapshot_module
+
+        status_path = os.path.join(os.path.abspath(report_dir), status_file)
+        try:
+            status_document = (
+                status_snapshot_module.load_published_status_snapshot(
+                    status_path, os.path.abspath(report_dir)
+                )
+            )
+        except (
+            status_snapshot_module.StatusSnapshotError,
+            OSError,
+        ) as exc:
+            raise LifecycleError(
+                f"status_file: published snapshot validation failed: {exc}"
+            ) from exc
+        if status_document["run_start_pt"] != run_start_pt:
+            raise LifecycleError(
+                "status_file: published snapshot run_start_pt must exactly match "
+                f"the lifecycle binding ({run_start_pt})"
+            )
     occurred_at = _now_utc(now_utc)
     sequence = _append_event(
         action="finish",
@@ -1519,6 +1591,7 @@ def _reject_unused(args: argparse.Namespace, allowed: set[str]) -> None:
         "reason_code",
         "report_file",
         "status_file",
+        "report_dir",
     }
     for name in sorted(optional - allowed):
         if getattr(args, name) is not None:
@@ -1532,7 +1605,8 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "action", choices=("start", "event", "finish", "export", "validate")
+        "action",
+        choices=("start", "event", "finish", "status", "export", "validate"),
     )
     parser.add_argument("--invocation-id")
     parser.add_argument("--run-start-pt")
@@ -1541,6 +1615,7 @@ def main() -> int:
     parser.add_argument("--reason-code", choices=REASON_CODES)
     parser.add_argument("--report-file")
     parser.add_argument("--status-file")
+    parser.add_argument("--report-dir", help=argparse.SUPPRESS)
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--projection-file", default=DEFAULT_PROJECTION_FILE)
     parser.add_argument(
@@ -1590,6 +1665,7 @@ def main() -> int:
                     "reason_code",
                     "report_file",
                     "status_file",
+                    "report_dir",
                 },
             )
             if args.invocation_id is None or args.classification is None:
@@ -1605,7 +1681,17 @@ def main() -> int:
                 status_file=args.status_file,
                 state_file=args.state_file,
                 projection_file=args.projection_file,
+                report_dir=args.report_dir or DEFAULT_REPORT_DIR,
                 now_utc=args.now_utc,
+            )
+        elif args.action == "status":
+            _reject_unused(args, {"invocation_id"})
+            if args.invocation_id is None:
+                raise LifecycleError("status requires --invocation-id")
+            result = invocation_status(
+                invocation_id=args.invocation_id,
+                state_file=args.state_file,
+                projection_file=args.projection_file,
             )
         elif args.action == "export":
             _reject_unused(args, set())

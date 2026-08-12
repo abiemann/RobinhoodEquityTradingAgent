@@ -15,6 +15,7 @@ consumers such as ``dashboard/serve.py``.  Neither function writes to disk.
 Typical invocation::
 
     python status_snapshot.py publish \
+        --invocation-id 11111111-1111-4111-8111-111111111111 \
         --scratch C:\\path\\to\\session-scratch \
         --candidate C:\\path\\to\\session-scratch\\rhmra-status-candidate.json \
         --output D:\\project\\run-reports\\rhmra-status-2026_01_02-10_13.json
@@ -41,6 +42,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import broker_snapshot
+import run_lifecycle
 
 
 SCHEMA_VERSION = 1
@@ -415,6 +417,35 @@ def _expected_filename(document: Mapping[str, Any]) -> str:
     return run_start.strftime("rhmra-status-%Y_%m_%d-%H_%M.json")
 
 
+def _validate_lifecycle_binding(
+    document: Mapping[str, Any], output_path: Path, *, invocation_id: str,
+    lifecycle_state_file: os.PathLike[str] | str,
+    lifecycle_projection_file: os.PathLike[str] | str,
+) -> Mapping[str, Any]:
+    '''Bind one candidate to the lifecycle journal's exact start timestamp.'''
+    try:
+        receipt = run_lifecycle.invocation_status(
+            invocation_id=invocation_id,
+            state_file=os.fspath(lifecycle_state_file),
+            projection_file=os.fspath(lifecycle_projection_file),
+        )
+    except (run_lifecycle.LifecycleError, OSError) as exc:
+        raise StatusSnapshotError(f'lifecycle: {exc}') from exc
+    if receipt['classification'] != 'running':
+        raise StatusSnapshotError('lifecycle: invocation is not currently running')
+    if document['run_start_pt'] != receipt['run_start_pt']:
+        expected = receipt['run_start_pt']
+        raise StatusSnapshotError(
+            f'status.run_start_pt: must exactly match lifecycle binding ({expected})'
+        )
+    if output_path.name != receipt['expected_status_file']:
+        expected = receipt['expected_status_file']
+        raise StatusSnapshotError(
+            f'output: filename must match lifecycle binding ({expected})'
+        )
+    return receipt
+
+
 def _validated_output_path(
     output: os.PathLike[str] | str,
     report_dir: os.PathLike[str] | str,
@@ -514,16 +545,29 @@ def verify_published_status_snapshot(
     candidate: os.PathLike[str] | str | None = None,
     scratch: os.PathLike[str] | str | None = None,
     report_dir: os.PathLike[str] | str = DEFAULT_REPORT_DIR,
+    invocation_id: str | None = None,
+    lifecycle_state_file: os.PathLike[str] | str = (
+        run_lifecycle.DEFAULT_STATE_FILE
+    ),
+    lifecycle_projection_file: os.PathLike[str] | str = (
+        run_lifecycle.DEFAULT_PROJECTION_FILE
+    ),
 ) -> dict[str, Any]:
     """Read-only validation and optional lost-receipt reconciliation.
 
     When candidate and scratch are supplied together, the final file must be
     byte-identical to that valid candidate in the marked session scratch.
+    Candidate-bound verification is lost-receipt recovery and therefore runs
+    before lifecycle finish; it intentionally rejects a finished invocation.
     """
 
     if (candidate is None) != (scratch is None):
         raise StatusSnapshotError(
             "verify: candidate and scratch must be supplied together"
+        )
+    if candidate is not None and invocation_id is None:
+        raise StatusSnapshotError(
+            'verify: candidate-bound verification requires invocation_id'
         )
 
     _validated, raw, output_path = _load_published_status_snapshot_with_raw(
@@ -562,6 +606,11 @@ def verify_published_status_snapshot(
             )
         candidate_document, candidate_raw = _read_strict_json(candidate_path)
         candidate_validated = validate_status_snapshot(candidate_document)
+        _validate_lifecycle_binding(
+            candidate_validated, output_path, invocation_id=invocation_id,
+            lifecycle_state_file=lifecycle_state_file,
+            lifecycle_projection_file=lifecycle_projection_file,
+        )
         if _expected_filename(candidate_validated) != output_path.name:
             raise StatusSnapshotError(
                 "candidate: run_start_pt does not match the final status filename"
@@ -579,6 +628,13 @@ def publish_status_snapshot(
     *,
     scratch: os.PathLike[str] | str,
     report_dir: os.PathLike[str] | str = DEFAULT_REPORT_DIR,
+    invocation_id: str,
+    lifecycle_state_file: os.PathLike[str] | str = (
+        run_lifecycle.DEFAULT_STATE_FILE
+    ),
+    lifecycle_projection_file: os.PathLike[str] | str = (
+        run_lifecycle.DEFAULT_PROJECTION_FILE
+    ),
 ) -> dict[str, Any]:
     """Validate *candidate* and atomically publish it at *output*.
 
@@ -626,6 +682,11 @@ def publish_status_snapshot(
 
     document, raw = _read_strict_json(candidate_path)
     validated = validate_status_snapshot(document)
+    _validate_lifecycle_binding(
+        validated, output_path, invocation_id=invocation_id,
+        lifecycle_state_file=lifecycle_state_file,
+        lifecycle_projection_file=lifecycle_projection_file,
+    )
     expected_filename = _expected_filename(validated)
     if output_path.name != expected_filename:
         raise StatusSnapshotError(
@@ -648,6 +709,14 @@ def publish_status_snapshot(
         validate_status_snapshot(staged_document)
         if staged_raw != raw:
             raise StatusSnapshotError("output: staged snapshot read-back mismatch")
+        # Re-check at the commit boundary.  The first binding check happens
+        # before staging; this second check prevents a lifecycle finish that
+        # races staging from being followed by publication for a closed run.
+        _validate_lifecycle_binding(
+            staged_document, output_path, invocation_id=invocation_id,
+            lifecycle_state_file=lifecycle_state_file,
+            lifecycle_projection_file=lifecycle_projection_file,
+        )
         try:
             os.link(temporary, output_path)
         except FileExistsError as exc:
@@ -699,6 +768,7 @@ def _parser() -> StrictArgumentParser:
     publish = subparsers.add_parser(
         "publish", help="validate and atomically publish one status candidate"
     )
+    publish.add_argument("--invocation-id", required=True)
     publish.add_argument("--scratch", required=True)
     publish.add_argument("--candidate", required=True)
     publish.add_argument("--output", required=True)
@@ -710,6 +780,7 @@ def _parser() -> StrictArgumentParser:
     verify = subparsers.add_parser(
         "verify", help="read-only validation of an existing final snapshot"
     )
+    verify.add_argument("--invocation-id", required=True)
     verify.add_argument("--scratch", required=True)
     verify.add_argument("--candidate", required=True)
     verify.add_argument("--output", required=True)
@@ -718,6 +789,17 @@ def _parser() -> StrictArgumentParser:
         default=str(DEFAULT_REPORT_DIR),
         help=argparse.SUPPRESS,
     )
+    for command in (publish, verify):
+        command.add_argument(
+            "--lifecycle-state-file",
+            default=run_lifecycle.DEFAULT_STATE_FILE,
+            help=argparse.SUPPRESS,
+        )
+        command.add_argument(
+            "--lifecycle-projection-file",
+            default=run_lifecycle.DEFAULT_PROJECTION_FILE,
+            help=argparse.SUPPRESS,
+        )
     return parser
 
 
@@ -767,6 +849,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output,
                 scratch=args.scratch,
                 report_dir=args.report_dir,
+                invocation_id=args.invocation_id,
+                lifecycle_state_file=args.lifecycle_state_file,
+                lifecycle_projection_file=args.lifecycle_projection_file,
             )
         else:
             result = verify_published_status_snapshot(
@@ -774,6 +859,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate=args.candidate,
                 scratch=args.scratch,
                 report_dir=args.report_dir,
+                invocation_id=args.invocation_id,
+                lifecycle_state_file=args.lifecycle_state_file,
+                lifecycle_projection_file=args.lifecycle_projection_file,
             )
         _print_json(result)
         return 0

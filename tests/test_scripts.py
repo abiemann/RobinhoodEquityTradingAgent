@@ -4046,6 +4046,41 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(document['run_start_pt'], '2026-08-04T09:00:01-07:00')
         return document
 
+    def write_published_status(
+        self, state_file,
+        *,
+        run_start_pt='2026-08-04T09:00:01-07:00',
+        filename='rhmra-status-2026_08_04-09_00.json',
+    ):
+        report_dir = os.path.join(os.path.dirname(state_file), 'run-reports')
+        os.makedirs(report_dir, exist_ok=True)
+        document = {
+            'schema_version': 1,
+            'run_start_pt': run_start_pt,
+            'rules_version': 'abcd123',
+            'dry_run': True,
+            'session': 'regular',
+            'account': {
+                'total_value': 100.0, 'cash': 100.0,
+                'buying_power': 100.0, 'equity_value': 0.0,
+            },
+            'realized_pnl_today': 0.0,
+            'positions': [],
+            'guards': {
+                'circuit_breaker': 'clear',
+                'stop_fills_today': 0,
+                'entry_phase': 'skipped',
+                'entry_skip_reason': 'test fixture',
+            },
+        }
+        with open(
+            os.path.join(report_dir, filename),
+            'w', encoding='utf-8', newline='\n',
+        ) as handle:
+            json.dump(document, handle, allow_nan=False)
+            handle.write('\n')
+        return report_dir
+
     def test_concurrent_same_second_starts_create_unique_invocations(self):
         with tempfile.TemporaryDirectory() as td:
             state_file = os.path.join(td, 'lifecycle.sqlite3')
@@ -4088,10 +4123,188 @@ class RunLifecycleTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, validated)
             self.assertEqual(validated['record_count'], 8)
 
+    def test_status_returns_exact_authoritative_artifact_binding_read_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = self.start(
+                state_file, projection_file, now='2026-08-12T18:43:41Z'
+            )
+            invocation_id = started['invocation_id']
+            proc, bound = self.invoke(
+                state_file, projection_file, 'event',
+                '--invocation-id', invocation_id, '--phase', 'preflight',
+                '--run-start-pt', '2026-08-12T11:43:42-07:00',
+                now='2026-08-12T18:43:42Z',
+            )
+            self.assertEqual(proc.returncode, 0, bound)
+            expected_names = {
+                'artifact_stamp': '2026_08_12-11_43',
+                'expected_report_file': 'rhmra-log-2026_08_12-11_43.md',
+                'expected_gate_file': 'rhmra-gates-2026_08_12-11_43.json',
+                'expected_status_file': 'rhmra-status-2026_08_12-11_43.json',
+            }
+            for key, expected in expected_names.items():
+                self.assertEqual(bound[key], expected)
+
+            with open(state_file, 'rb') as handle:
+                before_state = handle.read()
+            with open(projection_file, 'rb') as handle:
+                before_projection = handle.read()
+            proc, status = self.invoke(
+                state_file, projection_file, 'status',
+                '--invocation-id', invocation_id,
+            )
+            self.assertEqual(proc.returncode, 0, status)
+            self.assertEqual(
+                set(status),
+                {
+                    'schema_version', 'action', 'ok', 'invocation_id',
+                    'classification', 'phase', 'run_start_pt',
+                    'artifact_stamp', 'expected_report_file',
+                    'expected_gate_file', 'expected_status_file',
+                },
+            )
+            self.assertEqual(status['run_start_pt'], '2026-08-12T11:43:42-07:00')
+            for key, expected in expected_names.items():
+                self.assertEqual(status[key], expected)
+            with open(state_file, 'rb') as handle:
+                self.assertEqual(handle.read(), before_state)
+            with open(projection_file, 'rb') as handle:
+                self.assertEqual(handle.read(), before_projection)
+
+    def test_status_rejects_missing_unbound_and_finished_invocations_as_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            cases = (
+                (
+                    '--invocation-id',
+                    '22222222-2222-4222-8222-222222222222',
+                    'has not been started',
+                ),
+                ('--invocation-id', invocation_id, 'no Pacific time binding'),
+            )
+            for *arguments, detail in cases:
+                with self.subTest(detail=detail):
+                    proc, rejected = self.invoke(
+                        state_file, projection_file, 'status', *arguments
+                    )
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertEqual(rejected['reason'], 'lifecycle_conflict')
+                    self.assertIn(detail, rejected['detail'])
+
+            self.bind(state_file, projection_file, invocation_id)
+            report_dir = self.write_published_status(state_file)
+            proc, finished = self.invoke(
+                state_file, projection_file, 'finish',
+                '--invocation-id', invocation_id,
+                '--classification', 'completed',
+                '--report-file', 'rhmra-log-2026_08_04-09_00.md',
+                '--status-file', 'rhmra-status-2026_08_04-09_00.json',
+                '--report-dir', report_dir,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, finished)
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'status',
+                '--invocation-id', invocation_id,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn('already finished', rejected['detail'])
+
+            proc, rejected = self.invoke(state_file, projection_file, 'status')
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(rejected['reason'], 'lifecycle_state_error')
+            self.assertIn('requires --invocation-id', rejected['detail'])
+
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'status',
+                '--invocation-id', 'not-a-uuid',
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(rejected['reason'], 'lifecycle_state_error')
+            self.assertIn('canonical UUID', rejected['detail'])
+
+    def test_finish_strict_loads_status_and_requires_exact_bound_second(self):
+        cases = (
+            ('missing', None, 'published snapshot validation failed'),
+            ('invalid', {}, 'published snapshot validation failed'),
+            (
+                'rounded',
+                '2026-08-04T09:00:00-07:00',
+                'must exactly match the lifecycle binding',
+            ),
+        )
+        for label, status_value, expected_error in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                state_file = os.path.join(td, 'lifecycle.sqlite3')
+                projection_file = os.path.join(td, 'lifecycle.json')
+                started = self.start(state_file, projection_file)
+                invocation_id = started['invocation_id']
+                self.bind(state_file, projection_file, invocation_id)
+                report_dir = os.path.join(td, 'run-reports')
+                os.makedirs(report_dir, exist_ok=True)
+                if status_value == {}:
+                    with open(
+                        os.path.join(
+                            report_dir,
+                            'rhmra-status-2026_08_04-09_00.json',
+                        ),
+                        'w', encoding='utf-8',
+                    ) as handle:
+                        json.dump(status_value, handle)
+                elif isinstance(status_value, str):
+                    self.write_published_status(
+                        state_file, run_start_pt=status_value
+                    )
+                proc, rejected = self.invoke(
+                    state_file, projection_file, 'finish',
+                    '--invocation-id', invocation_id,
+                    '--classification', 'completed',
+                    '--report-file', 'rhmra-log-2026_08_04-09_00.md',
+                    '--status-file', 'rhmra-status-2026_08_04-09_00.json',
+                    '--report-dir', report_dir,
+                    now='2026-08-04T16:00:02Z',
+                )
+                self.assertEqual(proc.returncode, 1, rejected)
+                self.assertIn(expected_error, rejected['detail'])
+                with open(projection_file, encoding='utf-8') as handle:
+                    record = json.load(handle)['records'][0]
+                self.assertEqual(record['classification'], 'running')
+                self.assertTrue(
+                    all(event['type'] != 'finish' for event in record['events'])
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            self.bind(state_file, projection_file, invocation_id)
+            report_dir = self.write_published_status(state_file)
+            proc, finished = self.invoke(
+                state_file, projection_file, 'finish',
+                '--invocation-id', invocation_id,
+                '--classification', 'completed',
+                '--report-file', 'rhmra-log-2026_08_04-09_00.md',
+                '--status-file', 'rhmra-status-2026_08_04-09_00.json',
+                '--report-dir', report_dir,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, finished)
+            self.assertEqual(
+                finished['status_file'],
+                'rhmra-status-2026_08_04-09_00.json',
+            )
+
     def test_terminal_classifications_and_exactly_once_finish(self):
         with tempfile.TemporaryDirectory() as td:
             state_file = os.path.join(td, 'lifecycle.sqlite3')
             projection_file = os.path.join(td, 'lifecycle.json')
+            report_dir = self.write_published_status(state_file)
             finished_ids = {}
             for classification, reason in self.TERMINAL_REASONS.items():
                 started = self.start(state_file, projection_file)
@@ -4113,6 +4326,7 @@ class RunLifecycleTests(unittest.TestCase):
                     extra += [
                         '--status-file',
                         'rhmra-status-2026_08_04-09_00.json',
+                        '--report-dir', report_dir,
                     ]
                 proc, finished = self.invoke(
                     state_file,
@@ -4230,6 +4444,7 @@ class RunLifecycleTests(unittest.TestCase):
             started = self.start(state_file, projection_file)
             invocation_id = started['invocation_id']
             self.bind(state_file, projection_file, invocation_id)
+            report_dir = self.write_published_status(state_file)
             proc, event = self.invoke(
                 state_file,
                 projection_file,
@@ -4253,6 +4468,7 @@ class RunLifecycleTests(unittest.TestCase):
                 'rhmra-log-2026_08_04-09_00.md',
                 '--status-file',
                 'rhmra-status-2026_08_04-09_00.json',
+                '--report-dir', report_dir,
                 now='2026-08-04T16:00:03Z',
             )
             self.assertEqual(proc.returncode, 0, finished)
@@ -4685,6 +4901,34 @@ class DashboardServerTests(unittest.TestCase):
         projection_file = os.path.join(
             self.repo, "run-reports", "rhmra-run-lifecycle.json"
         )
+        report_dir = os.path.join(self.repo, "run-reports")
+        status_path = os.path.join(
+            report_dir, "rhmra-status-2026_08_04-12_02.json"
+        )
+        with open(status_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "run_start_pt": "2026-08-04T12:02:00-07:00",
+                    "rules_version": "abcd123",
+                    "dry_run": True,
+                    "session": "regular",
+                    "account": {
+                        "total_value": 100.0, "cash": 100.0,
+                        "buying_power": 100.0, "equity_value": 0.0,
+                    },
+                    "realized_pnl_today": 0.0,
+                    "positions": [],
+                    "guards": {
+                        "circuit_breaker": "clear",
+                        "stop_fills_today": 0,
+                        "entry_phase": "skipped",
+                        "entry_skip_reason": "test fixture",
+                    },
+                },
+                handle, allow_nan=False,
+            )
+            handle.write("\n")
 
         def lifecycle(*args):
             proc = subprocess.run(
@@ -4729,6 +4973,8 @@ class DashboardServerTests(unittest.TestCase):
             "rhmra-log-2026_08_04-12_02.md",
             "--status-file",
             "rhmra-status-2026_08_04-12_02.json",
+            "--report-dir",
+            report_dir,
             "--now-utc",
             "2026-08-04T19:03:00Z",
         )
@@ -4905,6 +5151,8 @@ class DashboardClientContractTests(unittest.TestCase):
             os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8"
         ) as handle:
             routine = handle.read()
+        with open(os.path.join(ROOT, "rules_version.py"), encoding="utf-8") as handle:
+            rules_version_helper = handle.read()
 
         self.assertIn('getJSON("/api/ledger")', dashboard)
         self.assertIn("const LEDGER_ROUNDING_POLICY =", dashboard)
@@ -4924,7 +5172,8 @@ class DashboardClientContractTests(unittest.TestCase):
         self.assertIn("ledger_pnl.py --ledger", routine)
         self.assertIn('--sale-time "<exact final last-execution timestamp in Pacific>"', routine)
         self.assertIn('status: "matched-ledger-pool"', routine)
-        self.assertIn("order_intents.py ledger_pnl.py", routine)
+        self.assertIn('"order_intents.py"', rules_version_helper)
+        self.assertIn('"ledger_pnl.py"', rules_version_helper)
         self.assertIn("NEVER use the rounded `get_equity_positions.average_buy_price`", routine)
         self.assertNotIn("realized_pnl = (price − average cost) × quantity", routine)
 
@@ -5499,8 +5748,14 @@ class MarketClockTests(unittest.TestCase):
         status_end = routine.index("The filename is exactly:", status_start)
         status = routine[status_start:status_end]
         self.assertIn("`status_snapshot.py` is the sole schema authority", status)
-        self.assertIn("status_snapshot.py publish --scratch", status)
-        self.assertIn("status_snapshot.py verify --scratch", status)
+        self.assertIn(
+            "status_snapshot.py publish --invocation-id '<INVOCATION_ID>' "
+            "--scratch", status
+        )
+        self.assertIn(
+            "status_snapshot.py verify --invocation-id '<INVOCATION_ID>' "
+            "--scratch", status
+        )
         self.assertIn("the already-bound `PYTHON_EXE`", status)
         self.assertIn("Every path is a separate opaque argument", status)
         self.assertIn("byte-identical to this invocation's valid scratch candidate", status)
@@ -5842,7 +6097,8 @@ class MarketClockTests(unittest.TestCase):
             '--identity-source <run-metadata|declared|unknown>',
             '--strategy-start-utc <STRATEGY_STARTED_AT_UTC>',
             '--strategy-end-utc <STRATEGY_FINISHED_AT_UTC>',
-            'only as a pair when both retained boundaries are available',
+            'only as a pair when both retained FIRST/REPORT renewal '
+            'boundaries are available',
             'if either is unavailable, omit both',
             'START CLOCK\'s `session` unchanged',
             '`unknown` only when the invocation finished without a '
@@ -6082,15 +6338,203 @@ class MarketClockTests(unittest.TestCase):
         rules_version = routine.split("**rules_version**", 1)[1].split(
             "\n\nAppend one row", 1
         )[0]
+        self.assertIn("& '<PYTHON_EXE>' rules_version.py", rules_version)
         self.assertIn(
-            "robinhood-momentum-routine-autonomous.md constants.md "
-            "validate_constants.py",
+            "exactly `schema_version`, `status`, and `rules_version`",
             rules_version,
         )
+        self.assertIn("The helper owns the canonical rule-set file list", rules_version)
+        self.assertIn(
+            "Never run, interpret, or substitute `git describe`, `git log`, "
+            "`git status`, or `git diff`",
+            rules_version,
+        )
+        self.assertNotIn("git log -1", rules_version)
+        self.assertNotIn("status --porcelain", rules_version)
 
         dry_run = routine.split("### DRY RUN", 1)[1].split("### CURRENT TIME", 1)[0]
         self.assertIn("NOT DRY RUN", dry_run)
         self.assertIn("never substitute `true`", dry_run)
+
+    def test_routine_binds_lifecycle_artifacts_and_recovers_without_guessing(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        lifecycle = routine.split(
+            "### INVOCATION LIFECYCLE", 1
+        )[1].split("**Mandatory configuration preflight", 1)[0]
+        for required in (
+            "BOUND_RUN_START_PT",
+            "ARTIFACT_STAMP",
+            "EXPECTED_REPORT_FILE",
+            "EXPECTED_GATE_FILE",
+            "EXPECTED_STATUS_FILE",
+            "retained invocation state through any context compaction",
+            "Never round `BOUND_RUN_START_PT` to a minute",
+            "run_lifecycle.py status --invocation-id <INVOCATION_ID>",
+            "exactly these eleven fields",
+            "action: \"status\"",
+            "classification `running`",
+            "This command is read-only",
+            "Never use `run_lifecycle.py export`, a second START CLOCK, "
+            "direct SQLite/projection access, a context summary",
+            "Never pass the test-only lifecycle path overrides",
+        ):
+            self.assertIn(required, lifecycle)
+
+        bootstrap = routine.split(
+            "### PYTHON LAUNCHER BOOTSTRAP", 1
+        )[1].split("### INVOCATION LIFECYCLE", 1)[0]
+        for required in (
+            "PYTHON_EXE` is retained invocation state",
+            "MUST survive context compaction unchanged",
+            "if the exact binding is lost, stop",
+            "never execute a literal `py`, `python`, or `python3` command "
+            "later in the run",
+        ):
+            self.assertIn(required, bootstrap)
+
+        report = routine.split("### REPORT", 1)[1]
+        status = report.split(
+            "**Publish the STATUS SNAPSHOT", 1
+        )[1].split("### PERFORMANCE TELEMETRY", 1)[0]
+        self.assertIn(
+            '"run_start_pt": "<exact BOUND_RUN_START_PT', status
+        )
+        self.assertIn("copy `BOUND_RUN_START_PT` byte-for-byte", status)
+        self.assertIn("never round it to `HH:MM:00`", status)
+        self.assertEqual(
+            status.count(
+                "status_snapshot.py publish --invocation-id '<INVOCATION_ID>'"
+            ),
+            2,
+        )
+        self.assertEqual(
+            status.count(
+                "status_snapshot.py verify --invocation-id '<INVOCATION_ID>'"
+            ),
+            1,
+        )
+        self.assertIn(
+            "status_file` exactly equal to `EXPECTED_STATUS_FILE", status
+        )
+        self.assertLess(
+            status.index("Before any candidate rewrite or second publish"),
+            status.index("replace the scratch candidate once"),
+        )
+        self.assertIn(
+            "exact invocation-bound `publish` command one final time", status
+        )
+
+        coordination = routine.split(
+            "### RUN COORDINATION", 1
+        )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
+        self.assertIn(
+            "Before release, require the report's bare name to equal "
+            "`EXPECTED_REPORT_FILE`", coordination
+        )
+        self.assertIn(
+            "never release and then create, rename, rewrite, or repair",
+            coordination,
+        )
+        lifecycle_finish = report.split(
+            "**Finalize lifecycle after persistence and release:**", 1
+        )[1].split("**AUTOMATION MEMORY", 1)[0]
+        self.assertIn("--report-file <EXPECTED_REPORT_FILE>", lifecycle_finish)
+        self.assertIn("--status-file <EXPECTED_STATUS_FILE>", lifecycle_finish)
+        self.assertIn(
+            "must never trigger a post-release rewrite or a second `finish`",
+            lifecycle_finish,
+        )
+
+    def test_routine_repeats_phase_fences_and_serializes_final_refresh(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        phase_ranges = (
+            ("**FIRST ", "**PRE-SECOND", "FIRST"),
+            ("**SECOND ", "**THIRD ", "SECOND"),
+            ("**THIRD ", "**FOURTH ", "THIRD"),
+            ("**FOURTH ", "### REPORT", "FOURTH"),
+            ("### REPORT", "**FINAL STATUS REFRESH", "REPORT"),
+        )
+        for start, end, phase in phase_ranges:
+            section = routine.split(start, 1)[1].split(end, 1)[0]
+            self.assertIn(f"**{phase} phase-entry fence:**", section)
+            self.assertIn("required", section)
+            self.assertIn("lease renewal", section)
+            self.assertIn("retained `PYTHON_EXE`", section)
+            self.assertIn("exact `RUN_LOCK_TOKEN`", section)
+        second = routine.split("**SECOND ", 1)[1].split(
+            "**THIRD ", 1
+        )[0]
+        self.assertIn("The FIRST renewal does not satisfy SECOND", second)
+
+        final_refresh = routine.split(
+            "**FINAL STATUS REFRESH", 1
+        )[1].split(
+            "**Finalize lifecycle after persistence and release:**", 1
+        )[0]
+        pnl_payload = (
+            '{ "account_number": "<resolved at runtime>", "span": "day", '
+            '"asset_classes": ["equity"], '
+            '"timezone": "America/New_York" }'
+        )
+        self.assertIn(pnl_payload, final_refresh)
+        self.assertIn(
+            "Complete, validate, and dedupe each call/page before starting "
+            "the next", final_refresh
+        )
+        self.assertIn(
+            "strictly sequential and must never be issued in parallel",
+            final_refresh,
+        )
+        self.assertIn(
+            "retry MUST repeat the identical full payload above", final_refresh
+        )
+        self.assertIn(
+            "never omit the asset class, substitute a start/end date form, "
+            "or change arguments", final_refresh
+        )
+
+        evaluator = routine.split(
+            "Then RE-RUN `evaluate_candidates.py`", 1
+        )[1].split(
+            "**FINAL machine-readable handoff", 1
+        )[0]
+        self.assertIn(
+            "--json-out run-reports/<EXPECTED_GATE_FILE>", evaluator
+        )
+        self.assertIn(
+            "never rebuild it from current time, another clock, or a context "
+            "summary", evaluator
+        )
+
+        coordination = routine.split(
+            "### RUN COORDINATION", 1
+        )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
+        self.assertIn(
+            "lifecycle `finish` time is never the strategy end boundary",
+            coordination,
+        )
+        telemetry = routine.split(
+            "### PERFORMANCE TELEMETRY", 1
+        )[1].split("The filename is exactly:", 1)[0]
+        self.assertIn(
+            "both retained FIRST/REPORT renewal boundaries are available",
+            telemetry,
+        )
+        self.assertIn(
+            "Never use lifecycle `finish`, report completion, or any other "
+            "later timestamp as `--strategy-end-utc`",
+            telemetry,
+        )
 
     def test_routine_keeps_automation_memory_bounded_and_non_authoritative(self):
         with open(

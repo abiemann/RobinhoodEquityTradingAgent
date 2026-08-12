@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +51,35 @@ def valid_status(run_start="2026-08-12T09:11:00-07:00"):
             "entry_phase": "ran",
             "entry_skip_reason": None,
         },
+    }
+
+
+def lifecycle_document(*records):
+    return {
+        "schema_version": 1,
+        "record_limit": 512,
+        "record_count": len(records),
+        "source_event_high_watermark": len(records) * 2,
+        "records": list(records),
+    }
+
+
+def lifecycle_record(
+    run_start_pt,
+    *,
+    status_file=None,
+    classification="completed",
+    sequence=1,
+):
+    finished = classification != "running"
+    return {
+        "classification": classification,
+        "finished_at_utc": "2026-08-12T19:14:16Z" if finished else None,
+        "invocation_id": "00000000-0000-4000-8000-000000000001",
+        "run_start_pt": run_start_pt,
+        "started_at_utc": "2026-08-12T18:43:22Z",
+        "status_file": status_file,
+        "events": [{"sequence": sequence}],
     }
 
 
@@ -214,6 +244,7 @@ class LatestStatusEndpointTests(unittest.TestCase):
                 "rejected_status": [
                     duplicate_name, nonfinite_name, oversized_name,
                 ],
+                "orphaned_status": [],
                 "gates": [],
             },
         )
@@ -233,6 +264,7 @@ class LatestStatusEndpointTests(unittest.TestCase):
             {
                 "status": [],
                 "rejected_status": [mismatched_name],
+                "orphaned_status": [],
                 "gates": [],
             },
         )
@@ -262,6 +294,137 @@ class LatestStatusEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(index["status"], [])
         self.assertEqual(index["rejected_status"], [name])
+
+    def test_exact_1143_linked_snapshot_wins_over_valid_1145_orphan(self):
+        linked_name = "rhmra-status-2026_08_12-11_43.json"
+        orphan_name = "rhmra-status-2026_08_12-11_45.json"
+        linked = valid_status("2026-08-12T11:43:42-07:00")
+        orphan = valid_status("2026-08-12T11:45:23-07:00")
+        self.write_status(linked_name, linked)
+        self.write_status(orphan_name, orphan)
+        lifecycle = lifecycle_document(lifecycle_record(
+            "2026-08-12T11:43:42-07:00", status_file=linked_name,
+        ))
+
+        with mock.patch.object(
+            DASHBOARD, "_lifecycle_projection", return_value=lifecycle
+        ):
+            index_status, index = self.request_json("/api/index")
+            latest_status, latest = self.latest()
+
+        self.assertEqual(index_status, 200)
+        self.assertEqual(index["status"], [linked_name])
+        self.assertEqual(index["rejected_status"], [])
+        self.assertEqual(index["orphaned_status"], [orphan_name])
+        self.assertEqual(latest_status, 200)
+        self.assertEqual(latest["filename"], linked_name)
+        self.assertEqual(latest["data"], linked)
+        self.assertEqual(
+            latest["warning"],
+            {
+                "code": "newer_snapshot_orphaned",
+                "orphaned_filename": orphan_name,
+                "fallback_filename": linked_name,
+                "orphaned_count": 1,
+                "rejected_count": 0,
+            },
+        )
+
+    def test_rounded_1143_snapshot_does_not_inherit_lifecycle_link(self):
+        name = "rhmra-status-2026_08_12-11_43.json"
+        self.write_status(name, valid_status("2026-08-12T11:43:00-07:00"))
+        lifecycle = lifecycle_document(lifecycle_record(
+            "2026-08-12T11:43:42-07:00", status_file=name,
+        ))
+
+        with mock.patch.object(
+            DASHBOARD, "_lifecycle_projection", return_value=lifecycle
+        ):
+            index_status, index = self.request_json("/api/index")
+            latest_status, latest = self.latest()
+
+        self.assertEqual(index_status, 200)
+        self.assertEqual(index["status"], [])
+        self.assertEqual(index["rejected_status"], [])
+        self.assertEqual(index["orphaned_status"], [name])
+        self.assertEqual(latest_status, 200)
+        self.assertIsNone(latest["filename"])
+        self.assertIsNone(latest["data"])
+        self.assertEqual(latest["warning"]["code"], "newer_snapshot_orphaned")
+        self.assertEqual(latest["warning"]["orphaned_filename"], name)
+
+    def test_bound_running_invocation_authorizes_exact_timestamp(self):
+        name = "rhmra-status-2026_08_12-12_10.json"
+        document = valid_status("2026-08-12T12:10:42-07:00")
+        self.write_status(name, document)
+        lifecycle = lifecycle_document(lifecycle_record(
+            "2026-08-12T12:10:42-07:00",
+            classification="running",
+        ))
+
+        with mock.patch.object(
+            DASHBOARD, "_lifecycle_projection", return_value=lifecycle
+        ):
+            status, index = self.request_json("/api/index")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(index["status"], [name])
+        self.assertEqual(index["orphaned_status"], [])
+
+    def test_lifecycle_unavailable_keeps_status_endpoints_available_and_empty(self):
+        name = "rhmra-status-2026_08_12-12_10.json"
+        self.write_status(name, valid_status("2026-08-12T12:10:42-07:00"))
+
+        with mock.patch.object(
+            DASHBOARD,
+            "_lifecycle_projection",
+            side_effect=OSError("private lifecycle path is unavailable"),
+        ):
+            index_status, index = self.request_json("/api/index")
+            latest_status, latest = self.latest()
+
+        warning = {"code": "lifecycle_unavailable"}
+        self.assertEqual(index_status, 200)
+        self.assertEqual(index, {
+            "status": [],
+            "rejected_status": [],
+            "orphaned_status": [],
+            "gates": [],
+            "warning": warning,
+        })
+        self.assertEqual(latest_status, 200)
+        self.assertEqual(latest, {
+            "filename": None,
+            "data": None,
+            "warning": warning,
+        })
+        self.assertNotIn("private lifecycle path", json.dumps(index))
+        self.assertNotIn("private lifecycle path", json.dumps(latest))
+
+    def test_pre_lifecycle_legacy_survives_and_future_orphan_cannot_hijack(self):
+        legacy_name = "rhmra-status-2026_08_04-16_40.json"
+        future_name = "rhmra-status-9999_12_31-23_59.json"
+        legacy = valid_status("2026-08-04T16:40:00-07:00")
+        future = valid_status("9999-12-31T23:59:00-08:00")
+        self.write_status(legacy_name, legacy)
+        self.write_status(future_name, future)
+        lifecycle = lifecycle_document(lifecycle_record(
+            "2026-08-04T22:35:43-07:00",
+            status_file="rhmra-status-2026_08_04-22_35.json",
+        ))
+
+        with mock.patch.object(
+            DASHBOARD, "_lifecycle_projection", return_value=lifecycle
+        ):
+            index_status, index = self.request_json("/api/index")
+            latest_status, latest = self.latest()
+
+        self.assertEqual(index_status, 200)
+        self.assertEqual(index["status"], [legacy_name])
+        self.assertEqual(index["orphaned_status"], [future_name])
+        self.assertEqual(latest_status, 200)
+        self.assertEqual(latest["filename"], legacy_name)
+        self.assertEqual(latest["data"], legacy)
 
 
 class DashboardStatusClientContractTests(unittest.TestCase):
@@ -366,6 +529,10 @@ class DashboardStatusClientContractTests(unittest.TestCase):
         self.assertIn("warning.rejected_filename", warning)
         self.assertIn("warning.fallback_filename", warning)
         self.assertIn("warning.rejected_count", warning)
+        self.assertIn('warning.code === "newer_snapshot_orphaned"', warning)
+        self.assertIn("warning.orphaned_filename", warning)
+        self.assertIn("warning.orphaned_count", warning)
+        self.assertIn('warning.code === "lifecycle_unavailable"', warning)
 
         runs = self.source[
             self.source.index("async function renderLegacyRuns"):
@@ -385,6 +552,8 @@ class DashboardStatusClientContractTests(unittest.TestCase):
             refresh_start:self.source.index("// runs land every", refresh_start)
         ]
         self.assertIn("Array.isArray(idx.rejected_status)", refresh)
+        self.assertIn("Array.isArray(idx.status)", refresh)
+        self.assertIn("renderSnapshotFallbackWarning(idx.warning)", refresh)
         self.assertIn(": []", refresh)
 
 

@@ -1351,6 +1351,42 @@ function clearSnapshot() {
 
 function renderSnapshotFallbackWarning(warning) {
   const filenamePattern = /^rhmra-status-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json$/;
+  if (hasExactFields(warning, ["code"]) &&
+      warning.code === "lifecycle_unavailable") {
+    banner(
+      "Invocation lifecycle is unavailable. Status selection failed closed, so account and position data were cleared.",
+      "warning",
+    );
+    return;
+  }
+  if (hasExactFields(warning, [
+        "code", "orphaned_filename", "fallback_filename", "orphaned_count",
+        "rejected_count",
+      ]) &&
+      warning.code === "newer_snapshot_orphaned" &&
+      typeof warning.orphaned_filename === "string" &&
+      filenamePattern.test(warning.orphaned_filename) &&
+      (warning.fallback_filename === null ||
+        (typeof warning.fallback_filename === "string" &&
+         filenamePattern.test(warning.fallback_filename))) &&
+      Number.isSafeInteger(warning.orphaned_count) &&
+      warning.orphaned_count > 0 &&
+      Number.isSafeInteger(warning.rejected_count) &&
+      warning.rejected_count >= 0) {
+    const selection = warning.fallback_filename
+      ? `Showing the newest lifecycle-associated snapshot, ${warning.fallback_filename}.`
+      : "No lifecycle-associated status snapshot is available, so account and position data were cleared.";
+    const count = warning.orphaned_count === 1 ? "" :
+      ` (${warning.orphaned_count} newer orphaned snapshots were ignored)`;
+    const rejected = warning.rejected_count > 0
+      ? ` ${warning.rejected_count} newer malformed snapshot${warning.rejected_count === 1 ? " was" : "s were"} also rejected.`
+      : "";
+    banner(
+      `Ignored lifecycle-orphaned status snapshot ${warning.orphaned_filename}${count}. ${selection}${rejected}`,
+      "warning",
+    );
+    return;
+  }
   if (!hasExactFields(warning, [
         "code", "rejected_filename", "fallback_filename", "rejected_count",
       ]) ||
@@ -2333,6 +2369,10 @@ async function refresh() {
       clearSnapshot();
     }
     const idx = await getJSON("/api/index");
+    if (idx.warning &&
+        !(latest.warning && latest.warning.code === idx.warning.code)) {
+      renderSnapshotFallbackWarning(idx.warning);
+    }
     let lifecycle = {records: []};
     try {
       lifecycle = await getJSON("/api/runs");
@@ -2357,7 +2397,9 @@ async function refresh() {
     const rejectedStatus = Array.isArray(idx.rejected_status)
       ? idx.rejected_status : [];
     await renderRuns(
-      idx.status, idx.gates, rows, config, lifecycle, rejectedStatus);
+      Array.isArray(idx.status) ? idx.status : [],
+      Array.isArray(idx.gates) ? idx.gates : [],
+      rows, config, lifecycle, rejectedStatus);
     renderEras(rows);
     renderPnlReconciliation(selectedSnapshot, rows);
     const phoneView = selectedSnapshot
