@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 
 
@@ -19,6 +20,7 @@ if ROOT not in sys.path:
 
 DASHBOARD_PATH = os.path.join(ROOT, "dashboard", "serve.py")
 DASHBOARD_HTML = os.path.join(ROOT, "dashboard", "index.html")
+FAVICON_SVG = os.path.join(ROOT, "dashboard", "favicon.svg")
 DASHBOARD_SPEC = importlib.util.spec_from_file_location(
     "dashboard_performance_serve", DASHBOARD_PATH
 )
@@ -243,6 +245,28 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertNotIn("Date.parse(right.lifecycle_started_at_utc)", source)
         self.assertNotIn("[...document.records].reverse()", source)
         self.assertNotIn("meat and potatoes", source.lower())
+
+    def test_dashboard_declares_a_safe_scalable_r_favicon(self):
+        self.assertIn(
+            '<link rel="icon" href="/dashboard/favicon.svg" '
+            'type="image/svg+xml" sizes="any">',
+            self.source,
+        )
+        self.assertTrue(os.path.isfile(FAVICON_SVG))
+        root = ET.parse(FAVICON_SVG).getroot()
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertEqual(root.attrib.get("viewBox"), "0 0 64 64")
+        namespace = {"svg": "http://www.w3.org/2000/svg"}
+        circle = root.find("svg:circle", namespace)
+        label = root.find("svg:text", namespace)
+        self.assertIsNotNone(circle)
+        self.assertIsNotNone(label)
+        self.assertEqual(circle.attrib.get("fill"), "#000000")
+        self.assertEqual(label.attrib.get("fill"), "#ffffff")
+        self.assertEqual((label.text or "").strip(), "R")
+        forbidden = ("script", "foreignObject", "image", "a")
+        self.assertFalse(any(root.find(f".//svg:{name}", namespace) is not None
+                             for name in forbidden))
 
     def test_full_performance_panel_uses_content_sized_reduced_motion_reveal(self):
         source = self.source

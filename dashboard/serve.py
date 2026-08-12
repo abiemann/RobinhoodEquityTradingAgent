@@ -694,6 +694,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _favicon_redirect(self):
+        self.send_response(302)
+        self.send_header('Location', '/dashboard/favicon.svg')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Security-Policy',
+                         'default-src \'none\'; base-uri \'none\'; '
+                         'form-action \'none\'; frame-ancestors \'none\'')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def _api_error(self, status, code):
         self._json({'error': code}, status=status)
 
@@ -872,6 +884,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = self._guard()
         if path is None:
             return
+        if path == '/favicon.ico':
+            return self._favicon_redirect()
         if _served_static_path(path):
             return super().do_HEAD()
         self.send_error(403, "not served")
@@ -880,6 +894,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = self._guard()
         if path is None:
             return
+        if path == '/favicon.ico':
+            return self._favicon_redirect()
         if path == '/api/phone-share/config':
             return self._json(_phone_share_public_config(self.server))
         if path == '/oauth2/callback':

@@ -4512,6 +4512,8 @@ class DashboardServerTests(unittest.TestCase):
             ("constants.md", self.valid_constants),
             ("trade-ledger.csv", "symbol,price\\nTEST,1.00\\n"),
             (os.path.join("dashboard", "index.html"), "<h1>Dashboard fixture</h1>"),
+            (os.path.join("dashboard", "favicon.svg"),
+             '<svg xmlns="http://www.w3.org/2000/svg"><circle/><text>R</text></svg>'),
             (os.path.join(
                 "run-reports", "rhmra-status-2026_08_04-12_02.json"
             ), "{}"),
@@ -4545,6 +4547,21 @@ class DashboardServerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def request_details(self, method, path, host="127.0.0.1"):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_port, timeout=2
+        )
+        try:
+            connection.request(method, path, headers={"Host": host})
+            response = connection.getresponse()
+            return (
+                response.status,
+                response.read(),
+                {name.lower(): value for name, value in response.getheaders()},
+            )
+        finally:
+            connection.close()
+
     def test_whitelist_rejects_traversal_and_serves_allowed_files(self):
         for method in ("GET", "HEAD"):
             for path in ("/dashboard/../README.md", "/dashboard/%2e%2e/README.md",
@@ -4572,6 +4589,29 @@ class DashboardServerTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/trade-ledger.csv")[0], 200)
         self.assertEqual(self.request("GET", "/README.md")[0], 403)
         self.assertEqual(self.request("GET", "/dashboard/index.html", host="example.test")[0], 403)
+
+    def test_favicon_redirect_and_asset_preserve_the_static_allowlist(self):
+        for method in ("GET", "HEAD"):
+            status, body, headers = self.request_details(method, "/favicon.ico")
+            self.assertEqual(status, 302, method)
+            self.assertEqual(headers.get("location"), "/dashboard/favicon.svg")
+            self.assertEqual(headers.get("cache-control"), "no-store")
+            self.assertEqual(headers.get("content-length"), "0")
+            self.assertEqual(body, b"")
+
+            status, body, headers = self.request_details(
+                method, "/dashboard/favicon.svg"
+            )
+            self.assertEqual(status, 200, method)
+            self.assertEqual(headers.get("content-type"), "image/svg+xml")
+            if method == "GET":
+                self.assertIn(b"<svg", body)
+                self.assertIn(b">R</text>", body)
+            else:
+                self.assertEqual(body, b"")
+
+        self.assertEqual(self.request("GET", "/favicon.svg")[0], 403)
+        self.assertEqual(self.request("GET", "/README.md")[0], 403)
 
     def test_config_reports_dashboard_settings_and_fails_closed(self):
         status, body = self.request("GET", "/api/config")
