@@ -695,13 +695,16 @@ def _scratch_marker_document(scratch_id: str) -> dict[str, Any]:
     }
 
 
-def _validated_output_scratch(
-    outputs: Sequence[str],
+def validate_scratch_directory(
+    scratch_path: os.PathLike[str] | str,
 ) -> tuple[Path, Mapping[str, Any]]:
-    parents = {Path(output).parent.resolve(strict=True) for output in outputs}
-    if len(parents) != 1:
-        raise SnapshotError('all staged outputs must share one scratch directory')
-    scratch = next(iter(parents))
+    '''Read-only validation of one successfully preflighted scratch directory.'''
+
+    if not os.path.isabs(scratch_path):
+        raise SnapshotError('scratch directory must be an absolute path')
+    scratch = Path(scratch_path).resolve(strict=True)
+    if not scratch.is_dir():
+        raise SnapshotError(f'{scratch}: scratch path is not a directory')
     project = Path(__file__).resolve().parent
     if scratch == project or project in scratch.parents:
         raise SnapshotError('staged outputs must remain outside the project folder')
@@ -723,6 +726,15 @@ def _validated_output_scratch(
     ):
         raise SnapshotError(f'{scratch}: invalid broker-snapshot scratch marker')
     return scratch, marker
+
+
+def _validated_output_scratch(
+    outputs: Sequence[str],
+) -> tuple[Path, Mapping[str, Any]]:
+    parents = {Path(output).parent.resolve(strict=True) for output in outputs}
+    if len(parents) != 1:
+        raise SnapshotError('all staged outputs must share one scratch directory')
+    return validate_scratch_directory(next(iter(parents)))
 
 
 def _stage_metadata_path(path: str) -> str:

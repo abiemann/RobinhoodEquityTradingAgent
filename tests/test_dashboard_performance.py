@@ -566,7 +566,9 @@ class PerformanceClientContractTests(unittest.TestCase):
         )
         self.assertIn("chip.querySelector('.t')", collect)
         self.assertIn("chip.querySelector('.o')", collect)
-        self.assertIn("['ran', 'skipped', 'halted'].find", collect)
+        self.assertIn(
+            "['ran', 'skipped', 'halted', 'unavailable'].find", collect
+        )
         self.assertNotIn("performanceStartLabel", collect)
         self.assertNotIn("lifecycle_started_at_utc", collect)
         self.assertNotIn("run-performance-marker", collect)

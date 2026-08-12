@@ -12,7 +12,8 @@ off-machine. Serves exactly three things and refuses everything else:
 plus six conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
-  /api/latest          {"filename": ..., "data": {...}} newest status snapshot
+  /api/latest          newest strictly valid status snapshot, plus a warning
+                       when malformed newer files were rejected
   /api/runs            validated, secret-free invocation lifecycle projection
   /api/performance     validated, secret-free run performance projection
   /api/config          current DRY_RUN and opening-blackout settings
@@ -122,6 +123,7 @@ from run_lifecycle import (
     PROJECTION_LIMIT,
     validate_current_projection_read_only,
 )
+from status_snapshot import StatusSnapshotError, load_published_status_snapshot
 from validate_constants import ConstantsValidationError, validate_constants_file
 
 ALLOWED_PREFIXES = ("/dashboard/",)
@@ -129,6 +131,9 @@ ALLOWED_EXACT = ("/trade-ledger.csv",)
 PUBLIC_RUN_REPORT_RE = re.compile(
     r"/run-reports/rhmra-(?:(?:status|gates)-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json"
     r"|log-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.md)\Z"
+)
+STATUS_REPORT_FILENAME_RE = re.compile(
+    r"rhmra-status-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json\Z"
 )
 
 
@@ -509,6 +514,71 @@ def _reject_json_constant(value):
 def _reports(pattern):
     files = glob.glob(os.path.join(REPO, "run-reports", pattern))
     return sorted(os.path.basename(f) for f in files)
+
+
+def _status_reports():
+    return [
+        name for name in _reports("rhmra-status-*.json")
+        if STATUS_REPORT_FILENAME_RE.fullmatch(name) is not None
+    ]
+
+
+def _status_snapshot_index():
+    """Partition published status names through the shared strict loader."""
+    valid = []
+    rejected = []
+    report_dir = os.path.join(REPO, "run-reports")
+    for name in _status_reports():
+        try:
+            load_published_status_snapshot(
+                os.path.join(report_dir, name), report_dir
+            )
+        except (StatusSnapshotError, OSError, UnicodeError, ValueError):
+            rejected.append(name)
+        else:
+            valid.append(name)
+    return {"status": valid, "rejected_status": rejected}
+
+
+def _latest_status_snapshot():
+    """Return the newest strictly valid snapshot and safe fallback metadata.
+
+    Status filenames sort chronologically. A malformed newest file must not
+    replace the last truthful account view, so walk backward through the
+    published files and expose only the first document accepted by the shared
+    deterministic validator. Diagnostics identify files only by their
+    already-whitelisted basename and never expose parser details or a local
+    absolute path.
+    """
+    names = _status_reports()
+    if not names:
+        return {"filename": None, "data": None}
+
+    newest = names[-1]
+    report_dir = os.path.join(REPO, "run-reports")
+    rejected_count = 0
+    selected_name = None
+    selected_document = None
+    for name in reversed(names):
+        try:
+            selected_document = load_published_status_snapshot(
+                os.path.join(report_dir, name), report_dir
+            )
+        except (StatusSnapshotError, OSError, UnicodeError, ValueError):
+            rejected_count += 1
+            continue
+        selected_name = name
+        break
+
+    result = {"filename": selected_name, "data": selected_document}
+    if newest != selected_name:
+        result["warning"] = {
+            "code": "newest_snapshot_rejected",
+            "rejected_filename": newest,
+            "fallback_filename": selected_name,
+            "rejected_count": rejected_count,
+        }
+    return result
 
 
 def _served_static_path(path):
@@ -953,8 +1023,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/index":
-            return self._json({"status": _reports("rhmra-status-*.json"),
-                               "gates": _reports("rhmra-gates-*.json")})
+            status_index = _status_snapshot_index()
+            return self._json({
+                "status": status_index["status"],
+                "rejected_status": status_index["rejected_status"],
+                "gates": _reports("rhmra-gates-*.json"),
+            })
         if path == "/api/runs":
             try:
                 return self._json(_lifecycle_projection())
@@ -974,15 +1048,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"error": str(exc)}, status=500)
             return self._json(document)
         if path == "/api/latest":
-            names = _reports("rhmra-status-*.json")
-            if not names:
-                return self._json({"filename": None, "data": None})
-            newest = names[-1]  # timestamps in names sort chronologically
-            try:
-                with open(os.path.join(REPO, "run-reports", newest), encoding="utf-8") as f:
-                    return self._json({"filename": newest, "data": json.load(f)})
-            except (OSError, ValueError) as e:
-                return self._json({"filename": newest, "error": str(e)}, status=500)
+            return self._json(_latest_status_snapshot())
         if _served_static_path(path):
             return super().do_GET()
         self.send_error(403, "not served")

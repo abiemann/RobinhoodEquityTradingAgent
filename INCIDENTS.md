@@ -760,6 +760,36 @@ that both portfolio and quote staging reject either pagination flag. The determi
 remains strict; weakening its rejection would hide orchestration mistakes and compromise snapshot
 provenance.
 
+## STATUS SNAPSHOT — deterministic publication and dashboard fallback
+
+**2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The
+08:13 snapshot replaced the required contract with a richer invented object, the 09:35 snapshot
+omitted required `guards` structure, and the 10:13 snapshot omitted `schema_version` entirely.
+All three files were syntactically valid JSON, so the routine's old `json.load` read-back accepted
+them even though consumers could not interpret them safely. The dashboard correctly refused the
+newest unsupported object, but it left account values from the previous render in the DOM beneath
+the error banner. That stale display could be mistaken for the rejected run's current account
+state. The eight completed runs and one correctly fenced overlap made zero broker write calls, so
+the incident affected observability rather than orders or account state.
+
+**Rules produced:** an LLM-authored status document is only a candidate. `status_snapshot.py` is
+the schema and publication authority: it accepts a candidate only from the marked session scratch
+directory, validates strict UTF-8/JSON, duplicate/non-finite values, exact keys, types, enums, and
+cross-field semantics, then stages, flushes, reads back, hashes, and atomically publishes the exact
+run-start filename without overwriting an existing file. A failed candidate may be rewritten and
+submitted once; a second failure leaves every prior truthful snapshot untouched and closes the
+lifecycle as `final-status-unavailable` / `status-write-failed` without attaching a status file.
+
+The dashboard independently validates status files. It scans newest to oldest, renders the newest
+valid snapshot, and shows a visible warning naming the rejected newest file and the fallback it
+selected. If no valid snapshot exists, or client-side validation rejects the server response, it
+clears account, position, freshness, rules, P&L, and the local pending phone-share view instead of
+retaining stale DOM. Any previously uploaded strictly valid encrypted snapshot remains truthful,
+ages visibly, and expires normally; rejected data never replaces it. A lifecycle invocation whose
+linked status is rejected remains visible with a neutral
+`status rejected` / `status unavailable` outcome; malformed account data never invents a risk-halt
+label. Rejected files remain local and readable for incident review, but are never display data.
+
 ---
 
 ## The pattern across all of these

@@ -71,6 +71,7 @@
   .show-more-eras:focus-visible { outline:2px solid #686e78; outline-offset:2px; }
   .empty { color:var(--dim); font-style:italic; }
   .error { background:#3a1f1d; border-color:var(--red); color:var(--red); }
+  .warning { background:#292516; border-color:#665522; color:var(--amber); }
   .hint { text-transform:none; letter-spacing:0; font-weight:400; }
   .runs { display:flex; gap:6px; flex-wrap:wrap; }
   /* every run gets the same treatment — a run that skipped the scan still ran */
@@ -278,6 +279,123 @@ let performanceRecordsByInvocation = new Map();
 let selectedPerformanceInvocationId = null;
 let performanceTelemetryUnavailable = false;
 let performanceScrollEpoch = 0;
+
+const STATUS_SNAPSHOT_FIELDS = [
+  "schema_version", "run_start_pt", "rules_version", "dry_run", "session",
+  "account", "realized_pnl_today", "positions", "guards",
+];
+const STATUS_ACCOUNT_FIELDS = [
+  "total_value", "cash", "buying_power", "equity_value",
+];
+const STATUS_POSITION_FIELDS = [
+  "symbol", "quantity", "avg_buy_price", "current_price", "stop_price",
+  "stop_state",
+];
+const STATUS_GUARD_FIELDS = [
+  "circuit_breaker", "stop_fills_today", "entry_phase",
+  "entry_skip_reason",
+];
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactFields(value, fields) {
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === fields.length && fields.every(field =>
+    Object.prototype.hasOwnProperty.call(value, field));
+}
+
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) &&
+    Math.abs(value) <= Number.MAX_SAFE_INTEGER;
+}
+
+function validStatusTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?-(?:07|08):00$/,
+  );
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year >= 1 && month >= 1 && month <= 12 &&
+    day >= 1 && day <= days[month - 1] &&
+    hour <= 23 && minute <= 59 && second <= 59 &&
+    Number.isFinite(new Date(value).getTime());
+}
+
+function validStatusSnapshot(snapshot) {
+  if (!hasExactFields(snapshot, STATUS_SNAPSHOT_FIELDS) ||
+      snapshot.schema_version !== 1 ||
+      !validStatusTimestamp(snapshot.run_start_pt) ||
+      typeof snapshot.rules_version !== "string" ||
+      !/^(?:[0-9a-f]{4,40}(?:-dirty)?|unknown)$/.test(snapshot.rules_version) ||
+      typeof snapshot.dry_run !== "boolean" ||
+      !["pre-market", "regular", "after-hours", "closed", "closed-weekend",
+        "closed-holiday", "closed-early", "calendar-unknown"].includes(
+          snapshot.session) ||
+      !hasExactFields(snapshot.account, STATUS_ACCOUNT_FIELDS) ||
+      !STATUS_ACCOUNT_FIELDS.every(field => finiteNumber(snapshot.account[field])) ||
+      !(snapshot.realized_pnl_today === null ||
+        finiteNumber(snapshot.realized_pnl_today)) ||
+      !Array.isArray(snapshot.positions) || snapshot.positions.length > 1000 ||
+      !hasExactFields(snapshot.guards, STATUS_GUARD_FIELDS)) return false;
+
+  const symbols = new Set();
+  for (const position of snapshot.positions) {
+    if (!hasExactFields(position, STATUS_POSITION_FIELDS) ||
+        typeof position.symbol !== "string" ||
+        !/^[A-Z][A-Z0-9.-]{0,15}$/.test(position.symbol) ||
+        symbols.has(position.symbol) ||
+        !finiteNumber(position.quantity) || position.quantity <= 0 ||
+        !finiteNumber(position.avg_buy_price) || position.avg_buy_price <= 0 ||
+        !finiteNumber(position.current_price) || position.current_price <= 0 ||
+        !(position.stop_price === null ||
+          (finiteNumber(position.stop_price) && position.stop_price > 0)) ||
+        !["confirmed", "queued", "none"].includes(position.stop_state) ||
+        ((position.stop_state === "none") !== (position.stop_price === null))) {
+      return false;
+    }
+    symbols.add(position.symbol);
+  }
+
+  if ((snapshot.positions.length === 0) !==
+      (snapshot.account.equity_value === 0)) return false;
+  const quotedEquity = snapshot.positions.reduce(
+    (total, position) => total + position.quantity * position.current_price,
+    0,
+  );
+  if (!finiteNumber(quotedEquity) ||
+      Math.abs(snapshot.account.equity_value - quotedEquity) > Math.max(
+        0.05,
+        0.01 * Math.max(
+          Math.abs(snapshot.account.equity_value), Math.abs(quotedEquity),
+        ),
+      )) return false;
+
+  const guards = snapshot.guards;
+  const breakerValid = [
+    "clear", "tripped", "indeterminate", "not-evaluated",
+  ].includes(guards.circuit_breaker);
+  const stopCountValid =
+    (guards.stop_fills_today === null ||
+      (Number.isSafeInteger(guards.stop_fills_today) &&
+       guards.stop_fills_today >= 0));
+  const phaseValid = ["ran", "skipped", "halted"].includes(
+    guards.entry_phase);
+  const reasonValid = guards.entry_phase === "ran"
+    ? guards.entry_skip_reason === null
+    : (typeof guards.entry_skip_reason === "string" &&
+       guards.entry_skip_reason.trim().length > 0 &&
+       [...guards.entry_skip_reason].length <= 1000);
+  const notEvaluatedValid = guards.circuit_breaker !== "not-evaluated" ||
+    (guards.stop_fills_today === null && guards.entry_phase === "skipped");
+  return breakerValid && stopCountValid && phaseValid && reasonValid &&
+    notEvaluatedValid;
+}
 
 function numberToCents(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
@@ -1211,8 +1329,53 @@ async function forgetGooglePhone() {
     Boolean(deleteWarning));
 }
 
-function banner(msg) {
-  $("banner").innerHTML = `<section class="error">${esc(msg)}</section>`;
+function banner(msg, severity = "error") {
+  const item = document.createElement("section");
+  item.className = severity === "warning" ? "warning" : "error";
+  item.setAttribute("role", severity === "warning" ? "status" : "alert");
+  item.textContent = String(msg);
+  $("banner").append(item);
+}
+
+function clearSnapshot() {
+  $("rules").textContent = "";
+  $("staleness").textContent = "";
+  $("staleness").className = "pill";
+  $("account").innerHTML = '<span class="empty">no valid snapshot available</span>';
+  $("positions").innerHTML = '<span class="empty">no valid snapshot available</span>';
+  $("pnl-reconciliation").hidden = true;
+  $("pnl-reconciliation").textContent = "";
+  latestPnlReconciliation = null;
+  latestPhoneView = null;
+}
+
+function renderSnapshotFallbackWarning(warning) {
+  const filenamePattern = /^rhmra-status-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json$/;
+  if (!hasExactFields(warning, [
+        "code", "rejected_filename", "fallback_filename", "rejected_count",
+      ]) ||
+      warning.code !== "newest_snapshot_rejected" ||
+      typeof warning.rejected_filename !== "string" ||
+      !filenamePattern.test(warning.rejected_filename) ||
+      !(warning.fallback_filename === null ||
+        (typeof warning.fallback_filename === "string" &&
+         filenamePattern.test(warning.fallback_filename))) ||
+      !Number.isSafeInteger(warning.rejected_count) ||
+      warning.rejected_count <= 0) {
+    banner("The latest-snapshot service reported an invalid fallback warning.");
+    return;
+  }
+  const fallback = warning.fallback_filename;
+  const rejectedCount = warning.rejected_count;
+  const suffix = rejectedCount === 1 ? "" :
+    ` (${rejectedCount} recent snapshots were rejected)`;
+  const selection = fallback
+    ? `Showing the most recent valid snapshot, ${fallback}.`
+    : "No valid status snapshot is available, so account and position data were cleared.";
+  banner(
+    `Rejected newest status snapshot ${warning.rejected_filename} because it failed strict validation${suffix}. ${selection}`,
+    "warning",
+  );
 }
 
 function renderMode(config) {
@@ -1229,9 +1392,10 @@ function renderMode(config) {
 }
 
 function renderSnapshot(snap) {
-  if (snap.schema_version !== 1) {
-    banner(`Snapshot schema_version ${esc(snap.schema_version)} is not supported by this dashboard (expects 1). Refusing to render it — update dashboard/index.html.`);
-    return;
+  if (!validStatusSnapshot(snap)) {
+    clearSnapshot();
+    banner("The snapshot selected by the server failed browser validation. Account and position data were cleared.");
+    return false;
   }
   $("rules").textContent = "rules " + snap.rules_version;
 
@@ -1251,7 +1415,7 @@ function renderSnapshot(snap) {
 
   if (!snap.positions.length) {
     $("positions").innerHTML = `<span class="empty">account is flat — no open positions</span>`;
-    return;
+    return true;
   }
   const rows = snap.positions.map(p => {
     const symbol = typeof p.symbol === "string" ? p.symbol.trim() : "";
@@ -1273,6 +1437,7 @@ function renderSnapshot(snap) {
   }).join("");
   $("positions").innerHTML = `<table><tr><th>Symbol</th><th>Qty</th><th>Avg buy</th>
     <th>Current</th><th>Unrealized</th><th>Stop</th><th>To stop</th></tr>${rows}</table>`;
+  return true;
 }
 
 // Ledger rows, parsed once per refresh and shared by the runs strip and the era
@@ -1745,28 +1910,61 @@ function runOutcomeText(parts) {
   return container.textContent?.trim() || "run";
 }
 
-async function renderLegacyRuns(statusNames, gateNames, rows, config) {
-  if (!statusNames.length) {
+function latestRunDay(statusNames, rejectedStatusNames, lifecycleRecords = []) {
+  const authoritativeDays = [
+    ...statusNames.map(name => name.slice(13, 23)),
+    ...lifecycleRecords.map(invocationDay).filter(Boolean),
+  ].sort();
+  const fallbackDays = rejectedStatusNames.map(
+    name => name.slice(13, 23)).sort();
+  const days = authoritativeDays.length ? authoritativeDays : fallbackDays;
+  return days.length ? days[days.length - 1] : null;
+}
+
+async function renderLegacyRuns(statusNames, gateNames, rows, config, rejectedStatusNames = []) {
+  const today = latestRunDay(statusNames, rejectedStatusNames);
+  if (today === null) {
     performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
     syncPerformanceSelection(new Set());
     return;
   }
-  const today = statusNames[statusNames.length - 1].slice(13, 23); // YYYY_MM_DD of newest
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
+  const rejectedToday = rejectedStatusNames.filter(
+    name => name.slice(13, 23) === today);
   const records = await Promise.all(todays.map(async n => {
-    try { return { name: n, status: await getJSON("/run-reports/" + n) }; }
-    catch { return { name: n, status: null }; }
+    try {
+      const status = await getJSON("/run-reports/" + n);
+      const valid = validStatusSnapshot(status);
+      return {
+        name: n,
+        status: valid ? status : null,
+        statusRejected: !valid,
+      };
+    } catch { return { name: n, status: null, statusRejected: false }; }
   }));
+  records.push(...rejectedToday.map(name => ({
+    name, status: null, statusRejected: true,
+  })));
+  records.sort((left, right) => left.name.localeCompare(right.name));
+  const rejectedCount = records.filter(record => record.statusRejected).length;
+  if (rejectedCount) {
+    banner(`Rejected ${rejectedCount} malformed status snapshot${rejectedCount === 1 ? "" : "s"} in Runs Today; no guard outcome was inferred from rejected data.`, "warning");
+  }
   // A fill belongs to the last run that had started before it. Prefer the
   // snapshot's second-precise PT timestamp; filenames are minute-precise only.
   const starts = records.map(({name, status}) =>
     typeof status?.run_start_pt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(status.run_start_pt)
       ? status.run_start_pt.slice(0, 19) : filenameStart(name));
   const availableGates = new Set(gateNames || []);
-  const chips = await Promise.all(records.map(async ({name: n, status: s}, k) => {
+  const chips = await Promise.all(records.map(async ({name: n, status: s, statusRejected}, k) => {
     try {
-      if (!s) throw new Error("unreadable status");
+      if (!s) {
+        const label = statusRejected ? "status rejected" : "unreadable status";
+        return `<span class="run status-unavailable" title="${esc(label)}">` +
+          `<span class="t">${starts[k].slice(11, 16)}</span>` +
+          `<span class="o">${esc(label)}</span></span>`;
+      }
       const phase = s.guards?.entry_phase ?? "?";
       const reason = s.guards?.entry_skip_reason;
       // the last run of the day still needs an upper bound, or it would sweep up
@@ -1792,40 +1990,56 @@ async function renderLegacyRuns(statusNames, gateNames, rows, config) {
   syncPerformanceSelection(new Set());
 }
 
-async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocument) {
+async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocument,
+                          rejectedStatusNames = []) {
   const lifecycle = Array.isArray(lifecycleDocument?.records)
     ? lifecycleDocument.records : [];
   if (!lifecycle.length) {
-    return renderLegacyRuns(statusNames, gateNames, rows, config);
+    return renderLegacyRuns(
+      statusNames, gateNames, rows, config, rejectedStatusNames);
   }
 
-  const days = [
-    ...statusNames.map(name => name.slice(13, 23)),
-    ...lifecycle.map(invocationDay).filter(Boolean),
-  ].sort();
-  if (!days.length) {
+  const today = latestRunDay(statusNames, rejectedStatusNames, lifecycle);
+  if (today === null) {
     performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
     syncPerformanceSelection(new Set());
     return;
   }
-  const today = days[days.length - 1];
   const names = statusNames.filter(name => name.slice(13, 23) === today);
+  const rejectedNames = rejectedStatusNames.filter(
+    name => name.slice(13, 23) === today);
   const loaded = await Promise.all(names.map(async name => {
-    try { return { name, status: await getJSON("/run-reports/" + name) }; }
-    catch { return { name, status: null }; }
+    try {
+      const status = await getJSON("/run-reports/" + name);
+      const valid = validStatusSnapshot(status);
+      return {
+        name,
+        status: valid ? status : null,
+        statusRejected: !valid,
+      };
+    } catch { return { name, status: null, statusRejected: false }; }
   }));
-  const statusByName = new Map(loaded.map(item => [item.name, item.status]));
+  loaded.push(...rejectedNames.map(name => ({
+    name, status: null, statusRejected: true,
+  })));
+  const rejectedCount = loaded.filter(item => item.statusRejected).length;
+  if (rejectedCount) {
+    banner(`Rejected ${rejectedCount} malformed status snapshot${rejectedCount === 1 ? "" : "s"} in Runs Today; lifecycle outcomes remain visible and no guard outcome was inferred from rejected data.`, "warning");
+  }
+  const statusByName = new Map(loaded.map(item => [item.name, item]));
   const linked = new Set();
   const records = lifecycle
     .filter(record => invocationDay(record) === today)
     .map(record => {
       const name = typeof record.status_file === "string" ? record.status_file : null;
       if (name) linked.add(name);
+      const loadedStatus = name ? statusByName.get(name) : null;
       return {
         lifecycle: record,
         name,
-        status: name ? statusByName.get(name) ?? null : null,
+        status: loadedStatus?.status ?? null,
+        statusRejected: loadedStatus?.statusRejected === true,
         start: invocationStart(record),
       };
     });
@@ -1835,6 +2049,7 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
       lifecycle: null,
       name: item.name,
       status: item.status,
+      statusRejected: item.statusRejected,
       start: typeof item.status?.run_start_pt === "string"
         ? item.status.run_start_pt.slice(0, 19) : filenameStart(item.name),
     });
@@ -1886,17 +2101,22 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
         ? await rejectedSymbols(record.name, availableGates) : [];
       tip = runTooltip(status, statusPhase, reason, fills, rejected, config);
     } else if (record.lifecycle) {
-      parts.push("completed; status unavailable");
-      displayPhase = "halted";
-      tip = lifecycleTooltip(record.lifecycle) || "completed invocation has no linked status";
+      parts.push(record.statusRejected
+        ? "completed; status rejected" : "completed; status unavailable");
+      displayPhase = "unavailable";
+      tip = record.statusRejected
+        ? "completed invocation; linked status failed strict validation"
+        : lifecycleTooltip(record.lifecycle) || "completed invocation has no linked status";
     } else {
-      parts.push("unreadable status");
-      displayPhase = "halted";
-      tip = "legacy status snapshot is unreadable";
+      parts.push(record.statusRejected ? "status rejected" : "unreadable status");
+      displayPhase = "unavailable";
+      tip = record.statusRejected
+        ? "legacy status snapshot failed strict validation"
+        : "legacy status snapshot is unreadable";
     }
 
-    const safePhase = ["ran", "skipped", "halted"].includes(displayPhase)
-      ? displayPhase : "halted";
+    const safePhase = ["ran", "skipped", "halted", "unavailable"].includes(displayPhase)
+      ? displayPhase : "unavailable";
     const outcomeClass = record.lifecycle?.classification ?? "legacy";
     const invocationId = typeof record.lifecycle?.invocation_id === "string"
       ? record.lifecycle.invocation_id : null;
@@ -1942,7 +2162,8 @@ function collectRunView() {
     return {
       time: chip.querySelector('.t')?.textContent?.trim() || '',
       label: chip.querySelector('.o')?.textContent?.trim() || '',
-      phase: ['ran', 'skipped', 'halted'].find(name => chip.classList.contains(name)) || '',
+      phase: ['ran', 'skipped', 'halted', 'unavailable'].find(
+        name => chip.classList.contains(name)) || '',
       tooltip: appendPhoneTimingSummary(baseTooltip, record),
     };
   });
@@ -2101,8 +2322,16 @@ async function refresh() {
     const config = await getJSON("/api/config");
     renderMode(config);
     const latest = await getJSON("/api/latest");
-    if (latest.error) banner(`Newest snapshot ${latest.filename} is unreadable: ${latest.error}`);
-    else if (latest.data) renderSnapshot(latest.data);
+    if (latest.warning) renderSnapshotFallbackWarning(latest.warning);
+    let selectedSnapshot = null;
+    if (latest.error) {
+      clearSnapshot();
+      banner(`Newest snapshot ${latest.filename || "unavailable"} is unreadable.`);
+    } else if (latest.data && renderSnapshot(latest.data)) {
+      selectedSnapshot = latest.data;
+    } else if (!latest.data) {
+      clearSnapshot();
+    }
     const idx = await getJSON("/api/index");
     let lifecycle = {records: []};
     try {
@@ -2125,11 +2354,14 @@ async function refresh() {
     } catch (error) {
       banner("Strategy ledger comparison unavailable: " + error);
     }
-    await renderRuns(idx.status, idx.gates, rows, config, lifecycle);
+    const rejectedStatus = Array.isArray(idx.rejected_status)
+      ? idx.rejected_status : [];
+    await renderRuns(
+      idx.status, idx.gates, rows, config, lifecycle, rejectedStatus);
     renderEras(rows);
-    renderPnlReconciliation(latest.data, rows);
-    const phoneView = latest.data?.schema_version === 1
-      ? buildPhoneView(config, latest.data, collectRunView(), buildEraView(rows), latestPnlReconciliation) : null;
+    renderPnlReconciliation(selectedSnapshot, rows);
+    const phoneView = selectedSnapshot
+      ? buildPhoneView(config, selectedSnapshot, collectRunView(), buildEraView(rows), latestPnlReconciliation) : null;
     latestPhoneView = phoneView;
     if (phoneView) {
       void uploadPhoneShare(false);
@@ -2142,7 +2374,10 @@ async function refresh() {
       if ($('phone-share-dialog').open) renderShareDialog(skipped, Boolean(phoneShareSession));
     }
     $("updated").textContent = "refreshed " + new Date().toLocaleTimeString();
-  } catch (e) { banner("Dashboard failed to load: " + e); }
+  } catch (e) {
+    clearSnapshot();
+    banner("Dashboard failed to load: " + e);
+  }
 }
 
 // runs land every ~30 min, so 30s polling is ample and costs only local reads.
