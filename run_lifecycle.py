@@ -54,7 +54,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -352,22 +354,245 @@ def _run_stamp(run_start_pt: str) -> str:
     return parsed.strftime("%Y_%m_%d-%H_%M")
 
 
+_MOUNTINFO_ESCAPE_RE = re.compile(r'\\([0-7]{3})')
+_UNSAFE_SHARED_FILESYSTEMS = frozenset({'9p', 'drvfs'})
+_SQLITE_ROLLBACK_MAGIC = b'\xd9\xd5\x05\xf9\x20\xa1\x63\xd7'
+_PREFLIGHTED_STATE_DIRECTORIES: set[str] = set()
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return _MOUNTINFO_ESCAPE_RE.sub(
+        lambda match: chr(int(match.group(1), 8)), value
+    )
+
+
+def _nearest_existing_directory(path: str) -> str | None:
+    candidate = os.path.abspath(path)
+    while not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return None
+        candidate = parent
+    return candidate
+
+
+def _filesystem_type_from_mountinfo(
+    candidate: str, lines: Iterable[str]
+) -> str | None:
+    candidate = candidate.rstrip('/') or '/'
+    best: tuple[int, str] | None = None
+    for raw_line in lines:
+        left, separator, right = raw_line.rstrip('\n').partition(' - ')
+        if not separator:
+            continue
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 5 or not right_fields:
+            continue
+        mount_point = _decode_mountinfo_path(left_fields[4]).rstrip('/') or '/'
+        contains = (
+            candidate == mount_point
+            or mount_point == '/'
+            or candidate.startswith(mount_point.rstrip('/') + '/')
+        )
+        if contains and (best is None or len(mount_point) > best[0]):
+            best = (len(mount_point), right_fields[0].lower())
+    return None if best is None else best[1]
+
+
+def _linux_filesystem_type(path: str) -> str | None:
+    '''Return the most-specific Linux mount type containing path.'''
+    if not sys.platform.startswith('linux'):
+        return None
+    anchor = _nearest_existing_directory(path)
+    if anchor is None:
+        return None
+    candidate = os.path.realpath(anchor)
+    try:
+        with open('/proc/self/mountinfo', encoding='utf-8', errors='replace') as handle:
+            return _filesystem_type_from_mountinfo(candidate, handle)
+    except OSError:
+        return None
+
+
+def _unsupported_state_filesystem(detail: str) -> LifecycleError:
+    return LifecycleError(
+        'lifecycle state filesystem preflight failed before production journal '
+        f'access: {detail}. Use a host-native project and Python runtime with '
+        'local SQLite semantics; in Claude, use the Code tab with Environment '
+        'Local on native Windows instead of Cowork/local-agent. Do not retry here '
+        'or delete, rename, copy over, or edit SQLite sidecars'
+    )
+
+
+def _exercise_sqlite_probe(probe_file: str) -> None:
+    first: sqlite3.Connection | None = None
+    try:
+        first = sqlite3.connect(probe_file, timeout=2, isolation_level=None)
+        journal_mode = first.execute('PRAGMA journal_mode = DELETE').fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != 'delete':
+            raise _unsupported_state_filesystem(
+                'SQLite DELETE-journal mode was not available'
+            )
+        first.execute('PRAGMA synchronous = FULL')
+        first.execute('CREATE TABLE probe (value TEXT NOT NULL)')
+        first.execute('BEGIN IMMEDIATE')
+        first.execute('INSERT INTO probe(value) VALUES (\'committed\')')
+        first.commit()
+        first.close()
+        first = None
+
+        first = sqlite3.connect(probe_file, timeout=2, isolation_level=None)
+        row = first.execute('SELECT value FROM probe').fetchone()
+        if row is None or row[0] != 'committed':
+            raise _unsupported_state_filesystem(
+                'a committed SQLite value could not be read back'
+            )
+        first.execute('BEGIN IMMEDIATE')
+        child_code = '''
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+connection.execute('PRAGMA busy_timeout = 0')
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as exc:
+    code = getattr(exc, 'sqlite_errorcode', None)
+    base_code = code & 0xFF if isinstance(code, int) else None
+    message = str(exc).lower()
+    connection.close()
+    if base_code in (
+        getattr(sqlite3, 'SQLITE_BUSY', 5),
+        getattr(sqlite3, 'SQLITE_LOCKED', 6),
+    ) or any(token in message for token in ('busy', 'locked')):
+        print('blocked')
+        raise SystemExit(0)
+    print('unexpected-lock-error')
+    raise SystemExit(2)
+connection.rollback()
+connection.close()
+print('acquired')
+raise SystemExit(3)
+'''
+        try:
+            competitor = subprocess.run(
+                [sys.executable, '-c', child_code, probe_file],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _unsupported_state_filesystem(
+                f'cross-process SQLite lock probe could not run: {exc}'
+            ) from exc
+        if competitor.returncode != 0 or competitor.stdout.strip() != 'blocked':
+            raise _unsupported_state_filesystem(
+                'cross-process SQLite writer exclusion was not enforced'
+            )
+        first.rollback()
+        first.close()
+        first = None
+    finally:
+        if first is not None:
+            try:
+                if first.in_transaction:
+                    first.rollback()
+            finally:
+                first.close()
+
+
+def _exercise_atomic_replace_probe(probe_directory: str) -> None:
+    temporary = os.path.join(probe_directory, 'replace.tmp')
+    replaced = os.path.join(probe_directory, 'replace.json')
+    original = json.dumps({'ok': False}, separators=(',', ':')) + '\n'
+    receipt = json.dumps({'ok': True}, separators=(',', ':')) + '\n'
+    with open(replaced, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(original)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with open(temporary, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(receipt)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, replaced)
+    with open(replaced, encoding='utf-8') as handle:
+        if handle.read() != receipt:
+            raise _unsupported_state_filesystem(
+                'an atomically replaced file could not be read back'
+            )
+
+
+def _probe_sqlite_state_directory(directory: str) -> None:
+    '''Exercise the SQLite and atomic-replace semantics used by live state.'''
+    try:
+        probe_directory = tempfile.mkdtemp(
+            prefix='.rhmra-sqlite-preflight-', dir=directory
+        )
+    except OSError as exc:
+        raise _unsupported_state_filesystem(
+            f'disposable probe directory could not be created: {exc}'
+        ) from exc
+    try:
+        _exercise_sqlite_probe(
+            os.path.join(probe_directory, 'probe.sqlite3')
+        )
+        _exercise_atomic_replace_probe(probe_directory)
+    except LifecycleError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise _unsupported_state_filesystem(str(exc)) from exc
+    finally:
+        try:
+            shutil.rmtree(probe_directory)
+        except OSError as exc:
+            raise _unsupported_state_filesystem(
+                f'disposable probe cleanup failed: {exc}'
+            ) from exc
+
+
+def _prepare_state_directory(directory: str) -> None:
+    '''Reject known shared mounts and probe unknown POSIX state filesystems.'''
+    if os.name == 'nt':
+        os.makedirs(directory, exist_ok=True)
+        return
+
+    filesystem_type = _linux_filesystem_type(directory)
+    if filesystem_type in _UNSAFE_SHARED_FILESYSTEMS or (
+        filesystem_type is not None and filesystem_type.startswith('fuse')
+    ):
+        raise _unsupported_state_filesystem(
+            f'filesystem type {filesystem_type!r} is not supported for live SQLite state'
+        )
+
+    os.makedirs(directory, exist_ok=True)
+    key = os.path.normcase(os.path.realpath(directory))
+    if key not in _PREFLIGHTED_STATE_DIRECTORIES:
+        _probe_sqlite_state_directory(directory)
+        _PREFLIGHTED_STATE_DIRECTORIES.add(key)
+
+
 def _connect(state_file: str) -> sqlite3.Connection:
     path = os.path.abspath(state_file)
     directory = os.path.dirname(path)
     if not directory:
         raise LifecycleError("state file must have a parent directory")
-    os.makedirs(directory, exist_ok=True)
+    _prepare_state_directory(directory)
     connection = sqlite3.connect(path, timeout=10, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 10000")
-    connection.execute("PRAGMA synchronous = FULL")
-    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        connection.close()
+        raise
     classifications_sql = ", ".join(repr(item) for item in CLASSIFICATIONS)
     phases_sql = ", ".join(repr(item) for item in PHASES)
     reasons_sql = ", ".join(repr(item) for item in REASON_CODES)
-    connection.execute("BEGIN IMMEDIATE")
     try:
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS lifecycle_metadata "
             "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -448,9 +673,11 @@ def _connect(state_file: str) -> sqlite3.Connection:
             raise LifecycleError("unsupported lifecycle journal schema version")
         connection.commit()
     except Exception:
-        if connection.in_transaction:
-            connection.rollback()
-        connection.close()
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+        finally:
+            connection.close()
         raise
     try:
         os.chmod(path, 0o600)
@@ -901,6 +1128,38 @@ def publish_projection(
         connection.close()
 
 
+def _has_hot_rollback_journal(state_file: str) -> bool:
+    journal = os.path.abspath(state_file) + '-journal'
+    try:
+        if os.path.getsize(journal) <= 512:
+            return False
+        with open(journal, 'rb') as handle:
+            return handle.read(len(_SQLITE_ROLLBACK_MAGIC)) == _SQLITE_ROLLBACK_MAGIC
+    except OSError:
+        return False
+
+
+def _is_readonly_error(exc: BaseException) -> bool:
+    code = getattr(exc, 'sqlite_errorcode', None)
+    if isinstance(code, int) and (
+        code & 0xFF
+    ) == getattr(sqlite3, 'SQLITE_READONLY', 8):
+        return True
+    message = str(exc).lower()
+    return 'readonly' in message or 'read-only' in message
+
+
+def _interrupted_transaction_recovery_message() -> str:
+    return (
+        'cannot open lifecycle journal read-only: an interrupted SQLite '
+        'transaction requires host-native recovery. Pause scheduled runners, '
+        'then run the checked-in helper from the native host (py -3 '
+        'run_lifecycle.py export on Windows, or the bound absolute python3 '
+        'path on native Linux/macOS) and validate again. Never delete, '
+        'rename, copy over, or edit the .sqlite3-journal sidecar'
+    )
+
+
 def validate_current_projection_read_only(
     state_file: str = DEFAULT_STATE_FILE,
     projection_file: str = DEFAULT_PROJECTION_FILE,
@@ -926,6 +1185,10 @@ def validate_current_projection_read_only(
     except (OSError, sqlite3.Error) as exc:
         if connection is not None:
             connection.close()
+        if _is_readonly_error(exc) and _has_hot_rollback_journal(absolute):
+            raise LifecycleError(
+                _interrupted_transaction_recovery_message()
+            ) from exc
         raise LifecycleError(f"cannot open lifecycle journal read-only: {exc}") from exc
     assert connection is not None
     try:

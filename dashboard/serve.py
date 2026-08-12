@@ -9,11 +9,12 @@ off-machine. Serves exactly three things and refuses everything else:
   /run-reports/...     public telemetry only (status + gates JSON, reports)
   /trade-ledger.csv    the append-only fill ledger
 
-plus five conveniences so the page never has to guess filenames or mode:
+plus six conveniences so the page never has to guess filenames or mode:
 
   /api/index           {"status": [...], "gates": [...]} sorted filename lists
   /api/latest          {"filename": ..., "data": {...}} newest status snapshot
   /api/runs            validated, secret-free invocation lifecycle projection
+  /api/performance     validated, secret-free run performance projection
   /api/config          current DRY_RUN and opening-blackout settings
   /api/ledger          sanitized ledger-basis P&L comparison data
 
@@ -115,6 +116,7 @@ from dashboard.phone_share.public_config import (
     GOOGLE_PHONE_VIEWER_URL,
 )
 from ledger_pnl import LedgerPnlError, reconcile_ledger
+import run_performance
 from run_lifecycle import (
     LifecycleError,
     PROJECTION_LIMIT,
@@ -536,6 +538,32 @@ def _lifecycle_projection():
     return validate_current_projection_read_only(state_file, projection_file)
 
 
+def _performance_projection():
+    """Return validated timing telemetry without exposing its private files."""
+    empty = {
+        "schema_version": 1,
+        "record_limit": run_performance.PROJECTION_LIMIT,
+        "record_count": 0,
+        "source_event_high_watermark": 0,
+        "records": [],
+    }
+    state_file = os.path.join(
+        REPO,
+        "run-reports",
+        os.path.basename(run_performance.DEFAULT_STATE_FILE),
+    )
+    projection_file = os.path.join(
+        REPO,
+        "run-reports",
+        os.path.basename(run_performance.DEFAULT_PROJECTION_FILE),
+    )
+    if not os.path.exists(state_file) and not os.path.exists(projection_file):
+        return empty
+    return run_performance.validate_current_projection_read_only(
+        state_file, projection_file
+    )
+
+
 def _dashboard_config():
     """Return only dashboard-safe values from the validated configuration."""
     try:
@@ -915,6 +943,11 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 return self._json(_lifecycle_projection())
             except (LifecycleError, OSError, UnicodeError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=500)
+        if path == "/api/performance":
+            try:
+                return self._json(_performance_projection())
+            except (OSError, UnicodeError, ValueError) as exc:
                 return self._json({"error": str(exc)}, status=500)
         if path == "/api/config":
             return self._json(_dashboard_config())

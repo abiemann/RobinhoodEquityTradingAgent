@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal
@@ -51,6 +52,7 @@ from market_calendar import (CALENDAR_YEARS, CLOSED_DATES,
                              EARLY_CLOSE_MINUTES_BY_DATE,
                              NORMAL_REGULAR_CLOSE_MINUTE,
                              REGULAR_OPEN_MINUTE)
+import run_lifecycle as lifecycle_module
 
 DASHBOARD_SPEC = importlib.util.spec_from_file_location("dashboard_serve", DASHBOARD)
 assert DASHBOARD_SPEC and DASHBOARD_SPEC.loader
@@ -3814,6 +3816,219 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIsNone(document['run_start_pt'])
         return document
 
+    def test_state_filesystem_preflight_rejects_fuse_before_live_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            journal_file = state_file + '-journal'
+            with open(state_file, 'wb') as handle:
+                handle.write(b'production-state')
+            with open(journal_file, 'wb') as handle:
+                handle.write(b'production-journal')
+            before = {
+                state_file: b'production-state',
+                journal_file: b'production-journal',
+            }
+
+            with (
+                mock.patch.object(lifecycle_module.os, 'name', 'posix'),
+                mock.patch.object(
+                    lifecycle_module,
+                    '_linux_filesystem_type',
+                    return_value='fuse.cowork',
+                ),
+                mock.patch.object(
+                    lifecycle_module, '_probe_sqlite_state_directory'
+                ) as probe,
+            ):
+                with self.assertRaisesRegex(
+                    lifecycle_module.LifecycleError,
+                    'before production journal access',
+                ) as raised:
+                    lifecycle_module._prepare_state_directory(td)
+
+            probe.assert_not_called()
+            self.assertIn('Code tab with Environment Local', str(raised.exception))
+            self.assertIn('Cowork/local-agent', str(raised.exception))
+            for path, expected in before.items():
+                with open(path, 'rb') as handle:
+                    self.assertEqual(handle.read(), expected)
+
+    def test_disposable_state_probe_cleans_up_after_disk_io_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            journal_file = state_file + '-journal'
+            with open(state_file, 'wb') as handle:
+                handle.write(b'production-state')
+            with open(journal_file, 'wb') as handle:
+                handle.write(b'production-journal')
+            before = {
+                state_file: b'production-state',
+                journal_file: b'production-journal',
+            }
+
+            with mock.patch.object(
+                lifecycle_module.sqlite3,
+                'connect',
+                side_effect=sqlite3.OperationalError('disk I/O error'),
+            ):
+                with self.assertRaisesRegex(
+                    lifecycle_module.LifecycleError, 'disk I/O error'
+                ):
+                    lifecycle_module._probe_sqlite_state_directory(td)
+
+            self.assertFalse(
+                any(
+                    name.startswith('.rhmra-sqlite-preflight-')
+                    for name in os.listdir(td)
+                )
+            )
+            for path, expected in before.items():
+                with open(path, 'rb') as handle:
+                    self.assertEqual(handle.read(), expected)
+
+    def test_disposable_state_probe_accepts_native_filesystem(self):
+        with tempfile.TemporaryDirectory() as td:
+            lifecycle_module._probe_sqlite_state_directory(td)
+            self.assertEqual(os.listdir(td), [])
+
+    def test_sqlite_probe_closes_connection_when_rollback_fails(self):
+        connection = mock.MagicMock()
+        connection.in_transaction = True
+        connection.execute.side_effect = sqlite3.OperationalError(
+            'probe failed'
+        )
+        connection.rollback.side_effect = sqlite3.OperationalError(
+            'rollback failed'
+        )
+
+        with mock.patch.object(
+            lifecycle_module.sqlite3,
+            'connect',
+            return_value=connection,
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, 'rollback failed'
+            ):
+                lifecycle_module._exercise_sqlite_probe('probe.sqlite3')
+
+        connection.rollback.assert_called_once_with()
+        connection.close.assert_called_once_with()
+
+    def test_mountinfo_parser_decodes_escaped_paths_and_uses_longest_mount(self):
+        mountinfo = [
+            '1 0 0:1 / / rw - overlay overlay rw',
+            r'2 1 0:2 / /sessions/D:\134Projects rw - fuse.cowork bridge rw',
+            r'3 2 0:3 / /sessions/D:\134Projects/Native rw - ext4 disk rw',
+        ]
+        self.assertEqual(
+            lifecycle_module._filesystem_type_from_mountinfo(
+                r'/sessions/D:\Projects/Repository', mountinfo
+            ),
+            'fuse.cowork',
+        )
+        self.assertEqual(
+            lifecycle_module._filesystem_type_from_mountinfo(
+                r'/sessions/D:\Projects/Native/Repository', mountinfo
+            ),
+            'ext4',
+        )
+
+    def test_connect_closes_handle_on_pragma_or_begin_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            for target in (
+                'PRAGMA busy_timeout = 10000',
+                'PRAGMA synchronous = FULL',
+                'PRAGMA foreign_keys = ON',
+                'BEGIN IMMEDIATE',
+            ):
+                with self.subTest(target=target):
+                    connection = mock.MagicMock()
+                    connection.in_transaction = False
+
+                    def execute(statement, *args):
+                        if statement == target:
+                            raise sqlite3.OperationalError('disk I/O error')
+                        return mock.MagicMock()
+
+                    connection.execute.side_effect = execute
+                    with (
+                        mock.patch.object(
+                            lifecycle_module,
+                            '_prepare_state_directory',
+                        ) as prepare_state_directory,
+                        mock.patch.object(
+                            lifecycle_module.sqlite3,
+                            'connect',
+                            return_value=connection,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            sqlite3.OperationalError, 'disk I/O error'
+                        ):
+                            lifecycle_module._connect(state_file)
+                    prepare_state_directory.assert_called_once_with(td)
+                    connection.close.assert_called_once_with()
+
+    def test_disposable_probe_cleanup_failure_is_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                lifecycle_module.shutil,
+                'rmtree',
+                side_effect=PermissionError('probe still open'),
+            ):
+                with self.assertRaisesRegex(
+                    lifecycle_module.LifecycleError,
+                    'disposable probe cleanup failed',
+                ):
+                    lifecycle_module._probe_sqlite_state_directory(td)
+            leftovers = [
+                os.path.join(td, name)
+                for name in os.listdir(td)
+                if name.startswith('.rhmra-sqlite-preflight-')
+            ]
+            self.assertEqual(len(leftovers), 1)
+            shutil.rmtree(leftovers[0])
+
+    def test_hot_journal_detection_rejects_undersized_magic_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            journal_file = state_file + '-journal'
+            with open(journal_file, 'wb') as handle:
+                handle.write(
+                    lifecycle_module._SQLITE_ROLLBACK_MAGIC + bytes(504)
+                )
+            self.assertFalse(
+                lifecycle_module._has_hot_rollback_journal(state_file)
+            )
+            with open(journal_file, 'ab') as handle:
+                handle.write(b'x')
+            self.assertTrue(
+                lifecycle_module._has_hot_rollback_journal(state_file)
+            )
+
+    def test_readonly_error_without_hot_journal_stays_generic(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            with open(state_file, 'wb') as handle:
+                handle.write(b'placeholder')
+            error = sqlite3.OperationalError(
+                'attempt to write a readonly database'
+            )
+            with mock.patch.object(
+                lifecycle_module.sqlite3, 'connect', side_effect=error
+            ):
+                with self.assertRaises(
+                    lifecycle_module.LifecycleError
+                ) as raised:
+                    lifecycle_module.validate_current_projection_read_only(
+                        state_file, projection_file
+                    )
+            message = str(raised.exception)
+            self.assertIn('cannot open lifecycle journal read-only', message)
+            self.assertNotIn('run_lifecycle.py export', message)
+
     def bind(self, state_file, projection_file, invocation_id):
         proc, document = self.invoke(
             state_file,
@@ -4499,6 +4714,102 @@ class DashboardServerTests(unittest.TestCase):
             403,
         )
 
+        baseline_record_count = document['record_count']
+        baseline_high_watermark = document['source_event_high_watermark']
+        baseline_size = os.path.getsize(state_file)
+        connection = sqlite3.connect(state_file)
+        try:
+            baseline_page_count = connection.execute(
+                'PRAGMA page_count'
+            ).fetchone()[0]
+            baseline_event_count = connection.execute(
+                'SELECT count(*) FROM lifecycle_events'
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        crash_script = '''
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute('PRAGMA journal_mode = DELETE')
+connection.execute('PRAGMA synchronous = FULL')
+connection.execute('PRAGMA cache_size = 1')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('CREATE TABLE interrupted_write (payload BLOB)')
+connection.execute(
+    'INSERT INTO interrupted_write(payload) VALUES (zeroblob(1048576))'
+)
+os._exit(0)
+'''
+        crashed = subprocess.run(
+            [sys.executable, '-c', crash_script, state_file],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        journal_file = state_file + '-journal'
+        self.assertTrue(os.path.isfile(journal_file))
+        with open(journal_file, 'rb') as handle:
+            self.assertEqual(
+                handle.read(8), lifecycle_module._SQLITE_ROLLBACK_MAGIC
+            )
+
+        def digest(path):
+            with open(path, 'rb') as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+
+        before_read_only = {
+            state_file: digest(state_file),
+            journal_file: digest(journal_file),
+        }
+        status, body = self.request('GET', '/api/runs')
+        self.assertEqual(status, 500)
+        recovery_error = json.loads(body)['error']
+        self.assertIn('interrupted SQLite transaction', recovery_error)
+        self.assertIn('run_lifecycle.py export', recovery_error)
+        self.assertIn('Never delete', recovery_error)
+        self.assertEqual(
+            {path: digest(path) for path in before_read_only},
+            before_read_only,
+        )
+
+        recovered = lifecycle('export')
+        self.assertEqual(recovered['record_count'], baseline_record_count)
+        self.assertEqual(
+            recovered['source_event_high_watermark'],
+            baseline_high_watermark,
+        )
+        self.assertFalse(os.path.exists(journal_file))
+        self.assertEqual(os.path.getsize(state_file), baseline_size)
+        status, body = self.request('GET', '/api/runs')
+        self.assertEqual(status, 200)
+        document = json.loads(body)
+        self.assertEqual(document['record_count'], 1)
+        connection = sqlite3.connect(state_file)
+        try:
+            interrupted_tables = connection.execute(
+                'SELECT count(*) FROM sqlite_master '
+                'WHERE type = \'table\' AND name = \'interrupted_write\''
+            ).fetchone()[0]
+            recovered_page_count = connection.execute(
+                'PRAGMA page_count'
+            ).fetchone()[0]
+            recovered_event_count = connection.execute(
+                'SELECT count(*) FROM lifecycle_events'
+            ).fetchone()[0]
+            integrity = connection.execute(
+                'PRAGMA integrity_check'
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(interrupted_tables, 0)
+        self.assertEqual(recovered_page_count, baseline_page_count)
+        self.assertEqual(recovered_event_count, baseline_event_count)
+        self.assertEqual(integrity, 'ok')
+
         current_projection = document
         lifecycle(
             "start", "--now-utc", "2026-08-04T19:04:00Z"
@@ -5068,11 +5379,50 @@ class MarketClockTests(unittest.TestCase):
         bootstrap_start = routine.index("### PYTHON LAUNCHER BOOTSTRAP")
         lifecycle_start = routine.index("### INVOCATION LIFECYCLE")
         self.assertLess(bootstrap_start, lifecycle_start)
+        bootstrap_contract = routine[bootstrap_start:lifecycle_start]
+        self.assertIn(
+            'Windows-hosted checkout exposed inside a POSIX/FUSE sandbox',
+            bootstrap_contract,
+        )
+        self.assertIn(
+            'never fall back to `/usr/bin/python3`', bootstrap_contract
+        )
+        self.assertIn(
+            'Code sidebar', bootstrap_contract
+        )
+        self.assertIn('Environment: Local', bootstrap_contract)
+        self.assertIn('Cowork/local-agent', bootstrap_contract)
+        self.assertIn(
+            'before opening the production journal', bootstrap_contract
+        )
+        lifecycle_contract = routine[
+            lifecycle_start:routine.index('### ACCOUNT SCOPE')
+        ]
+        self.assertIn(
+            'terminal for that execution context', lifecycle_contract
+        )
+        self.assertIn('current shell, not the host OS', lifecycle_contract)
+        self.assertIn('native Windows Git Bash', lifecycle_contract)
+        self.assertIn(
+            'make no further tool call or state-file open', lifecycle_contract
+        )
+        self.assertIn(
+            'do not create a report, status snapshot, gate record',
+            lifecycle_contract,
+        )
+        self.assertIn('`.sqlite3-journal`', lifecycle_contract)
+        self.assertIn(
+            'Never advise deleting, renaming, copying over, editing',
+            lifecycle_contract,
+        )
         bootstrap = routine[bootstrap_start:lifecycle_start]
         self.assertIn("ONLY action permitted before invocation lifecycle start", bootstrap)
         self.assertIn("`load_workspace_dependencies`", bootstrap)
         self.assertIn("no more than 20 seconds", bootstrap)
-        self.assertIn(".\\resolve_python.ps1", bootstrap)
+        self.assertIn("-File ./resolve_python.ps1", bootstrap)
+        self.assertIn("forward-slash `./resolve_python.ps1`", bootstrap)
+        self.assertIn("works in both PowerShell and native Git Bash", bootstrap)
+        self.assertNotIn("-File .\\resolve_python.ps1", bootstrap)
         self.assertIn("`-PreferredPath`", bootstrap)
         self.assertIn("one-way candidate hint", bootstrap)
         self.assertIn("displayed escape for one Windows", bootstrap)
@@ -5088,6 +5438,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("retry that exact resolver command once", bootstrap)
         self.assertIn("`sandbox_permissions: require_escalated`", bootstrap)
         self.assertIn("reuse that exact absolute path", bootstrap)
+        self.assertIn("escape it for the current shell", bootstrap)
+        self.assertIn("must not be rejected or rewritten", bootstrap)
+        self.assertIn('POSIX/native Git Bash', bootstrap)
+        self.assertIn('`\'"\'"\'`', bootstrap)
 
         lifecycle = routine[lifecycle_start:routine.index("### ACCOUNT SCOPE")]
         self.assertIn("`& '<PYTHON_EXE>' run_lifecycle.py start`", lifecycle)
@@ -5160,6 +5514,84 @@ class MarketClockTests(unittest.TestCase):
             os.path.normcase(os.path.realpath(direct_lines[1])),
             os.path.normcase(os.path.realpath(document["python"])),
         )
+
+        git_bash_candidates = (
+            os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "Git",
+                "bin",
+                "bash.exe",
+            ),
+            shutil.which("bash.exe"),
+        )
+        git_bash = None
+        for candidate in git_bash_candidates:
+            if candidate is None or not os.path.isfile(candidate):
+                continue
+            bash_identity = subprocess.run(
+                [candidate, "-c", "uname -s"],
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                timeout=20,
+            )
+            bash_system = bash_identity.stdout.strip().upper()
+            if (
+                bash_identity.returncode == 0
+                and bash_system.startswith(("MINGW", "MSYS"))
+            ):
+                git_bash = candidate
+                break
+
+        def posix_literal(value):
+            return "'" + value.replace("'", "'\"'\"'") + "'"
+
+        self.assertEqual(posix_literal("a'b"), "'a'\"'\"'b'")
+
+        if git_bash is not None:
+            resolver_command = (
+                "powershell.exe -NoProfile -NonInteractive "
+                "-ExecutionPolicy Bypass -File ./resolve_python.ps1 "
+                f"-PreferredPath {posix_literal(sys.executable)}"
+            )
+            through_bash = subprocess.run(
+                [git_bash, "-c", resolver_command],
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                timeout=20,
+            )
+            self.assertEqual(
+                through_bash.returncode, 0, through_bash.stderr
+            )
+            bash_document = json.loads(through_bash.stdout)
+            self.assertEqual(bash_document["schema_version"], 1)
+            self.assertEqual(bash_document["status"], "valid")
+            self.assertTrue(os.path.isabs(bash_document["python"]))
+            self.assertNotIn(
+                "microsoft\\windowsapps", bash_document["python"].lower()
+            )
+            self.assertEqual(
+                bash_document["version"].split(".", 1)[0], "3"
+            )
+
+            bash_python_command = (
+                f"{posix_literal(bash_document['python'])} -I -c "
+                f"{posix_literal('import os; print(os.name)')}"
+            )
+            through_bash_python = subprocess.run(
+                [git_bash, "-c", bash_python_command],
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                timeout=20,
+            )
+            self.assertEqual(
+                through_bash_python.returncode,
+                0,
+                through_bash_python.stderr,
+            )
+            self.assertEqual(through_bash_python.stdout.strip(), "nt")
 
         with open(RESOLVE_PYTHON, encoding="utf-8-sig") as f:
             resolver = f.read()
@@ -5304,6 +5736,271 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Do not fall back to START CLOCK", pre_buy)
         self.assertIn("In DRY RUN", pre_buy)
 
+    def test_routine_timing_boundaries_are_retained_and_telemetry_is_nonfatal(self):
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+
+        coordination = routine.split(
+            '### RUN COORDINATION — fenced single-flight lease', 1
+        )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
+        first_boundary = coordination.index(
+            'first successful renewal at the start of FIRST'
+        )
+        report_boundary = coordination.index(
+            'successful renewal at the start of REPORT'
+        )
+        self.assertLess(first_boundary, report_boundary)
+        for required in (
+            'unchanged `renewed_at` as `STRATEGY_STARTED_AT_UTC`',
+            'later order-boundary renewals must never overwrite it',
+            'unchanged `renewed_at` as `STRATEGY_FINISHED_AT_UTC`',
+            'Retain both values through report/status persistence, '
+            'read-back, release, and lifecycle finish',
+            'If FIRST or REPORT is never reached',
+            'leave the corresponding boundary unavailable',
+            'never substitute acquisition time, START CLOCK, lifecycle '
+            'timestamps, a later renewal, report time, or a guessed value',
+            'must not add a timing-only lease renewal, lifecycle event, '
+            'clock read, broker call, or other phase call',
+        ):
+            self.assertIn(required, coordination)
+
+        lifecycle_finish = routine.index(
+            '**Finalize lifecycle after persistence and release:**'
+        )
+        report_readback = routine.index('**Then READ THE REPORT BACK, once')
+        telemetry_start = routine.index(
+            '### PERFORMANCE TELEMETRY — after lifecycle finish'
+        )
+        self.assertLess(lifecycle_finish, report_readback)
+        self.assertLess(report_readback, telemetry_start)
+
+        telemetry = routine[telemetry_start:routine.index(
+            'The filename is exactly:', telemetry_start
+        )]
+        self.assertEqual(
+            routine.count('run_performance.py record-internal'), 1
+        )
+        for required in (
+            'Only after all permitted report/status persistence and '
+            'read-back',
+            'single successful lifecycle `finish`',
+            'exactly once for that invocation',
+            '--invocation-id <INVOCATION_ID>',
+            '--session',
+            '--runner <codex|claude|unknown>',
+            '--model \'<TIMING_MODEL>\'',
+            '--configuration \'<TIMING_CONFIG>\'',
+            '--identity-source <run-metadata|declared|unknown>',
+            '--strategy-start-utc <STRATEGY_STARTED_AT_UTC>',
+            '--strategy-end-utc <STRATEGY_FINISHED_AT_UTC>',
+            'only as a pair when both retained boundaries are available',
+            'if either is unavailable, omit both',
+            'START CLOCK\'s `session` unchanged',
+            '`unknown` only when the invocation finished without a '
+            'successful START CLOCK',
+            'four identity arguments from the already-bound timing '
+            'identity as one indivisible set',
+            'matching declaration plus metadata also supplies '
+            '`run-metadata`',
+            '`unknown` for runner, model, configuration, and identity '
+            'source together',
+            'Never pass a partially known identity with '
+            '`--identity-source unknown`',
+            'do not retry or call another timing command',
+            'observational and non-authoritative',
+            'must never change trading, broker calls, report/status '
+            'contents, lease handling, lifecycle classification/reason, '
+            'or the run result',
+            'Timing unavailable: <diagnostic>',
+            'before the mandatory last output-file line',
+            'cannot observe its own final framework completion',
+            'separate post-run observation with an explicit source',
+        ):
+            self.assertIn(required, telemetry)
+
+    def test_timing_identity_and_metric_names_do_not_guess(self):
+        documents = {}
+        for filename in (
+            'robinhood-momentum-routine-autonomous.md',
+            'README.md',
+            'QUICKSTART.md',
+            'CLAUDE-LOCAL-SCHEDULING.md',
+        ):
+            with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
+                documents[filename] = f.read()
+            self.assertNotIn(
+                'meat and potatoes', documents[filename].lower(), filename
+            )
+
+        routine = documents['robinhood-momentum-routine-autonomous.md']
+        identity = routine.split(
+            '### TIMING IDENTITY — explicit provenance only', 1
+        )[1].split('## Tradeoffs / known limitations', 1)[0]
+        for required in (
+            'exactly one well-formed line in the current task input',
+            'TIMING_IDENTITY: runner=<runner> model=<model> '
+            'config=<configuration>',
+            'direct framework metadata that explicitly identifies this '
+            'current task',
+            'Zero declaration lines means that declaration source is '
+            'absent',
+            'Multiple, malformed, or internally conflicting '
+            '`TIMING_IDENTITY` lines make provenance invalid',
+            'all three identity values are explicit',
+            'matching direct framework metadata takes precedence',
+            'require all three values to match exactly',
+            'collapse all four timing identity bindings together',
+            '`TIMING_RUNNER`, `TIMING_MODEL`, `TIMING_CONFIG`, and '
+            '`TIMING_IDENTITY_SOURCE` to the literal string `unknown`',
+            'Never retain a known runner, model, or configuration with '
+            '`TIMING_IDENTITY_SOURCE=unknown`',
+            'literal string `unknown`',
+            'Never infer timing identity from the preferred-model prose',
+            'a global or remembered configuration',
+            'model exposed somewhere in the tool surface',
+            'available tools/connectors',
+            '`runner` value must be `codex` or `claude`',
+            'model and configuration labels must exactly match the task '
+            'settings selected for this run',
+            '`TIMING_IDENTITY_SOURCE=declared`',
+            '`TIMING_IDENTITY_SOURCE=run-metadata`',
+            '`TIMING_IDENTITY_SOURCE=unknown`',
+            'Do not use the post-run-only `manual-ui` source',
+        ):
+            self.assertIn(required, identity)
+
+        readme = documents['README.md']
+        tested_on = readme.split('## Tested On', 1)[1].split(
+            '## Guardrails', 1
+        )[0]
+        for required in (
+            '**End-to-end task**',
+            '**Routine total**',
+            '**Strategy execution**',
+            '**Routine overhead**',
+            '`lifecycle finished_at_utc - lifecycle started_at_utc`',
+            '`REPORT renewal renewed_at - first FIRST renewal renewed_at`',
+            '`Routine total - Strategy execution`',
+            '`End-to-end task - Routine total`',
+            'current task cannot know its own completion timestamp',
+            'observation with an explicit source',
+            'unavailable rather than zero',
+            'Keep after-hours and market-hours observations separate',
+            'a later observer—not the completed task itself',
+            '`run_performance.py observe-task`',
+            '`codex-worked-for` only for Codex',
+            '`claude-run-duration` only for Claude',
+            'preserves the source alongside the value',
+        ):
+            self.assertIn(required, tested_on)
+
+    def test_post_run_observation_commands_are_complete_and_source_preserving(self):
+        codex_observe = (
+            '& \'<PYTHON_EXE>\' run_performance.py observe-task '
+            '--invocation-id \'<INVOCATION_ID>\' '
+            '--task-duration-ms <DURATION_MS> --runner codex '
+            '--model \'gpt-5.6-luna\' '
+            '--configuration \'reasoning=high\' '
+            '--identity-source manual-ui '
+            '--clock-source codex-worked-for'
+        )
+        claude_observe = (
+            '& \'<PYTHON_EXE>\' run_performance.py observe-task '
+            '--invocation-id \'<INVOCATION_ID>\' '
+            '--task-duration-ms <DURATION_MS> --runner claude '
+            '--model \'claude-sonnet-4-6\' '
+            '--configuration \'effort=high\' '
+            '--identity-source manual-ui '
+            '--clock-source claude-run-duration'
+        )
+        documents = {}
+        for filename in (
+            'README.md', 'QUICKSTART.md', 'CLAUDE-LOCAL-SCHEDULING.md'
+        ):
+            with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
+                documents[filename] = f.read()
+
+        for filename in ('README.md', 'QUICKSTART.md'):
+            self.assertEqual(documents[filename].count(codex_observe), 1)
+            self.assertEqual(documents[filename].count(claude_observe), 1)
+        self.assertEqual(
+            documents['CLAUDE-LOCAL-SCHEDULING.md'].count(claude_observe), 1
+        )
+        self.assertNotIn(
+            codex_observe, documents['CLAUDE-LOCAL-SCHEDULING.md']
+        )
+
+        readme = documents['README.md']
+        self.assertIn(
+            '17m41 End-to-end task (Codex runner metadata)', readme
+        )
+        self.assertNotIn('17m41 End-to-end task (Codex app UI)', readme)
+        self.assertIn(
+            'A real framework-provided observation must retain '
+            '`--identity-source run-metadata` and '
+            '`--clock-source runner-metadata`',
+            readme,
+        )
+
+    def test_scheduler_prompts_declare_exact_timing_identity(self):
+        with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        scheduling = readme.split('### Scheduling', 1)[1].split(
+            '### View on Phone setup', 1
+        )[0]
+        codex_prompt = scheduling.split(
+            'Use this prompt in Codex:', 1
+        )[1].split('Use this prompt in Claude Desktop Code Local:', 1)[0]
+        claude_prompt = scheduling.split(
+            'Use this prompt in Claude Desktop Code Local:', 1
+        )[1].split('Keep exactly one `TIMING_IDENTITY` line', 1)[0]
+        codex_declaration = (
+            'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna '
+            'config=reasoning=high'
+        )
+        claude_declaration = (
+            'TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 '
+            'config=effort=high'
+        )
+        self.assertEqual(codex_prompt.count('TIMING_IDENTITY:'), 1)
+        self.assertEqual(claude_prompt.count('TIMING_IDENTITY:'), 1)
+        self.assertIn(codex_declaration, codex_prompt)
+        self.assertIn(claude_declaration, claude_prompt)
+        self.assertIn(
+            'synchronized with the runner, model, and configuration '
+            'actually selected', scheduling
+        )
+        self.assertIn('does not switch the model', scheduling)
+
+        with open(
+            os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md'),
+            encoding='utf-8',
+        ) as f:
+            claude_guide = f.read()
+        task_prompt = claude_guide.split('```text', 1)[1].split('```', 1)[0]
+        self.assertEqual(task_prompt.count('TIMING_IDENTITY:'), 1)
+        self.assertIn(claude_declaration, task_prompt)
+        self.assertIn(
+            'keep it synchronized with the model and effort actually '
+            'selected', claude_guide
+        )
+
+        with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
+            quickstart = f.read().split(
+                '## Timing for later scheduled runs', 1
+            )[1]
+        self.assertIn('copy exactly one matching declaration', quickstart)
+        self.assertIn(codex_declaration, quickstart)
+        self.assertIn(claude_declaration, quickstart)
+        self.assertIn(
+            'current task cannot observe its own final completion',
+            quickstart,
+        )
+
     def test_routine_full_halts_when_constants_cannot_be_read(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
@@ -5428,6 +6125,23 @@ class MarketClockTests(unittest.TestCase):
             '`get_accounts`',
             'fresh task',
             'Do not rerun this automation until that fresh-task check succeeds',
+            'Claude Code recovery-path override',
+            'Customize → Connectors',
+            'Settings → Connectors',
+            '`/mcp`',
+            'choose Re-authenticate',
+            'If reauthentication still fails',
+            'remove only that single existing Robinhood connector',
+            'add it back once there',
+            'complete OAuth, and restart Claude',
+            'never leave or create a duplicate',
+            'same main checkout with worktree isolation off',
+            'click Run now',
+            'proof that the scheduled context can see the connector',
+            'Only if no account connector exists and the standalone `claude` CLI is installed',
+            'claude mcp add --transport http robinhood-trading',
+            'optionally confirm it with `claude mcp list`',
+            'never use the CLI to create a duplicate',
         ):
             self.assertIn(required, connector)
 
@@ -5437,6 +6151,586 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('remove and re-create the MCP connection', readme)
         self.assertIn('fresh task exposes `get_accounts`', readme)
         self.assertIn('still absent in that', readme)
+        self.assertIn(
+            'Claude Desktop Code tab, Environment Local', readme
+        )
+        for required in (
+            '## Tested On',
+            '| Runner | Model / configuration | After-hours observed runtime | Market-hours observed runtime | Status |',
+            '4m40 End-to-end task (Claude transcript observation); '
+            '4m05 Routine total (lifecycle)',
+            'Pending — measure during a market-hours run',
+            '6m03 End-to-end task (Codex app UI); '
+            '4m16 Routine total (lifecycle)',
+            '17m41 End-to-end task (Codex runner metadata); '
+            '14m24 Routine total (lifecycle)',
+            'observed wall-clock times on this installation',
+            'not controlled benchmarks',
+            'after-hours End-to-end task comparison is about 4m40 for '
+            'Claude versus 6m03',
+            'workloads are comparable',
+            'flat account and skipped the entry path',
+            'End-to-end task sources are not identical',
+            'Routine total durations were 4m05 for Claude and 4m16 for '
+            'Codex',
+            'Codex market-hours End-to-end task took 17m41',
+            '2026-08-10 full market-hours Routine total',
+            '15-candidate scan recorded 14m24',
+            'compare each session class separately',
+            'market-hours timing has not yet been measured',
+        ):
+            self.assertIn(required, readme)
+        self.assertNotIn('## Models and runner support', readme)
+        for required in (
+            'Part A native bootstrap/MCP reads/lifecycle+lease',
+            'prescribed per-task `DRY_RUN` acceptance still required',
+            '**Part A only**',
+            'used `DRY_RUN = false`',
+            'Part B was never tested with **Run now**',
+            'after hours with a flat account',
+            'no order-mutation tool call',
+            '**Schedule: Manual** first',
+            'saved Custom cron becomes active immediately',
+            'immediately Pause it in task detail',
+            'Only after both proofs pass',
+            'Scheduled tasks must run at most once per hour.',
+            '`0 6-13 * * 1-5`',
+            '`30 6-13 * * 1-5`',
+            'local machine/app timezone',
+            'intended Pacific bounds',
+            'randomized start delays',
+            'permission control is currently labeled **Auto**',
+            'Allowed permissions',
+            '`place_equity_order`',
+            '`cancel_equity_order`',
+            'do not enable live Claude trading',
+            'original **Cowork/Scheduled** interface',
+            'Code **Routines** list does not control it',
+            'bind its exact returned `PYTHON_EXE`',
+        ):
+            self.assertIn(required, readme)
+        self.assertNotIn(
+            'Schedules must run at most once per hour', readme
+        )
+        self.assertNotIn('deterministic start delays', readme)
+        self.assertNotIn(
+            'host-native `py -3 run_lifecycle.py export`', readme
+        )
+        self.assertIn('Routines → New routine → Local', readme)
+        self.assertIn('isolated-worktree option **off**', readme)
+        self.assertIn('Customize → Connectors', readme)
+        self.assertIn('Settings → Connectors', readme)
+        self.assertIn('Do not add a duplicate', readme)
+        self.assertIn('choose **Re-authenticate**', readme)
+        self.assertIn('If reauthentication still fails', readme)
+        self.assertIn(
+            'remove only that single existing Robinhood connector', readme
+        )
+        self.assertIn('add it back once there', readme)
+        self.assertIn('complete OAuth, and restart Claude', readme)
+        self.assertIn('never leave or create a duplicate', readme)
+        self.assertIn('same native Windows main checkout', readme)
+        self.assertIn('Desktop local scheduled task', readme)
+        self.assertIn('success proves the scheduled context can see the connector', readme)
+        self.assertIn(
+            'Only if no account connector exists and the standalone `claude` CLI is installed',
+            readme,
+        )
+        self.assertIn('optionally confirm it with `claude mcp list`', readme)
+        self.assertIn('never use the CLI to create a duplicate', readme)
+        self.assertIn(
+            'Read `./robinhood-momentum-routine-autonomous.md`', readme
+        )
+        self.assertNotIn(
+            'Read `\\RobinhoodEquityTradingAgent\\robinhood-momentum-routine-autonomous.md`',
+            readme,
+        )
+        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', readme)
+        with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
+            quickstart = f.read()
+        self.assertIn(
+            'brand-new Claude Desktop **Code** session whose '
+            '**Environment** selector above the prompt is **Local**',
+            quickstart,
+        )
+        self.assertIn('Do not use Claude Cowork/local-agent', quickstart)
+        self.assertIn('do not fall back to `/usr/bin/python3`', quickstart)
+        self.assertIn('genuinely native Linux/macOS checkout', quickstart)
+        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', quickstart)
+
+        guide_path = os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md')
+        with open(guide_path, encoding='utf-8') as f:
+            claude_guide = f.read()
+        for required in (
+            'execution-environment example only',
+            'copy the prompt, schedule, model, permission mode',
+            'this guide—not from the image',
+            '**Schedule: Manual**',
+            'Saving a Local task with a Custom cron makes it active '
+            'immediately',
+            'Only after both Manual **Run now** proofs pass',
+            'immediately open its task detail, choose **Pause**',
+            'verify that it is disabled and that no run began',
+            'Scheduled tasks must run at most once per hour.',
+            '`0 6-13 * * 1-5`',
+            '`30 6-13 * * 1-5`',
+            'randomized delay',
+            'local machine/app timezone',
+            'intended Pacific bounds',
+            'original **Cowork/Scheduled** interface',
+            'Code **Routines** list does not control that legacy task',
+            'permission control is currently labeled **Auto**',
+            '**Allowed permissions**',
+            'If this Claude build cannot keep both',
+            'do not enable live Claude trading',
+            '**Part A only**',
+            '`DRY_RUN = false`',
+            'Part B was never tested with **Run now**',
+            'after hours with a flat account',
+            'no order-mutation tool call',
+            'bind the exact returned `python` value as `PYTHON_EXE`',
+            'Never substitute a bare `py`, `python`, or `python3`',
+        ):
+            self.assertIn(required, claude_guide)
+        self.assertNotIn(
+            'Schedules must run at most once per hour', claude_guide
+        )
+        self.assertNotIn('deterministic delay', claude_guide)
+        self.assertNotIn(
+            '`py -3 run_lifecycle.py export`', claude_guide
+        )
+
+        manual_creation = claude_guide.index(
+            'Create uniquely named Part A and Part B Local tasks with '
+            '**Schedule: Manual**'
+        )
+        part_a_run = claude_guide.index(
+            'While Part A still has **Schedule: Manual**, open it and '
+            'click **Run now**'
+        )
+        part_b_run = claude_guide.index(
+            'Repeat **Run now** for Part B while it is still Manual'
+        )
+        add_crons = claude_guide.index(
+            'Only after both Manual tests succeed should you edit Part A '
+            'and Part B to their Custom crons'
+        )
+        self.assertLess(manual_creation, part_a_run)
+        self.assertLess(part_a_run, part_b_run)
+        self.assertLess(part_b_run, add_crons)
+
+        for relative_image in (
+            'images/claude-local-routine-form.png',
+            'images/claude-local-hourly-limit.png',
+        ):
+            with self.subTest(image=relative_image):
+                self.assertIn(f']({relative_image})', claude_guide)
+                image_path = os.path.join(
+                    ROOT, *relative_image.split('/')
+                )
+                self.assertTrue(os.path.isfile(image_path), image_path)
+                self.assertGreater(os.path.getsize(image_path), 0, image_path)
+
+        with open(os.path.join(ROOT, 'INCIDENTS.md'), encoding='utf-8') as f:
+            incidents = f.read()
+        resolution = incidents.split(
+            '**2026-08-11 15:55 resolution', 1
+        )[1].split('## BROKER TIMESTAMPS', 1)[0]
+        resolution = re.sub(r'\s+', ' ', resolution)
+        for required in (
+            'Part A alone ran',
+            '`DRY_RUN = false`',
+            'Part B was never tested with **Run now**',
+            'flat and the run occurred after hours',
+            'No order-mutation tool was called',
+            '`DRY_RUN = true` acceptance',
+            'Scheduled tasks must run at most once per hour.',
+            'saved Custom cron becomes active immediately',
+            '**Schedule: Manual**',
+            'add the Custom crons only after both proofs pass',
+            'immediately Pause it in task detail',
+            'permission control currently labeled **Auto**',
+            'Allowed permissions',
+            'intended Pacific bounds',
+            'randomized start delays',
+            'original Cowork/Scheduled interface',
+            'Code Routines list does not control it',
+        ):
+            self.assertIn(required, resolution)
+        self.assertNotIn(
+            'Schedules must run at most once per hour', resolution
+        )
+        self.assertNotIn('deterministic start delays', resolution)
+
+    def test_quickstart_preserves_safe_first_test_contract_and_local_links(self):
+        with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
+            quickstart = f.read()
+        connector = quickstart.split(
+            '## 1. Connect Robinhood once', 1
+        )[1].split('## 2. Paste one prompt', 1)[0]
+        setup_prompt = quickstart.split('```text', 1)[1].split(
+            '```', 1
+        )[0]
+
+        for required in (
+            'ChatGPT Desktop in Codex mode, or Codex',
+            'exact settings path may vary by app version',
+            '(README.md#first-time-app-setup)',
+            'Inspect the installed connectors first',
+            'exactly one Robinhood connector should exist',
+            'setup must never create a duplicate',
+            'Authenticate** or **Re-authenticate',
+            'Add one only if no Robinhood connector exists',
+            'If no Robinhood connector exists and you add one',
+            'first inspect the account connector in Claude Desktop',
+            'add exactly one custom connector and complete OAuth',
+            'ask which known connector to keep',
+            'remove the duplicates explicitly',
+            'never silently delete an unknown connector',
+            'Restart Claude, then open a brand-new **Code** session',
+            '**Environment** selector above the prompt to **Local**',
+            'select this exact repository\'s main checkout',
+            'keep worktree isolation **off**',
+            'Code sidebar is only a list filter',
+            'remove only that single connector',
+            'add it back once',
+            'verify `get_accounts` in another fresh task/session',
+            'Never leave or create a duplicate',
+            'before any broker work',
+        ):
+            self.assertIn(required, connector)
+
+        claude = connector.split('- **Claude Code:**', 1)[1].split(
+            '\n\n', 1
+        )[0]
+        claude_order = (
+            'account connector',
+            'complete OAuth',
+            'Restart Claude',
+            'brand-new **Code** session',
+            '**Environment** selector above the prompt',
+            'exact repository\'s main checkout',
+            '`/mcp`',
+        )
+        for earlier, later in zip(claude_order, claude_order[1:]):
+            self.assertLess(claude.index(earlier), claude.index(later))
+
+        for required in (
+            'Never ask me to paste passwords, MFA codes, account numbers',
+            'changing `DRY_RUN` from `false` to `true` if necessary',
+            'writing the confirmed `AGENTIC_ACCOUNT_NAME`',
+            'Never change `DRY_RUN` from `true` to `false`',
+            're-run validation after either authorized edit',
+            'Neither `place_equity_order` nor `cancel_equity_order` '
+            'may be preapproved',
+            'In Codex, keep both set to `Needs approval`',
+            'control may be labeled `Auto`',
+            '`Allowed permissions`',
+            'stop before running the routine',
+            'Dry run prevents new entries, but it may still sell or '
+            'protect existing positions',
+            'Do not create or enable a schedule',
+            'If this exact repository checkout is already open',
+            'Otherwise open a safe writable parent folder',
+            'clone into a new subfolder without overwriting anything',
+            'stop before lifecycle or broker work',
+            'open that cloned repository in a brand-new native '
+            'project session',
+            'Do not continue from the parent-folder session',
+            'sidebar Local filter is insufficient',
+            'powershell.exe -NoProfile -NonInteractive '
+            '-ExecutionPolicy Bypass -File ./resolve_python.ps1',
+            'bind the exact returned absolute Python 3 path as '
+            '`PYTHON_EXE`',
+            'reuse that exact executable with current-shell literal '
+            'quoting',
+            'Never substitute a bare `python`, `python3`, `py`, or a '
+            'generic “Windows equivalent.”',
+            '`powershell.exe` is unavailable',
+            'close the wrong context',
+            'sidebar Local filter alone is insufficient',
+            'genuinely native Linux/macOS checkout',
+            'does not validate the Claude Windows Desktop scheduler '
+            'path',
+            'zero agentic-enabled accounts, stop',
+            'if several exist, show only their display names',
+            'must then resolve to exactly one account',
+            'must be agentic enabled',
+            'no default, partial-match, first-account, or '
+            'account-number fallback',
+            'same bound `PYTHON_EXE`',
+            '`\'<PYTHON_EXE>\' -m unittest discover -s tests`',
+            'Do not use a bare launcher or invent an ad-hoc '
+            'serializer, path, or extra broker call',
+            'first supervised entry-eligible run with '
+            '`DRY_RUN = true` remains the end-to-end proof of '
+            'broker-response staging',
+            'Creating a missing saved scan is a broker-side setup '
+            'mutation',
+            'obtain my explicit confirmation before creating it',
+            'ask for explicit confirmation before running anything',
+            'no schedule was created',
+        ):
+            self.assertIn(required, setup_prompt)
+
+        resolver = setup_prompt.index(
+            'powershell.exe -NoProfile -NonInteractive '
+            '-ExecutionPolicy Bypass -File ./resolve_python.ps1'
+        )
+        validate = setup_prompt.index(
+            'Execute `validate_constants.py --json`', resolver
+        )
+        full_suite = setup_prompt.index(
+            '`\'<PYTHON_EXE>\' -m unittest discover -s tests`',
+            validate,
+        )
+        self.assertLess(resolver, validate)
+        self.assertLess(validate, full_suite)
+        self.assertNotIn('its included Python', quickstart)
+        self.assertNotIn(
+            '`python3 -m unittest discover -s tests`', setup_prompt
+        )
+        self.assertNotIn(
+            "or the environment's Windows equivalent", setup_prompt
+        )
+        self.assertIn(
+            'Only after the safe first test succeeds and you separately '
+            'consent to scheduling',
+            quickstart,
+        )
+        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', quickstart)
+
+        root_real = os.path.realpath(ROOT)
+        local_targets = set()
+        # This pattern intentionally covers ordinary links and image links.
+        for raw_target in re.findall(
+            r'\[[^\]]*\]\(([^)]+)\)', quickstart
+        ):
+            target = raw_target.strip().strip('<>')
+            if target.startswith('#') or re.match(
+                r'^(?:https?|mailto):', target, re.IGNORECASE
+            ):
+                continue
+            path_target = target.split('#', 1)[0]
+            self.assertTrue(path_target, raw_target)
+            self.assertFalse(os.path.isabs(path_target), raw_target)
+            resolved = os.path.realpath(os.path.join(ROOT, path_target))
+            self.assertEqual(
+                os.path.normcase(os.path.commonpath((root_real, resolved))),
+                os.path.normcase(root_real),
+                f'QUICKSTART link escapes the repository: {raw_target}',
+            )
+            self.assertTrue(os.path.isfile(resolved), resolved)
+            self.assertGreater(os.path.getsize(resolved), 0, resolved)
+            local_targets.add(path_target.replace('\\', '/'))
+        self.assertIn('README.md', local_targets)
+        self.assertIn('CLAUDE-LOCAL-SCHEDULING.md', local_targets)
+
+        with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        pre_live = readme.split(
+            '## Testing before going live', 1
+        )[1].split('## Architecture', 1)[0]
+        for required in (
+            'both `place_equity_order` and `cancel_equity_order`',
+            '**"Needs approval"** (or the platform\'s equivalent)',
+            'Neither mutation tool may be preapproved',
+            'control may be labeled **Auto**',
+            'inspect **Allowed permissions**',
+            'both tools to remain approval-gated',
+            'stop before running the routine or enabling live trading',
+        ):
+            self.assertIn(required, pre_live)
+
+    def test_claude_schedule_migration_requires_a_new_code_local_routine(self):
+        documents = (
+            'robinhood-momentum-routine-autonomous.md',
+            'README.md',
+            'CLAUDE-LOCAL-SCHEDULING.md',
+        )
+
+        for filename in documents:
+            with self.subTest(document=filename):
+                with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
+                    text = re.sub(r'\s+', ' ', f.read().lower())
+
+                # Anchor these checks to the migration guidance. Generic
+                # mentions elsewhere in these long documents must not pass it.
+                sidebar = text.rfind('sidebar')
+                self.assertNotEqual(
+                    sidebar, -1,
+                    f'{filename} must explain the Claude sidebar Local trap',
+                )
+                guide = text[max(0, sidebar - 1500):sidebar + 6000]
+
+                legacy_cowork = (
+                    re.search(
+                        r'(?:legacy|old|existing).{0,160}'
+                        r'(?:cowork|local-agent).{0,160}'
+                        r'(?:routine|scheduled task|schedule)', guide,
+                    )
+                    or re.search(
+                        r'(?:cowork|local-agent).{0,160}'
+                        r'(?:routine|scheduled task|schedule).{0,160}'
+                        r'(?:legacy|old|existing)', guide,
+                    )
+                )
+                self.assertIsNotNone(
+                    legacy_cowork,
+                    f'{filename} must identify the old Cowork schedule as legacy',
+                )
+
+                sidebar_trap = text[max(0, sidebar - 100):sidebar + 500]
+                self.assertIn('local', sidebar_trap)
+                self.assertTrue(
+                    any(term in sidebar_trap for term in (
+                        'does not', 'doesn\'t', 'cannot', 'will not', 'do not',
+                        'do not assume',
+                    )),
+                    f'{filename} must negate migration by sidebar selection',
+                )
+                self.assertTrue(
+                    any(term in sidebar_trap for term in (
+                        'migrate', 'convert', 'move', 'recreate', 'change',
+                    )),
+                    f'{filename} must explain what sidebar Local cannot do',
+                )
+                self.assertTrue(
+                    any(term in sidebar_trap for term in (
+                        'existing', 'old', 'legacy',
+                    )),
+                    f'{filename} must identify the task that is not migrated',
+                )
+                self.assertRegex(
+                    sidebar_trap,
+                    r'(?:local.{0,100}selector.{0,100}new session|'
+                    r'new[- ]session.{0,100}(?:local|selector)|'
+                    r'(?:choosing|selecting).{0,80}local.{0,80}'
+                    r'(?:new chat|new session))',
+                    f'{filename} must cover the Local new-session selector',
+                )
+
+                self.assertRegex(
+                    guide,
+                    r'(?:new|newly created|replacement).{0,240}'
+                    r'(?:routine|scheduled task)',
+                )
+                self.assertRegex(
+                    guide,
+                    r'(?:(?:new|replacement).{0,120}'
+                    r'(?:uniquely named|distinct name|new name).{0,120}'
+                    r'(?:task|routine)|(?:task|routine).{0,120}'
+                    r'(?:uniquely named|distinct name|new name))',
+                )
+                self.assertIn('code', guide)
+                self.assertRegex(
+                    guide,
+                    r'code.{0,100}routines?.{0,100}new routine.{0,100}local',
+                )
+                self.assertTrue(
+                    any(path in guide for path in (
+                        r'd:\projects\robinhoodequitytradingagent',
+                        'd:/projects/robinhoodequitytradingagent',
+                    ))
+                    or re.search(
+                        r'(?:this )?exact.{0,100}native windows.{0,100}'
+                        r'(?:checkout|project folder|repository)', guide,
+                    ),
+                    f'{filename} must require the exact native repository',
+                )
+                self.assertRegex(
+                    guide,
+                    r'(?:(?:worktree|worktree isolation).{0,80}'
+                    r'(?:off|disabled)|(?:off|disable).{0,80}worktree)',
+                )
+                self.assertIn('run now', guide)
+                self.assertRegex(guide, r'dry_run\s*=\s*`?true')
+                self.assertIn('powershell', guide)
+                self.assertIn('resolver', guide)
+                self.assertIn('get_accounts', guide)
+                self.assertRegex(guide, r'(?:proof|prove|require.{0,80}success)')
+
+                pause = re.search(
+                    r'(?:pause|disable).{0,160}(?:old|legacy|existing)|'
+                    r'(?:old|legacy|existing).{0,160}(?:pause|disable)',
+                    guide,
+                )
+                self.assertIsNotNone(pause)
+                run_now_after_pause = guide.find('run now', pause.start())
+                self.assertNotEqual(
+                    run_now_after_pause,
+                    -1,
+                    f'{filename} must test the replacement after pausing '
+                    'the old task',
+                )
+                self.assertLess(
+                    pause.start(), run_now_after_pause,
+                    f'{filename} must pause the old task before testing',
+                )
+
+                delete_only_after_success = (
+                    re.search(
+                        r'(?:delet(?:e|ing)|remove).{0,120}'
+                        r'(?:old|legacy|existing)'
+                        r'.{0,240}(?:only after|after).{0,160}'
+                        r'(?:success|succeeds|passes)', guide,
+                    )
+                    or re.search(
+                        r'(?:only after|after).{0,160}'
+                        r'(?:success|succeeds|passes|proof).{0,240}'
+                        r'(?:delet(?:e|ing)|remove).{0,120}'
+                        r'(?:old|legacy|existing)',
+                        guide,
+                    )
+                    or re.search(
+                        r'(?:do not|never).{0,100}'
+                        r'(?:delet(?:e|ing)|remove)'
+                        r'.{0,160}(?:old|legacy|existing).{0,240}'
+                        r'(?:until|unless).{0,160}'
+                        r'(?:success|succeeds|passes)', guide,
+                    )
+                    or re.search(
+                        r'(?:success|successful|proof|require).{0,300}'
+                        r'before.{0,100}(?:delet(?:e|ing)|remove)', guide,
+                    )
+                )
+                self.assertIsNotNone(
+                    delete_only_after_success,
+                    f'{filename} must retain the old task until the new '
+                    'routine succeeds',
+                )
+
+                enable_only_after_success = (
+                    re.search(
+                        r'(?:success|successful|proof|require).{0,320}'
+                        r'before.{0,120}'
+                        r'(?:enabl(?:e|ing)|activat(?:e|ing))', guide,
+                    )
+                    or re.search(
+                        r'before.{0,120}'
+                        r'(?:enabl(?:e|ing)|activat(?:e|ing)).{0,320}'
+                        r'(?:success|successful|proof|require)', guide,
+                    )
+                    or re.search(
+                        r'before.{0,120}(?:activating|enabling).{0,320}'
+                        r'(?:success|successful|proof|require)', guide,
+                    )
+                    or re.search(
+                        r'(?:enabl(?:e|ed|ing)|activat(?:e|ed|ing)).{0,160}'
+                        r'only after.{0,160}'
+                        r'(?:success|succeed|successful|proof)', guide,
+                    )
+                    or re.search(
+                        r'(?:only after|after).{0,160}'
+                        r'(?:success|succeed|successful|proof).{0,160}'
+                        r'(?:enabl(?:e|ed|ing)|activat(?:e|ed|ing))', guide,
+                    )
+                )
+                self.assertIsNotNone(
+                    enable_only_after_success,
+                    f'{filename} must not enable the replacement schedule '
+                    'until the supervised proof succeeds',
+                )
 
     def test_routine_requires_durable_order_intent_reconciliation(self):
         with open(

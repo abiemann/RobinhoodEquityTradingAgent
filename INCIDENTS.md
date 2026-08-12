@@ -153,6 +153,87 @@ check/pending with the exact acquired token, rules version, then account resolut
 journal work are explicitly forbidden before acquisition, and placeholder, invocation, remembered,
 or otherwise invented fencing tokens are never authoritative.
 
+**2026-08-11, Claude Cowork FUSE transaction left a hot rollback journal that blocked read-only
+lifecycle validation.** A Claude
+Cowork/local-agent run opened the Windows checkout through its isolated Linux VM and a writable
+FUSE mount. Host `powershell.exe` was unavailable, so the agent fell back to
+`/usr/bin/python3` and ran `run_lifecycle.py start`. SQLite began a write transaction and
+created a valid rollback journal, then returned `disk I/O error` during transactional I/O on that
+bridge and left the transaction hot. No lifecycle start event committed, no lease was
+acquired, no Robinhood call or mutation occurred, and no account status file changed. The adjacent
+hot journal then made the dashboard's intentionally read-only SQLite open fail with
+`attempt to write a readonly database`, because rollback recovery itself requires a write.
+
+The failed agent ignored the lifecycle-start terminal rule, ran further SQLite probes, created an
+unlinked normal-looking report, misattributed the journal to the prior successful run, and advised
+deleting it. That advice was unsafe: the journal carried SQLite before-images needed for recovery.
+After the runner was stopped, host-native `py -3 run_lifecycle.py export` let SQLite perform its
+own rollback, republished the projection, preserved all 326 committed events, and restored the
+dashboard without changing the last truthful account snapshot.
+
+**Rule produced:** a Windows-hosted checkout exposed through POSIX/FUSE is never treated as native
+Linux. If the host Windows resolver cannot run, the routine halts before lifecycle rather than
+falling back to sandbox Python; Claude uses the Desktop Code tab with Environment: Local on native
+Windows, not Cowork/local-agent. Before a write-capable lifecycle mutation opens production state,
+the helper rejects known shared mounts and probes unknown POSIX filesystems using disposable state.
+A failed lifecycle start is terminal:
+no later probes or run artifacts. The dashboard remains read-only and gives the supported
+host-native `run_lifecycle.py export` recovery action. No agent or operator manually deletes,
+renames, overwrites, edits, or bypasses SQLite journal/WAL/SHM sidecars.
+
+**2026-08-11 14:59 follow-up, the new guard halted safely but the recovery instruction was
+incomplete.** The next Claude scheduled attempt ran in a Bash execution context and the sole
+bootstrap command failed with exit 127 because `powershell.exe` was not found. This time the agent
+followed the hardened rule: it did not substitute sandbox Python, did not start lifecycle, made no
+Robinhood call, and created no report, status, lock, intent, or other run artifact. Repository and
+lifecycle timestamps confirmed that the attempt wrote nothing.
+
+Screenshots showed the Code tab with the **Local** sidebar filter and new-session selector already
+selected, but those controls do not migrate an existing scheduled task. Although the exported run
+contained no scheduler metadata, app-local session provenance placed it under
+`local-agent-mode-sessions`, labeled it `sessionType: scheduled`, and linked it to the legacy task
+store. The native Code scheduler task list was empty, while genuine Code Local sessions launched
+PowerShell. This definitively identified the 14:59 firing as the legacy Cowork/local-agent task.
+Telling the operator only to “select Local” therefore repeated an action already taken and did not
+migrate the schedule.
+
+**Follow-up rule produced:** pause the legacy task and create a new, uniquely named task through
+Code → Routines → New routine → Local, bound to the exact native Windows main checkout with
+worktree isolation off. Run it once under supervision with `DRY_RUN = true`; require both the
+PowerShell resolver and `get_accounts`, then the complete lifecycle/report/status/dashboard smoke
+test. Delete the paused legacy task only after that proof. Until this succeeds, the Claude Code
+scheduler path remains unproven end to end.
+
+**2026-08-11 15:55 resolution, native Claude Code Local demonstrated the platform path but did not
+complete the prescribed acceptance test.** Part A alone ran from the native Windows main checkout
+with worktree isolation off and `DRY_RUN = false`; Part B was never tested with **Run now**. Part A
+used PowerShell and one resolver-bound Windows Python, called `get_accounts` and the required
+read-only account tools, completed lifecycle and lease handling, published its report and status
+snapshot, released the lease, and left the dashboard healthy. Monitoring observed no unexpected
+SQLite journal, WAL, or SHM sidecar.
+
+The account was flat and the run occurred after hours, so the regular-hours-only gate skipped the
+entry path before the scan, daily-loss snapshot, or any order work. No order-mutation tool was
+called. That made the live-mode run safe, but it proves only the native execution substrate,
+connector/account-read path, coordination state, artifacts, and dashboard—not the required
+`DRY_RUN = true` acceptance, Part B, an entry-eligible scan, or an order path.
+
+The installed Claude Local form rejected the twice-hourly expression `0,30 6-13 * * 1-5`
+with “Scheduled tasks must run at most once per hour.” The documented workaround uses two complementary
+hourly Local tasks with the same prompt: Part A `0 6-13 * * 1-5` and Part B
+`30 6-13 * * 1-5`. Because a saved Custom cron becomes active immediately, the safe rule is to
+create both tasks with **Schedule: Manual**, test each with **Run now** and `DRY_RUN = true`, inspect
+each task's Allowed permissions, and add the Custom crons only after both proofs pass. If a cron
+task already exists, immediately Pause it in task detail and verify that it is disabled and no run
+began. The permission control currently labeled **Auto** must not auto-approve
+`place_equity_order` or `cancel_equity_order`; if the build cannot keep both approval-gated, live
+Claude trading stays disabled. Cron previews must show the intended Pacific bounds after any
+timezone conversion, and randomized start delays are expected.
+
+Legacy cleanup remains separate: return to the original Cowork/Scheduled interface, pause the
+legacy task there, and verify that it no longer fires. The Code Routines list does not control it.
+Delete the legacy task only after both replacement proofs pass and no further legacy firing occurs.
+
 ## BROKER TIMESTAMPS
 
 **2026-07-17.** `datetime.fromisoformat()` in the sandbox raised

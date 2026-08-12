@@ -7,5 +7,6 @@ trade-ledger.csv
 __pycache__/
 ALERTS.md
 HANDOFF.md
+memory.md
 .handoffs/
 .vs/

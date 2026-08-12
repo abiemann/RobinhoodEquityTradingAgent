@@ -65,12 +65,45 @@ All tunable values live in **`constants.md`** next to the routine document — m
 
 The preferred models are **Claude Sonnet 4.6** and **Codex Luna 5.6 (high)**. If neither is available, let the framework select a **medium-strength** general-purpose model.
 
-| AI | Model / configuration |
-|---|---|
-| Claude | Sonnet 4.6 |
-| Codex | Luna 5.6 (high) |
+| Runner | Model / configuration | After-hours observed runtime | Market-hours observed runtime | Status |
+|---|---|---|---|---|
+| Claude Desktop Code tab, Environment Local, native Windows checkout | `claude-sonnet-4-6`; `effort=high` | 4m40 End-to-end task (Claude transcript observation); 4m05 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | Pending — measure during a market-hours run | Part A native bootstrap/MCP reads/lifecycle+lease/artifacts/dashboard observed 2026-08-11; prescribed per-task `DRY_RUN` acceptance still required before entry-eligible or live use |
+| Codex | `gpt-5.6-luna`; `reasoning=high` | 6m03 End-to-end task (Codex app UI); 4m16 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | 17m41 End-to-end task (Codex runner metadata); 14m24 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | Tested |
+
+These are observed wall-clock times on this installation, not controlled benchmarks. The after-hours End-to-end task comparison is about 4m40 for Claude versus 6m03 in the Codex app UI. The workloads are comparable—both used a flat account and skipped the entry path—but the End-to-end task sources are not identical; the supporting Routine total durations were 4m05 for Claude and 4m16 for Codex. Likewise, the Codex market-hours End-to-end task took 17m41, while its representative 2026-08-10 full market-hours Routine total with a 15-candidate scan recorded 14m24. Market-hours workloads can include the daily-loss snapshot, scan, and candidate/order evaluation, so compare each session class separately. Claude's market-hours timing has not yet been measured.
+
+Use these names consistently in future comparisons:
+
+- **End-to-end task** is the framework-observed interval from task dispatch/turn start through final framework completion. The current task cannot know its own completion timestamp, so this value is recorded only after the run as an observation with an explicit source, such as Codex app UI or a Claude transcript.
+- **Routine total** is `lifecycle finished_at_utc - lifecycle started_at_utc`.
+- **Strategy execution** is `REPORT renewal renewed_at - first FIRST renewal renewed_at`.
+- **Routine overhead** is `Routine total - Strategy execution`.
+
+The portion outside the routine is `End-to-end task - Routine total`. If either strategy boundary is unavailable, Strategy execution and Routine overhead are unavailable rather than zero. New internal measurements are persisted by `run_performance.py`; the local [dashboard](#tools) compares them by market session, runner, model, and configuration. Keep after-hours and market-hours observations separate because their workloads differ materially.
+
+After the framework shows that a task has completed, a later observer—not the completed task itself—can attach the End-to-end task observation with `run_performance.py observe-task`, the lifecycle `invocation_id`, duration in milliseconds, the same runner/model/configuration identity, and explicit identity and clock sources. Use `codex-worked-for` only for Codex's displayed Worked for duration, `claude-run-duration` only for Claude's recorded run duration, or the matching manual source for a real stopwatch/observation. The helper rejects a task duration shorter than Routine total and preserves the source alongside the value.
+
+After resolving and binding the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>` and copy exactly one matching PowerShell command:
+
+Codex displayed **Worked for** duration:
+
+```powershell
+& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner codex --model 'gpt-5.6-luna' --configuration 'reasoning=high' --identity-source manual-ui --clock-source codex-worked-for
+```
+
+Claude recorded run duration:
+
+```powershell
+& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-4-6' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
+```
+
+These two templates are only for a human reading the named UI/transcript duration and confirming the selected task settings, which is why their identity source is `manual-ui`. A real framework-provided observation must retain `--identity-source run-metadata` and `--clock-source runner-metadata`; never relabel runner metadata as an app-UI observation. In a POSIX-style shell, use the same arguments without PowerShell's leading `&`.
+
+The observed 2026-08-11 Claude Desktop Code Local run was **Part A only**, used `DRY_RUN = false`, and Part B was never tested with **Run now**. It was safe because it ran after hours with a flat account and made no order-mutation tool call. It proved native PowerShell bootstrap with one resolver-bound Windows Python, Robinhood `get_accounts` and account reads, lifecycle and lease handling, report/status publication, lease release, and dashboard health; it did not complete the prescribed `DRY_RUN = true` acceptance test or exercise the entry-eligible scan, daily-loss snapshot, or order path. Every installation and task still requires that supervised proof before entry-eligible or live use; follow the [Claude Desktop Local scheduling guide](CLAUDE-LOCAL-SCHEDULING.md). A **Local** filter in the Code sidebar or the **Local** selector for a new session does not migrate an existing scheduled task; an older Cowork/local-agent task can still own its scheduled firing. The replacement task must use this native Windows main checkout with worktree isolation **off** so it shares the local uncommitted configuration and gitignored runtime state. Do not run the live routine from Cowork/local-agent, a cloud/remote session, or WSL access to the Windows checkout: those paths do not provide the same local SQLite and atomic-replace semantics. Before any write-capable lifecycle mutation opens production state, the helper rejects known shared mounts and probes unknown POSIX filesystems using disposable state.
 
 ## Guardrails
+
+- **Execution-substrate preflight**: before a non-Windows runtime opens production lifecycle state for mutation, `run_lifecycle.py` rejects known FUSE/DrvFS/9P shared mounts and probes unknown filesystems with a disposable SQLite commit, cross-process writer-exclusion check, and replacement of an existing file. A Cowork/local-agent Linux VM sharing this Windows checkout fails closed before lifecycle mutation or broker access.
 
 - **Verified Python bootstrap**: before lifecycle startup, Windows scheduled runs use the checked-in resolver to reject Microsoft Store aliases, launch-probe permitted absolute Python 3 runtimes, and bind one executable for the whole invocation. A stalled workspace-runtime lookup or inaccessible `WindowsApps` stub cannot masquerade as "Python missing" while a real interpreter is available.
 - **Account scope** resolved by name every run; halts if the name matches zero, multiple, or a non-agentic account — never falls back to another account.
@@ -117,7 +150,7 @@ It is a separate file for a practical reason. The routine document is executed b
 ## Testing before going live
 
 1. Leave `DRY_RUN = true` and let a few supervised runs log the **new entries** they *would* have placed. Do the same after any strategy-constant change. Important: dry run does not make an account read-only; if the selected account already holds positions, profit-taking, stop repairs, and residue sweeps remain live.
-2. Keep `place_equity_order` on **"Needs approval"** in the agent's tool permissions.
+2. Keep both `place_equity_order` and `cancel_equity_order` on **"Needs approval"** (or the platform's equivalent) in the agent's tool permissions. Neither mutation tool may be preapproved. In Claude, where the control may be labeled **Auto**, inspect **Allowed permissions** and require both tools to remain approval-gated; if that cannot be guaranteed, stop before running the routine or enabling live trading.
 3. Run for several sessions and confirm: the candidate list looks sane, approvals actually fire on the scheduled runner, notifications land, and fills + stop placement behave.
 4. In dry run, confirm the broker accepts the documented order flows. The current connector's canonical stop-market payload uses `type: "stop_market"` plus `stop_price`, with no `trigger` input — so do not rediscover or improvise stop fields during a live run; a review alert is a safety failure to report, not a reason to try another schema.
 5. Only after the above look right, consider dropping the approval gate and going live by locally setting `DRY_RUN = false` in `constants.md` (an uncommitted edit).
@@ -132,6 +165,7 @@ The routine document is executed by an LLM, so **none of the math lives in it.**
 - **market_clock.py** + **market_calendar.py** — the run's clock and reviewed NYSE calendar, first executed as the **first operational action after the configuration preflight**. The start reading provides distinct Eastern broker and Pacific report dates, the report header and filename, market session, exchange-calendar verdict, stop-fill windows, re-entry cooldown windows, and opening-blackout verdict. The same script is re-run around the daily-loss snapshot, at the buy boundary, and for fresh order-intent baselines/reconciliation cutoffs so no guard or placement uses a stale timestamp; those later readings never change run filenames or historical windows. `NO_BUY_FIRST_MINUTES` is loaded through the same full constants validator, so the value is never re-typed and malformed sibling settings cannot slip past the clock's second read. Every clock result also carries the constants-file SHA-256, which must match the preflight hash so a mid-run edit cannot mix two configurations. The checked-in calendar covers 2026–2028 full closures and 1:00 p.m. ET early closes; dates outside that coverage fail closed for entries. The clock derives US DST offsets from the rule itself rather than the OS timezone database, because `TZ=`/`zoneinfo` lookups fail *silently* on hosts without tzdata — Windows returns GMT rather than erroring, and a wrong-but-plausible clock is worse than none.
 - **run_lock.py** — the broker single-writer guard, run immediately after the start clock. A one-row SQLite transaction makes acquisition/takeover atomic across platforms; acquire/renew/release return machine-readable JSON and a fencing token. The lease is stored under gitignored `run-reports/`, and a malformed database or ownership mismatch fails closed.
 - **run_lifecycle.py** — the invocation-history authority. It journals an attempt before configuration or broker access and publishes a bounded, validated, privacy-safe projection, so overlap, lease loss, configuration/coordination halt, snapshot failure, risk halt, and final-status failure remain visible even when no account snapshot can be written.
+- **run_performance.py** — the non-authoritative performance recorder. After lifecycle finish it joins the lifecycle timestamps to the already-required FIRST and REPORT lease-renewal boundaries, computes Routine total, Strategy execution, and Routine overhead deterministically, and publishes a bounded projection for the dashboard. Missing timing data can make a metric unavailable, but can never change trading, report/status data, or lifecycle outcome. End-to-end task remains a separately sourced post-run observation because a task cannot observe its own final framework completion.
 - **order_intents.py** — the durable placement-lifecycle authority. It creates and persists one immutable `ref_id` plus the exact reviewed payload before submission, records broker acknowledgements/fills, verifies pagination cursor continuity, reconciles lost responses by broker ID or one exact post-baseline fingerprint, and permits at most one same-run same-key retry after a proven no-match. Its local SQLite journal also links the single allowed zero-fill stop retry and blocks corrupt, ambiguous, stale, or cross-run replay state.
 - **broker_snapshot.py** — the daily-loss transport and staging authority. It validates the scratch marker and external response-source probe, unwraps only known transport envelopes, enforces kind-specific broker schemas and pagination rules, writes atomically, verifies hashes/read-back, and seals coherent A/B generations so a retry cannot mix old and new pages.
 - **daily_loss.py** — the circuit-breaker authority. It consumes raw, fully paginated portfolio/position/order responses and raw quote batches, filters individual executions by Eastern broker date, reconciles them against `intraday_quantity`, and calculates mark-to-market P&L with exact decimal arithmetic. Old GTC orders that fill today, partial fills, same-day round trips, execution fees, and overnight holdings are all included; malformed or incomplete input can only block entries.
@@ -172,9 +206,9 @@ again. Do not run scheduled trading until that fresh-task check succeeds.
 
 ![ChatGPT/Codex Robinhood MCP connector configuration](images/codex-robinhood-mcp-connector.png)
 
-### Robinhood MCP connector (CLAUDE)
+### Robinhood MCP connector (CLAUDE CODE)
 
-In Claude, open **Settings → Connectors → Add → Add custom connector** and enter:
+In Claude Desktop, open **Customize → Connectors** (or **Settings → Connectors**, depending on the version), choose **+ → Add custom connector**, and enter:
 
 | Field | Value |
 |---|---|
@@ -186,25 +220,37 @@ Then click **Add**, then:
 1. Complete Robinhood's authorization flow.
 2. Restart Claude so the MCP settings take effect.
 
-A successful setup exposes tools such as `get_accounts`.
+A connector added to the Claude account is available to Claude Code when Claude Code is signed in with that same subscription. For setup or recovery, use Claude Desktop first: open **Customize → Connectors** (or **Settings → Connectors**) and confirm that exactly one Robinhood account connector exists and is authorized. Do not add a duplicate. Then open `/mcp` in a Claude Desktop **Code** tab session with **Environment: Local** on this native Windows main checkout with worktree isolation **off**, select the Robinhood server, and choose **Re-authenticate**. If reauthentication still fails, return to **Customize → Connectors** (or **Settings → Connectors**), remove only that single existing Robinhood connector, add it back once there, complete OAuth, and restart Claude; never leave or create a duplicate. Open a fresh session on that same native Windows main checkout with worktree isolation **off** and verify `get_accounts`. If you use a Desktop local scheduled task, click **Run now** and require `get_accounts` there too; success proves the scheduled context can see the connector. Only if no account connector exists and the standalone `claude` CLI is installed may you optionally add the server once with `claude mcp add --transport http robinhood-trading https://agent.robinhood.com/mcp/trading`, complete OAuth through `/mcp`, and optionally confirm it with `claude mcp list`; never use the CLI to create a duplicate. A successful setup exposes tools such as `get_accounts`.
 
 ![Claude Robinhood MCP connector configuration](images/claude-robinhood-mcp-connector.png)
 
-### Scheduled Task
+### Scheduling
 
-Create a scheduled task with this project folder as its working directory, enable **Act** mode, and use **Claude Sonnet 4.6** or **Codex Luna 5.6 (high)**. If neither preferred model is available, let the framework select a medium-strength general-purpose model. The prompt can be:
+For Codex, create a scheduled task with this project folder as its working directory, enable **Act** mode, and select **Codex Luna 5.6** with **reasoning high** (`gpt-5.6-luna`, `reasoning=high`).
 
+For Claude, follow the illustrated [Claude Desktop Local scheduling guide](CLAUDE-LOCAL-SCHEDULING.md). Changing the Code sidebar to **Local**, or selecting **Local** for a new session, does not migrate an existing scheduled task. Return to the original **Cowork/Scheduled** interface, pause the legacy task there, and verify that it no longer fires; the Code **Routines** list does not control it. In Claude Desktop, create **new, uniquely named** Part A and Part B tasks through **Code → Routines → New routine → Local**, select this exact native Windows project folder, choose Sonnet 4.6, keep the isolated-worktree option **off**, and save both with **Schedule: Manual** first. A saved Custom cron becomes active immediately. If a cron task already exists, immediately Pause it in task detail and verify that it is disabled and no run began. With `DRY_RUN = true`, use **Run now** on both Manual tasks and require the Windows PowerShell resolver, `get_accounts`, lifecycle, report/status publication, lease release, dashboard health, and safe Allowed permissions. Only after both proofs pass should you edit each task to its Custom cron and activate the schedules. Delete the legacy task only after both replacement proofs pass and no further legacy firing occurs. The observed Part A live-mode run proved the native platform path only; it was not the prescribed acceptance test, and Part B remains untested.
+
+Use this prompt in Codex:
+
+> TIMING_IDENTITY: runner=codex model=gpt-5.6-luna config=reasoning=high
+>
 > Treat every run as stateless: never use automation memory for trading decisions or prior-run state. If the automation framework requires `memory.md`, overwrite it with only the one-line report/status pointer specified by the routine; never append scan or account details.
 >
-> Read `\RobinhoodEquityTradingAgent\robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
+> Read `./robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 
-For the recurring schedule, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. Keep the computer awake while the task is expected to run. Before enabling live orders, keep `DRY_RUN = true` and leave `place_equity_order` set to **Needs approval**.
+Use this prompt in Claude Desktop Code Local:
+
+> TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 config=effort=high
+>
+> Treat every run as stateless: never use automation memory for trading decisions or prior-run state. If the automation framework requires `memory.md`, overwrite it with only the one-line report/status pointer specified by the routine; never append scan or account details.
+>
+> Read `./robinhood-momentum-routine-autonomous.md` and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
+
+Keep exactly one `TIMING_IDENTITY` line in each task. It must stay synchronized with the runner, model, and configuration actually selected in that task's settings; if any selection changes, update the declaration before the next run. The line records the selection for comparison and does not switch the model.
+
+For Codex, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. The Claude Desktop Local form observed on 2026-08-11 rejected a single twice-hourly expression with **“Scheduled tasks must run at most once per hour.”** After both Manual proofs pass, give the same prompt to Part A with `0 6-13 * * 1-5` and Part B with `30 6-13 * * 1-5`. Cron uses the local machine/app timezone: require both previews to show the intended Pacific bounds, and convert the hours if the machine is not on Pacific time. Claude applies randomized start delays. Claude Desktop must remain open, and the computer must remain awake and online. The task-form permission control is currently labeled **Auto**; choose and verify a mode that does not auto-approve `place_equity_order` or `cancel_equity_order`, then inspect each task's Allowed permissions after **Run now**. If both mutation tools cannot remain approval-gated, do not enable live Claude trading.
 
 Only one instance of the trading agent can operate at a time. If another scheduled instance starts while one is already running, the new instance stops before connecting to Robinhood or placing or cancelling any orders. If the first instance crashed, its lock expires automatically so the next scheduled run can take over safely; the old instance can no longer place or cancel orders.
-
-### Scheduled Task Example
-
-![Claude scheduled task configured to run the Robinhood trading routine](images/scheduled-task-example.png)
 
 ### View on Phone setup (optional)
 
@@ -284,7 +330,11 @@ This override sends token requests directly to Google's HTTPS endpoint and delib
 
 - **Dashboard** (`dashboard/serve.py` + `dashboard/index.html`) — a local web view of the day's trading. Run `python3 dashboard/serve.py` (Windows: `py -3 dashboard\serve.py`) and open `http://127.0.0.1:8765/`. Stop it with **Ctrl+C** in its terminal; if it was started detached, kill it by port — Windows PowerShell: `Stop-Process -Id (Get-NetTCPConnection -LocalPort 8765 -State Listen).OwningProcess -Force`, or macOS/Linux: `lsof -ti:8765 | xargs kill`. Pass a different port as the first argument (`py -3 dashboard\serve.py 9000`) if 8765 is taken. Shows account value, cash, and buying power; open positions with purchase price, current price, unrealized P&L, **stop coverage** (a position without an active stop is flagged UNPROTECTED), and distance to stop; a timeline of today's runs with the reason each one skipped or traded; and per-rules-era strategy ledger totals, newest era first. Robinhood's account-wide realized P&L remains the headline authority; exact integer-cent strategy totals are shown separately, with a visible warning when basis is incomplete or the figures genuinely differ. Completed closed/unknown-calendar skips use neutral `market closed` / `calendar unavailable` labels, while real lifecycle failures remain distinct red outcomes. Standard library only — no install, no build step. It is a pure viewer: it reads the per-run status snapshots, gate records, and ledger that the routine already writes, holds **no broker credentials**, places no orders, and binds to localhost only (the data includes account activity and must never be exposed off-machine). Optional phone viewing remains off until configured and explicitly started. Its Google Drive/PWA path uploads only an encrypted display snapshot to the user's hidden Drive app-data area and cannot place orders. Data freshness matches the run cadence — a snapshot up to ~30 minutes old is normal and the page says how old it is. If the snapshot format ever changes (`schema_version`), the dashboard refuses to render rather than misreading it.
 
-  Its run timeline also reads the helper-validated lifecycle projection, so invocations that have no account status file still appear as `snapshot failure`, `overlap skipped`, `lease lost`, `configuration halt`, or `coordination halt`. The private SQLite lifecycle journal and projection file are not served as static files.
+  Its run timeline also reads the helper-validated lifecycle projection, so invocations that have no account status file still appear as `snapshot failure`, `overlap skipped`, `lease lost`, `configuration halt`, or `coordination halt`. The private SQLite lifecycle journal and projection file are not served as static files. If SQLite reports an interrupted rollback journal, the dashboard remains read-only and tells the operator to pause runners, run the checked-in Windows resolver, bind its exact returned `PYTHON_EXE`, and execute that interpreter with `run_lifecycle.py export`; it never attempts recovery itself, a bare `py`/`python`/`python3` is not a supported substitute, and the `.sqlite3-journal` sidecar must never be deleted manually.
+
+  On a genuinely native Linux/macOS checkout, use the already-bound absolute host `python3` executable with `run_lifecycle.py export`.
+
+  The **Run performance — local timing by runner and model** panel stays compact until it is needed. A small `*` in the top-right corner of a **Runs today** chip means that exact lifecycle invocation has timing data; select the marked chip with a mouse, touch, Enter, or Space to show only that run's Start/session, Runner/model/configuration, End-to-end task, Routine total, Strategy execution, and Routine overhead. Matching is by exact lifecycle `invocation_id`, never by a nearby timestamp, and the selection clears when the run is no longer in today's timeline. Missing durations display as `not measured`, not zero. End-to-end task appears only after a post-run observation supplies its explicit clock source; tooltips preserve that source and the underlying timing boundaries. Performance data is a separate local-only projection: an unavailable or invalid performance file produces an isolated nonfatal notice, suppresses timing markers, and cannot change the run timeline, trading data, profit display, or phone view.
 
   ![RHMRA Dashboard showing account totals, the View on Phone control, a flat positions panel, today's run timeline, and strategy realized P&L by rules era](images/dashboard-example.png)
 
