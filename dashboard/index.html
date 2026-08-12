@@ -249,6 +249,7 @@ const ERA_ROW_LIMIT = 12;
 let erasExpanded = false;
 let eraDateSignature = null;
 const PHONE_SHARE_SCHEMA = 1;
+const PHONE_SHARE_TOOLTIP_LIMIT = 500;
 const LEDGER_ROUNDING_POLICY = "per-fill-half-away-from-zero-to-cent";
 let latestPnlReconciliation = null;
 let performanceRecordsByInvocation = new Map();
@@ -1536,6 +1537,27 @@ function performanceIdentity(record) {
   return parts.length ? parts : null;
 }
 
+function phoneTimingSummary(record) {
+  if (!validPerformanceRecord(record)) return null;
+  const identity = performanceIdentity(record)?.join(' / ') ?? 'not measured';
+  const summary = [
+    `Timing — session: ${performanceSessionLabel(record.session)}`,
+    `runner / model / configuration: ${identity}`,
+    `End-to-end task: ${formatPerformanceDuration(record.task_duration_ms)}`,
+    `Routine total: ${formatPerformanceDuration(record.routine_total_ms)}`,
+    `Strategy execution: ${formatPerformanceDuration(record.strategy_execution_ms)}`,
+    `Routine overhead: ${formatPerformanceDuration(record.routine_overhead_ms)}`,
+  ].join('\n');
+  return summary.length <= PHONE_SHARE_TOOLTIP_LIMIT ? summary : null;
+}
+
+function appendPhoneTimingSummary(baseTooltip, record) {
+  const summary = phoneTimingSummary(record);
+  if (!summary) return baseTooltip;
+  const combined = baseTooltip ? `${baseTooltip}\n${summary}` : summary;
+  return combined.length <= PHONE_SHARE_TOOLTIP_LIMIT ? combined : baseTooltip;
+}
+
 function performanceDurationCell(milliseconds, detailParts = []) {
   const measured = Number.isSafeInteger(milliseconds) && milliseconds >= 0;
   const display = formatPerformanceDuration(milliseconds);
@@ -1839,12 +1861,18 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
 }
 
 function collectRunView() {
-  return [...$('runs').querySelectorAll('.run')].map(chip => ({
-    time: chip.querySelector('.t')?.textContent?.trim() || '',
-    label: chip.querySelector('.o')?.textContent?.trim() || '',
-    phase: ['ran', 'skipped', 'halted'].find(name => chip.classList.contains(name)) || '',
-    tooltip: chip.getAttribute('title') || '',
-  }));
+  return [...$('runs').querySelectorAll('.run')].map(chip => {
+    const invocationId = chip.dataset.performanceInvocationId;
+    const record = invocationId
+      ? performanceRecordsByInvocation.get(invocationId) ?? null : null;
+    const baseTooltip = chip.getAttribute('title') || '';
+    return {
+      time: chip.querySelector('.t')?.textContent?.trim() || '',
+      label: chip.querySelector('.o')?.textContent?.trim() || '',
+      phase: ['ran', 'skipped', 'halted'].find(name => chip.classList.contains(name)) || '',
+      tooltip: appendPhoneTimingSummary(baseTooltip, record),
+    };
+  });
 }
 
 function aggregateEras(rows) {

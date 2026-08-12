@@ -323,21 +323,77 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("performanceRecordsByInvocation = new Map()", unavailable)
         self.assertIn("selectedPerformanceInvocationId = null", unavailable)
 
-    def test_performance_is_absent_from_phone_view(self):
+    def test_phone_timing_summary_is_bounded_display_only_and_schema_compatible(self):
+        summary_start = self.source.index("function phoneTimingSummary")
+        append_start = self.source.index(
+            "function appendPhoneTimingSummary", summary_start
+        )
+        summary = self.source[summary_start:append_start]
+        append_end = self.source.index(
+            "function performanceDurationCell", append_start
+        )
+        append = self.source[append_start:append_end]
+
+        self.assertIn("if (!validPerformanceRecord(record)) return null", summary)
+        self.assertIn("PHONE_SHARE_TOOLTIP_LIMIT = 500", self.source)
+        self.assertIn(
+            "summary.length <= PHONE_SHARE_TOOLTIP_LIMIT ? summary : null",
+            summary,
+        )
+        self.assertIn("].join('\\n')", summary)
+        self.assertIn("if (!summary) return baseTooltip", append)
+        self.assertIn("`${baseTooltip}\\n${summary}`", append)
+        self.assertIn(
+            "combined.length <= PHONE_SHARE_TOOLTIP_LIMIT ? combined : baseTooltip",
+            append,
+        )
+        for label in (
+            "session:",
+            "runner / model / configuration:",
+            "End-to-end task:",
+            "Routine total:",
+            "Strategy execution:",
+            "Routine overhead:",
+        ):
+            self.assertIn(label, summary)
+        for private_field in (
+            "invocation_id",
+            "started_at",
+            "finished_at",
+            "identity_source",
+            "clock_source",
+            "observed_at",
+            "status_file",
+            "path",
+        ):
+            self.assertNotIn(private_field, summary)
+
         start = self.source.index("function buildPhoneView")
         end = self.source.index("function base64Url", start)
         phone_view = self.source[start:end]
-        self.assertNotIn("performance", phone_view.lower())
+        self.assertIn("runView.push({ time, label, phase, tooltip })", phone_view)
         self.assertIn("runs: runView", phone_view)
         self.assertIn("eras: eraView", phone_view)
+        self.assertNotIn("timing:", phone_view.lower())
+
+    def test_phone_timing_uses_only_exact_starred_chip_invocation_lookup(self):
         collect_start = self.source.index("function collectRunView")
         collect_end = self.source.index("function aggregateEras", collect_start)
         collect = self.source[collect_start:collect_end]
+        self.assertIn("chip.dataset.performanceInvocationId", collect)
+        self.assertIn(
+            "performanceRecordsByInvocation.get(invocationId)", collect
+        )
+        self.assertIn(
+            "tooltip: appendPhoneTimingSummary(baseTooltip, record)", collect
+        )
         self.assertIn("chip.querySelector('.t')", collect)
         self.assertIn("chip.querySelector('.o')", collect)
         self.assertIn("['ran', 'skipped', 'halted'].find", collect)
-        self.assertNotIn("performanceInvocationId", collect)
+        self.assertNotIn("performanceStartLabel", collect)
+        self.assertNotIn("lifecycle_started_at_utc", collect)
         self.assertNotIn("run-performance-marker", collect)
+        self.assertNotIn("timing:", collect.lower())
 
     def test_mobile_performance_rows_expose_column_labels(self):
         self.assertIn(".performance-table td::before", self.source)
