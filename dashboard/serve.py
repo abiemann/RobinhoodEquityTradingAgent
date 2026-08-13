@@ -790,6 +790,14 @@ def _canonical_request_path(request_path):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # Reports are written and strict-read as UTF-8.  The stdlib MIME database
+    # returns bare text/markdown, which lets browsers guess a legacy Windows
+    # encoding and display valid symbols such as checkmarks as mojibake.
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".md": "text/markdown; charset=utf-8",
+    }
+
     # Drain every body the API itself accepts so an early auth rejection can
     # still reach the browser cleanly. Larger, unsupported bodies remain
     # bounded and are deliberately left alone.

@@ -4922,6 +4922,9 @@ class DashboardServerTests(unittest.TestCase):
             (os.path.join(
                 "run-reports", "rhmra-status-2026_08_04-12_02.json"
             ), "{}"),
+            (os.path.join(
+                "run-reports", "rhmra-log-2026_08_04-12_02.md"
+            ), "Report symbols: \u2713 \u2014\n"),
         ):
             with open(os.path.join(self.repo, name), "w", encoding="utf-8") as f:
                 f.write(content)
@@ -5017,6 +5020,25 @@ class DashboardServerTests(unittest.TestCase):
 
         self.assertEqual(self.request("GET", "/favicon.svg")[0], 403)
         self.assertEqual(self.request("GET", "/README.md")[0], 403)
+
+    def test_markdown_reports_declare_utf8_for_get_and_head(self):
+        path = "/run-reports/rhmra-log-2026_08_04-12_02.md"
+        expected_text = "Report symbols: \u2713 \u2014" + os.linesep
+        expected = expected_text.encode("utf-8")
+        for method in ("GET", "HEAD"):
+            status, body, headers = self.request_details(method, path)
+            self.assertEqual(status, 200, method)
+            self.assertEqual(
+                headers.get("content-type"),
+                "text/markdown; charset=utf-8",
+                method,
+            )
+            self.assertEqual(headers.get("content-length"), str(len(expected)))
+            if method == "GET":
+                self.assertEqual(body, expected)
+                self.assertEqual(body.decode("utf-8"), expected_text)
+            else:
+                self.assertEqual(body, b"")
 
     def test_config_reports_dashboard_settings_and_fails_closed(self):
         status, body = self.request("GET", "/api/config")
