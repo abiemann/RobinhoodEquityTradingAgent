@@ -79,15 +79,18 @@
          padding:4px 10px; border-radius:6px; border:1px solid var(--blue); cursor:default; }
   .run .t { font-size:12px; font-weight:600; color:var(--text); }
   .run .o { font-size:11px; color:var(--dim); white-space:nowrap; }
-  button.run.has-performance { position:relative; min-height:44px; padding-right:16px;
-                               appearance:none; background:transparent; color:inherit;
-                               line-height:inherit; cursor:pointer; }
-  button.run.has-performance:hover { background:#252a31; }
-  button.run.has-performance:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
-  button.run.has-performance.performance-selected { background:#24303b;
-                                                     box-shadow:inset 0 0 0 1px var(--blue); }
-  .run-performance-marker { position:absolute; top:2px; right:4px; color:var(--blue);
-                            font-size:11px; font-weight:700; line-height:1; }
+  button.run.has-details { position:relative; min-height:44px; padding-right:16px;
+                           appearance:none; background:transparent; color:inherit;
+                           line-height:inherit; cursor:pointer; }
+  button.run.has-details:hover { background:#252a31; }
+  button.run.has-details:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+  button.run.has-details.performance-selected { background:#24303b;
+                                                 box-shadow:inset 0 0 0 1px var(--blue); }
+  .run-detail-marker { position:absolute; top:2px; right:4px;
+                       font-size:11px; font-weight:700; line-height:1;
+                       color:var(--green); }
+  .run-detail-marker.health-warning { color:var(--amber); }
+  .run-detail-marker.health-error { color:var(--red); }
   #performance-section { display:grid; grid-template-rows:0fr; min-width:0;
                          padding:0; margin-bottom:0; border:0; border-radius:0;
                          background:transparent; opacity:0; overflow:hidden;
@@ -107,6 +110,18 @@
   .performance-notice { margin-bottom:10px; padding:8px 10px; border:1px solid #665522;
                         border-radius:6px; background:#292516; color:var(--amber); }
   .performance-notice[hidden] { display:none; }
+  .run-detail-diagnostic { display:flex; align-items:flex-start; gap:10px;
+                           margin-bottom:12px; padding:10px 12px; border:1px solid var(--line);
+                           border-radius:6px; background:#181b20; }
+  .run-detail-diagnostic.healthy { border-color:#24583d; }
+  .run-detail-diagnostic.warning { border-color:#665522; background:#292516; }
+  .run-detail-diagnostic.error { border-color:var(--red); background:#3a1f1d; }
+  .run-detail-diagnostic strong { flex:0 0 auto; }
+  .run-detail-diagnostic.healthy strong { color:var(--green); }
+  .run-detail-diagnostic.warning strong { color:var(--amber); }
+  .run-detail-diagnostic.error strong { color:var(--red); }
+  .run-detail-copy { min-width:0; overflow-wrap:anywhere; }
+  .run-detail-report { display:inline-block; margin-top:4px; color:var(--blue); }
   .performance-scroll { width:100%; overflow-x:auto; }
   .performance-table { min-width:820px; }
   .performance-table th:first-child, .performance-table td:first-child,
@@ -239,12 +254,13 @@
          aria-hidden="true" inert>
   <div class="performance-collapse-track">
     <div class="performance-panel">
-      <h2 id="performance-heading">Run performance <span class="hint">&mdash; local timing by runner and model;
-        <span aria-hidden="true">*</span> timing available &mdash; select a marked run above</span></h2>
+      <h2 id="performance-heading">Run details <span class="hint">&mdash; green success, orange warning,
+        red error &mdash; select a marked run above</span></h2>
+      <div id="run-detail-diagnostic" role="status" aria-live="polite"></div>
       <div id="performance-notice" class="performance-notice" role="status"
            aria-live="polite" hidden></div>
       <div class="performance-scroll">
-        <div id="performance" role="status" aria-live="polite"><span class="empty">Select a starred run above to view its timing details.</span></div>
+        <div id="performance" role="status" aria-live="polite"><span class="empty">Select a marked run above to view its details.</span></div>
       </div>
     </div>
   </div>
@@ -276,9 +292,12 @@ const PHONE_SHARE_TOOLTIP_LIMIT = 500;
 const LEDGER_ROUNDING_POLICY = "per-fill-half-away-from-zero-to-cent";
 let latestPnlReconciliation = null;
 let performanceRecordsByInvocation = new Map();
-let selectedPerformanceInvocationId = null;
+let runDetailsByInvocation = new Map();
+let selectedRunInvocationId = null;
 let performanceTelemetryUnavailable = false;
+let performanceTelemetryMessage = "";
 let performanceScrollEpoch = 0;
+let runDetailContentEpoch = 0;
 
 const STATUS_SNAPSHOT_FIELDS = [
   "schema_version", "run_start_pt", "rules_version", "dry_run", "session",
@@ -1701,6 +1720,22 @@ function lifecycleOwnsFillWindow(record) {
   return true;
 }
 
+function warningBelongsToReportedRun(warning, lifecycleDocument, reportNames) {
+  if (!warning || typeof warning !== "object") return false;
+  const filename = warning.code === "newest_snapshot_rejected"
+    ? warning.rejected_filename
+    : warning.code === "newer_snapshot_orphaned"
+      ? warning.orphaned_filename : null;
+  if (typeof filename !== "string") return false;
+  const reports = new Set(reportNames || []);
+  const records = Array.isArray(lifecycleDocument?.records)
+    ? lifecycleDocument.records : [];
+  return records.some(record =>
+    record?.status_file === filename &&
+    typeof record?.report_file === "string" &&
+    reports.has(record.report_file));
+}
+
 const PERFORMANCE_DURATION_FIELDS = [
   "task_duration_ms", "routine_total_ms", "strategy_execution_ms",
   "routine_overhead_ms", "outside_lifecycle_ms", "total_overhead_ms",
@@ -1839,6 +1874,40 @@ function setPerformanceSectionOpen(open) {
   else section.setAttribute("inert", "");
 }
 
+function clearRunDetailContent() {
+  $("run-detail-diagnostic").innerHTML = "";
+  $("performance").innerHTML = "";
+  const notice = $("performance-notice");
+  notice.textContent = "";
+  notice.hidden = true;
+}
+
+function closeRunDetails() {
+  const section = $("performance-section");
+  const wasOpen = section.classList.contains("performance-open");
+  const epoch = ++runDetailContentEpoch;
+  setPerformanceSectionOpen(false);
+  const reducedMotion = typeof globalThis.matchMedia === "function" &&
+    globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!wasOpen || reducedMotion) {
+    clearRunDetailContent();
+    return;
+  }
+  let fallback = null;
+  const finish = event => {
+    if (event && (event.target !== section ||
+        event.propertyName !== "grid-template-rows")) return;
+    section.removeEventListener("transitionend", finish);
+    if (fallback !== null) globalThis.clearTimeout(fallback);
+    if (epoch === runDetailContentEpoch &&
+        !section.classList.contains("performance-open")) {
+      clearRunDetailContent();
+    }
+  };
+  section.addEventListener("transitionend", finish);
+  fallback = globalThis.setTimeout(() => finish(null), 950);
+}
+
 function schedulePerformanceScroll(target) {
   const epoch = ++performanceScrollEpoch;
   if (!target || typeof target.scrollIntoView !== "function") return;
@@ -1855,16 +1924,36 @@ function schedulePerformanceScroll(target) {
   else globalThis.requestAnimationFrame(scroll);
 }
 
+function runDetailSeverity(detail) {
+  const lifecycle = detail?.lifecycle;
+  if (!lifecycle || typeof lifecycle.report_file !== "string" ||
+      lifecycle.classification === "running") return null;
+  if (lifecycle.classification === "completed") {
+    if (detail.status && !detail.statusRejected && !detail.statusOrphaned) {
+      return "healthy";
+    }
+    return "warning";
+  }
+  if (["runtime-budget", "overlap"].includes(lifecycle.classification)) {
+    return "warning";
+  }
+  if ([
+    "risk-halt", "snapshot-failure", "configuration-halt",
+    "coordination-halt", "lease-lost", "final-status-unavailable",
+  ].includes(lifecycle.classification)) return "error";
+  return null;
+}
+
+function runDetailStatusLabel(severity) {
+  return ({healthy: "Success", warning: "Warning", error: "Error"})[severity] ??
+    "Run status unavailable";
+}
+
 function renderPerformanceUnavailable(message) {
   performanceRecordsByInvocation = new Map();
-  selectedPerformanceInvocationId = null;
   performanceTelemetryUnavailable = true;
-  performanceScrollEpoch += 1;
-  setPerformanceSectionOpen(true);
-  const notice = $("performance-notice");
-  notice.textContent = "Run performance unavailable: " + String(message);
-  notice.hidden = false;
-  $("performance").innerHTML = '<span class="empty">timing data could not be loaded</span>';
+  performanceTelemetryMessage = String(message);
+  renderSelectedRunDetails();
 }
 
 function performanceRecordRow(record) {
@@ -1913,20 +2002,57 @@ function performanceRecordRow(record) {
       `</tr>`;
 }
 
-function renderSelectedPerformance() {
+function runDetailDiagnosticMarkup(detail) {
+  const severity = runDetailSeverity(detail);
+  if (!severity) return "";
+  const label = runDetailStatusLabel(severity);
+  const lifecycle = detail.lifecycle;
+  let message;
+  if (severity === "healthy") {
+    message = "The run completed with a valid lifecycle-bound status snapshot.";
+  } else if (lifecycle.classification === "completed" && detail.statusRejected) {
+    message = "The run completed, but its linked status snapshot failed strict validation. No guard outcome was inferred from it.";
+  } else if (lifecycle.classification === "completed" && detail.statusOrphaned) {
+    message = "The run completed, but its status snapshot did not exactly match the lifecycle binding.";
+  } else if (lifecycle.classification === "completed") {
+    message = "The run completed, but no valid linked status snapshot is available.";
+  } else {
+    message = lifecycleTooltip(lifecycle) || "The lifecycle recorded a terminal run diagnostic.";
+  }
+  const reportHref = "/run-reports/" + encodeURIComponent(lifecycle.report_file);
+  return `<div class="run-detail-diagnostic ${esc(severity)}">` +
+    `<strong>${esc(label)}</strong><div class="run-detail-copy">${esc(message)}` +
+    `<br><a class="run-detail-report" href="${esc(reportHref)}" target="_blank" ` +
+    `rel="noopener">Open run report</a></div></div>`;
+}
+
+function renderSelectedRunDetails() {
+  const detail = selectedRunInvocationId === null
+    ? null : runDetailsByInvocation.get(selectedRunInvocationId) ?? null;
+  const record = detail;
+  if (!record) {
+    closeRunDetails();
+    return;
+  }
+  runDetailContentEpoch += 1;
+  const performanceRecord = performanceRecordsByInvocation.get(selectedRunInvocationId) ?? null;
+  const notice = $("performance-notice");
   if (performanceTelemetryUnavailable) {
     setPerformanceSectionOpen(true);
-    return;
-  }
-  const record = selectedPerformanceInvocationId === null
-    ? null : performanceRecordsByInvocation.get(selectedPerformanceInvocationId) ?? null;
-  if (!record) {
-    setPerformanceSectionOpen(false);
-    return;
+    notice.textContent = "Run timing unavailable: " + performanceTelemetryMessage;
+    notice.hidden = false;
+  } else {
+    notice.textContent = "";
+    notice.hidden = true;
   }
   setPerformanceSectionOpen(true);
-  const taskLabel = performanceTaskLabel(record);
-  const row = performanceRecordRow(record);
+  $("run-detail-diagnostic").innerHTML = runDetailDiagnosticMarkup(detail);
+  if (!performanceRecord) {
+    $("performance").innerHTML = '<span class="empty">Timing data is not available for this run.</span>';
+    return;
+  }
+  const taskLabel = performanceTaskLabel(performanceRecord);
+  const row = performanceRecordRow(performanceRecord);
   $("performance").innerHTML = `<table class="performance-table"><thead><tr>` +
     `<th>Start / session</th><th>Runner / model / configuration</th>` +
     `<th>${esc(taskLabel)}</th><th>Routine total</th>` +
@@ -1961,33 +2087,28 @@ function renderPerformance(document) {
     indexed.set(record.invocation_id, record);
   }
   performanceTelemetryUnavailable = false;
+  performanceTelemetryMessage = "";
   performanceRecordsByInvocation = indexed;
-  if (selectedPerformanceInvocationId !== null &&
-      !performanceRecordsByInvocation.has(selectedPerformanceInvocationId)) {
-    selectedPerformanceInvocationId = null;
-    performanceScrollEpoch += 1;
-  }
-  renderSelectedPerformance();
+  renderSelectedRunDetails();
 }
 
-function updatePerformanceChipSelection() {
+function updateRunDetailChipSelection() {
   for (const chip of $("runs").querySelectorAll(
-      "button.run[data-performance-invocation-id]")) {
-    const selected = chip.dataset.performanceInvocationId ===
-      selectedPerformanceInvocationId;
+      "button.run[data-run-invocation-id]")) {
+    const selected = chip.dataset.runInvocationId === selectedRunInvocationId;
     chip.classList.toggle("performance-selected", selected);
     chip.setAttribute("aria-expanded", selected ? "true" : "false");
   }
 }
 
-function syncPerformanceSelection(availableInvocationIds) {
-  if (selectedPerformanceInvocationId !== null &&
-      !availableInvocationIds.has(selectedPerformanceInvocationId)) {
-    selectedPerformanceInvocationId = null;
+function syncRunDetailSelection(availableInvocationIds) {
+  if (selectedRunInvocationId !== null &&
+      !availableInvocationIds.has(selectedRunInvocationId)) {
+    selectedRunInvocationId = null;
     performanceScrollEpoch += 1;
   }
-  updatePerformanceChipSelection();
-  renderSelectedPerformance();
+  updateRunDetailChipSelection();
+  renderSelectedRunDetails();
 }
 
 function runOutcomeText(parts) {
@@ -2007,12 +2128,15 @@ function latestRunDay(statusNames, rejectedStatusNames, lifecycleRecords = []) {
   return days.length ? days[days.length - 1] : null;
 }
 
-async function renderLegacyRuns(statusNames, gateNames, rows, config, rejectedStatusNames = []) {
+async function renderLegacyRuns(statusNames, gateNames, rows, config,
+                                rejectedStatusNames = [], orphanedStatusNames = [],
+                                reportNames = []) {
   const today = latestRunDay(statusNames, rejectedStatusNames);
   if (today === null) {
+    runDetailsByInvocation = new Map();
     performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
-    syncPerformanceSelection(new Set());
+    syncRunDetailSelection(new Set());
     return;
   }
   const todays = statusNames.filter(n => n.slice(13, 23) === today);
@@ -2033,10 +2157,6 @@ async function renderLegacyRuns(statusNames, gateNames, rows, config, rejectedSt
     name, status: null, statusRejected: true,
   })));
   records.sort((left, right) => left.name.localeCompare(right.name));
-  const rejectedCount = records.filter(record => record.statusRejected).length;
-  if (rejectedCount) {
-    banner(`Rejected ${rejectedCount} malformed status snapshot${rejectedCount === 1 ? "" : "s"} in Runs Today; no guard outcome was inferred from rejected data.`, "warning");
-  }
   // A fill belongs to the last run that had started before it. Prefer the
   // snapshot's second-precise PT timestamp; filenames are minute-precise only.
   const starts = records.map(({name, status}) =>
@@ -2071,29 +2191,36 @@ async function renderLegacyRuns(statusNames, gateNames, rows, config, rejectedSt
     } catch { return `<span class="run" title="unreadable"><span class="t">?</span>` +
                      `<span class="o">${esc(n)}</span></span>`; }
   }));
+  runDetailsByInvocation = new Map();
   performanceScrollEpoch += 1;
   $("runs").innerHTML = chips.join("");
-  syncPerformanceSelection(new Set());
+  syncRunDetailSelection(new Set());
 }
 
 async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocument,
-                          rejectedStatusNames = []) {
+                          rejectedStatusNames = [], orphanedStatusNames = [],
+                          reportNames = []) {
   const lifecycle = Array.isArray(lifecycleDocument?.records)
     ? lifecycleDocument.records : [];
+  const availableReports = new Set(reportNames || []);
   if (!lifecycle.length) {
     return renderLegacyRuns(
-      statusNames, gateNames, rows, config, rejectedStatusNames);
+      statusNames, gateNames, rows, config, rejectedStatusNames,
+      orphanedStatusNames, reportNames);
   }
 
   const today = latestRunDay(statusNames, rejectedStatusNames, lifecycle);
   if (today === null) {
+    runDetailsByInvocation = new Map();
     performanceScrollEpoch += 1;
     $("runs").innerHTML = '<span class="empty">no invocations yet</span>';
-    syncPerformanceSelection(new Set());
+    syncRunDetailSelection(new Set());
     return;
   }
   const names = statusNames.filter(name => name.slice(13, 23) === today);
   const rejectedNames = rejectedStatusNames.filter(
+    name => name.slice(13, 23) === today);
+  const orphanedNames = orphanedStatusNames.filter(
     name => name.slice(13, 23) === today);
   const loaded = await Promise.all(names.map(async name => {
     try {
@@ -2107,12 +2234,11 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
     } catch { return { name, status: null, statusRejected: false }; }
   }));
   loaded.push(...rejectedNames.map(name => ({
-    name, status: null, statusRejected: true,
+    name, status: null, statusRejected: true, statusOrphaned: false,
   })));
-  const rejectedCount = loaded.filter(item => item.statusRejected).length;
-  if (rejectedCount) {
-    banner(`Rejected ${rejectedCount} malformed status snapshot${rejectedCount === 1 ? "" : "s"} in Runs Today; lifecycle outcomes remain visible and no guard outcome was inferred from rejected data.`, "warning");
-  }
+  loaded.push(...orphanedNames.map(name => ({
+    name, status: null, statusRejected: false, statusOrphaned: true,
+  })));
   const statusByName = new Map(loaded.map(item => [item.name, item]));
   const linked = new Set();
   const records = lifecycle
@@ -2121,21 +2247,25 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
       const name = typeof record.status_file === "string" ? record.status_file : null;
       if (name) linked.add(name);
       const loadedStatus = name ? statusByName.get(name) : null;
+      const statusMatches = loadedStatus?.status?.run_start_pt === record.run_start_pt;
       return {
         lifecycle: record,
         name,
-        status: loadedStatus?.status ?? null,
+        status: statusMatches ? loadedStatus.status : null,
         statusRejected: loadedStatus?.statusRejected === true,
+        statusOrphaned: loadedStatus?.statusOrphaned === true ||
+          (loadedStatus?.status != null && !statusMatches),
         start: invocationStart(record),
       };
     });
   for (const item of loaded) {
-    if (linked.has(item.name)) continue;
+    if (linked.has(item.name) || item.statusOrphaned) continue;
     records.push({
       lifecycle: null,
       name: item.name,
       status: item.status,
       statusRejected: item.statusRejected,
+      statusOrphaned: false,
       start: typeof item.status?.run_start_pt === "string"
         ? item.status.run_start_pt.slice(0, 19) : filenameStart(item.name),
     });
@@ -2155,7 +2285,8 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
       `${today.replace(/_/g, "-")}T23:59:59`,
   ]));
   const availableGates = new Set(gateNames || []);
-  const availablePerformanceIds = new Set();
+  const availableDetailIds = new Set();
+  runDetailsByInvocation = new Map();
   const chips = await Promise.all(records.map(async record => {
     const start = record.start ?? `${today.replace(/_/g, "-")}T00:00:00`;
     const next = nextFillOwner.get(record);
@@ -2206,42 +2337,55 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
     const outcomeClass = record.lifecycle?.classification ?? "legacy";
     const invocationId = typeof record.lifecycle?.invocation_id === "string"
       ? record.lifecycle.invocation_id : null;
+    const hasReport = invocationId !== null &&
+      typeof record.lifecycle?.report_file === "string" &&
+      availableReports.has(record.lifecycle.report_file);
     const hasPerformance = invocationId !== null &&
       performanceRecordsByInvocation.has(invocationId);
     const contents = `<span class="t">${start.slice(11, 16)}</span>` +
       `<span class="o">${parts.join(", ")}</span>`;
-    if (!hasPerformance) {
+    if (!hasReport) {
       return `<span class="run ${esc(safePhase)} ${esc(outcomeClass)}" title="${esc(tip)}">` +
         `${contents}</span>`;
     }
-    availablePerformanceIds.add(invocationId);
-    const selected = selectedPerformanceInvocationId === invocationId;
-    const accessibleLabel = `${start.slice(11, 16)}; ${runOutcomeText(parts)}; timing details available`;
-    return `<button type="button" class="run ${esc(safePhase)} ${esc(outcomeClass)} has-performance` +
+    const severity = runDetailSeverity(record);
+    if (!severity) {
+      return `<span class="run ${esc(safePhase)} ${esc(outcomeClass)}" title="${esc(tip)}">` +
+        `${contents}</span>`;
+    }
+    runDetailsByInvocation.set(invocationId, record);
+    availableDetailIds.add(invocationId);
+    const selected = selectedRunInvocationId === invocationId;
+    const statusLabel = runDetailStatusLabel(severity);
+    const markerClass = severity === "healthy" ? "" : ` health-${severity}`;
+    const detailAvailabilityLabel = `${statusLabel} run details available` +
+      `${hasPerformance ? "; timing available" : "; timing unavailable"}.`;
+    const accessibleLabel = `${start.slice(11, 16)}; ${runOutcomeText(parts)}; ${detailAvailabilityLabel}`;
+    return `<button type="button" class="run ${esc(safePhase)} ${esc(outcomeClass)} has-details` +
       `${selected ? " performance-selected" : ""}" title="${esc(tip)}" ` +
-      `data-performance-invocation-id="${esc(invocationId)}" aria-controls="performance-section" ` +
+      `data-run-invocation-id="${esc(invocationId)}" aria-controls="performance-section" ` +
       `aria-expanded="${selected ? "true" : "false"}" aria-label="${esc(accessibleLabel)}">` +
-      `${contents}<span class="run-performance-marker" aria-hidden="true">*</span>` +
-      `<span class="sr-only">Timing details available.</span></button>`;
+      `${contents}<span class="run-detail-marker${markerClass}" aria-hidden="true">*</span>` +
+      `<span class="sr-only">${esc(detailAvailabilityLabel)}</span></button>`;
   }));
   const activeRunChip = document.activeElement;
-  const focusedPerformanceInvocationId = activeRunChip &&
+  const focusedRunInvocationId = activeRunChip &&
     $("runs").contains(activeRunChip)
-    ? activeRunChip.dataset?.performanceInvocationId ?? null : null;
+    ? activeRunChip.dataset?.runInvocationId ?? null : null;
   performanceScrollEpoch += 1;
   $("runs").innerHTML = chips.join("");
-  syncPerformanceSelection(availablePerformanceIds);
-  if (focusedPerformanceInvocationId !== null) {
+  syncRunDetailSelection(availableDetailIds);
+  if (focusedRunInvocationId !== null) {
     const replacement = [...$("runs").querySelectorAll(
-      "button.run[data-performance-invocation-id]")].find(
-        chip => chip.dataset.performanceInvocationId === focusedPerformanceInvocationId);
+      "button.run[data-run-invocation-id]")].find(
+        chip => chip.dataset.runInvocationId === focusedRunInvocationId);
     replacement?.focus({ preventScroll: true });
   }
 }
 
 function collectRunView() {
   return [...$('runs').querySelectorAll('.run')].map(chip => {
-    const invocationId = chip.dataset.performanceInvocationId;
+    const invocationId = chip.dataset.runInvocationId;
     const record = invocationId
       ? performanceRecordsByInvocation.get(invocationId) ?? null : null;
     const baseTooltip = chip.getAttribute('title') || '';
@@ -2408,7 +2552,6 @@ async function refresh() {
     const config = await getJSON("/api/config");
     renderMode(config);
     const latest = await getJSON("/api/latest");
-    if (latest.warning) renderSnapshotFallbackWarning(latest.warning);
     let selectedSnapshot = null;
     if (latest.error) {
       clearSnapshot();
@@ -2419,10 +2562,6 @@ async function refresh() {
       clearSnapshot();
     }
     const idx = await getJSON("/api/index");
-    if (idx.warning &&
-        !(latest.warning && latest.warning.code === idx.warning.code)) {
-      renderSnapshotFallbackWarning(idx.warning);
-    }
     let lifecycle = {records: []};
     try {
       lifecycle = await getJSON("/api/runs");
@@ -2446,10 +2585,22 @@ async function refresh() {
     }
     const rejectedStatus = Array.isArray(idx.rejected_status)
       ? idx.rejected_status : [];
+    const orphanedStatus = Array.isArray(idx.orphaned_status)
+      ? idx.orphaned_status : [];
+    const reportNames = Array.isArray(idx.reports) ? idx.reports : [];
     await renderRuns(
       Array.isArray(idx.status) ? idx.status : [],
       Array.isArray(idx.gates) ? idx.gates : [],
-      rows, config, lifecycle, rejectedStatus);
+      rows, config, lifecycle, rejectedStatus, orphanedStatus, reportNames);
+    if (latest.warning &&
+        !warningBelongsToReportedRun(latest.warning, lifecycle, reportNames)) {
+      renderSnapshotFallbackWarning(latest.warning);
+    }
+    if (idx.warning &&
+        !(latest.warning && latest.warning.code === idx.warning.code) &&
+        !warningBelongsToReportedRun(idx.warning, lifecycle, reportNames)) {
+      renderSnapshotFallbackWarning(idx.warning);
+    }
     renderEras(rows);
     renderPnlReconciliation(selectedSnapshot, rows);
     const phoneView = selectedSnapshot
@@ -2476,14 +2627,14 @@ async function refresh() {
 // cache: no-store throughout, or the browser serves a stale snapshot forever.
 $('runs').addEventListener('click', event => {
   const chip = event.target?.closest?.(
-    'button.run[data-performance-invocation-id]');
+    'button.run[data-run-invocation-id]');
   if (!chip || !$('runs').contains(chip)) return;
-  const invocationId = chip.dataset.performanceInvocationId;
-  if (!performanceRecordsByInvocation.has(invocationId)) return;
-  const closing = selectedPerformanceInvocationId === invocationId;
-  selectedPerformanceInvocationId = closing ? null : invocationId;
-  updatePerformanceChipSelection();
-  renderSelectedPerformance();
+  const invocationId = chip.dataset.runInvocationId;
+  if (!runDetailsByInvocation.has(invocationId)) return;
+  const closing = selectedRunInvocationId === invocationId;
+  selectedRunInvocationId = closing ? null : invocationId;
+  updateRunDetailChipSelection();
+  renderSelectedRunDetails();
   schedulePerformanceScroll(closing ? chip : $("performance-section"));
 });
 $('phone-share-button').addEventListener('click', openPhoneShareDialog);

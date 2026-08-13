@@ -147,6 +147,12 @@ class LatestStatusEndpointTests(unittest.TestCase):
         ) as handle:
             json.dump(document, handle, allow_nan=False)
 
+    def write_report(self, name, content="# Run report\n"):
+        with open(
+            os.path.join(self.report_dir, name), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(content)
+
     def request_json(self, path):
         connection = http.client.HTTPConnection(
             "127.0.0.1", self.server.server_port, timeout=2
@@ -246,6 +252,7 @@ class LatestStatusEndpointTests(unittest.TestCase):
                 ],
                 "orphaned_status": [],
                 "gates": [],
+                "reports": [],
             },
         )
 
@@ -266,6 +273,7 @@ class LatestStatusEndpointTests(unittest.TestCase):
                 "rejected_status": [mismatched_name],
                 "orphaned_status": [],
                 "gates": [],
+                "reports": [],
             },
         )
         self.assertEqual(latest_status, 200)
@@ -373,7 +381,9 @@ class LatestStatusEndpointTests(unittest.TestCase):
 
     def test_lifecycle_unavailable_keeps_status_endpoints_available_and_empty(self):
         name = "rhmra-status-2026_08_12-12_10.json"
+        report_name = "rhmra-log-2026_08_12-12_10.md"
         self.write_status(name, valid_status("2026-08-12T12:10:42-07:00"))
+        self.write_report(report_name)
 
         with mock.patch.object(
             DASHBOARD,
@@ -390,6 +400,7 @@ class LatestStatusEndpointTests(unittest.TestCase):
             "rejected_status": [],
             "orphaned_status": [],
             "gates": [],
+            "reports": [report_name],
             "warning": warning,
         })
         self.assertEqual(latest_status, 200)
@@ -400,6 +411,61 @@ class LatestStatusEndpointTests(unittest.TestCase):
         })
         self.assertNotIn("private lifecycle path", json.dumps(index))
         self.assertNotIn("private lifecycle path", json.dumps(latest))
+
+    def test_index_lists_only_canonical_safe_readable_reports(self):
+        valid_name = "rhmra-log-2026_08_12-12_10.md"
+        boundary_name = "rhmra-log-2026_08_12-12_11.md"
+        empty_name = "rhmra-log-2026_08_12-12_12.md"
+        oversized_name = "rhmra-log-2026_08_12-12_13.md"
+        invalid_utf8_name = "rhmra-log-2026_08_12-12_14.md"
+        directory_name = "rhmra-log-2026_08_12-12_15.md"
+        self.write_report(valid_name)
+        with open(
+            os.path.join(self.report_dir, boundary_name), "wb"
+        ) as handle:
+            handle.seek(DASHBOARD.MAX_REPORT_BYTES - 1)
+            handle.write(b"a")
+        with open(os.path.join(self.report_dir, empty_name), "wb"):
+            pass
+        with open(
+            os.path.join(self.report_dir, oversized_name), "wb"
+        ) as handle:
+            handle.seek(DASHBOARD.MAX_REPORT_BYTES)
+            handle.write(b"a")
+        with open(
+            os.path.join(self.report_dir, invalid_utf8_name), "wb"
+        ) as handle:
+            handle.write(b"\xff")
+        os.mkdir(os.path.join(self.report_dir, directory_name))
+        self.write_report("rhmra-log-2026_08_12-12_16.md.bak")
+        nested = os.path.join(self.report_dir, "nested")
+        os.mkdir(nested)
+        with open(
+            os.path.join(nested, "rhmra-log-2026_08_12-12_17.md"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# Nested report\n")
+
+        status, index = self.request_json("/api/index")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(index["reports"], [valid_name, boundary_name])
+
+    def test_index_rejects_report_symlink(self):
+        target = os.path.join(self.repo, "outside-report.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("# Outside report\n")
+        name = "rhmra-log-2026_08_12-12_10.md"
+        try:
+            os.symlink(target, os.path.join(self.report_dir, name))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation is unavailable: {exc}")
+
+        status, index = self.request_json("/api/index")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(index["reports"], [])
 
     def test_pre_lifecycle_legacy_survives_and_future_orphan_cannot_hijack(self):
         legacy_name = "rhmra-status-2026_08_04-16_40.json"
@@ -521,7 +587,7 @@ class DashboardStatusClientContractTests(unittest.TestCase):
         self.assertIn("else if (!latest.data)", refresh)
         self.assertGreaterEqual(refresh.count("clearSnapshot()"), 2)
 
-    def test_fallback_warning_and_historical_statuses_are_fail_closed(self):
+    def test_fallback_warning_and_report_diagnostics_are_fail_closed(self):
         warning = self.function_source(
             "renderSnapshotFallbackWarning", "renderMode"
         )
@@ -543,15 +609,28 @@ class DashboardStatusClientContractTests(unittest.TestCase):
         )
         self.assertIn("completed; status rejected", runs)
         self.assertIn('displayPhase = "unavailable"', runs)
-        self.assertIn("no guard outcome was inferred from rejected data", runs)
         self.assertIn("rejectedStatusNames = []", runs)
+        self.assertIn("orphanedStatusNames = []", runs)
         self.assertIn("statusRejected: true", runs)
+        self.assertIn("statusOrphaned: true", runs)
+        self.assertNotIn("Rejected ${rejectedCount}", runs)
+        legacy_start = runs.index("async function renderLegacyRuns")
+        lifecycle_start = runs.index("async function renderRuns")
+        self.assertNotIn("banner(", runs[legacy_start:lifecycle_start])
+        self.assertNotIn("banner(", runs[lifecycle_start:])
+        self.assertIn("statusByName.get(name)", runs)
+        self.assertIn("runDetailsByInvocation.set(invocationId", runs)
+        self.assertIn("reportNames = []", runs)
+        self.assertIn("const availableReports = new Set(reportNames || [])", runs)
+        self.assertIn("availableReports.has(record.lifecycle.report_file)", runs)
 
         refresh_start = self.source.index("async function refresh()")
         refresh = self.source[
             refresh_start:self.source.index("// runs land every", refresh_start)
         ]
         self.assertIn("Array.isArray(idx.rejected_status)", refresh)
+        self.assertIn("Array.isArray(idx.orphaned_status)", refresh)
+        self.assertIn("Array.isArray(idx.reports)", refresh)
         self.assertIn("Array.isArray(idx.status)", refresh)
         self.assertIn("renderSnapshotFallbackWarning(idx.warning)", refresh)
         self.assertIn(": []", refresh)

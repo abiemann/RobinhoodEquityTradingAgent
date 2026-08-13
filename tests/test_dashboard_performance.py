@@ -229,7 +229,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         with open(DASHBOARD_HTML, encoding="utf-8") as handle:
             cls.source = handle.read()
 
-    def test_performance_section_is_separate_and_uses_exact_terms(self):
+    def test_run_details_section_is_separate_and_keeps_exact_timing_terms(self):
         source = self.source
         runs = source.index('<div class="runs" id="runs">')
         performance = source.index(
@@ -250,10 +250,10 @@ class PerformanceClientContractTests(unittest.TestCase):
             source.index('<div class="performance-collapse-track">', performance),
             source.index('<div class="performance-panel">', performance),
         )
-        self.assertIn('<h2 id="performance-heading">Run performance', source)
+        self.assertIn('<h2 id="performance-heading">Run details', source)
         for term in (
-            "Run performance",
-            "Select a starred run above to view its timing details.",
+            "Run details",
+            "Select a marked run above to view its details.",
             "Reference run duration",
             "Routine total",
             "Strategy execution",
@@ -261,7 +261,8 @@ class PerformanceClientContractTests(unittest.TestCase):
             'getJSON("/api/performance")',
         ):
             self.assertIn(term, source)
-        self.assertIn("performanceRecordsByInvocation.get(selectedPerformanceInvocationId)", source)
+        self.assertIn("runDetailsByInvocation.get(selectedRunInvocationId)", source)
+        self.assertIn("performanceRecordsByInvocation.get(selectedRunInvocationId)", source)
         self.assertIn("indexed.set(record.invocation_id, record)", source)
         self.assertIn("performanceRecordRow(record)", source)
         self.assertNotIn("Date.parse(right.lifecycle_started_at_utc)", source)
@@ -318,62 +319,68 @@ class PerformanceClientContractTests(unittest.TestCase):
             r"#performance-section[^{}]*\{[^}]*transition:none;[^}]*\}",
         )
 
-    def test_timing_chips_are_exact_id_accessible_controls(self):
+    def test_report_chips_are_exact_id_accessible_controls_with_optional_timing(self):
         source = self.source
         runs_start = source.index("async function renderRuns")
         runs_end = source.index("function collectRunView", runs_start)
         runs = source[runs_start:runs_end]
-        self.assertIn(
-            "performanceRecordsByInvocation.has(invocationId)", runs
-        )
-        self.assertIn("availablePerformanceIds.add(invocationId)", runs)
+        self.assertIn("reportNames = []", runs)
+        self.assertIn("const availableReports = new Set(reportNames || [])", runs)
+        self.assertIn("record.lifecycle?.report_file", runs)
+        self.assertIn("availableReports.has(record.lifecycle.report_file)", runs)
+        self.assertIn("runDetailsByInvocation.set(invocationId", runs)
+        self.assertIn("availableDetailIds.add(invocationId)", runs)
         self.assertIn('<button type="button" class="run ', runs)
-        self.assertIn('data-performance-invocation-id="${esc(invocationId)}"', runs)
+        self.assertIn('data-run-invocation-id="${esc(invocationId)}"', runs)
         self.assertIn('aria-controls="performance-section"', runs)
         self.assertIn('aria-expanded="${selected ? "true" : "false"}"', runs)
         self.assertNotIn("aria-pressed", runs)
         self.assertIn('aria-label="${esc(accessibleLabel)}"', runs)
-        self.assertIn('class="run-performance-marker" aria-hidden="true">*</span>', runs)
-        self.assertIn('<span class="sr-only">Timing details available.</span>', runs)
-        self.assertIn("if (!hasPerformance)", runs)
+        self.assertIn('const markerClass = severity === "healthy"', runs)
+        self.assertIn('run-detail-marker${markerClass}', runs)
+        self.assertIn('aria-hidden="true">*</span>', runs)
+        self.assertIn('class="sr-only">${esc(detailAvailabilityLabel)}</span>', runs)
+        self.assertIn("if (!hasReport)", runs)
         self.assertIn('return `<span class="run ', runs)
+        self.assertIn("performanceRecordsByInvocation.has(invocationId)", runs)
         self.assertNotIn("performanceStartLabel", runs)
         self.assertNotIn("lifecycle_started_at_utc) ===", runs)
 
-    def test_selection_renders_one_record_and_survives_only_valid_today_match(self):
+    def test_selection_renders_one_report_detail_and_survives_exact_today_match(self):
         source = self.source
-        selected_start = source.index("function renderSelectedPerformance")
+        selected_start = source.index("function renderSelectedRunDetails")
         selected_end = source.index("function renderPerformance(document)", selected_start)
         selected = source[selected_start:selected_end]
-        self.assertIn("performanceRecordsByInvocation.get(selectedPerformanceInvocationId)", selected)
-        self.assertIn("performanceRecordRow(record)", selected)
-        self.assertNotIn(".map(record", selected)
+        self.assertIn("runDetailsByInvocation.get(selectedRunInvocationId)", selected)
+        self.assertIn("performanceRecordsByInvocation.get(selectedRunInvocationId)", selected)
+        self.assertIn("performanceRecordRow(performanceRecord)", selected)
+        self.assertNotIn(".map(", selected)
 
-        sync_start = source.index("function syncPerformanceSelection")
+        sync_start = source.index("function syncRunDetailSelection")
         sync_end = source.index("function runOutcomeText", sync_start)
         sync = source[sync_start:sync_end]
-        self.assertIn("!availableInvocationIds.has(selectedPerformanceInvocationId)", sync)
-        self.assertIn("selectedPerformanceInvocationId = null", sync)
-        self.assertIn("renderSelectedPerformance()", sync)
+        self.assertIn("!availableInvocationIds.has(selectedRunInvocationId)", sync)
+        self.assertIn("selectedRunInvocationId = null", sync)
+        self.assertIn("renderSelectedRunDetails()", sync)
         self.assertNotIn("schedulePerformanceScroll", sync)
-        self.assertIn("syncPerformanceSelection(availablePerformanceIds)", source)
-        self.assertIn("syncPerformanceSelection(new Set())", source)
+        self.assertIn("syncRunDetailSelection(availableDetailIds)", source)
+        self.assertIn("syncRunDetailSelection(new Set())", source)
         legacy_start = source.index("async function renderLegacyRuns")
         legacy_end = source.index("async function renderRuns", legacy_start)
         legacy = source[legacy_start:legacy_end]
         self.assertIn('no invocations yet', legacy)
-        self.assertIn("syncPerformanceSelection(new Set())", legacy)
+        self.assertIn("syncRunDetailSelection(new Set())", legacy)
 
         handler = source[source.index("$('runs').addEventListener('click'"):
                          source.index("$('phone-share-button').addEventListener")]
-        self.assertIn("button.run[data-performance-invocation-id]", handler)
-        self.assertIn("performanceRecordsByInvocation.has(invocationId)", handler)
+        self.assertIn("button.run[data-run-invocation-id]", handler)
+        self.assertIn("runDetailsByInvocation.has(invocationId)", handler)
         self.assertIn(
-            "const closing = selectedPerformanceInvocationId === invocationId",
+            "const closing = selectedRunInvocationId === invocationId",
             handler,
         )
         self.assertIn(
-            "selectedPerformanceInvocationId = closing ? null : invocationId",
+            "selectedRunInvocationId = closing ? null : invocationId",
             handler,
         )
         self.assertIn(
@@ -403,8 +410,8 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("scrollIntoView", scroll)
         self.assertEqual(source.count("schedulePerformanceScroll("), 2)
 
-        update_start = source.index("function updatePerformanceChipSelection")
-        update_end = source.index("function syncPerformanceSelection", update_start)
+        update_start = source.index("function updateRunDetailChipSelection")
+        update_end = source.index("function syncRunDetailSelection", update_start)
         update = source[update_start:update_end]
         self.assertIn(
             'setAttribute("aria-expanded", selected ? "true" : "false")',
@@ -412,26 +419,32 @@ class PerformanceClientContractTests(unittest.TestCase):
         )
         self.assertNotIn("aria-pressed", update)
 
-        selected_start = source.index("function renderSelectedPerformance")
+        selected_start = source.index("function renderSelectedRunDetails")
         selected_end = source.index("function renderPerformance(document)", selected_start)
         selected = source[selected_start:selected_end]
-        self.assertIn("setPerformanceSectionOpen(false)", selected)
+        self.assertIn("closeRunDetails()", selected)
+        close_start = source.index("function closeRunDetails")
+        close_end = source.index("function schedulePerformanceScroll", close_start)
+        self.assertIn(
+            "setPerformanceSectionOpen(false)",
+            source[close_start:close_end],
+        )
         self.assertGreaterEqual(selected.count("setPerformanceSectionOpen(true)"), 2)
 
         refresh_start = source.index("async function refresh()")
         refresh_end = source.index("// runs land every", refresh_start)
         self.assertNotIn("schedulePerformanceScroll", source[refresh_start:refresh_end])
 
-    def test_panel_opens_before_live_region_content_is_updated(self):
+    def test_panel_opens_before_selected_live_content_is_updated(self):
         source = self.source
         unavailable_start = source.index("function renderPerformanceUnavailable")
         unavailable_end = source.index("function performanceRecordRow", unavailable_start)
         unavailable = source[unavailable_start:unavailable_end]
-        opened = unavailable.index("setPerformanceSectionOpen(true)")
-        self.assertLess(opened, unavailable.index("notice.textContent"))
-        self.assertLess(opened, unavailable.index('$("performance").innerHTML'))
+        self.assertNotIn("setPerformanceSectionOpen(true)", unavailable)
+        self.assertNotIn("selectedRunInvocationId = null", unavailable)
+        self.assertIn("renderSelectedRunDetails()", unavailable)
 
-        selected_start = source.index("function renderSelectedPerformance")
+        selected_start = source.index("function renderSelectedRunDetails")
         selected_end = source.index("function renderPerformance(document)", selected_start)
         selected = source[selected_start:selected_end]
         success_start = selected.index(
@@ -455,37 +468,138 @@ class PerformanceClientContractTests(unittest.TestCase):
             )
 
         normal_start = source.index("const activeRunChip", source.index("async function renderRuns"))
-        normal_end = source.index("syncPerformanceSelection(availablePerformanceIds)", normal_start)
+        normal_end = source.index("syncRunDetailSelection(availableDetailIds)", normal_start)
         normal = source[normal_start:normal_end]
         self.assertLess(
             normal.index("performanceScrollEpoch += 1"),
             normal.index('$("runs").innerHTML = chips.join("")'),
         )
 
-    def test_run_refresh_preserves_exact_chip_focus_without_scrolling(self):
+    def test_run_refresh_preserves_exact_detail_chip_focus_without_scrolling(self):
         source = self.source
         runs_start = source.index("async function renderRuns")
         runs_end = source.index("function collectRunView", runs_start)
         runs = source[runs_start:runs_end]
-        self.assertIn("focusedPerformanceInvocationId", runs)
+        self.assertIn("focusedRunInvocationId", runs)
         self.assertIn(
-            'chip.dataset.performanceInvocationId === focusedPerformanceInvocationId',
+            'chip.dataset.runInvocationId === focusedRunInvocationId',
             runs,
         )
         self.assertIn("replacement?.focus({ preventScroll: true })", runs)
         self.assertNotIn("querySelector(" + chr(96), runs)
         self.assertNotIn("schedulePerformanceScroll", runs)
 
-    def test_marker_styling_is_compact_touchable_and_distinguishes_selection(self):
+    def test_health_marker_is_compact_touchable_and_not_color_only(self):
         source = self.source
-        self.assertIn("button.run.has-performance", source)
+        self.assertIn("button.run.has-details", source)
         self.assertIn("min-height:44px", source)
-        self.assertIn(".run-performance-marker", source)
+        self.assertIn(".run-detail-marker", source)
         self.assertIn("position:absolute", source)
         self.assertIn("top:2px", source)
         self.assertIn("right:4px", source)
-        self.assertIn("button.run.has-performance:focus-visible", source)
-        self.assertIn("button.run.has-performance.performance-selected", source)
+        marker_start = source.index(".run-detail-marker {")
+        marker_end = source.index("}", marker_start) + 1
+        self.assertIn("color:var(--green)", source[marker_start:marker_end])
+        self.assertIn(".run-detail-marker.health-warning", source)
+        self.assertIn("color:var(--amber)", source)
+        self.assertIn(".run-detail-marker.health-error", source)
+        self.assertIn("color:var(--red)", source)
+        self.assertNotIn(".run-detail-marker.warning", source)
+        self.assertNotIn(".run-detail-marker.error", source)
+        self.assertIn("button.run.has-details:focus-visible", source)
+        self.assertIn("button.run.has-details.performance-selected", source)
+        runs = source[source.index("async function renderRuns"):
+                      source.index("function collectRunView")]
+        self.assertIn("runDetailStatusLabel(severity)", runs)
+        self.assertIn("detailAvailabilityLabel", runs)
+
+    def test_run_detail_severity_is_report_bound_and_fail_closed(self):
+        source = self.source
+        severity_start = source.index("function runDetailSeverity")
+        severity_end = source.index("function runDetailStatusLabel", severity_start)
+        severity = source[severity_start:severity_end]
+        self.assertIn("report_file", severity)
+        self.assertIn('"completed"', severity)
+        self.assertIn('"healthy"', severity)
+        self.assertIn("statusRejected", severity)
+        self.assertIn("statusOrphaned", severity)
+        self.assertIn('"warning"', severity)
+        for classification in ("runtime-budget", "overlap"):
+            self.assertIn(f'"{classification}"', severity)
+        for classification in (
+            "risk-halt",
+            "snapshot-failure",
+            "configuration-halt",
+            "coordination-halt",
+            "lease-lost",
+            "final-status-unavailable",
+        ):
+            self.assertIn(f'"{classification}"', severity)
+        self.assertIn('"error"', severity)
+        self.assertIn('"running"', severity)
+        self.assertIn("return null", severity)
+        self.assertNotIn('?? "healthy"', severity)
+
+    def test_selected_panel_combines_diagnostic_and_optional_timing(self):
+        source = self.source
+        self.assertIn('id="run-detail-diagnostic"', source)
+        selected_start = source.index("function renderSelectedRunDetails")
+        selected_end = source.index("function renderPerformance(document)", selected_start)
+        selected = source[selected_start:selected_end]
+        self.assertIn(
+            "runDetailsByInvocation.get(selectedRunInvocationId)", selected
+        )
+        self.assertIn(
+            "performanceRecordsByInvocation.get(selectedRunInvocationId)", selected
+        )
+        self.assertIn("runDetailDiagnosticMarkup(detail)", selected)
+        self.assertIn("performanceRecordRow(performanceRecord)", selected)
+        diagnostic_render = selected.index("runDetailDiagnosticMarkup(detail)")
+        timing_render = selected.index("performanceRecordRow(performanceRecord)")
+        self.assertNotIn(" else ", selected[
+            min(diagnostic_render, timing_render):max(diagnostic_render, timing_render)
+        ])
+        diagnostic_start = source.index("function runDetailDiagnosticMarkup")
+        diagnostic_end = source.index(
+            "function renderSelectedRunDetails", diagnostic_start
+        )
+        diagnostic = source[diagnostic_start:diagnostic_end]
+        self.assertIn("runDetailStatusLabel", diagnostic)
+        self.assertIn("lifecycleTooltip", diagnostic)
+        self.assertIn("esc(", diagnostic)
+        self.assertNotIn("getJSON(", diagnostic)
+
+    def test_reclick_close_clears_all_detail_content_and_live_regions(self):
+        source = self.source
+        selected_start = source.index("function renderSelectedRunDetails")
+        selected_end = source.index("function renderPerformance(document)", selected_start)
+        selected = source[selected_start:selected_end]
+        self.assertIn("const record = detail", selected)
+        closed = selected[selected.index("if (!record)"):]
+        self.assertIn("closeRunDetails()", closed)
+        close_start = source.index("function closeRunDetails")
+        close_end = source.index("function schedulePerformanceScroll", close_start)
+        close = source[close_start:close_end]
+        clear_start = source.index("function clearRunDetailContent")
+        clear_end = source.index("function closeRunDetails", clear_start)
+        clear = source[clear_start:clear_end]
+        for text in (
+            '$("run-detail-diagnostic").innerHTML = ""',
+            '$("performance").innerHTML = ""',
+            "notice.textContent = """,
+            "notice.hidden = true",
+        ):
+            self.assertIn(text, clear)
+        self.assertIn("setPerformanceSectionOpen(false)", close)
+        self.assertIn('section.setAttribute("inert", "")', source)
+        self.assertIn('section.addEventListener("transitionend", finish)', close)
+        self.assertIn('event.propertyName !== "grid-template-rows"', close)
+        self.assertIn("runDetailContentEpoch", close)
+        self.assertIn("setTimeout(() => finish(null), 950)", close)
+        self.assertLess(
+            close.index("setPerformanceSectionOpen(false)"),
+            close.index('section.addEventListener("transitionend", finish)'),
+        )
 
     def test_null_duration_renders_not_measured_without_coercing_zero(self):
         start = self.source.index("function formatPerformanceDuration")
@@ -540,7 +654,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertNotIn("End-to-end", label)
 
         row_start = self.source.index("function performanceRecordRow")
-        row_end = self.source.index("function renderSelectedPerformance", row_start)
+        row_end = self.source.index("function runDetailDiagnosticMarkup", row_start)
         row = self.source[row_start:row_end]
         self.assertIn('data-label="${esc(taskLabel)}"', row)
         self.assertIn(
@@ -550,15 +664,15 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertNotIn("estimatedTask", row)
         self.assertNotIn("Task clock", row)
 
-        selected_start = self.source.index("function renderSelectedPerformance")
+        selected_start = self.source.index("function renderSelectedRunDetails")
         selected_end = self.source.index("function renderPerformance(document)", selected_start)
         selected = self.source[selected_start:selected_end]
-        self.assertIn("const taskLabel = performanceTaskLabel(record)", selected)
+        self.assertIn("const taskLabel = performanceTaskLabel(performanceRecord)", selected)
         self.assertIn("<th>${esc(taskLabel)}</th>", selected)
 
         render_start = self.source.index("function renderPerformance(document)")
         render_end = self.source.index(
-            "function updatePerformanceChipSelection", render_start
+            "function updateRunDetailChipSelection", render_start
         )
         render = self.source[render_start:render_end]
         self.assertIn(
@@ -594,7 +708,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn('${esc("Identity source: " + record.identity_source)}', source)
         self.assertIn('title="${esc(details)}"', source)
 
-    def test_failure_uses_nonfatal_section_notice(self):
+    def test_timing_failure_is_nonfatal_and_does_not_force_open_or_clear_selection(self):
         self.assertIn('id="performance-notice"', self.source)
         self.assertIn("renderPerformanceUnavailable(error instanceof Error", self.source)
         performance_fetch = self.source.index('getJSON("/api/performance")')
@@ -606,9 +720,11 @@ class PerformanceClientContractTests(unittest.TestCase):
         unavailable_end = self.source.index("function performanceRecordRow", unavailable_start)
         unavailable = self.source[unavailable_start:unavailable_end]
         self.assertIn("performanceRecordsByInvocation = new Map()", unavailable)
-        self.assertIn("selectedPerformanceInvocationId = null", unavailable)
         self.assertIn("performanceTelemetryUnavailable = true", unavailable)
-        self.assertIn("setPerformanceSectionOpen(true)", unavailable)
+        self.assertIn("renderSelectedRunDetails()", unavailable)
+        self.assertNotIn("selectedRunInvocationId = null", unavailable)
+        self.assertNotIn("runDetailsByInvocation = new Map()", unavailable)
+        self.assertNotIn("setPerformanceSectionOpen(true)", unavailable)
 
     def test_phone_timing_summary_is_bounded_display_only_and_schema_compatible(self):
         summary_start = self.source.index("function phoneTimingSummary")
@@ -667,11 +783,11 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("eras: eraView", phone_view)
         self.assertNotIn("timing:", phone_view.lower())
 
-    def test_phone_timing_uses_only_exact_starred_chip_invocation_lookup(self):
+    def test_phone_timing_uses_only_exact_report_chip_invocation_lookup(self):
         collect_start = self.source.index("function collectRunView")
         collect_end = self.source.index("function aggregateEras", collect_start)
         collect = self.source[collect_start:collect_end]
-        self.assertIn("chip.dataset.performanceInvocationId", collect)
+        self.assertIn("chip.dataset.runInvocationId", collect)
         self.assertIn(
             "performanceRecordsByInvocation.get(invocationId)", collect
         )
@@ -685,7 +801,7 @@ class PerformanceClientContractTests(unittest.TestCase):
         )
         self.assertNotIn("performanceStartLabel", collect)
         self.assertNotIn("lifecycle_started_at_utc", collect)
-        self.assertNotIn("run-performance-marker", collect)
+        self.assertNotIn("run-detail-marker", collect)
         self.assertNotIn("timing:", collect.lower())
 
     def test_mobile_performance_rows_expose_column_labels(self):

@@ -123,7 +123,11 @@ from run_lifecycle import (
     PROJECTION_LIMIT,
     validate_current_projection_read_only,
 )
-from status_snapshot import StatusSnapshotError, load_published_status_snapshot
+from status_snapshot import (
+    MAX_REPORT_BYTES,
+    StatusSnapshotError,
+    load_published_status_snapshot,
+)
 from validate_constants import ConstantsValidationError, validate_constants_file
 
 ALLOWED_PREFIXES = ("/dashboard/",)
@@ -134,6 +138,9 @@ PUBLIC_RUN_REPORT_RE = re.compile(
 )
 STATUS_REPORT_FILENAME_RE = re.compile(
     r"rhmra-status-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json\Z"
+)
+RUN_REPORT_FILENAME_RE = re.compile(
+    r"rhmra-log-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.md\Z"
 )
 
 
@@ -521,6 +528,35 @@ def _status_reports():
         name for name in _reports("rhmra-status-*.json")
         if STATUS_REPORT_FILENAME_RE.fullmatch(name) is not None
     ]
+
+
+def _run_reports():
+    """Return canonical reports that are safe for exact lifecycle matching."""
+    report_dir = os.path.join(REPO, "run-reports")
+    accepted = []
+    try:
+        entries = os.scandir(report_dir)
+    except OSError:
+        return accepted
+    with entries:
+        for entry in entries:
+            if RUN_REPORT_FILENAME_RE.fullmatch(entry.name) is None:
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                size = entry.stat(follow_symlinks=False).st_size
+                if size <= 0 or size > MAX_REPORT_BYTES:
+                    continue
+                with open(entry.path, "rb") as handle:
+                    raw = handle.read(MAX_REPORT_BYTES + 1)
+                if not raw or len(raw) > MAX_REPORT_BYTES:
+                    continue
+                raw.decode("utf-8")
+            except (OSError, UnicodeError):
+                continue
+            accepted.append(entry.name)
+    return sorted(accepted)
 
 
 def _status_name_for_run_start(run_start_pt):
@@ -1104,6 +1140,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/index":
+            reports = _run_reports()
             try:
                 status_index = _status_snapshot_index()
             except (LifecycleError, OSError, UnicodeError, ValueError):
@@ -1112,6 +1149,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "rejected_status": [],
                     "orphaned_status": [],
                     "gates": _reports("rhmra-gates-*.json"),
+                    "reports": reports,
                     "warning": _lifecycle_unavailable_warning(),
                 })
             return self._json({
@@ -1119,6 +1157,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "rejected_status": status_index["rejected_status"],
                 "orphaned_status": status_index["orphaned_status"],
                 "gates": _reports("rhmra-gates-*.json"),
+                "reports": reports,
             })
         if path == "/api/runs":
             try:
