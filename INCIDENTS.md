@@ -805,14 +805,37 @@ and released its lease and lifecycle cleanly. The transport protection worked; t
 handoff was incomplete.
 
 **Rule produced:** `bind-transport` now accepts the exact validated `AGENTIC_ACCOUNT_NAME`,
-exact-matches it while strictly reading the saved canary, requires one agentic-enabled match, and
-returns `account_name`, `account_number`, and `agentic_enabled` in its ephemeral success receipt
+exact-matches it while strictly reading the saved canary, requires the connector's Boolean
+`agentic_allowed` on the one match, and
+returns `account_name`, `account_number`, and caller-relative `agentic_allowed` in its ephemeral success receipt
 before privacy-deleting the canary. The run binds account scope only from that validated receipt;
 raw/model-visible response data, narration, memory, and prior runs are never authorities. The
 persistent attempt, transport, and source-root markers remain account-number-free. A missing,
 duplicate, disabled, or malformed match is `coordination-halt` / `account-scope-failed`; a real
 save/path/envelope failure remains `snapshot-failure` / `snapshot-write-failed`. Neither permits a
 second save path or a second `get_accounts` call.
+
+**2026-08-13 14:19 follow-up, the save succeeded but the serializer decorated the JSON.** The
+composed Codex operation correctly called `JSON.stringify` on the complete successful
+`get_accounts` result and wrote one canary in the bound native-temp source root, but it inserted the
+literal six ASCII characters `\ufeff` before the opening `{`. This was not a UTF-8 BOM, Windows ACL
+failure, write denial, or broker-schema failure; the strict reader correctly rejected byte zero as
+invalid JSON and privacy-deleted the canary. Exactly one Robinhood call occurred (`get_accounts`),
+with no portfolio, position, order, scan, placement, or cancellation call. The lease was released,
+the lifecycle closed as `snapshot-failure` / `snapshot-write-failed`, the failure report and timing
+were recorded, and the previous truthful status snapshot remained untouched.
+
+The same forensic review found a second latent mismatch before another test run: the live connector
+returns `agentic_allowed`, while the first account-scope helper revision expected the invented field
+`agentic_enabled`. **Rules produced:** the routine now pins one exact composed serializer: save the
+complete `JSON.stringify(fullToolResult)` object, parse-check it in memory, and give `apply_patch`
+exactly the serialized object with no prefix, suffix, BOM, whitespace, fence, label, comment, or
+object coercion. Every later broker/scan/historical handoff repeats that recipe and the same bound
+root. The strict helper does not strip either literal `\ufeff` or a real UTF-8 BOM; either consumes
+the one attempt and fails closed. Account selection now validates the connector's exact Boolean
+`agentic_allowed` and preserves that exact caller-relative name in the receipt. Regression tests cover
+both forbidden prefixes, deletion, permanent no-retry fencing, missing/wrong/false eligibility, and
+account-free persistent markers.
 
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 

@@ -148,6 +148,21 @@ def _read_source(path: str) -> tuple[Any, bytes]:
         raw = Path(path).read_bytes()
     except OSError as exc:
         raise SnapshotError(f"{path}: cannot read source result: {exc}") from exc
+    if raw.startswith(b"\\ufeff"):
+        raise SnapshotError(
+            f"{path}: source result has forbidden literal six-byte \\ufeff "
+            "prefix before JSON"
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise SnapshotError(
+            f"{path}: source result has forbidden UTF-8 BOM before JSON"
+        )
+    framed = raw[:-1] if raw.endswith(b"\n") else raw
+    if not framed.startswith(b"{") or not framed.endswith(b"}"):
+        raise SnapshotError(
+            f"{path}: source result must be exactly one JSON object with no "
+            "leading prefix or trailing decoration; one terminal LF is allowed"
+        )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1594,16 +1609,16 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
             resolved_account.get('account_number'),
             f'{canary}.data.accounts matching {account_name!r}.account_number',
         )
-        agentic_enabled = resolved_account.get('agentic_enabled')
-        if not isinstance(agentic_enabled, bool):
+        agentic_allowed = resolved_account.get('agentic_allowed')
+        if not isinstance(agentic_allowed, bool):
             raise SnapshotError(
                 f'{canary}.data.accounts matching '
-                f'{account_name!r}.agentic_enabled: expected a boolean'
+                f'{account_name!r}.agentic_allowed: expected a boolean'
             )
-        if not agentic_enabled:
+        if not agentic_allowed:
             raise SnapshotError(
                 f'{canary}.data.accounts matching {account_name!r}: '
-                'account is not agentic-enabled'
+                'account is not accessible to this agent'
             )
     except Exception as exc:
         validation_error = exc
@@ -1643,7 +1658,7 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
         'canary_removed': True,
         'account_name': account_name,
         'account_number': account_number,
-        'agentic_enabled': agentic_enabled,
+        'agentic_allowed': agentic_allowed,
     }
 
 

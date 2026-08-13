@@ -123,7 +123,7 @@ def bound_source_root(scratch):
                             {
                                 "nickname": "Agentic",
                                 "account_number": "test-account",
-                                "agentic_enabled": True,
+                                "agentic_allowed": True,
                             }
                         ]
                     }
@@ -934,7 +934,11 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("immediate terminal transport failure", block)
         self.assertIn("MUST NOT start B", block)
         self.assertIn("Generation B is reserved only", block)
-        self.assertIn("including all `data`, pagination, transport-envelope, and `guide` fields", block)
+        self.assertIn(
+            "including all `content`, `structuredContent`, `data`, pagination, "
+            "transport-envelope, and `guide` fields",
+            block,
+        )
         matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
             "For positions and orders, stage each returned page", 1
         )[0]
@@ -3486,7 +3490,7 @@ class BrokerSnapshotTests(unittest.TestCase):
     @staticmethod
     def valid_accounts_document(
         *, account_number='test-account', label_field='nickname',
-        account_name='Agentic', agentic_enabled=True,
+        account_name='Agentic', agentic_allowed=True,
     ):
         return {
             'data': {
@@ -3494,7 +3498,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     {
                         label_field: account_name,
                         'account_number': account_number,
-                        'agentic_enabled': agentic_enabled,
+                        'agentic_allowed': agentic_allowed,
                     }
                 ]
             }
@@ -3627,6 +3631,101 @@ class BrokerSnapshotTests(unittest.TestCase):
             with open(attempt_path, 'rb') as handle:
                 self.assertEqual(handle.read(), original_attempt)
 
+    def test_bind_rejects_forbidden_json_prefixes_without_stripping_or_retry(self):
+        payload = json.dumps(
+            self.valid_accounts_document(), separators=(',', ':'), sort_keys=True
+        ).encode('utf-8')
+        cases = (
+            (
+                'literal-unicode-escape',
+                b'\\ufeff' + payload,
+                'source result has forbidden literal six-byte \\ufeff prefix '
+                'before JSON',
+            ),
+            (
+                'utf8-bom',
+                b'\xef\xbb\xbf' + payload,
+                'source result has forbidden UTF-8 BOM before JSON',
+            ),
+            (
+                'leading-space',
+                b' ' + payload,
+                'source result must be exactly one JSON object with no leading '
+                'prefix or trailing decoration',
+            ),
+            (
+                'leading-newline',
+                b'\n' + payload,
+                'source result must be exactly one JSON object with no leading '
+                'prefix or trailing decoration',
+            ),
+            (
+                'trailing-space',
+                payload + b' ',
+                'source result must be exactly one JSON object with no leading '
+                'prefix or trailing decoration',
+            ),
+            (
+                'extra-terminal-newline',
+                payload + b'\n\n',
+                'source result must be exactly one JSON object with no leading '
+                'prefix or trailing decoration',
+            ),
+            (
+                'json-array',
+                b'[]',
+                'source result must be exactly one JSON object with no leading '
+                'prefix or trailing decoration',
+            ),
+        )
+        for label, raw, expected_message in cases:
+            with self.subTest(prefix=label), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch, bind_transport=False)
+                source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+                self.addCleanup(shutil.rmtree, source_root, True)
+                canary = os.path.join(source_root, 'accounts.json')
+                with open(canary, 'wb') as handle:
+                    handle.write(raw)
+
+                rejected, error = self.invoke(
+                    'bind-transport', '--scratch', scratch,
+                    '--source-root', source_root, '--canary', canary,
+                    '--account-name', 'Agentic',
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse(error['ok'])
+                self.assertIn(expected_message, error['error']['message'])
+                self.assertFalse(os.path.exists(canary))
+                self.assertTrue(os.path.exists(os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport-attempt.json',
+                )))
+                self.assertFalse(os.path.exists(os.path.join(
+                    scratch, '.rhmra-broker-response-transport.json',
+                )))
+                self.assertFalse(os.path.exists(os.path.join(
+                    source_root,
+                    '.rhmra-broker-response-source-root.json',
+                )))
+
+                retry_canary = self.write_json(
+                    source_root, 'valid-retry.json',
+                    self.valid_accounts_document(),
+                )
+                retry, retry_error = self.invoke(
+                    'bind-transport', '--scratch', scratch,
+                    '--source-root', source_root, '--canary', retry_canary,
+                    '--account-name', 'Agentic',
+                )
+                self.assertNotEqual(retry.returncode, 0)
+                self.assertFalse(retry_error['ok'])
+                self.assertIn(
+                    'already attempted', retry_error['error']['message']
+                )
+                self.assertFalse(os.path.exists(retry_canary))
+
     def test_invalid_scratch_does_not_consume_attempt_or_cleanup_canary(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
@@ -3724,17 +3823,24 @@ class BrokerSnapshotTests(unittest.TestCase):
             source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
             self._transport_roots[os.path.abspath(scratch)] = source_root
             canary_document = {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"data":{"accounts":[]}}',
+                    }
+                ],
                 'structuredContent': {
                     'data': {
                         'accounts': [
                             {
                                 'account_number': 'sensitive-account',
                                 'nickname': 'Agentic',
-                                'agentic_enabled': True,
+                                'agentic_allowed': True,
                             }
                         ]
-                    }
-                }
+                    },
+                    'guide': 'synthetic connector guide',
+                },
             }
             canary = self.write_json(
                 source_root, 'get-accounts-canary.json', canary_document
@@ -3756,7 +3862,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'schema_version', 'action', 'ok', 'transport', 'scratch',
                     'scratch_id', 'source_root', 'canary_sha256',
                     'canary_removed', 'account_name', 'account_number',
-                    'agentic_enabled',
+                    'agentic_allowed',
                 },
             )
             self.assertEqual(receipt['schema_version'], 1)
@@ -3771,7 +3877,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertFalse(os.path.exists(canary))
             self.assertEqual(receipt['account_name'], 'Agentic')
             self.assertEqual(receipt['account_number'], 'sensitive-account')
-            self.assertIs(receipt['agentic_enabled'], True)
+            self.assertIs(receipt['agentic_allowed'], True)
 
             marker_path = os.path.join(
                 scratch, '.rhmra-broker-response-transport.json'
@@ -3810,7 +3916,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     persistent_markers += handle.read()
             for private_value in (
                 'sensitive-account', 'Agentic', 'account_name',
-                'account_number', 'agentic_enabled',
+                'account_number', 'agentic_allowed', 'agentic_enabled',
             ):
                 self.assertNotIn(private_value, persistent_markers)
 
@@ -3862,20 +3968,20 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertFalse(os.path.exists(canary))
             self.assertEqual(receipt['account_name'], 'Agentic')
             self.assertEqual(receipt['account_number'], 'name-field-account')
-            self.assertIs(receipt['agentic_enabled'], True)
+            self.assertIs(receipt['agentic_allowed'], True)
 
     def test_bind_rejects_unresolved_duplicate_disabled_or_malformed_account(self):
         valid = {
             'nickname': 'Agentic',
             'account_number': 'test-account',
-            'agentic_enabled': True,
+            'agentic_allowed': True,
         }
         cases = {
             'no-match': [
                 {
                     'nickname': 'Other',
                     'account_number': 'other-account',
-                    'agentic_enabled': True,
+                    'agentic_allowed': True,
                 }
             ],
             'duplicate-match': [
@@ -3883,13 +3989,13 @@ class BrokerSnapshotTests(unittest.TestCase):
                 {
                     'name': 'Agentic',
                     'account_number': 'duplicate-account',
-                    'agentic_enabled': True,
+                    'agentic_allowed': True,
                 },
             ],
             'disabled': [
                 {
                     **valid,
-                    'agentic_enabled': False,
+                    'agentic_allowed': False,
                 }
             ],
             'empty-account-number': [
@@ -3898,10 +4004,29 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'account_number': '',
                 }
             ],
-            'nonboolean-agentic-enabled': [
+            'nonboolean-agentic-allowed': [
                 {
                     **valid,
-                    'agentic_enabled': 'true',
+                    'agentic_allowed': 'true',
+                }
+            ],
+            'null-agentic-allowed': [
+                {
+                    **valid,
+                    'agentic_allowed': None,
+                }
+            ],
+            'missing-agentic-allowed': [
+                {
+                    'nickname': 'Agentic',
+                    'account_number': 'test-account',
+                }
+            ],
+            'legacy-agentic-enabled-only': [
+                {
+                    'nickname': 'Agentic',
+                    'account_number': 'test-account',
+                    'agentic_enabled': True,
                 }
             ],
             'malformed-account-entry': ['not-an-account-object'],
@@ -3933,6 +4058,21 @@ class BrokerSnapshotTests(unittest.TestCase):
                 )
                 self.assertNotEqual(proc.returncode, 0, error)
                 self.assertFalse(error['ok'])
+                if label in {
+                    'nonboolean-agentic-allowed',
+                    'null-agentic-allowed',
+                    'missing-agentic-allowed',
+                    'legacy-agentic-enabled-only',
+                }:
+                    self.assertIn(
+                        '.agentic_allowed: expected a boolean',
+                        error['error']['message'],
+                    )
+                if label == 'disabled':
+                    self.assertIn(
+                        'account is not accessible to this agent',
+                        error['error']['message'],
+                    )
                 self.assertFalse(os.path.exists(canary))
                 self.assertTrue(os.path.exists(os.path.join(
                     scratch,
@@ -7308,14 +7448,44 @@ class MarketClockTests(unittest.TestCase):
             'Never call `get_accounts` again after that success',
             transport_binding,
         )
+        self.assertEqual(
+            transport_binding.count(
+                'const payload = JSON.stringify(fullToolResult);'
+            ),
+            1,
+        )
+        target_declaration = (
+            'const targetPath = "<fresh absolute SOURCE_ROOT direct-child '
+            'path using / separators>";'
+        )
+        self.assertIn(target_declaration, transport_binding)
+        self.assertLess(
+            transport_binding.index(target_declaration),
+            transport_binding.index('const fullToolResult = await'),
+        )
+        self.assertIn('const parsed = JSON.parse(payload);', transport_binding)
+        self.assertIn('payload[0] !== "{"', transport_binding)
+        self.assertIn('payload[payload.length - 1] !== "}"', transport_binding)
+        self.assertIn(
+            '"\\n+" + payload.replaceAll("\\n", "\\n+") + '
+            '"\\n*** End Patch"',
+            transport_binding,
+        )
+        self.assertIn('Put zero bytes or characters before `{`', transport_binding)
+        self.assertIn('literal six-character `\\ufeff`', transport_binding)
+        self.assertIn('no real U+FEFF BOM', transport_binding)
+        self.assertIn('Never use `String(fullToolResult)`', transport_binding)
+        self.assertIn('never emit the raw result or `payload`', transport_binding)
+        self.assertIn('exact composed JSON save recipe', transport_binding)
+        self.assertNotIn('"\\n+\\ufeff" + payload', transport_binding)
         self.assertIn("--account-name '<validated AGENTIC_ACCOUNT_NAME>'", transport_binding)
         self.assertIn('exactly these twelve fields', transport_binding)
         for field in (
-            '`account_name`', '`account_number`', '`agentic_enabled`',
+            '`account_name`', '`account_number`', '`agentic_allowed`',
         ):
             self.assertIn(field, transport_binding)
         self.assertIn(
-            'Bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ENABLED` '
+            'Bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ALLOWED` '
             'only from this validated receipt',
             transport_binding,
         )
@@ -8327,14 +8497,14 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("same bound file-change capability", scan_phase)
         self.assertIn("same composed tool operation", scan_phase)
         self.assertIn("tools.apply_patch", scan_phase)
+        self.assertIn("EXACT COMPOSED JSON SAVE RECIPE", scan_phase)
+        self.assertIn("COMPLETE `fullToolResult`", scan_phase)
+        self.assertIn("zero-prefix/zero-decoration", scan_phase)
         self.assertIn("any `text(...)`, `yield_control`", scan_phase)
+        self.assertIn("compact saved-path receipt", scan_phase)
         self.assertIn(
-            "compact receipt containing the saved path and write status",
-            scan_phase,
-        )
-        self.assertIn(
-            "do not run `TextEncoder`, an ad-hoc byte counter, or another "
-            "path/save experiment",
+            "do not run `TextEncoder`, an ad-hoc byte counter, add a "
+            "BOM/prefix, or perform another path/save experiment",
             scan_phase,
         )
         self.assertIn(
