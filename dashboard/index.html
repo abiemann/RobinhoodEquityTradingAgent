@@ -132,6 +132,7 @@
                          color:var(--text); font-weight:600; }
   .performance-secondary { display:block; min-width:0; overflow-wrap:anywhere;
                            color:var(--dim); font-size:12px; }
+  .performance-unknown { color:var(--amber); }
   .performance-duration { font-variant-numeric:tabular-nums; }
   .performance-missing { color:var(--dim); font-style:italic; font-weight:400; }
   @media (prefers-reduced-motion: reduce) {
@@ -296,6 +297,7 @@ let runDetailsByInvocation = new Map();
 let selectedRunInvocationId = null;
 let performanceTelemetryUnavailable = false;
 let performanceTelemetryMessage = "";
+let performanceSchemaVersion = 3;
 let performanceScrollEpoch = 0;
 let runDetailContentEpoch = 0;
 
@@ -1740,22 +1742,84 @@ const PERFORMANCE_DURATION_FIELDS = [
   "task_duration_ms", "routine_total_ms", "strategy_execution_ms",
   "routine_overhead_ms", "outside_lifecycle_ms", "total_overhead_ms",
 ];
+const PERFORMANCE_DOCUMENT_KEYS = new Set([
+  "schema_version", "record_limit", "record_count",
+  "source_event_high_watermark", "records",
+]);
 const PERFORMANCE_TEXT_FIELDS = [
   "invocation_id", "lifecycle_started_at_utc", "lifecycle_finished_at_utc",
   "strategy_started_at_utc", "strategy_finished_at_utc", "session", "runner",
   "model", "configuration", "identity_source", "internal_recorded_at_utc",
   "task_clock_source", "task_observed_at_utc",
 ];
+const PERFORMANCE_V1_V2_RECORD_KEYS = new Set([
+  ...PERFORMANCE_TEXT_FIELDS, ...PERFORMANCE_DURATION_FIELDS,
+]);
+const PERFORMANCE_V3_RECORD_KEYS = new Set([
+  ...PERFORMANCE_V1_V2_RECORD_KEYS, "identity_warning",
+]);
+const PERFORMANCE_IDENTITY_FIELD_NAMES = [
+  "runner", "model", "configuration",
+];
+const PERFORMANCE_IDENTITY_FIELD_SOURCE_NAMES =
+  PERFORMANCE_IDENTITY_FIELD_NAMES.map(field => `${field}_identity_source`);
+const PERFORMANCE_V4_RECORD_KEYS = new Set([
+  ...PERFORMANCE_V3_RECORD_KEYS, ...PERFORMANCE_IDENTITY_FIELD_SOURCE_NAMES,
+]);
 const PERFORMANCE_TASK_CLOCK_SOURCES = new Set([
   "runner-metadata", "codex-worked-for", "claude-run-duration",
   "manual-stopwatch", "manual-observation", "final-summary-boundary", "unknown",
 ]);
+const PERFORMANCE_V1_V2_IDENTITY_SOURCES = new Set([
+  "run-metadata", "task-definition", "manual-ui", "declared", "unknown",
+]);
+const PERFORMANCE_V3_IDENTITY_SOURCES = new Set([
+  ...PERFORMANCE_V1_V2_IDENTITY_SOURCES, "self-reported",
+]);
+const PERFORMANCE_V4_IDENTITY_FIELD_SOURCES = new Set([
+  ...PERFORMANCE_V1_V2_IDENTITY_SOURCES,
+  "runtime-environment", "self-reported",
+]);
+const PERFORMANCE_V4_IDENTITY_SOURCES = new Set([
+  ...PERFORMANCE_V4_IDENTITY_FIELD_SOURCES, "composite",
+]);
+const PERFORMANCE_V3_IDENTITY_WARNINGS = new Set([
+  "metadata-declaration-conflict", "metadata-self-conflict",
+  "declaration-self-conflict", "metadata-invalid", "declaration-invalid",
+  "self-incomplete", "self-unrecognized",
+]);
+const PERFORMANCE_V4_IDENTITY_WARNINGS = new Set([
+  ...PERFORMANCE_V3_IDENTITY_WARNINGS,
+  "metadata-runtime-conflict", "declaration-runtime-conflict",
+  "runtime-self-conflict", "runtime-environment-invalid",
+  "runtime-self-unverified", "runtime-environment-incomplete",
+]);
 const PERFORMANCE_LEGACY_SCHEMA_VERSION = 1;
-const PERFORMANCE_SCHEMA_VERSION = 2;
+const PERFORMANCE_COMPARABLE_SCHEMA_VERSION = 2;
+const PERFORMANCE_IDENTITY_SCHEMA_VERSION = 3;
+const PERFORMANCE_SCHEMA_VERSION = 4;
 const PERFORMANCE_COMPARABLE_CLOCK_SOURCE = "final-summary-boundary";
+
+function aggregatePerformanceIdentitySource(record) {
+  const sources = new Set(PERFORMANCE_IDENTITY_FIELD_SOURCE_NAMES
+    .map(field => record[field]).filter(source => source !== "unknown"));
+  if (sources.size === 0) return "unknown";
+  return sources.size === 1 ? [...sources][0] : "composite";
+}
 
 function validPerformanceRecord(record, schemaVersion = PERFORMANCE_SCHEMA_VERSION) {
   if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  const expectedKeys = schemaVersion === PERFORMANCE_SCHEMA_VERSION
+    ? PERFORMANCE_V4_RECORD_KEYS
+    : schemaVersion === PERFORMANCE_IDENTITY_SCHEMA_VERSION
+      ? PERFORMANCE_V3_RECORD_KEYS
+      : [PERFORMANCE_LEGACY_SCHEMA_VERSION, PERFORMANCE_COMPARABLE_SCHEMA_VERSION]
+          .includes(schemaVersion)
+        ? PERFORMANCE_V1_V2_RECORD_KEYS : null;
+  if (expectedKeys === null) return false;
+  const actualKeys = Object.keys(record);
+  if (actualKeys.length !== expectedKeys.size ||
+      !actualKeys.every(key => expectedKeys.has(key))) return false;
   if (typeof record.invocation_id !== "string" || !record.invocation_id) return false;
   if (!PERFORMANCE_TEXT_FIELDS.every(field =>
     record[field] === null ||
@@ -1765,6 +1829,33 @@ function validPerformanceRecord(record, schemaVersion = PERFORMANCE_SCHEMA_VERSI
     (Number.isSafeInteger(record[field]) && record[field] >= 0))) return false;
   if (!Number.isSafeInteger(record.routine_total_ms) ||
       record.routine_total_ms < 0) return false;
+  const identitySources = schemaVersion === PERFORMANCE_SCHEMA_VERSION
+    ? PERFORMANCE_V4_IDENTITY_SOURCES
+    : schemaVersion === PERFORMANCE_IDENTITY_SCHEMA_VERSION
+      ? PERFORMANCE_V3_IDENTITY_SOURCES : PERFORMANCE_V1_V2_IDENTITY_SOURCES;
+  if (!identitySources.has(record.identity_source)) return false;
+  const identityValues = [record.runner, record.model, record.configuration];
+  if (record.identity_source === "unknown" &&
+      identityValues.some(value => value !== "unknown")) return false;
+  if (["run-metadata", "declared"].includes(record.identity_source) &&
+      identityValues.includes("unknown")) return false;
+  if (record.identity_source === "self-reported" &&
+      identityValues.every(value => value === "unknown")) return false;
+  if (schemaVersion === PERFORMANCE_SCHEMA_VERSION) {
+    if (!PERFORMANCE_IDENTITY_FIELD_SOURCE_NAMES.every(field =>
+      PERFORMANCE_V4_IDENTITY_FIELD_SOURCES.has(record[field]))) return false;
+    if (!PERFORMANCE_IDENTITY_FIELD_NAMES.every((field, index) =>
+      (identityValues[index] === "unknown") ===
+        (record[`${field}_identity_source`] === "unknown"))) return false;
+    if (record.identity_source !== aggregatePerformanceIdentitySource(record))
+      return false;
+  }
+  const identityWarnings = schemaVersion === PERFORMANCE_SCHEMA_VERSION
+    ? PERFORMANCE_V4_IDENTITY_WARNINGS
+    : schemaVersion === PERFORMANCE_IDENTITY_SCHEMA_VERSION
+      ? PERFORMANCE_V3_IDENTITY_WARNINGS : null;
+  if (identityWarnings !== null && record.identity_warning !== null &&
+      !identityWarnings.has(record.identity_warning)) return false;
   const taskValues = [
     record.task_duration_ms,
     record.task_clock_source,
@@ -1826,9 +1917,15 @@ function performanceStartLabel(startedAtUtc) {
 }
 
 function performanceIdentity(record) {
-  const parts = [record.runner, record.model, record.configuration]
-    .filter(value => typeof value === "string" && value);
-  return parts.length ? parts : null;
+  return [record.runner, record.model, record.configuration].map(value =>
+    typeof value === "string" && value ? value : "unknown");
+}
+
+function performanceIdentityFieldProvenance(
+    record, schemaVersion = performanceSchemaVersion) {
+  if (schemaVersion !== PERFORMANCE_SCHEMA_VERSION) return null;
+  return PERFORMANCE_IDENTITY_FIELD_NAMES.map(field =>
+    `${field}=${record[`${field}_identity_source`]}`).join(", ");
 }
 
 function performanceTaskLabel(record) {
@@ -1836,13 +1933,19 @@ function performanceTaskLabel(record) {
     ? "Comparable run duration" : "Reference run duration";
 }
 
-function phoneTimingSummary(record) {
-  if (!validPerformanceRecord(record)) return null;
-  const identity = performanceIdentity(record)?.join(' / ') ?? 'not measured';
+function phoneTimingSummary(record, schemaVersion = performanceSchemaVersion) {
+  if (!validPerformanceRecord(record, schemaVersion)) return null;
+  const identity = performanceIdentity(record).join(' / ');
   const taskLabel = performanceTaskLabel(record);
   const summary = [
     `Timing — session: ${performanceSessionLabel(record.session)}`,
     `runner / model / configuration: ${identity}`,
+    `identity provenance: ${record.identity_source}`,
+    ...(performanceIdentityFieldProvenance(record, schemaVersion) === null
+      ? [] : [`field provenance: ${performanceIdentityFieldProvenance(
+        record, schemaVersion)}`]),
+    ...(record.identity_warning === null || record.identity_warning === undefined
+      ? [] : [`identity warning: ${record.identity_warning}`]),
     `${taskLabel}: ${formatPerformanceDuration(record.task_duration_ms)}`,
     `Routine total: ${formatPerformanceDuration(record.routine_total_ms)}`,
     `Strategy execution: ${formatPerformanceDuration(record.strategy_execution_ms)}`,
@@ -1960,12 +2063,12 @@ function performanceRecordRow(record) {
     const identity = performanceIdentity(record);
     const taskLabel = performanceTaskLabel(record);
     const comparableTask = record.task_clock_source === PERFORMANCE_COMPARABLE_CLOCK_SOURCE;
-    const identityHtml = identity
-      ? `<span class="performance-primary">${esc(identity[0])}</span>` +
-        (identity.length > 1
-          ? `<span class="performance-secondary">${identity.slice(1).map(esc).join(" / ")}</span>`
-          : "")
-      : '<span class="performance-missing">not measured</span>';
+    const identityValue = value => value === "unknown"
+      ? '<span class="performance-unknown">unknown</span>' : esc(value);
+    const identityHtml =
+      `<span class="performance-primary">${identityValue(identity[0])}</span>` +
+      `<span class="performance-secondary">${identity.slice(1).map(identityValue).join(" / ")}</span>` +
+      `<span class="performance-secondary">Provenance: ${esc(record.identity_source)}</span>`;
     const identityTitle = record.identity_source
       ? ` title="${esc("Identity source: " + record.identity_source)}"` : "";
     const taskDetails = [
@@ -2054,7 +2157,7 @@ function renderSelectedRunDetails() {
   const taskLabel = performanceTaskLabel(performanceRecord);
   const row = performanceRecordRow(performanceRecord);
   $("performance").innerHTML = `<table class="performance-table"><thead><tr>` +
-    `<th>Start / session</th><th>Runner / model / configuration</th>` +
+    `<th>Start / session</th><th class="performance-identity">Runner / model / configuration</th>` +
     `<th>${esc(taskLabel)}</th><th>Routine total</th>` +
     `<th>Strategy execution</th><th>Routine overhead</th>` +
     `</tr></thead><tbody>${row}</tbody></table>`;
@@ -2064,8 +2167,17 @@ function renderPerformance(document) {
   const notice = $("performance-notice");
   notice.hidden = true;
   notice.textContent = "";
+  const documentKeys = document && typeof document === "object" &&
+    !Array.isArray(document) ? Object.keys(document) : [];
   if (!document ||
-      ![PERFORMANCE_LEGACY_SCHEMA_VERSION, PERFORMANCE_SCHEMA_VERSION]
+      documentKeys.length !== PERFORMANCE_DOCUMENT_KEYS.size ||
+      !documentKeys.every(key => PERFORMANCE_DOCUMENT_KEYS.has(key)) ||
+      ![
+        PERFORMANCE_LEGACY_SCHEMA_VERSION,
+        PERFORMANCE_COMPARABLE_SCHEMA_VERSION,
+        PERFORMANCE_IDENTITY_SCHEMA_VERSION,
+        PERFORMANCE_SCHEMA_VERSION,
+      ]
         .includes(document.schema_version) ||
       !Number.isSafeInteger(document.record_limit) || document.record_limit <= 0 ||
       !Number.isSafeInteger(document.source_event_high_watermark) ||
@@ -2088,6 +2200,7 @@ function renderPerformance(document) {
   }
   performanceTelemetryUnavailable = false;
   performanceTelemetryMessage = "";
+  performanceSchemaVersion = document.schema_version;
   performanceRecordsByInvocation = indexed;
   renderSelectedRunDetails();
 }

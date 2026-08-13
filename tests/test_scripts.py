@@ -6290,6 +6290,8 @@ class MarketClockTests(unittest.TestCase):
             'verified absolute `PYTHON_EXE`',
             '`run_lifecycle.py start`',
             '`validate_constants.py --json`',
+            '`run_performance.py resolve-identity --invocation-id '
+            '<INVOCATION_ID>',
             '`market_clock.py --json --expected-constants-sha256',
             '`run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>`',
             '`run_lock.py acquire`',
@@ -6308,8 +6310,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('before successful lease acquisition', startup)
         self.assertIn('Never invent a placeholder token', startup)
         self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
-        self.assertIn('Items 1–12 normally succeed before `get_accounts`', startup)
-        self.assertIn('If item 10 or 11 fails', startup)
+        self.assertIn('Items 1–13 normally succeed before `get_accounts`', startup)
+        self.assertIn('If item 11 or 12 fails', startup)
         self.assertIn('named read-only positions/orders calls', startup)
         self.assertIn('is the sole exception', startup)
         self.assertIn('no broker mutation is permitted', startup)
@@ -6432,10 +6434,14 @@ class MarketClockTests(unittest.TestCase):
             'exactly once for that invocation',
             '--invocation-id <INVOCATION_ID>',
             '--session',
-            '--runner <codex|claude|unknown>',
-            '--model \'<TIMING_MODEL>\'',
-            '--configuration \'<TIMING_CONFIG>\'',
-            '--identity-source <run-metadata|declared|unknown>',
+            "run_performance.py record-internal --invocation-id "
+            "<INVOCATION_ID> --session",
+            'Do not pass `--runner`, `--model`, `--configuration`, or '
+            '`--identity-source` from the model',
+            'consumes the invocation-bound identity persisted by the sole '
+            'pre-START-CLOCK `resolve-identity` call',
+            'missing or unusable identity binding becomes all-unknown '
+            'identity',
             'Never pass strategy timestamps',
             'derives the unique host-stamped `position-management` through '
             '`report` lifecycle pair',
@@ -6443,14 +6449,8 @@ class MarketClockTests(unittest.TestCase):
             'START CLOCK\'s `session` unchanged',
             '`unknown` only when the invocation finished without a '
             'successful START CLOCK',
-            'four identity arguments from the already-bound timing '
-            'identity as one indivisible set',
-            'matching declaration plus metadata also supplies '
-            '`run-metadata`',
-            '`unknown` for runner, model, configuration, and identity '
-            'source together',
-            'Never pass a partially known identity with '
-            '`--identity-source unknown`',
+            'direct metadata, declaration, self-report, and warning '
+            'precedence are never reconstructed at finalization',
             'do not retry or call another timing command',
             'final tool call of a normally reported run',
             'reuse its one internal-record host-clock reading',
@@ -6539,38 +6539,71 @@ class MarketClockTests(unittest.TestCase):
 
         routine = documents['robinhood-momentum-routine-autonomous.md']
         identity = routine.split(
-            '### TIMING IDENTITY — explicit provenance only', 1
+            '### TIMING IDENTITY — deterministic provenance with '
+            'self-report fallback', 1
         )[1].split('## Tradeoffs / known limitations', 1)[0]
         for required in (
-            'exactly one well-formed line in the current task input',
+            'Immediately after the routine-file read returns',
+            'before any subsequent launcher/helper/broker call',
+            'Who am I in this running task?',
+            'runner product, exact model family/version, and current '
+            'reasoning/effort setting',
+            'SELF_IDENTITY=<runner>|<model>|<configuration>',
+            'use the literal string `unknown` for each field',
+            '1–48 ASCII characters',
+            'shell-inert grammar',
+            'may not contain `|`, quotes, backticks, `$`, separators, '
+            'slashes, or control characters',
+            'never quote or escape an unsafe component into the command',
+            'Do not consult or copy a `TIMING_IDENTITY` declaration',
+            'the deterministic registry, prior runs, memory, available '
+            'tools/connectors, or a global configuration',
+            'Do not ask the user, emit the claim in conversation, call a '
+            'discovery tool, probe a helper, or repeat',
             'TIMING_IDENTITY: runner=<runner> model=<model> '
             'config=<configuration>',
-            'direct framework metadata that explicitly identifies this '
-            'current task',
-            'Zero declaration lines means that declaration source is '
-            'absent',
-            'Multiple, malformed, or internally conflicting '
-            '`TIMING_IDENTITY` lines make provenance invalid',
-            'all three identity values are explicit',
-            'matching direct framework metadata takes precedence',
-            'require all three values to match exactly',
-            'collapse all four timing identity bindings together',
-            '`TIMING_RUNNER`, `TIMING_MODEL`, `TIMING_CONFIG`, and '
-            '`TIMING_IDENTITY_SOURCE` to the literal string `unknown`',
-            'Never retain a known runner, model, or configuration with '
-            '`TIMING_IDENTITY_SOURCE=unknown`',
-            'literal string `unknown`',
-            'Never infer timing identity from the preferred-model prose',
-            'a global or remembered configuration',
-            'model exposed somewhere in the tool surface',
-            'available tools/connectors',
-            '`runner` value must be `codex` or `claude`',
-            'model and configuration labels must exactly match the task '
-            'settings selected for this run',
-            '`TIMING_IDENTITY_SOURCE=declared`',
-            '`TIMING_IDENTITY_SOURCE=run-metadata`',
-            '`TIMING_IDENTITY_SOURCE=unknown`',
-            'Do not use the post-run-only `manual-ui` source',
+            'DECLARED_IDENTITY=absent',
+            'DECLARED_IDENTITY=invalid',
+            'METADATA_IDENTITY=absent',
+            'METADATA_IDENTITY=invalid',
+            'run_performance.py resolve-identity',
+            'before `market_clock.py` and START CLOCK',
+            '--self-identity \'<SELF_IDENTITY>\'',
+            '--declared-identity \'<DECLARED_IDENTITY>\'',
+            '--metadata-identity \'<METADATA_IDENTITY>\'',
+            'complete direct metadata, then one valid declaration, then '
+            'deterministic runtime evidence combined with an exact '
+            'registry-resolved self-report, then unknown',
+            'reads only the official `CLAUDECODE` runtime marker and '
+            '`CLAUDE_EFFORT` setting with exact `os.environ.get` calls',
+            'it never enumerates the environment',
+            'Do not inspect, enumerate, copy, echo, store, or pass '
+            'environment values yourself',
+            'the resolver accepts no environment argument',
+            'inherited and spoofable corroboration, not authentication',
+            'aggregate `composite` provenance',
+            'never maps a vague family label such as `GPT-5`',
+            'never maps a vague family label such as `GPT-5` to a specific '
+            'model or invents a missing setting',
+            '`runner_identity_source`',
+            '`model_identity_source`',
+            '`configuration_identity_source`',
+            '`identity_warning`',
+            'Any unknown field, self-reported field, or identity conflict '
+            'excludes the record',
+            '`TIMING_IDENTITY` declaration synchronized with actual task '
+            'settings',
+            'strongest symmetric source available to both Claude and Codex',
+            'exactly one JSON object with these twelve fields and no others',
+            '`runtime-environment`, `self-reported`, `composite`, or '
+            '`unknown`',
+            'persists the same invocation-bound result',
+            'context compaction never authorizes a second '
+            'self-identification or resolver call',
+            'observational only',
+            'continue the trading routine unchanged',
+            'no trading, lifecycle, lease, report, status, or broker '
+            'authority',
         ):
             self.assertIn(required, identity)
 
@@ -6610,6 +6643,31 @@ class MarketClockTests(unittest.TestCase):
             'runner/model identity explicit as the comparison dimension',
         ):
             self.assertIn(required, tested_on)
+        self.assertIn(
+            'A schema-v2-or-newer `final-summary-boundary` value is labeled '
+            '**Comparable run duration**',
+            readme,
+        )
+        self.assertIn(
+            'Legacy schema-v1 files are reference-only', readme
+        )
+        self.assertIn(
+            'Schema v4 preserves runner, model, and configuration provenance '
+            'separately',
+            readme,
+        )
+        self.assertIn(
+            'Any unknown field, conflict, or self-reported field is shown in '
+            'the existing orange identity diagnostic',
+            readme,
+        )
+        self.assertIn(
+            'never changes the chip\'s independent run-health color', readme
+        )
+        self.assertIn(
+            'only bounded enum provenance, never raw environment data',
+            readme,
+        )
 
     def test_post_run_observation_commands_are_complete_and_source_preserving(self):
         codex_observe = (
@@ -6706,6 +6764,20 @@ class MarketClockTests(unittest.TestCase):
             'actually selected', scheduling
         )
         self.assertIn('does not switch the model', scheduling)
+        for required in (
+            'one pre-helper self-report',
+            'only framework-explicit identity',
+            'Direct metadata remains strongest',
+            'reads only `CLAUDECODE` and `CLAUDE_EFFORT`',
+            'without enumerating the environment',
+            'runtime evidence plus self-report can produce a `composite` '
+            'identity',
+            'Any unknown field, self-reported field, or conflict excludes '
+            'the sample from primary fair comparisons',
+            'strongest symmetric source across Claude and Codex',
+            'no trading authority',
+        ):
+            self.assertIn(required, scheduling)
 
         with open(
             os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md'),
@@ -6719,6 +6791,22 @@ class MarketClockTests(unittest.TestCase):
             'keep it synchronized with the model and effort actually '
             'selected', claude_guide
         )
+        for required in (
+            'one structured self-report',
+            'checked-in exact-match registry',
+            'reads only `CLAUDECODE` and `CLAUDE_EFFORT` through exact '
+            '`os.environ.get` calls',
+            'never enumerates, copies, echoes, stores, or passes environment '
+            'values',
+            'inherited environment can be spoofed',
+            'corroboration rather than authentication',
+            'field-level `composite`',
+            'Any unknown field, self-reported field, or conflict excludes '
+            'the run from primary fair-comparison cohorts',
+            'strongest symmetric source across Claude and Codex',
+            'cannot affect trading',
+        ):
+            self.assertIn(required, claude_guide)
 
         with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
             quickstart = f.read().split(
@@ -6732,6 +6820,35 @@ class MarketClockTests(unittest.TestCase):
             'attached',
             quickstart,
         )
+        for required in (
+            'one structured self-report',
+            'Complete direct task metadata',
+            'registry-recognized self-report',
+            'reads only the allowlisted `CLAUDECODE` runtime marker and '
+            '`CLAUDE_EFFORT` setting',
+            'never enumerates or persists the environment',
+            'inherited/spoofable corroboration rather than authentication',
+            'field-level `composite`',
+            'Any unknown field, self-reported field, or conflict excludes '
+            'the record from primary fair-comparison cohorts',
+            'strongest symmetric comparison source for Claude and Codex',
+        ):
+            self.assertIn(required, quickstart)
+
+        with open(os.path.join(ROOT, 'INCIDENTS.md'), encoding='utf-8') as f:
+            incident = f.read()
+        for required in (
+            'Claude exposed split identity evidence rather than one '
+            'introspection API',
+            '`CLAUDECODE` and `CLAUDE_EFFORT` environment keys',
+            'no local Python script can introspect the serving model',
+            'reads exactly those two allowlisted keys with '
+            '`os.environ.get`',
+            'never enumerates or persists the environment',
+            'corroboration rather than authentication',
+            'Schema v4 records each field\'s provenance',
+        ):
+            self.assertIn(required, incident)
 
     def test_routine_full_halts_when_constants_cannot_be_read(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
@@ -6744,7 +6861,10 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertLess(preflight_start, clock_command)
         preflight = routine[preflight_start:routine.index("\n\nNote the `DRY_RUN`", preflight_start)]
-        self.assertIn("Before `market_clock.py`, `get_accounts`", preflight)
+        self.assertIn(
+            "Before identity resolution, `market_clock.py`, `get_accounts`",
+            preflight,
+        )
         self.assertIn("`& '<PYTHON_EXE>' validate_constants.py --json`", preflight)
         self.assertIn("Do not construct a PowerShell, regex, prose, or ad-hoc replacement validator", preflight)
         self.assertIn("`values` as the SOLE configuration authority", preflight)
@@ -6755,6 +6875,10 @@ class MarketClockTests(unittest.TestCase):
             "`market_clock.py` is the only permitted later file reader",
             preflight,
         )
+        self.assertIn(
+            'one non-authoritative identity resolver', preflight
+        )
+        self.assertIn('pre-START-CLOCK helper actions', preflight)
         self.assertIn("Never declare the checked-in validator wrong", preflight)
         self.assertIn("FULL-RUN HALT immediately", preflight)
         self.assertIn("This is NOT DRY RUN", preflight)
@@ -6763,6 +6887,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn("treat it as `true`", routine)
         self.assertLess(
             routine.index("validate_constants.py --json"),
+            clock_command,
+        )
+        self.assertLess(
+            routine.index("run_performance.py resolve-identity"),
             clock_command,
         )
 
@@ -7075,7 +7203,7 @@ class MarketClockTests(unittest.TestCase):
             '### ORDER HANDLING', 1
         )[0]
         for required in (
-            'startup sequence reaches item 12 after items 1–11 have succeeded',
+            'startup sequence reaches item 14 after items 1–13 have succeeded',
             'not exposed or callable',
             'No Robinhood request was attempted',
             '`coordination-halt` / `account-scope-failed`',

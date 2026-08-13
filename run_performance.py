@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Non-authoritative, append-only performance telemetry for RHMRA runs.
 
-This sidecar measures a finished lifecycle without changing lifecycle state or
-trading authority.  It must be called only as best-effort telemetry after the
-lifecycle has finished; a failure here never authorizes, blocks, or changes
-broker work.
+This sidecar resolves descriptive runner identity for a running lifecycle and
+measures that lifecycle after it finishes, without changing lifecycle state or
+trading authority.  Identity and timing are best-effort telemetry; a failure
+never authorizes, blocks, or changes broker work.
 
 The SQLite journal retains every explicit observation.  The bounded JSON
 projection contains the 512 most recent internally recorded invocations at:
@@ -13,9 +13,11 @@ projection contains the 512 most recent internally recorded invocations at:
 
 Commands (successful commands emit exactly one JSON object):
 
+  py -3 run_performance.py resolve-identity --invocation-id UUID \
+      --self-identity 'Codex|Codex Luna 5.6|high' \
+      --declared-identity absent --metadata-identity absent
   py -3 run_performance.py record-internal --invocation-id UUID \
-      --session after-hours --runner codex --model gpt-5.6-luna \
-      --configuration reasoning=high --identity-source task-definition
+      --session after-hours
   py -3 run_performance.py observe-task --invocation-id UUID \
       --task-duration-ms 363000 --runner codex --model gpt-5.6-luna \
       --configuration reasoning=high --identity-source manual-ui \
@@ -23,7 +25,9 @@ Commands (successful commands emit exactly one JSON object):
   py -3 run_performance.py export
   py -3 run_performance.py validate
 
-``record-internal`` validates the lifecycle database and projection read-only,
+``resolve-identity`` validates a running lifecycle and records one append-only,
+invocation-bound resolution before START CLOCK.  ``record-internal`` validates
+the lifecycle database and projection read-only,
 requires a finished invocation, and derives strategy boundaries from the
 host-stamped lifecycle ``position-management`` and ``report`` markers.  When the lifecycle
 has an authoritative Pacific run start, that same command's single observation
@@ -55,6 +59,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+from types import MappingProxyType
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -64,10 +69,14 @@ import run_lifecycle
 
 RECEIPT_SCHEMA_VERSION = 1
 LEGACY_PROJECTION_SCHEMA_VERSION = 1
-PROJECTION_SCHEMA_VERSION = 2
+PREVIOUS_PROJECTION_SCHEMA_VERSION = 2
+IDENTITY_PROJECTION_SCHEMA_VERSION = 3
+PROJECTION_SCHEMA_VERSION = 4
 # Backward-compatible public name: command receipts remain schema version 1.
 SCHEMA_VERSION = RECEIPT_SCHEMA_VERSION
-JOURNAL_SCHEMA_VERSION = 2
+JOURNAL_SCHEMA_VERSION = 4
+IDENTITY_JOURNAL_SCHEMA_VERSION = 3
+PREVIOUS_JOURNAL_SCHEMA_VERSION = 2
 LEGACY_JOURNAL_SCHEMA_VERSION = 1
 PROJECTION_LIMIT = 512
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +108,44 @@ IDENTITY_SOURCES = (
     "declared",
     "unknown",
 )
+RESOLVED_IDENTITY_SOURCES = (
+    "run-metadata",
+    "declared",
+    "runtime-environment",
+    "self-reported",
+    "composite",
+    "unknown",
+)
+IDENTITY_FIELD_SOURCES = tuple(
+    dict.fromkeys((*IDENTITY_SOURCES, "runtime-environment", "self-reported"))
+)
+IDENTITY_V3_WARNINGS = (
+    "metadata-declaration-conflict",
+    "metadata-self-conflict",
+    "declaration-self-conflict",
+    "metadata-invalid",
+    "declaration-invalid",
+    "self-incomplete",
+    "self-unrecognized",
+)
+IDENTITY_WARNINGS = (
+    "metadata-declaration-conflict",
+    "metadata-runtime-conflict",
+    "metadata-self-conflict",
+    "declaration-runtime-conflict",
+    "declaration-self-conflict",
+    "runtime-self-conflict",
+    "metadata-invalid",
+    "declaration-invalid",
+    "runtime-environment-invalid",
+    "runtime-self-unverified",
+    "runtime-environment-incomplete",
+    "self-incomplete",
+    "self-unrecognized",
+)
+IDENTITY_WARNING_PRIORITY = {
+    value: index for index, value in enumerate(IDENTITY_WARNINGS)
+}
 CLOCK_SOURCES = (
     "runner-metadata",
     "codex-worked-for",
@@ -123,7 +170,7 @@ _TOP_LEVEL_KEYS = {
     "source_event_high_watermark",
     "records",
 }
-_RECORD_KEYS = {
+_LEGACY_RECORD_KEYS = {
     "invocation_id",
     "lifecycle_started_at_utc",
     "lifecycle_finished_at_utc",
@@ -143,6 +190,12 @@ _RECORD_KEYS = {
     "routine_overhead_ms",
     "outside_lifecycle_ms",
     "total_overhead_ms",
+}
+_IDENTITY_RECORD_KEYS = _LEGACY_RECORD_KEYS | {"identity_warning"}
+_RECORD_KEYS = _IDENTITY_RECORD_KEYS | {
+    "runner_identity_source",
+    "model_identity_source",
+    "configuration_identity_source",
 }
 _EVENT_COLUMNS = {
     "sequence",
@@ -170,6 +223,52 @@ _ESTIMATE_COLUMNS = {
     "estimated_run_total_ms",
     "clock_source",
 }
+_IDENTITY_COLUMNS = {
+    "invocation_id",
+    "occurred_at_utc",
+    "runner",
+    "model",
+    "configuration",
+    "identity_source",
+    "identity_warning",
+    "runner_identity_source",
+    "model_identity_source",
+    "configuration_identity_source",
+}
+_IDENTITY_V3_COLUMNS = _IDENTITY_COLUMNS - {
+    "runner_identity_source",
+    "model_identity_source",
+    "configuration_identity_source",
+}
+
+_RUNNER_ALIASES = {
+    "codex": "codex",
+    "codex desktop": "codex",
+    "openai codex": "codex",
+    "claude": "claude",
+    "claude code": "claude",
+    "claude desktop code": "claude",
+}
+_MODEL_ALIASES = {
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt 5.6 luna": "gpt-5.6-luna",
+    "codex luna 5.6": "gpt-5.6-luna",
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt 5.6 sol": "gpt-5.6-sol",
+    "codex sol 5.6": "gpt-5.6-sol",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude sonnet 4.6": "claude-sonnet-4-6",
+    "claude-sonnet-5": "claude-sonnet-5",
+    "claude sonnet 5": "claude-sonnet-5",
+}
+
+# Deliberately tiny and exact. Runtime identity reads only these named keys;
+# values are canonicalized to fixed labels and are never persisted verbatim.
+_CLAUDE_RUNTIME_MARKERS = {"1"}
+_CLAUDE_EFFORTS = {
+    value: f"effort={value}" for value in ("low", "medium", "high", "xhigh", "max")
+}
+_EMPTY_RUNTIME_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
 
 
 class PerformanceError(ValueError):
@@ -364,6 +463,290 @@ def _identity(
     return runner, model, configuration, identity_source
 
 
+def _claim_component(
+    value: str,
+    aliases: Mapping[str, str],
+    context: str,
+    *,
+    allow_unknown: bool,
+) -> tuple[str, bool]:
+    candidate = value.strip()
+    try:
+        _safe_label(candidate, _MODEL_RE, context)
+    except PerformanceError:
+        return "unknown", False
+    key = candidate.casefold()
+    if allow_unknown and key == "unknown":
+        return "unknown", True
+    canonical = aliases.get(key)
+    return (canonical, True) if canonical is not None else ("unknown", False)
+
+
+def _model_runner(model: str) -> str | None:
+    if model.startswith("gpt-"):
+        return "codex"
+    if model.startswith("claude-"):
+        return "claude"
+    return None
+
+
+def _claim_configuration(
+    value: str,
+    runner: str,
+    model: str,
+    *,
+    allow_unknown: bool,
+) -> tuple[str, bool]:
+    candidate = value.strip()
+    try:
+        _safe_label(candidate, _CONFIGURATION_RE, "identity claim configuration")
+    except PerformanceError:
+        return "unknown", False
+    key = candidate.casefold()
+    if allow_unknown and key == "unknown":
+        return "unknown", True
+    effective_runner = runner if runner != "unknown" else _model_runner(model)
+    aliases = {
+        "codex": {
+            "high": "reasoning=high",
+            "reasoning high": "reasoning=high",
+            "reasoning-high": "reasoning=high",
+            "reasoning=high": "reasoning=high",
+        },
+        "claude": {
+            "high": "effort=high",
+            "effort high": "effort=high",
+            "effort-high": "effort=high",
+            "effort=high": "effort=high",
+        },
+    }
+    canonical = aliases.get(effective_runner, {}).get(key)
+    return (canonical, True) if canonical is not None else ("unknown", False)
+
+
+def _parse_identity_claim(
+    value: Any, context: str, *, strong: bool
+) -> dict[str, Any]:
+    if not isinstance(value, str):
+        return {"status": "invalid", "warning": None}
+    stripped = value.strip()
+    sentinel = stripped.casefold()
+    if sentinel == "absent":
+        if strong:
+            return {"status": "absent", "warning": None}
+        return {"status": "invalid", "warning": "self-unrecognized"}
+    if sentinel == "invalid":
+        return {
+            "status": "invalid",
+            "warning": None if strong else "self-unrecognized",
+        }
+    parts = stripped.split("|")
+    if len(parts) != 3 or any(not part.strip() for part in parts):
+        return {
+            "status": "invalid",
+            "warning": None if strong else "self-unrecognized",
+        }
+    runner, runner_recognized = _claim_component(
+        parts[0], _RUNNER_ALIASES, f"{context}.runner", allow_unknown=not strong
+    )
+    model, model_recognized = _claim_component(
+        parts[1], _MODEL_ALIASES, f"{context}.model", allow_unknown=not strong
+    )
+    configuration, configuration_recognized = _claim_configuration(
+        parts[2], runner, model, allow_unknown=not strong
+    )
+    incompatible = (
+        runner != "unknown"
+        and model != "unknown"
+        and _model_runner(model) != runner
+    )
+    recognized = runner_recognized and model_recognized and configuration_recognized
+    if strong and (not recognized or "unknown" in (runner, model, configuration) or incompatible):
+        return {"status": "invalid", "warning": None}
+    warning = None
+    if incompatible:
+        model = "unknown"
+        configuration = "unknown"
+        warning = "self-unrecognized"
+    elif not recognized:
+        warning = "self-unrecognized"
+    elif "unknown" in (runner, model, configuration):
+        warning = "self-incomplete"
+    return {
+        "status": "valid",
+        "runner": runner,
+        "model": model,
+        "configuration": configuration,
+        "warning": warning,
+    }
+
+
+def _identity_conflicts(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return any(
+        left[field] != "unknown"
+        and right[field] != "unknown"
+        and left[field] != right[field]
+        for field in ("runner", "model", "configuration")
+    )
+
+
+def _runtime_environment_claim(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return canonical Claude evidence from two explicitly allowed keys only.
+
+    The default path deliberately calls ``os.environ.get`` for each allowlisted
+    key rather than enumerating the environment. Tests may provide a mapping;
+    its ``get`` method is the only operation used. Raw values never leave this
+    function.
+    """
+
+    get_value = os.environ.get if environment is None else environment.get
+    runtime_marker = get_value("CLAUDECODE")
+    effort = get_value("CLAUDE_EFFORT")
+    if runtime_marker is None and effort is None:
+        return {"status": "absent", "warning": None}
+    if (
+        not isinstance(runtime_marker, str)
+        or runtime_marker not in _CLAUDE_RUNTIME_MARKERS
+    ):
+        return {"status": "invalid", "warning": "runtime-environment-invalid"}
+
+    configuration = "unknown"
+    warning = None
+    if effort is not None:
+        if isinstance(effort, str) and effort in _CLAUDE_EFFORTS:
+            configuration = _CLAUDE_EFFORTS[effort]
+        else:
+            warning = "runtime-environment-invalid"
+    return {
+        "status": "valid",
+        "runner": "claude",
+        "model": "unknown",
+        "configuration": configuration,
+        "warning": warning,
+    }
+
+
+def _field_sources(identity: Mapping[str, Any], source: str) -> dict[str, str]:
+    return {
+        f"{field}_identity_source": source if identity[field] != "unknown" else "unknown"
+        for field in ("runner", "model", "configuration")
+    }
+
+
+def _aggregate_identity_source(field_sources: Mapping[str, str]) -> str:
+    known = {
+        field_sources[f"{field}_identity_source"]
+        for field in ("runner", "model", "configuration")
+        if field_sources[f"{field}_identity_source"] != "unknown"
+    }
+    if not known:
+        return "unknown"
+    if len(known) == 1:
+        return next(iter(known))
+    return "composite"
+
+
+def _resolve_identity_claims(
+    metadata_identity: Any,
+    declared_identity: Any,
+    self_identity: Any,
+    runtime_environment: Mapping[str, str] = _EMPTY_RUNTIME_ENVIRONMENT,
+) -> dict[str, Any]:
+    metadata = _parse_identity_claim(metadata_identity, "metadata identity", strong=True)
+    declaration = _parse_identity_claim(
+        declared_identity, "declared identity", strong=True
+    )
+    self_report = _parse_identity_claim(self_identity, "self identity", strong=False)
+    runtime = _runtime_environment_claim(runtime_environment)
+    warnings: list[str] = []
+    if metadata["status"] == "invalid":
+        warnings.append("metadata-invalid")
+    if declaration["status"] == "invalid":
+        warnings.append("declaration-invalid")
+    if runtime.get("warning") is not None:
+        warnings.append(runtime["warning"])
+
+    metadata_valid = metadata["status"] == "valid"
+    declaration_valid = declaration["status"] == "valid"
+    runtime_valid = runtime["status"] == "valid"
+    self_valid = self_report["status"] == "valid"
+    if metadata_valid:
+        selected = metadata
+        sources = _field_sources(selected, "run-metadata")
+        if declaration_valid and _identity_conflicts(metadata, declaration):
+            warnings.append("metadata-declaration-conflict")
+        if runtime_valid and _identity_conflicts(metadata, runtime):
+            warnings.append("metadata-runtime-conflict")
+        if self_valid and _identity_conflicts(metadata, self_report):
+            warnings.append("metadata-self-conflict")
+    elif declaration_valid:
+        selected = declaration
+        sources = _field_sources(selected, "declared")
+        if runtime_valid and _identity_conflicts(declaration, runtime):
+            warnings.append("declaration-runtime-conflict")
+        if self_valid and _identity_conflicts(declaration, self_report):
+            warnings.append("declaration-self-conflict")
+    else:
+        selected = {field: "unknown" for field in ("runner", "model", "configuration")}
+        sources = _field_sources(selected, "unknown")
+        runtime_self_conflict = False
+        if runtime_valid:
+            for field in ("runner", "model", "configuration"):
+                if runtime[field] != "unknown":
+                    selected[field] = runtime[field]
+                    sources[f"{field}_identity_source"] = "runtime-environment"
+        if self_valid:
+            for field in ("runner", "model", "configuration"):
+                if self_report[field] == "unknown":
+                    continue
+                if selected[field] == "unknown":
+                    selected[field] = self_report[field]
+                    sources[f"{field}_identity_source"] = "self-reported"
+                elif selected[field] != self_report[field]:
+                    runtime_self_conflict = runtime_valid
+        if (
+            selected["runner"] != "unknown"
+            and selected["model"] != "unknown"
+            and _model_runner(selected["model"]) != selected["runner"]
+        ):
+            selected["model"] = "unknown"
+            sources["model_identity_source"] = "unknown"
+            if sources["configuration_identity_source"] == "self-reported":
+                selected["configuration"] = "unknown"
+                sources["configuration_identity_source"] = "unknown"
+            runtime_self_conflict = runtime_valid
+        if runtime_self_conflict:
+            warnings.append("runtime-self-conflict")
+        elif self_report.get("warning") is not None:
+            warnings.append(self_report["warning"])
+        field_source_values = set(sources.values())
+        if "runtime-environment" in field_source_values:
+            if "self-reported" in field_source_values:
+                warnings.append("runtime-self-unverified")
+            elif "unknown" in field_source_values:
+                warnings.append("runtime-environment-incomplete")
+        if self_report.get("warning") is not None:
+            # De-duplication below preserves deterministic warning priority.
+            warnings.append(self_report["warning"])
+
+    identity_source = _aggregate_identity_source(sources)
+    warning = (
+        None
+        if not warnings
+        else min(set(warnings), key=lambda value: IDENTITY_WARNING_PRIORITY[value])
+    )
+    return {
+        "runner": selected["runner"],
+        "model": selected["model"],
+        "configuration": selected["configuration"],
+        "identity_source": identity_source,
+        "identity_warning": warning,
+        **sources,
+    }
+
+
 def _nonnegative_int(value: Any, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise PerformanceError(f"{context}: expected a nonnegative integer")
@@ -456,6 +839,31 @@ def _finished_lifecycle_record(
         "run_start_pt": run_start_pt,
         "events": record["events"],
     }
+
+
+def _require_running_lifecycle_invocation(
+    invocation_id: str,
+    lifecycle_state_file: str,
+    lifecycle_projection_file: str,
+) -> None:
+    try:
+        document = run_lifecycle.validate_current_projection_read_only(
+            lifecycle_state_file, lifecycle_projection_file
+        )
+    except (run_lifecycle.LifecycleError, OSError, sqlite3.Error) as exc:
+        raise PerformanceError(f"cannot validate lifecycle read-only: {exc}") from exc
+    record = next(
+        (
+            candidate
+            for candidate in document["records"]
+            if candidate["invocation_id"] == invocation_id
+        ),
+        None,
+    )
+    if record is None:
+        raise PerformanceError("invocation is not present in lifecycle projection")
+    if record["classification"] != "running" or record["finished_at_utc"] is not None:
+        raise PerformanceError("identity resolution requires a running lifecycle")
 
 
 def _lifecycle_strategy_pair(
@@ -552,6 +960,98 @@ def _create_estimate_schema(connection: sqlite3.Connection) -> None:
         END
         """
     )
+
+
+def _create_identity_schema(connection: sqlite3.Connection) -> None:
+    sources_sql = _sql_values(RESOLVED_IDENTITY_SOURCES)
+    field_sources_sql = _sql_values(IDENTITY_FIELD_SOURCES)
+    warnings_sql = _sql_values(IDENTITY_WARNINGS)
+    connection.execute(
+        f"""
+        CREATE TABLE performance_identities (
+            invocation_id TEXT PRIMARY KEY,
+            occurred_at_utc TEXT NOT NULL,
+            runner TEXT NOT NULL CHECK (runner IN ({_sql_values(RUNNERS)})),
+            model TEXT NOT NULL,
+            configuration TEXT NOT NULL,
+            identity_source TEXT NOT NULL
+                CHECK (identity_source IN ({sources_sql})),
+            identity_warning TEXT
+                CHECK (identity_warning IS NULL OR identity_warning IN ({warnings_sql})),
+            runner_identity_source TEXT NOT NULL
+                CHECK (runner_identity_source IN ({field_sources_sql})),
+            model_identity_source TEXT NOT NULL
+                CHECK (model_identity_source IN ({field_sources_sql})),
+            configuration_identity_source TEXT NOT NULL
+                CHECK (configuration_identity_source IN ({field_sources_sql})),
+            CHECK ((runner = 'unknown') = (runner_identity_source = 'unknown')),
+            CHECK ((model = 'unknown') = (model_identity_source = 'unknown')),
+            CHECK ((configuration = 'unknown') =
+                   (configuration_identity_source = 'unknown')),
+            CHECK (
+                (identity_source = 'unknown'
+                 AND runner = 'unknown'
+                 AND model = 'unknown'
+                 AND configuration = 'unknown')
+                OR
+                (identity_source IN ('run-metadata', 'declared')
+                 AND runner != 'unknown'
+                 AND model != 'unknown'
+                 AND configuration != 'unknown')
+                OR
+                (identity_source IN ('runtime-environment', 'self-reported', 'composite')
+                 AND (runner != 'unknown'
+                      OR model != 'unknown'
+                      OR configuration != 'unknown'))
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER performance_identities_no_update
+        BEFORE UPDATE ON performance_identities
+        BEGIN
+            SELECT RAISE(ABORT, 'performance identities are append-only');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER performance_identities_no_delete
+        BEFORE DELETE ON performance_identities
+        BEGIN
+            SELECT RAISE(ABORT, 'performance identities are append-only');
+        END
+        """
+    )
+
+
+def _migrate_v3_identity_schema(connection: sqlite3.Connection) -> None:
+    """Losslessly add field provenance to the append-only v3 identity table."""
+
+    connection.execute("DROP TRIGGER performance_identities_no_update")
+    connection.execute("DROP TRIGGER performance_identities_no_delete")
+    connection.execute(
+        "ALTER TABLE performance_identities RENAME TO performance_identities_v3"
+    )
+    _create_identity_schema(connection)
+    connection.execute(
+        """
+        INSERT INTO performance_identities (
+            invocation_id, occurred_at_utc, runner, model, configuration,
+            identity_source, identity_warning, runner_identity_source,
+            model_identity_source, configuration_identity_source
+        )
+        SELECT invocation_id, occurred_at_utc, runner, model, configuration,
+               identity_source, identity_warning,
+               CASE WHEN runner = 'unknown' THEN 'unknown' ELSE identity_source END,
+               CASE WHEN model = 'unknown' THEN 'unknown' ELSE identity_source END,
+               CASE WHEN configuration = 'unknown' THEN 'unknown' ELSE identity_source END
+        FROM performance_identities_v3
+        """
+    )
+    connection.execute("DROP TABLE performance_identities_v3")
 
 
 def _connect(state_file: str) -> sqlite3.Connection:
@@ -663,9 +1163,27 @@ def _connect(state_file: str) -> sqlite3.Connection:
                 ("schema_version", str(JOURNAL_SCHEMA_VERSION)),
             )
             _create_estimate_schema(connection)
+            _create_identity_schema(connection)
         elif row["value"] == str(LEGACY_JOURNAL_SCHEMA_VERSION):
             _validate_schema(connection, allow_legacy=True)
             _create_estimate_schema(connection)
+            _create_identity_schema(connection)
+            connection.execute(
+                "UPDATE performance_metadata SET value = ? "
+                "WHERE key = 'schema_version'",
+                (str(JOURNAL_SCHEMA_VERSION),),
+            )
+        elif row["value"] == str(PREVIOUS_JOURNAL_SCHEMA_VERSION):
+            _validate_schema(connection, allow_legacy=True)
+            _create_identity_schema(connection)
+            connection.execute(
+                "UPDATE performance_metadata SET value = ? "
+                "WHERE key = 'schema_version'",
+                (str(JOURNAL_SCHEMA_VERSION),),
+            )
+        elif row["value"] == str(IDENTITY_JOURNAL_SCHEMA_VERSION):
+            _validate_schema(connection, allow_legacy=True)
+            _migrate_v3_identity_schema(connection)
             connection.execute(
                 "UPDATE performance_metadata SET value = ? "
                 "WHERE key = 'schema_version'",
@@ -719,9 +1237,14 @@ def _validate_schema(
         version = int(metadata_pairs[0][1])
     except (TypeError, ValueError) as exc:
         raise PerformanceError("unsupported performance journal metadata") from exc
-    if version not in (LEGACY_JOURNAL_SCHEMA_VERSION, JOURNAL_SCHEMA_VERSION):
+    if version not in (
+        LEGACY_JOURNAL_SCHEMA_VERSION,
+        PREVIOUS_JOURNAL_SCHEMA_VERSION,
+        IDENTITY_JOURNAL_SCHEMA_VERSION,
+        JOURNAL_SCHEMA_VERSION,
+    ):
         raise PerformanceError("unsupported performance journal metadata")
-    if version == LEGACY_JOURNAL_SCHEMA_VERSION and not allow_legacy:
+    if version != JOURNAL_SCHEMA_VERSION and not allow_legacy:
         raise PerformanceError("legacy performance journal requires migration")
     triggers = {
         row["name"]
@@ -794,6 +1317,42 @@ def _validate_schema(
         for row in foreign_keys
     ):
         raise PerformanceError("performance estimate journal lacks event binding")
+    if version == PREVIOUS_JOURNAL_SCHEMA_VERSION:
+        identity_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'performance_identities'"
+        ).fetchone()
+        if identity_table is not None:
+            raise PerformanceError(
+                "legacy performance journal has unexpected identity state"
+            )
+        return version
+
+    identity_info = connection.execute(
+        "PRAGMA table_info(performance_identities)"
+    ).fetchall()
+    expected_identity_columns = (
+        _IDENTITY_V3_COLUMNS
+        if version == IDENTITY_JOURNAL_SCHEMA_VERSION
+        else _IDENTITY_COLUMNS
+    )
+    if {row["name"] for row in identity_info} != expected_identity_columns:
+        raise PerformanceError("performance identity journal has an unsafe schema")
+    identity_primary = {row["name"] for row in identity_info if row["pk"]}
+    if identity_primary != {"invocation_id"}:
+        raise PerformanceError("performance identity journal has an unsafe primary key")
+    identity_triggers = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'performance_identities'"
+        )
+    }
+    if not {
+        "performance_identities_no_update",
+        "performance_identities_no_delete",
+    }.issubset(identity_triggers):
+        raise PerformanceError("performance identity journal lacks append-only guards")
     return version
 
 
@@ -805,6 +1364,170 @@ def _validate_event_identity(row: Mapping[str, Any], context: str) -> None:
         row["identity_source"],
         context,
     )
+
+
+def _validate_resolved_identity_row(
+    row: Mapping[str, Any], context: str
+) -> dict[str, Any]:
+    invocation_id = _canonical_uuid(row["invocation_id"], f"{context}.invocation_id")
+    occurred = _canonical_utc(row["occurred_at_utc"], f"{context}.occurred_at_utc")
+    runner = _enum(row["runner"], RUNNERS, f"{context}.runner")
+    model = _safe_label(row["model"], _MODEL_RE, f"{context}.model")
+    configuration = _safe_label(
+        row["configuration"], _CONFIGURATION_RE, f"{context}.configuration"
+    )
+    source = _enum(
+        row["identity_source"],
+        RESOLVED_IDENTITY_SOURCES,
+        f"{context}.identity_source",
+    )
+    row_keys = set(row.keys())
+    warning = row["identity_warning"]
+    if warning is not None:
+        warning = _enum(
+            warning,
+            IDENTITY_V3_WARNINGS
+            if row_keys == _IDENTITY_V3_COLUMNS
+            else IDENTITY_WARNINGS,
+            f"{context}.identity_warning",
+        )
+    if "runner_identity_source" in row_keys:
+        field_sources = {
+            f"{field}_identity_source": _enum(
+                row[f"{field}_identity_source"],
+                IDENTITY_FIELD_SOURCES,
+                f"{context}.{field}_identity_source",
+            )
+            for field in ("runner", "model", "configuration")
+        }
+    else:
+        if row_keys != _IDENTITY_V3_COLUMNS:
+            raise PerformanceError(f"{context}: unsafe identity row shape")
+        if source not in (
+            "run-metadata",
+            "declared",
+            "self-reported",
+            "unknown",
+        ):
+            raise PerformanceError(f"{context}: v3 identity uses a future source")
+        field_sources = {
+            f"{field}_identity_source": (
+                "unknown" if value == "unknown" else source
+            )
+            for field, value in (
+                ("runner", runner),
+                ("model", model),
+                ("configuration", configuration),
+            )
+        }
+    _validate_field_provenance(
+        runner, model, configuration, source, field_sources, context
+    )
+    if source in ("run-metadata", "declared") and "unknown" in (
+        runner,
+        model,
+        configuration,
+    ):
+        raise PerformanceError(f"{context}: strong source requires complete identity")
+    if source == "self-reported" and all(
+        value == "unknown" for value in (runner, model, configuration)
+    ):
+        raise PerformanceError(f"{context}: self report must identify at least one field")
+    return {
+        "invocation_id": invocation_id,
+        "occurred_at_utc": occurred,
+        "runner": runner,
+        "model": model,
+        "configuration": configuration,
+        "identity_source": source,
+        "identity_warning": warning,
+        **field_sources,
+    }
+
+
+def _resolved_identity_for_invocation(
+    connection: sqlite3.Connection, invocation_id: str
+) -> dict[str, Any] | None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'performance_identities'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute(
+        "SELECT * FROM performance_identities WHERE invocation_id = ?",
+        (invocation_id,),
+    ).fetchone()
+    return (
+        None
+        if row is None
+        else _validate_resolved_identity_row(row, "resolved identity")
+    )
+
+
+def _validate_field_provenance(
+    runner: str,
+    model: str,
+    configuration: str,
+    source: str,
+    field_sources: Mapping[str, str],
+    context: str,
+) -> None:
+    for field, value in (
+        ("runner", runner),
+        ("model", model),
+        ("configuration", configuration),
+    ):
+        field_source = field_sources[f"{field}_identity_source"]
+        if (value == "unknown") != (field_source == "unknown"):
+            raise PerformanceError(
+                f"{context}: {field} and its provenance must both be known or unknown"
+            )
+    if source != _aggregate_identity_source(field_sources):
+        raise PerformanceError(f"{context}: aggregate identity source is inconsistent")
+
+
+def _validate_projection_identity(
+    record: Mapping[str, Any],
+    context: str,
+    *,
+    allow_self_report: bool,
+    allow_field_provenance: bool,
+) -> None:
+    runner = _enum(record["runner"], RUNNERS, f"{context}.runner")
+    model = _safe_label(record["model"], _MODEL_RE, f"{context}.model")
+    configuration = _safe_label(
+        record["configuration"], _CONFIGURATION_RE, f"{context}.configuration"
+    )
+    if allow_field_provenance:
+        allowed_sources = tuple(dict.fromkeys((*IDENTITY_FIELD_SOURCES, "composite")))
+    elif allow_self_report:
+        allowed_sources = tuple(dict.fromkeys((*IDENTITY_SOURCES, "self-reported")))
+    else:
+        allowed_sources = IDENTITY_SOURCES
+    source = _enum(
+        record["identity_source"], allowed_sources, f"{context}.identity_source"
+    )
+    if allow_field_provenance:
+        field_sources = {
+            f"{field}_identity_source": _enum(
+                record[f"{field}_identity_source"],
+                IDENTITY_FIELD_SOURCES,
+                f"{context}.{field}_identity_source",
+            )
+            for field in ("runner", "model", "configuration")
+        }
+        _validate_field_provenance(
+            runner, model, configuration, source, field_sources, context
+        )
+    if source == "unknown" and (
+        runner != "unknown" or model != "unknown" or configuration != "unknown"
+    ):
+        raise PerformanceError(f"{context}: unknown source requires unknown identity")
+    if source == "self-reported" and all(
+        value == "unknown" for value in (runner, model, configuration)
+    ):
+        raise PerformanceError(f"{context}: self report must identify at least one field")
 
 
 def _validate_internal_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
@@ -1031,11 +1754,37 @@ def _build_projection(
                 f"estimate for {invocation_id}",
             )
 
+    identity_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'performance_identities'"
+    ).fetchone()
+    if identity_table is not None and order:
+        placeholders = ", ".join("?" for _ in order)
+        identity_rows = connection.execute(
+            "SELECT * FROM performance_identities WHERE invocation_id IN ("
+            + placeholders
+            + ")",
+            order,
+        ).fetchall()
+        for row in identity_rows:
+            resolved = _validate_resolved_identity_row(row, "projected identity")
+            invocation_id = resolved["invocation_id"]
+            if invocation_id not in grouped:
+                raise PerformanceError("identity has no projected internal record")
+            if "identity" in grouped[invocation_id]:
+                raise PerformanceError("duplicate resolved identity")
+            if _utc_datetime(resolved["occurred_at_utc"]) > _utc_datetime(
+                grouped[invocation_id]["internal"]["occurred_at_utc"]
+            ):
+                raise PerformanceError("identity was resolved after internal record")
+            grouped[invocation_id]["identity"] = resolved
+
     records: list[dict[str, Any]] = []
     for invocation_id in order:
         internal = grouped[invocation_id]["internal"]
         tasks = grouped[invocation_id]["tasks"]
         estimate = grouped[invocation_id].get("estimate")
+        resolved_identity = grouped[invocation_id].get("identity")
         known_task_identities = {
             (task["runner"], task["model"], task["configuration"])
             for task in tasks
@@ -1080,7 +1829,53 @@ def _build_projection(
             or strategy_ms is None
             else task_duration - strategy_ms
         )
-        if (
+        trusted_tasks = [
+            task
+            for task in tasks
+            if task["identity_source"] in ("run-metadata", "manual-ui")
+            and all(
+                task[field] != "unknown"
+                for field in ("runner", "model", "configuration")
+            )
+        ]
+        trusted_external = (
+            selected_external
+            if selected_external in trusted_tasks
+            else (trusted_tasks[0] if trusted_tasks else None)
+        )
+        identity_warning = None
+        if resolved_identity is not None and resolved_identity[
+            "identity_source"
+        ] in ("run-metadata", "declared"):
+            identity = resolved_identity
+            identity_warning = resolved_identity["identity_warning"]
+        elif resolved_identity is not None and trusted_external is not None:
+            identity = trusted_external
+            identity_warning = resolved_identity["identity_warning"]
+            if _identity_conflicts(resolved_identity, trusted_external):
+                conflict_sources = {
+                    resolved_identity[f"{field}_identity_source"]
+                    for field in ("runner", "model", "configuration")
+                    if resolved_identity[field] != "unknown"
+                    and resolved_identity[field] != trusted_external[field]
+                }
+                identity_warning = (
+                    "metadata-runtime-conflict"
+                    if "runtime-environment" in conflict_sources
+                    else "metadata-self-conflict"
+                )
+            elif identity_warning in (
+                "runtime-self-unverified",
+                "runtime-environment-incomplete",
+                "runtime-environment-invalid",
+                "self-incomplete",
+                "self-unrecognized",
+            ):
+                identity_warning = None
+        elif resolved_identity is not None:
+            identity = resolved_identity
+            identity_warning = resolved_identity["identity_warning"]
+        elif (
             selected_external is not None
             and selected_external["identity_source"] != "unknown"
         ):
@@ -1103,6 +1898,21 @@ def _build_projection(
             "model": identity["model"],
             "configuration": identity["configuration"],
             "identity_source": identity["identity_source"],
+            "identity_warning": identity_warning,
+            "runner_identity_source": identity.get(
+                "runner_identity_source",
+                "unknown" if identity["runner"] == "unknown" else identity["identity_source"],
+            ),
+            "model_identity_source": identity.get(
+                "model_identity_source",
+                "unknown" if identity["model"] == "unknown" else identity["identity_source"],
+            ),
+            "configuration_identity_source": identity.get(
+                "configuration_identity_source",
+                "unknown"
+                if identity["configuration"] == "unknown"
+                else identity["identity_source"],
+            ),
             "internal_recorded_at_utc": internal["occurred_at_utc"],
             "task_duration_ms": task_duration,
             "task_clock_source": task_clock_source,
@@ -1139,7 +1949,13 @@ def validate_projection(
     )
     allowed_versions = {PROJECTION_SCHEMA_VERSION}
     if allow_legacy:
-        allowed_versions.add(LEGACY_PROJECTION_SCHEMA_VERSION)
+        allowed_versions.update(
+            (
+                LEGACY_PROJECTION_SCHEMA_VERSION,
+                PREVIOUS_PROJECTION_SCHEMA_VERSION,
+                IDENTITY_PROJECTION_SCHEMA_VERSION,
+            )
+        )
     if schema_version not in allowed_versions:
         raise PerformanceError("projection.schema_version: unsupported value")
     record_limit = _nonnegative_int(document["record_limit"], "projection.record_limit")
@@ -1163,7 +1979,16 @@ def validate_projection(
         context = f"projection.records[{index}]"
         if not isinstance(record, dict):
             raise PerformanceError(f"{context}: expected an object")
-        _exact_keys(record, _RECORD_KEYS, context)
+        record_keys = (
+            _RECORD_KEYS
+            if schema_version == PROJECTION_SCHEMA_VERSION
+            else (
+                _IDENTITY_RECORD_KEYS
+                if schema_version == IDENTITY_PROJECTION_SCHEMA_VERSION
+                else _LEGACY_RECORD_KEYS
+            )
+        )
+        _exact_keys(record, record_keys, context)
         invocation_id = _canonical_uuid(record["invocation_id"], f"{context}.invocation_id")
         if invocation_id in seen_ids:
             raise PerformanceError(f"{context}.invocation_id: duplicate invocation")
@@ -1192,13 +2017,26 @@ def validate_projection(
             context,
         )
         _enum(record["session"], SESSIONS, f"{context}.session")
-        _identity(
-            record["runner"],
-            record["model"],
-            record["configuration"],
-            record["identity_source"],
+        _validate_projection_identity(
+            record,
             f"{context}.identity",
+            allow_self_report=schema_version
+            in (IDENTITY_PROJECTION_SCHEMA_VERSION, PROJECTION_SCHEMA_VERSION),
+            allow_field_provenance=schema_version == PROJECTION_SCHEMA_VERSION,
         )
+        if schema_version in (
+            IDENTITY_PROJECTION_SCHEMA_VERSION,
+            PROJECTION_SCHEMA_VERSION,
+        ):
+            identity_warning = record["identity_warning"]
+            if identity_warning is not None:
+                _enum(
+                    identity_warning,
+                    IDENTITY_V3_WARNINGS
+                    if schema_version == IDENTITY_PROJECTION_SCHEMA_VERSION
+                    else IDENTITY_WARNINGS,
+                    f"{context}.identity_warning",
+                )
         if strategy_start is None:
             if any(
                 record[name] is not None
@@ -1429,9 +2267,22 @@ def validate_current_projection_read_only(
         actual = _load_json(projection_file)
         validate_projection(actual, allow_legacy=True)
         comparable = actual
-        if actual["schema_version"] == LEGACY_PROJECTION_SCHEMA_VERSION:
+        if actual["schema_version"] != PROJECTION_SCHEMA_VERSION:
             comparable = dict(actual)
             comparable["schema_version"] = PROJECTION_SCHEMA_VERSION
+            records = []
+            for record in actual["records"]:
+                upgraded = dict(record)
+                if actual["schema_version"] != IDENTITY_PROJECTION_SCHEMA_VERSION:
+                    upgraded["identity_warning"] = None
+                for field in ("runner", "model", "configuration"):
+                    upgraded[f"{field}_identity_source"] = (
+                        "unknown"
+                        if record[field] == "unknown"
+                        else record["identity_source"]
+                    )
+                records.append(upgraded)
+            comparable["records"] = records
         if comparable != expected:
             raise PerformanceError("projection is valid JSON but stale or inconsistent")
         connection.rollback()
@@ -1464,14 +2315,109 @@ def _publish_after_append(
         ) from exc
 
 
+def resolve_identity(
+    *,
+    invocation_id: str,
+    self_identity: str,
+    declared_identity: str,
+    metadata_identity: str,
+    state_file: str = DEFAULT_STATE_FILE,
+    projection_file: str = DEFAULT_PROJECTION_FILE,
+    lifecycle_state_file: str = DEFAULT_LIFECYCLE_STATE_FILE,
+    lifecycle_projection_file: str = DEFAULT_LIFECYCLE_PROJECTION_FILE,
+    now_utc: str | None = None,
+    runtime_environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    invocation_id = _canonical_uuid(invocation_id, "invocation_id")
+    resolved = _resolve_identity_claims(
+        metadata_identity,
+        declared_identity,
+        self_identity,
+        os.environ if runtime_environment is None else runtime_environment,
+    )
+    _reject_path_aliases(
+        performance_state_file=state_file,
+        performance_projection_file=projection_file,
+        lifecycle_state_file=lifecycle_state_file,
+        lifecycle_projection_file=lifecycle_projection_file,
+    )
+    _require_running_lifecycle_invocation(
+        invocation_id, lifecycle_state_file, lifecycle_projection_file
+    )
+    connection = _connect(state_file)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute(
+            "SELECT 1 FROM performance_events "
+            "WHERE invocation_id = ? AND event_type = 'internal'",
+            (invocation_id,),
+        ).fetchone() is not None:
+            raise PerformanceConflict(
+                "identity resolution cannot follow an internal observation"
+            )
+        if connection.execute(
+            "SELECT 1 FROM performance_identities WHERE invocation_id = ?",
+            (invocation_id,),
+        ).fetchone() is not None:
+            raise PerformanceConflict("identity resolution already exists")
+        _require_running_lifecycle_invocation(
+            invocation_id, lifecycle_state_file, lifecycle_projection_file
+        )
+        occurred = _now_utc(now_utc)
+        connection.execute(
+            """
+            INSERT INTO performance_identities (
+                invocation_id, occurred_at_utc, runner, model, configuration,
+                identity_source, identity_warning, runner_identity_source,
+                model_identity_source, configuration_identity_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invocation_id,
+                occurred,
+                resolved["runner"],
+                resolved["model"],
+                resolved["configuration"],
+                resolved["identity_source"],
+                resolved["identity_warning"],
+                resolved["runner_identity_source"],
+                resolved["model_identity_source"],
+                resolved["configuration_identity_source"],
+            ),
+        )
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "resolve-identity",
+        "ok": True,
+        "invocation_id": invocation_id,
+        "runner": resolved["runner"],
+        "model": resolved["model"],
+        "configuration": resolved["configuration"],
+        "identity_source": resolved["identity_source"],
+        "identity_warning": resolved["identity_warning"],
+        "runner_identity_source": resolved["runner_identity_source"],
+        "model_identity_source": resolved["model_identity_source"],
+        "configuration_identity_source": resolved[
+            "configuration_identity_source"
+        ],
+    }
+
+
 def record_internal(
     *,
     invocation_id: str,
     session: str,
-    runner: str,
-    model: str,
-    configuration: str,
-    identity_source: str,
+    runner: str | None = None,
+    model: str | None = None,
+    configuration: str | None = None,
+    identity_source: str | None = None,
     strategy_start_utc: str | None = None,
     strategy_end_utc: str | None = None,
     state_file: str = DEFAULT_STATE_FILE,
@@ -1482,8 +2428,17 @@ def record_internal(
 ) -> dict[str, Any]:
     invocation_id = _canonical_uuid(invocation_id, "invocation_id")
     session = _enum(session, SESSIONS, "session")
-    runner, model, configuration, identity_source = _identity(
-        runner, model, configuration, identity_source
+    supplied_values = (runner, model, configuration, identity_source)
+    if any(value is None for value in supplied_values) and not all(
+        value is None for value in supplied_values
+    ):
+        raise PerformanceError(
+            "runner, model, configuration, and identity source are all-or-none"
+        )
+    supplied_identity = (
+        None
+        if all(value is None for value in supplied_values)
+        else _identity(runner, model, configuration, identity_source)
     )
     _reject_path_aliases(
         performance_state_file=state_file,
@@ -1542,6 +2497,52 @@ def record_internal(
     connection = _connect(state_file)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        resolved_identity = _resolved_identity_for_invocation(
+            connection, invocation_id
+        )
+        if resolved_identity is not None:
+            if _utc_datetime(resolved_identity["occurred_at_utc"]) > _utc_datetime(
+                occurred
+            ):
+                raise PerformanceError("identity resolution postdates internal record")
+            if supplied_identity is not None and supplied_identity != (
+                "unknown",
+                "unknown",
+                "unknown",
+                "unknown",
+            ):
+                expected = (
+                    resolved_identity["runner"],
+                    resolved_identity["model"],
+                    resolved_identity["configuration"],
+                    resolved_identity["identity_source"],
+                )
+                if supplied_identity != expected:
+                    raise PerformanceError(
+                        "supplied identity conflicts with invocation-bound resolution"
+                    )
+            if resolved_identity["identity_source"] in (
+                "run-metadata",
+                "declared",
+            ):
+                stored_identity = (
+                    resolved_identity["runner"],
+                    resolved_identity["model"],
+                    resolved_identity["configuration"],
+                    resolved_identity["identity_source"],
+                )
+            else:
+                stored_identity = (
+                    "unknown",
+                    "unknown",
+                    "unknown",
+                    "unknown",
+                )
+        elif supplied_identity is not None:
+            stored_identity = supplied_identity
+        else:
+            stored_identity = ("unknown", "unknown", "unknown", "unknown")
+        runner, model, configuration, identity_source = stored_identity
         if connection.execute(
             "SELECT 1 FROM performance_events "
             "WHERE invocation_id = ? AND event_type = 'internal'",
@@ -1675,6 +2676,9 @@ def observe_task(
         if internal_row is None:
             raise PerformanceConflict("internal observation must be recorded first")
         internal = _validate_internal_row(internal_row, "existing internal observation")
+        resolved_identity = _resolved_identity_for_invocation(
+            connection, invocation_id
+        )
         if (
             internal["lifecycle_started_at_utc"] != lifecycle["started_at_utc"]
             or internal["lifecycle_finished_at_utc"] != lifecycle["finished_at_utc"]
@@ -1691,6 +2695,18 @@ def observe_task(
                 if candidate != internal[field]:
                     raise PerformanceError(
                         f"task {field} conflicts with internal observation"
+                    )
+        if resolved_identity is not None and resolved_identity[
+            "identity_source"
+        ] in ("run-metadata", "declared"):
+            for field, candidate in (
+                ("runner", runner),
+                ("model", model),
+                ("configuration", configuration),
+            ):
+                if candidate != resolved_identity[field]:
+                    raise PerformanceError(
+                        f"task {field} conflicts with resolved identity"
                     )
         existing_task_rows = connection.execute(
             "SELECT * FROM performance_events WHERE invocation_id = ? "
@@ -1751,7 +2767,7 @@ def observe_task(
             ),
         )
         # Receipt schema v1 reports selection among external observations.  The
-        # projection's schema-v2 canonical automatic duration is independent;
+        # projection's schema-v2-or-newer canonical automatic duration is independent;
         # preserving the receipt contract lets existing callers attach and
         # audit a reference without silently changing its returned meaning.
         selected_clock_source = selected_external["clock_source"]
@@ -1799,6 +2815,9 @@ def _reject_unused(args: argparse.Namespace, allowed: set[str]) -> None:
         "configuration",
         "identity_source",
         "clock_source",
+        "self_identity",
+        "declared_identity",
+        "metadata_identity",
     }
     for name in sorted(action_fields - allowed):
         if getattr(args, name) is not None:
@@ -1819,7 +2838,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "action", choices=("record-internal", "observe-task", "export", "validate")
+        "action",
+        choices=(
+            "resolve-identity",
+            "record-internal",
+            "observe-task",
+            "export",
+            "validate",
+        ),
     )
     parser.add_argument("--invocation-id")
     parser.add_argument("--strategy-start-utc", help=argparse.SUPPRESS)
@@ -1831,6 +2857,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--configuration")
     parser.add_argument("--identity-source")
     parser.add_argument("--clock-source")
+    parser.add_argument("--self-identity")
+    parser.add_argument("--declared-identity")
+    parser.add_argument("--metadata-identity")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--projection-file", default=DEFAULT_PROJECTION_FILE)
     parser.add_argument("--lifecycle-state-file", default=DEFAULT_LIFECYCLE_STATE_FILE)
@@ -1845,7 +2874,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         action = args.action
-        if action == "record-internal":
+        if action == "resolve-identity":
+            allowed = {
+                "invocation_id",
+                "self_identity",
+                "declared_identity",
+                "metadata_identity",
+            }
+            _reject_unused(args, allowed)
+            _require(
+                args,
+                (
+                    "invocation_id",
+                    "self_identity",
+                    "declared_identity",
+                    "metadata_identity",
+                ),
+            )
+            result = resolve_identity(
+                invocation_id=args.invocation_id,
+                self_identity=args.self_identity,
+                declared_identity=args.declared_identity,
+                metadata_identity=args.metadata_identity,
+                state_file=args.state_file,
+                projection_file=args.projection_file,
+                lifecycle_state_file=args.lifecycle_state_file,
+                lifecycle_projection_file=args.lifecycle_projection_file,
+                now_utc=args.now_utc,
+            )
+        elif action == "record-internal":
             allowed = {
                 "invocation_id",
                 "session",
@@ -1860,10 +2917,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (
                     "invocation_id",
                     "session",
-                    "runner",
-                    "model",
-                    "configuration",
-                    "identity_source",
                 ),
             )
             result = record_internal(

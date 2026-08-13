@@ -29,7 +29,7 @@ DASHBOARD = importlib.util.module_from_spec(DASHBOARD_SPEC)
 DASHBOARD_SPEC.loader.exec_module(DASHBOARD)
 
 
-def performance_record(**overrides):
+def performance_record(*, schema_version=4, **overrides):
     record = {
         "invocation_id": "11111111-1111-4111-8111-111111111111",
         "lifecycle_started_at_utc": "2026-08-11T23:37:45Z",
@@ -51,11 +51,19 @@ def performance_record(**overrides):
         "outside_lifecycle_ms": None,
         "total_overhead_ms": None,
     }
+    if schema_version in (3, 4):
+        record["identity_warning"] = None
+    if schema_version == 4:
+        record.update({
+            "runner_identity_source": "run-metadata",
+            "model_identity_source": "run-metadata",
+            "configuration_identity_source": "run-metadata",
+        })
     record.update(overrides)
     return record
 
 
-def performance_document(records, *, schema_version=2):
+def performance_document(records, *, schema_version=4):
     return {
         "schema_version": schema_version,
         "record_limit": 512,
@@ -127,7 +135,7 @@ class PerformanceEndpointTests(unittest.TestCase):
         self.assertEqual(
             document,
             {
-                "schema_version": 2,
+                "schema_version": DASHBOARD.run_performance.PROJECTION_SCHEMA_VERSION,
                 "record_limit": DASHBOARD.run_performance.PROJECTION_LIMIT,
                 "record_count": 0,
                 "source_event_high_watermark": 0,
@@ -184,6 +192,7 @@ class PerformanceEndpointTests(unittest.TestCase):
         expected = performance_document(
             [
                 performance_record(
+                    schema_version=1,
                     task_duration_ms=363000,
                     task_clock_source="codex-worked-for",
                     task_observed_at_utc="2026-08-11T23:43:48Z",
@@ -192,6 +201,89 @@ class PerformanceEndpointTests(unittest.TestCase):
             ],
             schema_version=1,
         )
+        with mock.patch.object(
+            DASHBOARD.run_performance,
+            "validate_current_projection_read_only",
+            return_value=expected,
+        ):
+            status, document = self.request_json("/api/performance")
+        self.assertEqual(status, 200)
+        self.assertEqual(document, expected)
+
+    def test_v2_projection_passes_through_without_v3_identity_fields(self):
+        self.create_private_placeholders()
+        expected = performance_document(
+            [performance_record(schema_version=2)],
+            schema_version=2,
+        )
+        with mock.patch.object(
+            DASHBOARD.run_performance,
+            "validate_current_projection_read_only",
+            return_value=expected,
+        ):
+            status, document = self.request_json("/api/performance")
+        self.assertEqual(status, 200)
+        self.assertEqual(document, expected)
+        self.assertNotIn("identity_warning", document["records"][0])
+
+    def test_v3_projection_passes_self_reported_identity_warning(self):
+        self.create_private_placeholders()
+        expected = performance_document([
+            performance_record(
+                schema_version=3,
+                runner="claude",
+                model="claude-sonnet-4-6",
+                configuration="unknown",
+                identity_source="self-reported",
+                identity_warning="self-incomplete",
+            )
+        ], schema_version=3)
+        with mock.patch.object(
+            DASHBOARD.run_performance,
+            "validate_current_projection_read_only",
+            return_value=expected,
+        ):
+            status, document = self.request_json("/api/performance")
+        self.assertEqual(status, 200)
+        self.assertEqual(document, expected)
+
+    def test_v3_projection_keeps_historical_task_and_manual_identity_sources(self):
+        self.create_private_placeholders()
+        expected = performance_document([
+            performance_record(
+                schema_version=3,
+                invocation_id="22222222-2222-4222-8222-222222222222",
+                identity_source="task-definition",
+            ),
+            performance_record(
+                schema_version=3,
+                invocation_id="33333333-3333-4333-8333-333333333333",
+                identity_source="manual-ui",
+            ),
+        ], schema_version=3)
+        with mock.patch.object(
+            DASHBOARD.run_performance,
+            "validate_current_projection_read_only",
+            return_value=expected,
+        ):
+            status, document = self.request_json("/api/performance")
+        self.assertEqual(status, 200)
+        self.assertEqual(document, expected)
+
+    def test_v4_projection_passes_field_level_runtime_and_self_provenance(self):
+        self.create_private_placeholders()
+        expected = performance_document([
+            performance_record(
+                runner="claude",
+                model="claude-sonnet-5",
+                configuration="effort=high",
+                identity_source="composite",
+                identity_warning="runtime-self-unverified",
+                runner_identity_source="runtime-environment",
+                model_identity_source="self-reported",
+                configuration_identity_source="runtime-environment",
+            )
+        ])
         with mock.patch.object(
             DASHBOARD.run_performance,
             "validate_current_projection_read_only",
@@ -265,6 +357,14 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("performanceRecordsByInvocation.get(selectedRunInvocationId)", source)
         self.assertIn("indexed.set(record.invocation_id, record)", source)
         self.assertIn("performanceRecordRow(record)", source)
+        self.assertIn(
+            '<th class="performance-identity">Runner / model / configuration</th>',
+            source,
+        )
+        self.assertIn(
+            ".performance-table .performance-identity { text-align:left; }",
+            source,
+        )
         self.assertNotIn("Date.parse(right.lifecycle_started_at_utc)", source)
         self.assertNotIn("[...document.records].reverse()", source)
         self.assertNotIn("meat and potatoes", source.lower())
@@ -512,6 +612,8 @@ class PerformanceClientContractTests(unittest.TestCase):
                       source.index("function collectRunView")]
         self.assertIn("runDetailStatusLabel(severity)", runs)
         self.assertIn("detailAvailabilityLabel", runs)
+        self.assertNotIn("identity_warning", runs)
+        self.assertNotIn("timingIdentityDiagnosticMarkup", runs)
 
     def test_run_detail_severity_is_report_bound_and_fail_closed(self):
         source = self.source
@@ -543,6 +645,7 @@ class PerformanceClientContractTests(unittest.TestCase):
     def test_selected_panel_combines_diagnostic_and_optional_timing(self):
         source = self.source
         self.assertIn('id="run-detail-diagnostic"', source)
+        self.assertNotIn('id="timing-identity-diagnostic"', source)
         selected_start = source.index("function renderSelectedRunDetails")
         selected_end = source.index("function renderPerformance(document)", selected_start)
         selected = source[selected_start:selected_end]
@@ -553,6 +656,7 @@ class PerformanceClientContractTests(unittest.TestCase):
             "performanceRecordsByInvocation.get(selectedRunInvocationId)", selected
         )
         self.assertIn("runDetailDiagnosticMarkup(detail)", selected)
+        self.assertNotIn("timingIdentityDiagnosticMarkup", selected)
         self.assertIn("performanceRecordRow(performanceRecord)", selected)
         diagnostic_render = selected.index("runDetailDiagnosticMarkup(detail)")
         timing_render = selected.index("performanceRecordRow(performanceRecord)")
@@ -568,6 +672,20 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("lifecycleTooltip", diagnostic)
         self.assertIn("esc(", diagnostic)
         self.assertNotIn("getJSON(", diagnostic)
+        self.assertNotIn("function timingIdentityDiagnosticMarkup", source)
+        self.assertNotIn(".timing-identity-diagnostic", source)
+
+    def test_only_literal_unknown_identity_values_are_orange(self):
+        source = self.source
+        row_start = source.index("function performanceRecordRow")
+        row_end = source.index("function runDetailDiagnosticMarkup", row_start)
+        row = source[row_start:row_end]
+        self.assertIn('value === "unknown"', row)
+        self.assertIn('class="performance-unknown">unknown</span>', row)
+        self.assertIn(": esc(value)", row)
+        self.assertIn("identityValue(identity[0])", row)
+        self.assertIn("identity.slice(1).map(identityValue)", row)
+        self.assertIn(".performance-unknown { color:var(--amber); }", source)
 
     def test_reclick_close_clears_all_detail_content_and_live_regions(self):
         source = self.source
@@ -638,7 +756,13 @@ class PerformanceClientContractTests(unittest.TestCase):
         self.assertIn("!record.task_observed_at_utc", validator)
         self.assertIn("record.outside_lifecycle_ms === null", validator)
         self.assertIn("record.total_overhead_ms === null", validator)
-        self.assertIn("const PERFORMANCE_SCHEMA_VERSION = 2", validator)
+        self.assertIn("const PERFORMANCE_SCHEMA_VERSION = 4", validator)
+        self.assertIn(
+            "const PERFORMANCE_IDENTITY_SCHEMA_VERSION = 3", validator
+        )
+        self.assertIn(
+            "const PERFORMANCE_COMPARABLE_SCHEMA_VERSION = 2", validator
+        )
         self.assertIn(
             "const PERFORMANCE_LEGACY_SCHEMA_VERSION = 1", validator
         )
@@ -675,16 +799,19 @@ class PerformanceClientContractTests(unittest.TestCase):
             "function updateRunDetailChipSelection", render_start
         )
         render = self.source[render_start:render_end]
-        self.assertIn(
-            "[PERFORMANCE_LEGACY_SCHEMA_VERSION, PERFORMANCE_SCHEMA_VERSION]",
-            render,
-        )
+        for version in (
+            "PERFORMANCE_LEGACY_SCHEMA_VERSION",
+            "PERFORMANCE_COMPARABLE_SCHEMA_VERSION",
+            "PERFORMANCE_IDENTITY_SCHEMA_VERSION",
+            "PERFORMANCE_SCHEMA_VERSION",
+        ):
+            self.assertIn(version, render)
         self.assertIn(
             "record => validPerformanceRecord(record, document.schema_version)",
             render,
         )
 
-    def test_legacy_v1_is_reference_only_and_v2_owns_comparable_timing(self):
+    def test_v4_identity_contract_is_exact_and_v1_v2_v3_remain_strict(self):
         validator_start = self.source.index("function validPerformanceRecord")
         validator_end = self.source.index(
             "function formatPerformanceDuration", validator_start
@@ -698,15 +825,149 @@ class PerformanceClientContractTests(unittest.TestCase):
             "return false",
             validator,
         )
+        for name in (
+            "PERFORMANCE_DOCUMENT_KEYS",
+            "PERFORMANCE_V1_V2_RECORD_KEYS",
+            "PERFORMANCE_V3_RECORD_KEYS",
+            "PERFORMANCE_V4_RECORD_KEYS",
+            "PERFORMANCE_V1_V2_IDENTITY_SOURCES",
+            "PERFORMANCE_V3_IDENTITY_SOURCES",
+            "PERFORMANCE_V4_IDENTITY_FIELD_SOURCES",
+            "PERFORMANCE_V4_IDENTITY_SOURCES",
+            "PERFORMANCE_V3_IDENTITY_WARNINGS",
+            "PERFORMANCE_V4_IDENTITY_WARNINGS",
+        ):
+            self.assertIn(name, self.source)
+        v1_v2_sources = self.source[
+            self.source.index("const PERFORMANCE_V1_V2_IDENTITY_SOURCES"):
+            self.source.index("const PERFORMANCE_V3_IDENTITY_SOURCES")
+        ]
+        v3_sources = self.source[
+            self.source.index("const PERFORMANCE_V3_IDENTITY_SOURCES"):
+            self.source.index("const PERFORMANCE_V4_IDENTITY_FIELD_SOURCES")
+        ]
+        v4_sources = self.source[
+            self.source.index("const PERFORMANCE_V4_IDENTITY_FIELD_SOURCES"):
+            self.source.index("const PERFORMANCE_V3_IDENTITY_WARNINGS")
+        ]
+        v3_warning_block = self.source[
+            self.source.index("const PERFORMANCE_V3_IDENTITY_WARNINGS"):
+            self.source.index("const PERFORMANCE_V4_IDENTITY_WARNINGS")
+        ]
+        v4_warning_block = self.source[
+            self.source.index("const PERFORMANCE_V4_IDENTITY_WARNINGS"):
+            self.source.index("const PERFORMANCE_LEGACY_SCHEMA_VERSION")
+        ]
+        self.assertNotIn('"self-reported"', v1_v2_sources)
+        self.assertIn('"self-reported"', v3_sources)
+        self.assertIn("...PERFORMANCE_V1_V2_IDENTITY_SOURCES", v3_sources)
+        self.assertIn('"runtime-environment"', v4_sources)
+        self.assertIn('"self-reported"', v4_sources)
+        self.assertIn('"composite"', v4_sources)
+        self.assertEqual(
+            set(re.findall(r'"([^"]+)"', v3_warning_block)),
+            {
+            "metadata-declaration-conflict",
+            "metadata-self-conflict",
+            "declaration-self-conflict",
+            "metadata-invalid",
+            "declaration-invalid",
+            "self-incomplete",
+            "self-unrecognized",
+            },
+        )
+        self.assertIn("...PERFORMANCE_V3_IDENTITY_WARNINGS", v4_warning_block)
+        self.assertEqual(
+            set(re.findall(r'"([^"]+)"', v4_warning_block)),
+            {
+                "metadata-runtime-conflict",
+                "declaration-runtime-conflict",
+                "runtime-self-conflict",
+                "runtime-environment-invalid",
+                "runtime-self-unverified",
+                "runtime-environment-incomplete",
+            },
+        )
+        self.assertIn("const actualKeys = Object.keys(record)", validator)
+        self.assertIn("actualKeys.length !== expectedKeys.size", validator)
+        self.assertIn("!actualKeys.every(key => expectedKeys.has(key))", validator)
+        self.assertIn(
+            "schemaVersion === PERFORMANCE_SCHEMA_VERSION", validator
+        )
+        self.assertIn(
+            "!identityWarnings.has(record.identity_warning)",
+            validator,
+        )
+        self.assertIn(
+            "? PERFORMANCE_V4_IDENTITY_WARNINGS", validator
+        )
+        self.assertIn(
+            "? PERFORMANCE_V3_IDENTITY_WARNINGS : null", validator
+        )
+        self.assertIn(
+            'record.identity_source === "unknown"', validator
+        )
+        self.assertIn(
+            '["run-metadata", "declared"].includes(record.identity_source)',
+            validator,
+        )
+        self.assertIn(
+            'record.identity_source === "self-reported"', validator
+        )
+        self.assertIn(
+            "PERFORMANCE_V4_IDENTITY_FIELD_SOURCES.has(record[field])",
+            validator,
+        )
+        self.assertIn(
+            "record.identity_source !== aggregatePerformanceIdentitySource(record)",
+            validator,
+        )
+        self.assertIn(
+            '(record[`${field}_identity_source`] === "unknown")',
+            validator,
+        )
+
+        render_start = self.source.index("function renderPerformance(document)")
+        render_end = self.source.index(
+            "function updateRunDetailChipSelection", render_start
+        )
+        render = self.source[render_start:render_end]
+        self.assertIn("const documentKeys =", render)
+        self.assertIn(
+            "documentKeys.length !== PERFORMANCE_DOCUMENT_KEYS.size", render
+        )
+        self.assertIn(
+            "!documentKeys.every(key => PERFORMANCE_DOCUMENT_KEYS.has(key))",
+            render,
+        )
+        for version in (
+            "PERFORMANCE_LEGACY_SCHEMA_VERSION",
+            "PERFORMANCE_COMPARABLE_SCHEMA_VERSION",
+            "PERFORMANCE_IDENTITY_SCHEMA_VERSION",
+            "PERFORMANCE_SCHEMA_VERSION",
+        ):
+            self.assertIn(version, render)
+        self.assertIn("performanceSchemaVersion = document.schema_version", render)
+
+        identity_start = self.source.index("function performanceIdentity")
+        identity_end = self.source.index("function performanceTaskLabel", identity_start)
+        identity = self.source[identity_start:identity_end]
+        self.assertIn('? value : "unknown"', identity)
+        self.assertNotIn(".filter(", identity)
 
     def test_every_dynamic_identity_and_detail_reaches_an_escape_boundary(self):
         source = self.source
-        self.assertIn("identity.slice(1).map(esc)", source)
-        self.assertIn("${esc(identity[0])}", source)
+        self.assertIn("identity.slice(1).map(identityValue)", source)
+        self.assertIn("${identityValue(identity[0])}", source)
+        self.assertIn(": esc(value)", source)
         self.assertIn("${esc(performanceStartLabel(record.lifecycle_started_at_utc))}", source)
         self.assertIn("${esc(performanceSessionLabel(record.session))}", source)
         self.assertIn('${esc("Identity source: " + record.identity_source)}', source)
         self.assertIn('title="${esc(details)}"', source)
+
+        self.assertIn("Provenance:", source)
+        self.assertNotIn("${esc(fieldDetail)}", source)
+        self.assertGreaterEqual(source.count("esc(record.identity_source)"), 1)
 
     def test_timing_failure_is_nonfatal_and_does_not_force_open_or_clear_selection(self):
         self.assertIn('id="performance-notice"', self.source)
@@ -737,7 +998,10 @@ class PerformanceClientContractTests(unittest.TestCase):
         )
         append = self.source[append_start:append_end]
 
-        self.assertIn("if (!validPerformanceRecord(record)) return null", summary)
+        self.assertIn(
+            "if (!validPerformanceRecord(record, schemaVersion)) return null",
+            summary,
+        )
         self.assertIn("PHONE_SHARE_TOOLTIP_LIMIT = 500", self.source)
         self.assertIn(
             "summary.length <= PHONE_SHARE_TOOLTIP_LIMIT ? summary : null",
@@ -751,6 +1015,14 @@ class PerformanceClientContractTests(unittest.TestCase):
             append,
         )
         self.assertIn("const taskLabel = performanceTaskLabel(record)", summary)
+        self.assertIn("identity provenance:", summary)
+        self.assertIn("field provenance:", summary)
+        self.assertIn(
+            "performanceIdentityFieldProvenance(record, schemaVersion)", summary
+        )
+        self.assertIn("identity warning:", summary)
+        self.assertIn("record.identity_source", summary)
+        self.assertIn("record.identity_warning", summary)
         self.assertIn(
             "`${taskLabel}: ${formatPerformanceDuration(record.task_duration_ms)}`",
             summary,
@@ -767,11 +1039,17 @@ class PerformanceClientContractTests(unittest.TestCase):
             "invocation_id",
             "started_at",
             "finished_at",
-            "identity_source",
             "clock_source",
             "observed_at",
             "status_file",
             "path",
+            "self_identity",
+            "declared_identity",
+            "metadata_identity",
+            "CLAUDECODE",
+            "CLAUDE_EFFORT",
+            "session_id",
+            "email",
         ):
             self.assertNotIn(private_field, summary)
 

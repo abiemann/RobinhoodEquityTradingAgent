@@ -137,6 +137,30 @@ class RunPerformanceTests(unittest.TestCase):
         values.update(overrides)
         return values
 
+    def identity_kwargs(self, invocation_id, **overrides):
+        values = {
+            "invocation_id": invocation_id,
+            "self_identity": "Codex|Codex Luna 5.6|high",
+            "declared_identity": "absent",
+            "metadata_identity": "absent",
+            "state_file": self.state,
+            "projection_file": self.projection,
+            "lifecycle_state_file": self.lifecycle_state,
+            "lifecycle_projection_file": self.lifecycle_projection,
+            "now_utc": "2026-08-11T19:00:01Z",
+        }
+        values.update(overrides)
+        return values
+
+    def finish_started_lifecycle(self, invocation_id, *, finish=FINISH):
+        run_lifecycle.finish_invocation(
+            invocation_id=invocation_id,
+            classification="completed",
+            state_file=self.lifecycle_state,
+            projection_file=self.lifecycle_projection,
+            now_utc=finish,
+        )
+
     def read_projection(self):
         with open(self.projection, encoding="utf-8") as handle:
             return json.load(handle)
@@ -591,6 +615,649 @@ class RunPerformanceTests(unittest.TestCase):
                 )
             )
 
+    def test_identity_registry_is_exact_and_preserves_partial_self_report(self):
+        partial = run_performance._resolve_identity_claims(
+            "absent",
+            "absent",
+            " Claude Desktop Code | Claude Sonnet 5 | unknown ",
+        )
+        self.assertEqual(
+            partial,
+            {
+                "runner": "claude",
+                "model": "claude-sonnet-5",
+                "configuration": "unknown",
+                "identity_source": "self-reported",
+                "identity_warning": "self-incomplete",
+                "runner_identity_source": "self-reported",
+                "model_identity_source": "self-reported",
+                "configuration_identity_source": "unknown",
+            },
+        )
+        generic = run_performance._resolve_identity_claims(
+            "absent", "absent", "OpenAI Codex|GPT-5|reasoning=high"
+        )
+        self.assertEqual(generic["runner"], "codex")
+        self.assertEqual(generic["model"], "unknown")
+        self.assertEqual(generic["configuration"], "reasoning=high")
+        self.assertEqual(generic["identity_warning"], "self-unrecognized")
+        sol = run_performance._resolve_identity_claims(
+            "absent", "absent", "Codex Desktop|GPT 5.6 Sol|high"
+        )
+        self.assertEqual(sol["model"], "gpt-5.6-sol")
+        self.assertIsNone(sol["identity_warning"])
+
+        missing_self = run_performance._resolve_identity_claims(
+            "absent", "absent", "absent"
+        )
+        self.assertEqual(missing_self["identity_source"], "unknown")
+        self.assertEqual(missing_self["identity_warning"], "self-unrecognized")
+
+    def test_identity_precedence_and_deterministic_conflict_warnings(self):
+        matching = run_performance._resolve_identity_claims(
+            "Codex Desktop|GPT 5.6 Luna|high",
+            "codex|gpt-5.6-luna|reasoning=high",
+            "OpenAI Codex|Codex Luna 5.6|high",
+        )
+        self.assertEqual(matching["identity_source"], "run-metadata")
+        self.assertIsNone(matching["identity_warning"])
+
+        conflict = run_performance._resolve_identity_claims(
+            "codex|gpt-5.6-luna|reasoning=high",
+            "claude|claude-sonnet-5|effort=high",
+            "Claude Code|Claude Sonnet 5|high",
+        )
+        self.assertEqual(conflict["runner"], "codex")
+        self.assertEqual(
+            conflict["identity_warning"], "metadata-declaration-conflict"
+        )
+
+        fallback = run_performance._resolve_identity_claims(
+            "invalid",
+            "Claude Code|Claude Sonnet 5|effort high",
+            "Claude|Claude Sonnet 5|high",
+        )
+        self.assertEqual(fallback["identity_source"], "declared")
+        self.assertEqual(fallback["identity_warning"], "metadata-invalid")
+
+    def test_claude_runtime_environment_exact_effort_values_are_composite(self):
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                resolved = run_performance._resolve_identity_claims(
+                    "absent",
+                    "absent",
+                    "unknown|Claude Sonnet 5|unknown",
+                    {"CLAUDECODE": "1", "CLAUDE_EFFORT": effort},
+                )
+                self.assertEqual(resolved["runner"], "claude")
+                self.assertEqual(resolved["model"], "claude-sonnet-5")
+                self.assertEqual(resolved["configuration"], f"effort={effort}")
+                self.assertEqual(resolved["identity_source"], "composite")
+                self.assertEqual(
+                    resolved["runner_identity_source"], "runtime-environment"
+                )
+                self.assertEqual(resolved["model_identity_source"], "self-reported")
+                self.assertEqual(
+                    resolved["configuration_identity_source"], "runtime-environment"
+                )
+                self.assertEqual(
+                    resolved["identity_warning"], "runtime-self-unverified"
+                )
+
+    def test_runtime_environment_missing_and_invalid_evidence_is_bounded(self):
+        missing_marker = run_performance._resolve_identity_claims(
+            "absent",
+            "absent",
+            "unknown|Claude Sonnet 5|unknown",
+            {"CLAUDE_EFFORT": "high"},
+        )
+        self.assertEqual(missing_marker["identity_source"], "self-reported")
+        self.assertEqual(
+            missing_marker["identity_warning"], "runtime-environment-invalid"
+        )
+
+        missing_effort = run_performance._resolve_identity_claims(
+            "absent",
+            "absent",
+            "unknown|Claude Sonnet 5|unknown",
+            {"CLAUDECODE": "1"},
+        )
+        self.assertEqual(missing_effort["runner"], "claude")
+        self.assertEqual(missing_effort["configuration"], "unknown")
+        self.assertEqual(missing_effort["identity_source"], "composite")
+        self.assertEqual(
+            missing_effort["identity_warning"], "runtime-self-unverified"
+        )
+
+        for environment in (
+            {"CLAUDECODE": "0", "CLAUDE_EFFORT": "high"},
+            {"CLAUDECODE": "1", "CLAUDE_EFFORT": "turbo"},
+            {"CLAUDECODE": "1", "CLAUDE_EFFORT": "HIGH"},
+        ):
+            with self.subTest(environment=environment):
+                result = run_performance._resolve_identity_claims(
+                    "absent",
+                    "absent",
+                    "unknown|Claude Sonnet 5|unknown",
+                    environment,
+                )
+                self.assertEqual(
+                    result["identity_warning"], "runtime-environment-invalid"
+                )
+
+    def test_runtime_environment_reads_only_two_allowlisted_keys(self):
+        class GuardedEnvironment:
+            def __init__(self):
+                self.reads = []
+
+            def get(self, key, default=None):
+                self.reads.append(key)
+                if key == "CLAUDECODE":
+                    return "1"
+                if key == "CLAUDE_EFFORT":
+                    return "high"
+                raise AssertionError(f"forbidden environment key read: {key}")
+
+            def __iter__(self):
+                raise AssertionError("environment enumeration is forbidden")
+
+        environment = GuardedEnvironment()
+        claim = run_performance._runtime_environment_claim(environment)
+        self.assertEqual(environment.reads, ["CLAUDECODE", "CLAUDE_EFFORT"])
+        self.assertEqual(claim["runner"], "claude")
+        self.assertEqual(claim["configuration"], "effort=high")
+
+    def test_runtime_self_conflict_does_not_promote_self_report(self):
+        resolved = run_performance._resolve_identity_claims(
+            "absent",
+            "absent",
+            "Codex|Codex Luna 5.6|high",
+            {"CLAUDECODE": "1", "CLAUDE_EFFORT": "high"},
+        )
+        self.assertEqual(resolved["runner"], "claude")
+        self.assertEqual(resolved["model"], "unknown")
+        self.assertEqual(resolved["configuration"], "effort=high")
+        self.assertEqual(resolved["identity_source"], "runtime-environment")
+        self.assertEqual(resolved["identity_warning"], "runtime-self-conflict")
+
+    def test_runtime_only_partial_identity_is_explicitly_incomplete(self):
+        resolved = run_performance._resolve_identity_claims(
+            "absent",
+            "absent",
+            "unknown|unknown|unknown",
+            {"CLAUDECODE": "1", "CLAUDE_EFFORT": "high"},
+        )
+        self.assertEqual(resolved["identity_source"], "runtime-environment")
+        self.assertEqual(resolved["model"], "unknown")
+        self.assertEqual(
+            resolved["identity_warning"], "runtime-environment-incomplete"
+        )
+
+    def test_resolve_identity_persists_before_clock_and_record_consumes_it(self):
+        invocation_id = self.start_lifecycle()
+        receipt = run_performance.resolve_identity(
+            **self.identity_kwargs(invocation_id)
+        )
+        self.assertEqual(
+            set(receipt),
+            {
+                "schema_version",
+                "action",
+                "ok",
+                "invocation_id",
+                "runner",
+                "model",
+                "configuration",
+                "identity_source",
+                "identity_warning",
+                "runner_identity_source",
+                "model_identity_source",
+                "configuration_identity_source",
+            },
+        )
+        self.assertEqual(receipt["identity_source"], "self-reported")
+        self.assertIsNone(receipt["identity_warning"])
+        self.finish_started_lifecycle(invocation_id)
+        kwargs = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            kwargs.pop(field)
+        run_performance.record_internal(**kwargs)
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["runner"], "codex")
+        self.assertEqual(record["model"], "gpt-5.6-luna")
+        self.assertEqual(record["configuration"], "reasoning=high")
+        self.assertEqual(record["identity_source"], "self-reported")
+        self.assertIsNone(record["identity_warning"])
+
+        connection = sqlite3.connect(self.state)
+        connection.row_factory = sqlite3.Row
+        try:
+            internal = connection.execute(
+                "SELECT * FROM performance_events WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(internal["runner"], "unknown")
+        self.assertEqual(internal["identity_source"], "unknown")
+
+    def test_runtime_environment_snapshot_is_canonical_private_and_immutable(self):
+        invocation_id = self.start_lifecycle()
+        environment = {
+            "CLAUDECODE": "1",
+            "CLAUDE_EFFORT": "high",
+            "CLAUDE_CODE_SESSION_ID": "private-session-id",
+            "BAGGAGE": "private-baggage",
+            "USER_EMAIL": "private@example.test",
+        }
+        receipt = run_performance.resolve_identity(
+            **self.identity_kwargs(
+                invocation_id,
+                self_identity="unknown|Claude Sonnet 5|unknown",
+                runtime_environment=environment,
+            )
+        )
+        environment["CLAUDE_EFFORT"] = "low"
+        environment["CLAUDE_CODE_SESSION_ID"] = "changed-session-id"
+        serialized_receipt = json.dumps(receipt, sort_keys=True)
+        for private in (
+            "private-session-id",
+            "private-baggage",
+            "private@example.test",
+            "changed-session-id",
+        ):
+            self.assertNotIn(private, serialized_receipt)
+
+        self.finish_started_lifecycle(invocation_id)
+        kwargs = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            kwargs.pop(field)
+        run_performance.record_internal(**kwargs)
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["configuration"], "effort=high")
+        self.assertEqual(record["identity_source"], "composite")
+        self.assertEqual(record["model_identity_source"], "self-reported")
+        serialized_projection = json.dumps(record, sort_keys=True)
+
+        connection = sqlite3.connect(self.state)
+        try:
+            stored = connection.execute(
+                "SELECT * FROM performance_identities WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        serialized_row = repr(stored)
+        for private in (
+            "private-session-id",
+            "private-baggage",
+            "private@example.test",
+            "changed-session-id",
+        ):
+            self.assertNotIn(private, serialized_projection)
+            self.assertNotIn(private, serialized_row)
+
+    def test_invalid_runtime_values_are_not_persisted_verbatim(self):
+        invocation_id = self.start_lifecycle()
+        secret_marker = "1;TOKEN=do-not-store"
+        secret_effort = "high;PASSWORD=do-not-store"
+        receipt = run_performance.resolve_identity(
+            **self.identity_kwargs(
+                invocation_id,
+                self_identity="unknown|Claude Sonnet 5|unknown",
+                runtime_environment={
+                    "CLAUDECODE": secret_marker,
+                    "CLAUDE_EFFORT": secret_effort,
+                },
+            )
+        )
+        self.assertEqual(
+            receipt["identity_warning"], "runtime-environment-invalid"
+        )
+        connection = sqlite3.connect(self.state)
+        try:
+            row = connection.execute(
+                "SELECT * FROM performance_identities WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        for secret in (secret_marker, secret_effort):
+            self.assertNotIn(secret, json.dumps(receipt, sort_keys=True))
+            self.assertNotIn(secret, repr(row))
+
+    def test_strong_resolution_rejects_conflict_and_accepts_unknown_fallback(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(
+            **self.identity_kwargs(
+                invocation_id,
+                metadata_identity="Codex|gpt-5.6-luna|reasoning=high",
+            )
+        )
+        self.finish_started_lifecycle(invocation_id)
+        with self.assertRaisesRegex(
+            run_performance.PerformanceError, "invocation-bound resolution"
+        ):
+            run_performance.record_internal(
+                **self.internal_kwargs(
+                    invocation_id,
+                    runner="claude",
+                    model="claude-sonnet-5",
+                    configuration="effort=high",
+                    identity_source="declared",
+                )
+            )
+        run_performance.record_internal(
+            **self.internal_kwargs(
+                invocation_id,
+                runner="unknown",
+                model="unknown",
+                configuration="unknown",
+                identity_source="unknown",
+            )
+        )
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["identity_source"], "run-metadata")
+        self.assertEqual(record["model"], "gpt-5.6-luna")
+
+    def test_identity_resolution_requires_running_lifecycle_and_is_append_only(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        with self.assertRaises(run_performance.PerformanceConflict):
+            run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        connection = sqlite3.connect(self.state)
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                connection.execute(
+                    "UPDATE performance_identities SET model = 'changed'"
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                connection.execute("DELETE FROM performance_identities")
+        finally:
+            connection.close()
+
+        finished_id = self.finish_lifecycle(
+            start="2026-08-11T20:00:00Z", finish="2026-08-11T20:01:00Z"
+        )
+        with self.assertRaisesRegex(
+            run_performance.PerformanceError, "requires a running lifecycle"
+        ):
+            run_performance.resolve_identity(
+                **self.identity_kwargs(
+                    finished_id, now_utc="2026-08-11T20:00:01Z"
+                )
+            )
+
+    def test_trusted_external_identity_must_be_complete_before_superseding(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        self.finish_started_lifecycle(invocation_id)
+        internal = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            internal.pop(field)
+        run_performance.record_internal(**internal)
+        run_performance.observe_task(
+            **self.task_kwargs(
+                invocation_id,
+                model="unknown",
+                configuration="unknown",
+                identity_source="manual-ui",
+                clock_source="manual-observation",
+            )
+        )
+
+        record = next(
+            item
+            for item in self.read_projection()["records"]
+            if item["invocation_id"] == invocation_id
+        )
+        self.assertEqual(record["runner"], "codex")
+        self.assertEqual(record["model"], "gpt-5.6-luna")
+        self.assertEqual(record["configuration"], "reasoning=high")
+        self.assertEqual(record["identity_source"], "self-reported")
+        self.assertIsNone(record["identity_warning"])
+
+    def test_complete_trusted_external_identity_clears_only_self_warnings(self):
+        for index, self_identity in enumerate(
+            (
+                "unknown|unknown|unknown",
+                "OpenAI Codex|GPT-5|reasoning=high",
+            )
+        ):
+            with self.subTest(self_identity=self_identity):
+                invocation_id = self.start_lifecycle(
+                    start=f"2026-08-11T20:0{index}:00Z"
+                )
+                run_performance.resolve_identity(
+                    **self.identity_kwargs(
+                        invocation_id,
+                        self_identity=self_identity,
+                        now_utc=f"2026-08-11T20:0{index}:01Z",
+                    )
+                )
+                self.finish_started_lifecycle(
+                    invocation_id, finish=f"2026-08-11T20:0{index}:30Z"
+                )
+                internal = self.internal_kwargs(
+                    invocation_id,
+                    strategy_start_utc=None,
+                    strategy_end_utc=None,
+                    now_utc=f"2026-08-11T20:0{index}:31Z",
+                )
+                for field in ("runner", "model", "configuration", "identity_source"):
+                    internal.pop(field)
+                run_performance.record_internal(**internal)
+                run_performance.observe_task(
+                    **self.task_kwargs(
+                        invocation_id,
+                        task_duration_ms=40_000,
+                        clock_source="manual-observation",
+                        now_utc=f"2026-08-11T20:0{index}:32Z",
+                    )
+                )
+
+                record = next(
+                    item
+                    for item in self.read_projection()["records"]
+                    if item["invocation_id"] == invocation_id
+                )
+                self.assertEqual(record["runner"], "codex")
+                self.assertEqual(record["model"], "gpt-5.6-luna")
+                self.assertEqual(record["configuration"], "reasoning=high")
+                self.assertEqual(record["identity_source"], "manual-ui")
+                self.assertIsNone(record["identity_warning"])
+
+    def test_trusted_external_rehabilitates_matching_runtime_composite(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(
+            **self.identity_kwargs(
+                invocation_id,
+                self_identity="unknown|Claude Sonnet 5|unknown",
+                runtime_environment={"CLAUDECODE": "1", "CLAUDE_EFFORT": "high"},
+            )
+        )
+        self.finish_started_lifecycle(invocation_id)
+        internal = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            internal.pop(field)
+        run_performance.record_internal(**internal)
+        run_performance.observe_task(
+            **self.task_kwargs(
+                invocation_id,
+                runner="claude",
+                model="claude-sonnet-5",
+                configuration="effort=high",
+                identity_source="run-metadata",
+                clock_source="manual-observation",
+            )
+        )
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["identity_source"], "run-metadata")
+        self.assertEqual(record["runner_identity_source"], "run-metadata")
+        self.assertEqual(record["model_identity_source"], "run-metadata")
+        self.assertEqual(record["configuration_identity_source"], "run-metadata")
+        self.assertIsNone(record["identity_warning"])
+
+    def test_trusted_external_rehabilitates_invalid_lower_runtime_evidence(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(
+            **self.identity_kwargs(
+                invocation_id,
+                self_identity="Claude|Claude Sonnet 5|high",
+                runtime_environment={
+                    "CLAUDECODE": "spoofed",
+                    "CLAUDE_EFFORT": "high",
+                },
+            )
+        )
+        self.finish_started_lifecycle(invocation_id)
+        internal = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            internal.pop(field)
+        run_performance.record_internal(**internal)
+        run_performance.observe_task(
+            **self.task_kwargs(
+                invocation_id,
+                runner="claude",
+                model="claude-sonnet-5",
+                configuration="effort=high",
+                identity_source="run-metadata",
+                clock_source="manual-observation",
+            )
+        )
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["identity_source"], "run-metadata")
+        self.assertIsNone(record["identity_warning"])
+
+    def test_trusted_external_conflicts_name_runtime_or_self_provenance(self):
+        cases = (
+            (
+                "unknown|unknown|unknown",
+                {"runner": "codex", "model": "gpt-5.6-luna", "configuration": "reasoning=high"},
+                "metadata-runtime-conflict",
+            ),
+            (
+                "unknown|Claude Sonnet 5|unknown",
+                {"runner": "claude", "model": "claude-sonnet-4-6", "configuration": "effort=high"},
+                "metadata-self-conflict",
+            ),
+        )
+        for index, (self_identity, trusted, warning) in enumerate(cases):
+            with self.subTest(warning=warning):
+                invocation_id = self.start_lifecycle(
+                    start=f"2026-08-11T20:1{index}:00Z"
+                )
+                run_performance.resolve_identity(
+                    **self.identity_kwargs(
+                        invocation_id,
+                        self_identity=self_identity,
+                        runtime_environment={
+                            "CLAUDECODE": "1",
+                            "CLAUDE_EFFORT": "high",
+                        },
+                    )
+                )
+                self.finish_started_lifecycle(
+                    invocation_id, finish=f"2026-08-11T20:1{index}:30Z"
+                )
+                internal = self.internal_kwargs(
+                    invocation_id,
+                    strategy_start_utc=None,
+                    strategy_end_utc=None,
+                    now_utc=f"2026-08-11T20:1{index}:31Z",
+                )
+                for field in ("runner", "model", "configuration", "identity_source"):
+                    internal.pop(field)
+                run_performance.record_internal(**internal)
+                run_performance.observe_task(
+                    **self.task_kwargs(
+                        invocation_id,
+                        **trusted,
+                        identity_source="run-metadata",
+                        clock_source="manual-observation",
+                        now_utc=f"2026-08-11T20:1{index}:32Z",
+                    )
+                )
+                record = next(
+                    item
+                    for item in self.read_projection()["records"]
+                    if item["invocation_id"] == invocation_id
+                )
+                self.assertEqual(record["identity_source"], "run-metadata")
+                self.assertEqual(record["identity_warning"], warning)
+
+    def test_resolve_identity_revalidates_running_lifecycle_inside_transaction(self):
+        invocation_id = self.start_lifecycle()
+        original = run_performance._require_running_lifecycle_invocation
+        calls = 0
+
+        def finish_after_initial_check(*args):
+            nonlocal calls
+            calls += 1
+            result = original(*args)
+            if calls == 1:
+                self.finish_started_lifecycle(invocation_id)
+            return result
+
+        with mock.patch.object(
+            run_performance,
+            "_require_running_lifecycle_invocation",
+            side_effect=finish_after_initial_check,
+        ):
+            with self.assertRaisesRegex(
+                run_performance.PerformanceError,
+                "requires a running lifecycle",
+            ):
+                run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        self.assertEqual(calls, 2)
+        connection = sqlite3.connect(self.state)
+        try:
+            identity_count = connection.execute(
+                "SELECT COUNT(*) FROM performance_identities"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(identity_count, 0)
+
+    def test_resolve_identity_rejects_internal_observation_that_wins_race(self):
+        invocation_id = self.start_lifecycle()
+        original = run_performance._require_running_lifecycle_invocation
+        calls = 0
+
+        def finalize_after_initial_check(*args):
+            nonlocal calls
+            calls += 1
+            result = original(*args)
+            if calls == 1:
+                self.finish_started_lifecycle(invocation_id)
+                run_performance.record_internal(
+                    **self.internal_kwargs(invocation_id)
+                )
+            return result
+
+        with mock.patch.object(
+            run_performance,
+            "_require_running_lifecycle_invocation",
+            side_effect=finalize_after_initial_check,
+        ):
+            with self.assertRaisesRegex(
+                run_performance.PerformanceConflict,
+                "cannot follow an internal observation",
+            ):
+                run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        self.assertEqual(calls, 1)
+        connection = sqlite3.connect(self.state)
+        try:
+            identity_count = connection.execute(
+                "SELECT COUNT(*) FROM performance_identities"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(identity_count, 0)
+        run_performance.validate_current_projection_read_only(
+            self.state, self.projection
+        )
+
     def test_all_unknown_identity_is_explicitly_supported(self):
         invocation_id = self.finish_lifecycle()
         result = run_performance.record_internal(
@@ -674,6 +1341,7 @@ class RunPerformanceTests(unittest.TestCase):
                 "SELECT * FROM performance_events ORDER BY sequence"
             ).fetchall()
             connection.execute("DROP TABLE performance_estimates")
+            connection.execute("DROP TABLE performance_identities")
             connection.execute(
                 "UPDATE performance_metadata SET value = ? "
                 "WHERE key = 'schema_version'",
@@ -688,6 +1356,10 @@ class RunPerformanceTests(unittest.TestCase):
         legacy_projection_file["schema_version"] = (
             run_performance.LEGACY_PROJECTION_SCHEMA_VERSION
         )
+        for record in legacy_projection_file["records"]:
+            record.pop("identity_warning")
+            for field in ("runner", "model", "configuration"):
+                record.pop(f"{field}_identity_source")
         with open(self.projection, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(legacy_projection_file, handle, sort_keys=True, indent=2)
             handle.write("\n")
@@ -753,6 +1425,237 @@ class RunPerformanceTests(unittest.TestCase):
         self.assertEqual(
             migrated_legacy["task_clock_source"], "codex-worked-for"
         )
+
+    def test_v2_journal_migrates_to_v3_without_event_loss(self):
+        legacy_id = self.finish_lifecycle()
+        run_performance.record_internal(**self.internal_kwargs(legacy_id))
+        connection = sqlite3.connect(self.state)
+        try:
+            before = connection.execute(
+                "SELECT * FROM performance_events ORDER BY sequence"
+            ).fetchall()
+            connection.execute("DROP TABLE performance_identities")
+            connection.execute(
+                "UPDATE performance_metadata SET value = ? "
+                "WHERE key = 'schema_version'",
+                (str(run_performance.PREVIOUS_JOURNAL_SCHEMA_VERSION),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        document = self.read_projection()
+        document["schema_version"] = run_performance.PREVIOUS_PROJECTION_SCHEMA_VERSION
+        for record in document["records"]:
+            record.pop("identity_warning")
+            for field in ("runner", "model", "configuration"):
+                record.pop(f"{field}_identity_source")
+        with open(self.projection, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(document, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        run_performance.validate_current_projection_read_only(
+            self.state, self.projection
+        )
+
+        current_id = self.finish_lifecycle(
+            start="2026-08-11T20:00:00Z", finish="2026-08-11T20:10:00Z"
+        )
+        run_performance.record_internal(
+            **self.internal_kwargs(
+                current_id,
+                strategy_start_utc=None,
+                strategy_end_utc=None,
+                now_utc="2026-08-11T20:11:00Z",
+            )
+        )
+        connection = sqlite3.connect(self.state)
+        try:
+            version = connection.execute(
+                "SELECT value FROM performance_metadata "
+                "WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            after = connection.execute(
+                "SELECT * FROM performance_events ORDER BY sequence"
+            ).fetchall()
+            identity_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(performance_identities)"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(version, str(run_performance.JOURNAL_SCHEMA_VERSION))
+        self.assertEqual(after[:len(before)], before)
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertEqual(identity_columns, run_performance._IDENTITY_COLUMNS)
+
+    def test_v3_identity_journal_migrates_to_v4_without_identity_loss(self):
+        invocation_id = self.start_lifecycle()
+        run_performance.resolve_identity(**self.identity_kwargs(invocation_id))
+        self.finish_started_lifecycle(invocation_id)
+        kwargs = self.internal_kwargs(invocation_id)
+        for field in ("runner", "model", "configuration", "identity_source"):
+            kwargs.pop(field)
+        run_performance.record_internal(**kwargs)
+        connection = sqlite3.connect(self.state)
+        try:
+            original = connection.execute(
+                "SELECT invocation_id, occurred_at_utc, runner, model, configuration, "
+                "identity_source, identity_warning FROM performance_identities"
+            ).fetchone()
+            connection.execute("DROP TRIGGER performance_identities_no_update")
+            connection.execute("DROP TRIGGER performance_identities_no_delete")
+            connection.execute("ALTER TABLE performance_identities RENAME TO identity_v4")
+            connection.execute(
+                """
+                CREATE TABLE performance_identities (
+                    invocation_id TEXT PRIMARY KEY,
+                    occurred_at_utc TEXT NOT NULL,
+                    runner TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    configuration TEXT NOT NULL,
+                    identity_source TEXT NOT NULL,
+                    identity_warning TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO performance_identities VALUES (?, ?, ?, ?, ?, ?, ?)",
+                original,
+            )
+            connection.execute("DROP TABLE identity_v4")
+            connection.execute(
+                """
+                CREATE TRIGGER performance_identities_no_update
+                BEFORE UPDATE ON performance_identities
+                BEGIN
+                    SELECT RAISE(ABORT, 'performance identities are append-only');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER performance_identities_no_delete
+                BEFORE DELETE ON performance_identities
+                BEGIN
+                    SELECT RAISE(ABORT, 'performance identities are append-only');
+                END
+                """
+            )
+            connection.execute(
+                "UPDATE performance_metadata SET value = ? "
+                "WHERE key = 'schema_version'",
+                (str(run_performance.IDENTITY_JOURNAL_SCHEMA_VERSION),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        v3_projection = self.read_projection()
+        v3_projection["schema_version"] = (
+            run_performance.IDENTITY_PROJECTION_SCHEMA_VERSION
+        )
+        for record in v3_projection["records"]:
+            for field in ("runner", "model", "configuration"):
+                record.pop(f"{field}_identity_source")
+        with open(self.projection, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(v3_projection, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        before_state = Path(self.state).read_bytes()
+        before_projection = Path(self.projection).read_bytes()
+        self.assertEqual(
+            run_performance.validate_current_projection_read_only(
+                self.state, self.projection
+            ),
+            v3_projection,
+        )
+        self.assertEqual(Path(self.state).read_bytes(), before_state)
+        self.assertEqual(Path(self.projection).read_bytes(), before_projection)
+
+        current_id = self.finish_lifecycle(
+            start="2026-08-11T20:00:00Z", finish="2026-08-11T20:10:00Z"
+        )
+        run_performance.record_internal(
+            **self.internal_kwargs(
+                current_id,
+                strategy_start_utc=None,
+                strategy_end_utc=None,
+                now_utc="2026-08-11T20:11:00Z",
+            )
+        )
+
+        connection = sqlite3.connect(self.state)
+        try:
+            version = connection.execute(
+                "SELECT value FROM performance_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            migrated = connection.execute(
+                "SELECT * FROM performance_identities WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(version, str(run_performance.JOURNAL_SCHEMA_VERSION))
+        self.assertEqual(migrated[0:7], original)
+        self.assertEqual(migrated[7:], ("self-reported", "self-reported", "self-reported"))
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["runner_identity_source"], "self-reported")
+        self.assertEqual(record["model_identity_source"], "self-reported")
+        self.assertEqual(record["configuration_identity_source"], "self-reported")
+
+    def test_legacy_projection_rejects_v3_self_report_semantics(self):
+        invocation_id = self.finish_lifecycle()
+        run_performance.record_internal(**self.internal_kwargs(invocation_id))
+        document = self.read_projection()
+        record = document["records"][0]
+        record["runner"] = "claude"
+        record["model"] = "claude-sonnet-5"
+        record["configuration"] = "unknown"
+        record["identity_source"] = "self-reported"
+        record["identity_warning"] = "self-incomplete"
+        record["runner_identity_source"] = "self-reported"
+        record["model_identity_source"] = "self-reported"
+        record["configuration_identity_source"] = "unknown"
+        self.assertEqual(run_performance.validate_projection(document), document)
+
+        v3 = json.loads(json.dumps(document))
+        v3["schema_version"] = run_performance.IDENTITY_PROJECTION_SCHEMA_VERSION
+        for field in ("runner", "model", "configuration"):
+            v3["records"][0].pop(f"{field}_identity_source")
+        self.assertEqual(run_performance.validate_projection(v3), v3)
+        v3["records"][0]["identity_warning"] = "runtime-self-unverified"
+        with self.assertRaisesRegex(
+            run_performance.PerformanceError, "identity_warning"
+        ):
+            run_performance.validate_projection(v3)
+
+        v3_row = {
+            "invocation_id": str(uuid.uuid4()),
+            "occurred_at_utc": "2026-08-11T19:00:01Z",
+            "runner": "claude",
+            "model": "claude-sonnet-5",
+            "configuration": "unknown",
+            "identity_source": "self-reported",
+            "identity_warning": "runtime-self-unverified",
+        }
+        with self.assertRaisesRegex(
+            run_performance.PerformanceError, "identity_warning"
+        ):
+            run_performance._validate_resolved_identity_row(v3_row, "v3 identity")
+
+        for version in (
+            run_performance.LEGACY_PROJECTION_SCHEMA_VERSION,
+            run_performance.PREVIOUS_PROJECTION_SCHEMA_VERSION,
+        ):
+            legacy = json.loads(json.dumps(document))
+            legacy["schema_version"] = version
+            legacy["records"][0].pop("identity_warning")
+            for field in ("runner", "model", "configuration"):
+                legacy["records"][0].pop(f"{field}_identity_source")
+            with self.subTest(version=version), self.assertRaises(
+                run_performance.PerformanceError
+            ):
+                run_performance.validate_projection(legacy)
 
     def test_path_aliases_are_rejected_before_mutation(self):
         invocation_id = self.finish_lifecycle()
@@ -954,6 +1857,9 @@ class RunPerformanceTests(unittest.TestCase):
         document["schema_version"] = (
             run_performance.LEGACY_PROJECTION_SCHEMA_VERSION
         )
+        document["records"][0].pop("identity_warning")
+        for field in ("runner", "model", "configuration"):
+            document["records"][0].pop(f"{field}_identity_source")
         self.assertEqual(
             run_performance.validate_projection(document), document
         )
@@ -1120,6 +2026,64 @@ class RunPerformanceTests(unittest.TestCase):
         payload = json.loads(invalid_lines[0])
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["reason"], "performance_state_error")
+
+    def test_cli_resolve_identity_emits_exact_receipt(self):
+        invocation_id = self.start_lifecycle()
+        resolved = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(ROOT, "run_performance.py"),
+                "resolve-identity",
+                "--invocation-id",
+                invocation_id,
+                "--self-identity",
+                "Claude Desktop Code|Claude Sonnet 5|unknown",
+                "--declared-identity",
+                "absent",
+                "--metadata-identity",
+                "absent",
+                "--state-file",
+                self.state,
+                "--projection-file",
+                self.projection,
+                "--lifecycle-state-file",
+                self.lifecycle_state,
+                "--lifecycle-projection-file",
+                self.lifecycle_projection,
+                "--now-utc",
+                "2026-08-11T19:00:01Z",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(resolved.stderr, "")
+        self.assertEqual(len(resolved.stdout.splitlines()), 1)
+        payload = json.loads(resolved.stdout)
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "action",
+                "ok",
+                "invocation_id",
+                "runner",
+                "model",
+                "configuration",
+                "identity_source",
+                "identity_warning",
+                "runner_identity_source",
+                "model_identity_source",
+                "configuration_identity_source",
+            },
+        )
+        self.assertEqual(payload["action"], "resolve-identity")
+        self.assertEqual(payload["runner"], "claude")
+        self.assertEqual(payload["model"], "claude-sonnet-5")
+        self.assertEqual(payload["configuration"], "unknown")
+        self.assertEqual(payload["identity_source"], "self-reported")
+        self.assertEqual(payload["identity_warning"], "self-incomplete")
 
 
 if __name__ == "__main__":
