@@ -849,6 +849,15 @@ post-telemetry memory tool call and leaving `record-internal` as the final tool 
 ambiguous recovery/timing state produces an unavailable metric or a safe halt, never a
 reconstructed value. This run remains excluded from fair comparisons.
 
+**Positive validation from the 16:44 follow-up:** the deterministic guardrails did exactly what
+they were designed to do. After context compaction, Claude attempted obsolete helper syntax, a
+prohibited discovery probe, and incorrect relative report/status paths. Every invalid command was
+rejected before it could publish, link, overwrite, or reinterpret authoritative state. Claude then
+used the lifecycle-bound commands successfully; the report, status, gate, lifecycle, lease, and
+performance records remained valid and mutually consistent, and no broker mutation occurred.
+This is an important defense-in-depth success: model instruction drift became visible,
+recoverable noise instead of silent state corruption or unintended trading authority.
+
 **2026-08-12 16:44 follow-up, a successful daily-loss result was redundantly reopened through
 interpolated Python source.** The deterministic evaluator completed successfully, wrote a valid
 `daily-loss-A.json`, and reported a clear breaker. Claude then made an unnecessary diagnostic
