@@ -148,6 +148,7 @@ class RunPerformanceTests(unittest.TestCase):
             "lifecycle_state_file": self.lifecycle_state,
             "lifecycle_projection_file": self.lifecycle_projection,
             "now_utc": "2026-08-11T19:00:01Z",
+            "runtime_environment": {},
         }
         values.update(overrides)
         return values
@@ -2056,6 +2057,11 @@ class RunPerformanceTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in ("CLAUDECODE", "CLAUDE_EFFORT")
+            },
         )
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         self.assertEqual(resolved.stderr, "")
