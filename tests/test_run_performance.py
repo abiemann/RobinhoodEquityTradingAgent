@@ -46,6 +46,7 @@ class RunPerformanceTests(unittest.TestCase):
         start=START,
         finish=FINISH,
         run_start_pt=None,
+        strategy_markers=False,
     ):
         invocation_id = invocation_id or str(uuid.uuid4())
         run_lifecycle.start_invocation(
@@ -64,6 +65,21 @@ class RunPerformanceTests(unittest.TestCase):
                 now_utc=datetime.fromisoformat(run_start_pt).astimezone(
                     timezone.utc
                 ).isoformat().replace("+00:00", "Z"),
+            )
+        if strategy_markers:
+            run_lifecycle.record_event(
+                invocation_id=invocation_id,
+                phase="position-management",
+                state_file=self.lifecycle_state,
+                projection_file=self.lifecycle_projection,
+                now_utc=self.STRATEGY_START,
+            )
+            run_lifecycle.record_event(
+                invocation_id=invocation_id,
+                phase="report",
+                state_file=self.lifecycle_state,
+                projection_file=self.lifecycle_projection,
+                now_utc=self.STRATEGY_FINISH,
             )
         run_lifecycle.finish_invocation(
             invocation_id=invocation_id,
@@ -233,6 +249,35 @@ class RunPerformanceTests(unittest.TestCase):
         self.assertIsNone(record["routine_overhead_ms"])
         self.assertEqual(record["outside_lifecycle_ms"], 120_000)
         self.assertIsNone(record["total_overhead_ms"])
+
+    def test_host_stamped_lifecycle_markers_supply_strategy_boundaries(self):
+        invocation_id = self.finish_lifecycle(strategy_markers=True)
+        receipt = run_performance.record_internal(
+            **self.internal_kwargs(
+                invocation_id,
+                strategy_start_utc=None,
+                strategy_end_utc=None,
+            )
+        )
+        self.assertEqual(receipt["strategy_execution_ms"], 360_000)
+        self.assertEqual(receipt["routine_overhead_ms"], 240_000)
+        record = self.read_projection()["records"][0]
+        self.assertEqual(record["strategy_started_at_utc"], self.STRATEGY_START)
+        self.assertEqual(record["strategy_finished_at_utc"], self.STRATEGY_FINISH)
+
+    def test_lifecycle_markers_reject_conflicting_supplied_boundaries(self):
+        invocation_id = self.finish_lifecycle(strategy_markers=True)
+        with self.assertRaisesRegex(
+            run_performance.PerformanceError,
+            "conflict with host-stamped lifecycle markers",
+        ):
+            run_performance.record_internal(
+                **self.internal_kwargs(
+                    invocation_id,
+                    strategy_start_utc="2026-08-11T19:01:59Z",
+                )
+            )
+        self.assertFalse(os.path.exists(self.state))
 
     def test_final_summary_duration_reuses_one_clock_and_remains_primary(self):
         invocation_id = self.finish_lifecycle(run_start_pt=self.RUN_START_PT)

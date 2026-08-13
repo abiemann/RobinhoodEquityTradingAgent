@@ -14,8 +14,6 @@ projection contains the 512 most recent internally recorded invocations at:
 Commands (successful commands emit exactly one JSON object):
 
   py -3 run_performance.py record-internal --invocation-id UUID \
-      --strategy-start-utc 2026-08-11T19:10:00Z \
-      --strategy-end-utc 2026-08-11T19:13:00Z \
       --session after-hours --runner codex --model gpt-5.6-luna \
       --configuration reasoning=high --identity-source task-definition
   py -3 run_performance.py observe-task --invocation-id UUID \
@@ -26,8 +24,8 @@ Commands (successful commands emit exactly one JSON object):
   py -3 run_performance.py validate
 
 ``record-internal`` validates the lifecycle database and projection read-only,
-requires a finished invocation, and records lifecycle boundaries plus the
-optional both-or-neither FIRST/REPORT renewal boundaries.  When the lifecycle
+requires a finished invocation, and derives strategy boundaries from the
+host-stamped lifecycle ``position-management`` and ``report`` markers.  When the lifecycle
 has an authoritative Pacific run start, that same command's single observation
 clock also records the canonical final-summary-boundary run duration used for
 fair runner/model comparisons.  ``observe-task`` attaches a positive external
@@ -456,7 +454,36 @@ def _finished_lifecycle_record(
         "started_at_utc": lifecycle_start,
         "finished_at_utc": lifecycle_finish,
         "run_start_pt": run_start_pt,
+        "events": record["events"],
     }
+
+
+def _lifecycle_strategy_pair(
+    lifecycle: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Return the unique host-stamped strategy marker pair, or no pair.
+
+    Missing, partial, or duplicate instrumentation must never be converted into
+    a guessed duration. Older lifecycle records legitimately have no markers.
+    """
+
+    phases: dict[str, list[str]] = {
+        "position-management": [],
+        "report": [],
+    }
+    for event in lifecycle["events"]:
+        phase = event["phase"]
+        if event["type"] == "event" and phase in phases:
+            phases[phase].append(event["occurred_at_utc"])
+    if any(len(values) != 1 for values in phases.values()):
+        return None, None
+    return _validate_strategy_pair(
+        phases["position-management"][0],
+        phases["report"][0],
+        lifecycle["started_at_utc"],
+        lifecycle["finished_at_utc"],
+        "lifecycle strategy markers",
+    )
 
 
 def _sql_values(values: Sequence[str]) -> str:
@@ -1469,13 +1496,30 @@ def record_internal(
     )
     lifecycle_start = lifecycle["started_at_utc"]
     lifecycle_finish = lifecycle["finished_at_utc"]
-    strategy_start, strategy_finish = _validate_strategy_pair(
+    supplied_strategy_start, supplied_strategy_finish = _validate_strategy_pair(
         strategy_start_utc,
         strategy_end_utc,
         lifecycle_start,
         lifecycle_finish,
         "record-internal",
     )
+    marker_strategy_start, marker_strategy_finish = _lifecycle_strategy_pair(
+        lifecycle
+    )
+    if marker_strategy_start is not None:
+        if supplied_strategy_start is not None and (
+            supplied_strategy_start != marker_strategy_start
+            or supplied_strategy_finish != marker_strategy_finish
+        ):
+            raise PerformanceError(
+                "record-internal: supplied strategy boundaries conflict with "
+                "host-stamped lifecycle markers"
+            )
+        strategy_start = marker_strategy_start
+        strategy_finish = marker_strategy_finish
+    else:
+        strategy_start = supplied_strategy_start
+        strategy_finish = supplied_strategy_finish
     occurred = _now_utc(now_utc)
     if _utc_datetime(occurred) < _utc_datetime(lifecycle_finish):
         raise PerformanceError("record-internal time precedes lifecycle finish")
@@ -1778,8 +1822,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "action", choices=("record-internal", "observe-task", "export", "validate")
     )
     parser.add_argument("--invocation-id")
-    parser.add_argument("--strategy-start-utc")
-    parser.add_argument("--strategy-end-utc")
+    parser.add_argument("--strategy-start-utc", help=argparse.SUPPRESS)
+    parser.add_argument("--strategy-end-utc", help=argparse.SUPPRESS)
     parser.add_argument("--session")
     parser.add_argument("--task-duration-ms")
     parser.add_argument("--runner")
@@ -1804,8 +1848,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if action == "record-internal":
             allowed = {
                 "invocation_id",
-                "strategy_start_utc",
-                "strategy_end_utc",
                 "session",
                 "runner",
                 "model",

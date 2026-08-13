@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$PreferredPath
+    [string]$PreferredPath,
+    [switch]$RecoverActiveContext
 )
 
 Set-StrictMode -Version Latest
@@ -67,6 +68,105 @@ function Read-Probe {
     }
     catch {
         return $null
+    }
+}
+
+if ($RecoverActiveContext) {
+    if ($PSBoundParameters.ContainsKey('PreferredPath')) {
+        [Console]::Error.WriteLine(
+            '-RecoverActiveContext cannot be combined with -PreferredPath.'
+        )
+        exit 1
+    }
+    $contextPath = Join-Path $PSScriptRoot 'run-reports\rhmra-active-context.json'
+    try {
+        $contextRaw = Get-Content -LiteralPath $contextPath -Raw -Encoding UTF8
+        $context = $contextRaw | ConvertFrom-Json
+        $contextNames = @($context.PSObject.Properties.Name | Sort-Object)
+        $expectedContextNames = @(
+            'artifact_stamp',
+            'expected_gate_file',
+            'expected_report_file',
+            'expected_status_file',
+            'invocation_id',
+            'lease_token_sha256',
+            'python',
+            'run_start_pt',
+            'schema_version',
+            'version'
+        ) | Sort-Object
+        if (
+            $contextNames.Count -ne $expectedContextNames.Count -or
+            (Compare-Object $contextNames $expectedContextNames)
+        ) {
+            throw 'active context receipt has the wrong shape'
+        }
+        if ($context.schema_version -ne 1 -or -not ($context.python -is [string])) {
+            throw 'active context receipt has invalid bootstrap fields'
+        }
+        $verified = Read-Probe $context.python
+        if ($null -eq $verified) {
+            throw 'active context Python no longer passes the launcher probe'
+        }
+        $helper = Join-Path $PSScriptRoot 'run_lifecycle.py'
+        $output = @(& $verified.executable $helper recover-context 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) {
+            throw 'lifecycle rejected the active context receipt'
+        }
+        $recovered = ([string]$output[0]) | ConvertFrom-Json
+        $recoveredNames = @($recovered.PSObject.Properties.Name | Sort-Object)
+        $expectedRecoveredNames = @(
+            'action',
+            'artifact_stamp',
+            'classification',
+            'expected_gate_file',
+            'expected_report_file',
+            'expected_status_file',
+            'invocation_id',
+            'ok',
+            'phase',
+            'python',
+            'run_start_pt',
+            'schema_version',
+            'version'
+        ) | Sort-Object
+        if (
+            $recoveredNames.Count -ne $expectedRecoveredNames.Count -or
+            (Compare-Object $recoveredNames $expectedRecoveredNames)
+        ) {
+            throw 'lifecycle recovery receipt has the wrong shape'
+        }
+        if (
+            $recovered.schema_version -ne 1 -or
+            $recovered.action -ne 'recover-context' -or
+            $recovered.ok -ne $true -or
+            $recovered.classification -ne 'running' -or
+            $recovered.python -cne $context.python -or
+            $recovered.version -cne $verified.version
+        ) {
+            throw 'lifecycle recovery receipt failed validation'
+        }
+        [ordered]@{
+            schema_version = 1
+            status = 'recovered'
+            python = $recovered.python
+            version = $recovered.version
+            invocation_id = $recovered.invocation_id
+            classification = $recovered.classification
+            phase = $recovered.phase
+            run_start_pt = $recovered.run_start_pt
+            artifact_stamp = $recovered.artifact_stamp
+            expected_report_file = $recovered.expected_report_file
+            expected_gate_file = $recovered.expected_gate_file
+            expected_status_file = $recovered.expected_status_file
+        } | ConvertTo-Json -Compress
+        exit 0
+    }
+    catch {
+        [Console]::Error.WriteLine(
+            'Active context recovery failed closed: ' + $_.Exception.Message
+        )
+        exit 1
     }
 }
 

@@ -1328,8 +1328,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _write_json_atomic(args.json_out, result)
         print(
-            f"Daily-loss status {result['status']}; exact result written to "
-            f"{args.json_out}"
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
         )
         return 0
     except (DailyLossError, OSError) as exc:

@@ -38,7 +38,7 @@ Use the same instructions in each task:
 ```text
 TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 config=effort=high
 
-Treat every run as stateless: never use automation memory for trading decisions or prior-run state. If the automation framework requires memory.md, overwrite it with only the one-line report/status pointer specified by the routine; never append scan or account details.
+Treat every run as stateless. Do not read, create, or update memory.md, and do not call a framework memory tool; the verified report/status artifacts are the durable record.
 
 Read ./robinhood-momentum-routine-autonomous.md and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 ```

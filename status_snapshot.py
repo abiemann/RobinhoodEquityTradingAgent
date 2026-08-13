@@ -18,6 +18,7 @@ Typical invocation::
         --invocation-id 11111111-1111-4111-8111-111111111111 \
         --scratch C:\\path\\to\\session-scratch \
         --candidate C:\\path\\to\\session-scratch\\rhmra-status-candidate.json \
+        --report D:\\project\\run-reports\\rhmra-log-2026_01_02-10_13.md \
         --output D:\\project\\run-reports\\rhmra-status-2026_01_02-10_13.json
 
 Every CLI invocation emits exactly one JSON object on stdout.  Exit zero means
@@ -48,6 +49,7 @@ import run_lifecycle
 SCHEMA_VERSION = 1
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SNAPSHOT_BYTES = 1_000_000
+MAX_REPORT_BYTES = 5_000_000
 MAX_POSITIONS = 1_000
 MAX_SKIP_REASON_CHARS = 1_000
 ROOT = Path(__file__).resolve().parent
@@ -111,6 +113,7 @@ _PT_TIMESTAMP_RE = re.compile(
 _RULES_VERSION_RE = re.compile(r"^(?:[0-9a-f]{4,40}(?:-dirty)?|unknown)$")
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,15}$")
 _STATUS_FILENAME_RE = re.compile(r"^rhmra-status-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.json$")
+_REPORT_FILENAME_RE = re.compile(r"^rhmra-log-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.md$")
 
 
 class StatusSnapshotError(ValueError):
@@ -492,6 +495,66 @@ def _validated_output_path(
     return output_path, report_path
 
 
+def _validate_bound_report(
+    report: os.PathLike[str] | str,
+    report_dir: os.PathLike[str] | str,
+    expected_filename: str,
+) -> Path:
+    """Strictly read back the lifecycle-bound report before status publication."""
+
+    if not Path(report).is_absolute():
+        raise StatusSnapshotError("report: expected an absolute path")
+    if not Path(report_dir).is_absolute():
+        raise StatusSnapshotError("report_dir: expected an absolute path")
+    try:
+        report_directory = Path(report_dir).resolve(strict=True)
+    except OSError as exc:
+        raise StatusSnapshotError(
+            f"report_dir: cannot resolve directory: {exc}"
+        ) from exc
+    if not report_directory.is_dir():
+        raise StatusSnapshotError("report_dir: expected a directory")
+
+    supplied = Path(report)
+    if supplied.name != expected_filename:
+        raise StatusSnapshotError(
+            f"report: filename must match lifecycle binding ({expected_filename})"
+        )
+    if _REPORT_FILENAME_RE.fullmatch(supplied.name) is None:
+        raise StatusSnapshotError("report: invalid run report filename")
+    if supplied.is_symlink():
+        raise StatusSnapshotError("report: expected a regular non-symlink file")
+    try:
+        resolved = supplied.resolve(strict=True)
+    except OSError as exc:
+        raise StatusSnapshotError(f"report: cannot resolve file: {exc}") from exc
+    if not resolved.is_file() or resolved.parent != report_directory:
+        raise StatusSnapshotError(
+            "report: expected a regular non-symlink direct child of report_dir"
+        )
+    try:
+        size = resolved.stat().st_size
+        if size <= 0:
+            raise StatusSnapshotError("report: expected a non-empty file")
+        if size > MAX_REPORT_BYTES:
+            raise StatusSnapshotError(
+                f"report: exceeds {MAX_REPORT_BYTES} bytes"
+            )
+        with resolved.open("rb") as handle:
+            raw = handle.read(MAX_REPORT_BYTES + 1)
+    except StatusSnapshotError:
+        raise
+    except OSError as exc:
+        raise StatusSnapshotError(f"report: cannot read file: {exc}") from exc
+    if len(raw) > MAX_REPORT_BYTES:
+        raise StatusSnapshotError(f"report: exceeds {MAX_REPORT_BYTES} bytes")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StatusSnapshotError("report: file is not strict UTF-8") from exc
+    return resolved
+
+
 def _load_published_status_snapshot_with_raw(
     path: os.PathLike[str] | str,
     report_dir: os.PathLike[str] | str,
@@ -544,6 +607,7 @@ def verify_published_status_snapshot(
     *,
     candidate: os.PathLike[str] | str | None = None,
     scratch: os.PathLike[str] | str | None = None,
+    report: os.PathLike[str] | str | None = None,
     report_dir: os.PathLike[str] | str = DEFAULT_REPORT_DIR,
     invocation_id: str | None = None,
     lifecycle_state_file: os.PathLike[str] | str = (
@@ -555,7 +619,8 @@ def verify_published_status_snapshot(
 ) -> dict[str, Any]:
     """Read-only validation and optional lost-receipt reconciliation.
 
-    When candidate and scratch are supplied together, the final file must be
+    When candidate and scratch are supplied together, the lifecycle-bound
+    report is required and is read back before the final file is accepted as
     byte-identical to that valid candidate in the marked session scratch.
     Candidate-bound verification is lost-receipt recovery and therefore runs
     before lifecycle finish; it intentionally rejects a finished invocation.
@@ -568,6 +633,10 @@ def verify_published_status_snapshot(
     if candidate is not None and invocation_id is None:
         raise StatusSnapshotError(
             'verify: candidate-bound verification requires invocation_id'
+        )
+    if candidate is not None and report is None:
+        raise StatusSnapshotError(
+            'verify: candidate-bound verification requires report'
         )
 
     _validated, raw, output_path = _load_published_status_snapshot_with_raw(
@@ -606,10 +675,13 @@ def verify_published_status_snapshot(
             )
         candidate_document, candidate_raw = _read_strict_json(candidate_path)
         candidate_validated = validate_status_snapshot(candidate_document)
-        _validate_lifecycle_binding(
+        receipt = _validate_lifecycle_binding(
             candidate_validated, output_path, invocation_id=invocation_id,
             lifecycle_state_file=lifecycle_state_file,
             lifecycle_projection_file=lifecycle_projection_file,
+        )
+        _validate_bound_report(
+            report, report_dir, receipt['expected_report_file']
         )
         if _expected_filename(candidate_validated) != output_path.name:
             raise StatusSnapshotError(
@@ -627,6 +699,7 @@ def publish_status_snapshot(
     output: os.PathLike[str] | str,
     *,
     scratch: os.PathLike[str] | str,
+    report: os.PathLike[str] | str,
     report_dir: os.PathLike[str] | str = DEFAULT_REPORT_DIR,
     invocation_id: str,
     lifecycle_state_file: os.PathLike[str] | str = (
@@ -638,9 +711,10 @@ def publish_status_snapshot(
 ) -> dict[str, Any]:
     """Validate *candidate* and atomically publish it at *output*.
 
-    The candidate must be a direct child of the supplied scratch directory,
-    and the output must be a new correctly named direct child of report_dir.
-    Existing output files are never replaced.
+    The candidate must be a direct child of the supplied scratch directory.
+    The lifecycle-bound report must already be a bounded, strict UTF-8 direct
+    child of report_dir, and the output must be a new correctly named direct
+    child of that directory. Existing output files are never replaced.
     """
 
     for label, supplied in (
@@ -682,10 +756,13 @@ def publish_status_snapshot(
 
     document, raw = _read_strict_json(candidate_path)
     validated = validate_status_snapshot(document)
-    _validate_lifecycle_binding(
+    receipt = _validate_lifecycle_binding(
         validated, output_path, invocation_id=invocation_id,
         lifecycle_state_file=lifecycle_state_file,
         lifecycle_projection_file=lifecycle_projection_file,
+    )
+    _validate_bound_report(
+        report, report_path, receipt['expected_report_file']
     )
     expected_filename = _expected_filename(validated)
     if output_path.name != expected_filename:
@@ -712,10 +789,13 @@ def publish_status_snapshot(
         # Re-check at the commit boundary.  The first binding check happens
         # before staging; this second check prevents a lifecycle finish that
         # races staging from being followed by publication for a closed run.
-        _validate_lifecycle_binding(
+        receipt = _validate_lifecycle_binding(
             staged_document, output_path, invocation_id=invocation_id,
             lifecycle_state_file=lifecycle_state_file,
             lifecycle_projection_file=lifecycle_projection_file,
+        )
+        _validate_bound_report(
+            report, report_path, receipt['expected_report_file']
         )
         try:
             os.link(temporary, output_path)
@@ -771,6 +851,7 @@ def _parser() -> StrictArgumentParser:
     publish.add_argument("--invocation-id", required=True)
     publish.add_argument("--scratch", required=True)
     publish.add_argument("--candidate", required=True)
+    publish.add_argument("--report", required=True)
     publish.add_argument("--output", required=True)
     publish.add_argument(
         "--report-dir",
@@ -783,6 +864,7 @@ def _parser() -> StrictArgumentParser:
     verify.add_argument("--invocation-id", required=True)
     verify.add_argument("--scratch", required=True)
     verify.add_argument("--candidate", required=True)
+    verify.add_argument("--report", required=True)
     verify.add_argument("--output", required=True)
     verify.add_argument(
         "--report-dir",
@@ -848,6 +930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.candidate,
                 args.output,
                 scratch=args.scratch,
+                report=args.report,
                 report_dir=args.report_dir,
                 invocation_id=args.invocation_id,
                 lifecycle_state_file=args.lifecycle_state_file,
@@ -858,6 +941,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output,
                 candidate=args.candidate,
                 scratch=args.scratch,
+                report=args.report,
                 report_dir=args.report_dir,
                 invocation_id=args.invocation_id,
                 lifecycle_state_file=args.lifecycle_state_file,

@@ -28,6 +28,8 @@ Commands (all successful commands emit one JSON object):
       --report-file rhmra-log-2026_08_04-12_02.md \
       --status-file rhmra-status-2026_08_04-12_02.json
   py -3 run_lifecycle.py status --invocation-id UUID
+  py -3 run_lifecycle.py bind-context --invocation-id UUID --run-token TOKEN
+  py -3 run_lifecycle.py recover-context
   py -3 run_lifecycle.py export
   py -3 run_lifecycle.py validate
 
@@ -51,7 +53,9 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -77,6 +81,12 @@ DEFAULT_PROJECTION_FILE = os.path.join(
     ROOT, "run-reports", "rhmra-run-lifecycle.json"
 )
 DEFAULT_REPORT_DIR = os.path.join(ROOT, "run-reports")
+DEFAULT_CONTEXT_FILE = os.path.join(
+    ROOT, "run-reports", "rhmra-active-context.json"
+)
+DEFAULT_LOCK_FILE = os.path.join(
+    ROOT, "run-reports", "rhmra-run-lock.sqlite3"
+)
 
 CLASSIFICATIONS = (
     "running",
@@ -187,6 +197,7 @@ _REPORT_RE = re.compile(
 _STATUS_RE = re.compile(
     r"^rhmra-status-(\d{4}_\d{2}_\d{2}-\d{2}_\d{2})\.json$"
 )
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class LifecycleError(ValueError):
@@ -1253,6 +1264,276 @@ def invocation_status(
     }
 
 
+def _active_lease_token(
+    lock_file: str = DEFAULT_LOCK_FILE, now_utc: str | None = None,
+) -> str:
+    """Read and validate the current unexpired lease without mutating it."""
+    absolute = os.path.abspath(lock_file)
+    if not os.path.isfile(absolute):
+        raise LifecycleConflict('active run lease is missing')
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            Path(absolute).as_uri() + '?mode=ro',
+            uri=True,
+            timeout=10,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA query_only = ON')
+        columns = [
+            row['name']
+            for row in connection.execute('PRAGMA table_info(run_lease)')
+        ]
+        if columns != [
+            'singleton', 'token', 'acquired_at', 'renewed_at', 'expires_at'
+        ]:
+            raise LifecycleError('active run lease has an unsupported schema')
+        rows = connection.execute(
+            'SELECT singleton, token, acquired_at, renewed_at, expires_at '
+            'FROM run_lease'
+        ).fetchall()
+    except LifecycleError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise LifecycleError(f'cannot read active run lease: {exc}') from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    if len(rows) != 1 or rows[0]['singleton'] != 1:
+        raise LifecycleConflict('active run lease is missing')
+    row = rows[0]
+    token = row['token']
+    if not isinstance(token, str) or not token.strip():
+        raise LifecycleError('active run lease token is malformed')
+    timestamps = tuple(
+        row[name] for name in ('acquired_at', 'renewed_at', 'expires_at')
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in timestamps
+    ):
+        raise LifecycleError('active run lease timestamps are malformed')
+    acquired_at, renewed_at, expires_at = map(float, timestamps)
+    if not acquired_at <= renewed_at <= expires_at:
+        raise LifecycleError('active run lease timestamps are inconsistent')
+    if now_utc is None:
+        now_value = datetime.now(timezone.utc).timestamp()
+    else:
+        now_text = _now_utc(now_utc)
+        now_value = datetime.fromisoformat(
+            now_text.replace('Z', '+00:00')
+        ).timestamp()
+    if now_value < acquired_at or now_value >= expires_at:
+        raise LifecycleConflict('active run lease is expired')
+    return token
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def _validate_context_receipt(document: Any) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise LifecycleError('active context receipt must be a JSON object')
+    _exact_keys(
+        document,
+        {
+            'schema_version', 'python', 'version', 'invocation_id',
+            'run_start_pt', 'artifact_stamp', 'expected_report_file',
+            'expected_gate_file', 'expected_status_file',
+            'lease_token_sha256',
+        },
+        'active context receipt',
+    )
+    if document['schema_version'] != SCHEMA_VERSION or isinstance(
+        document['schema_version'], bool
+    ):
+        raise LifecycleError('active context receipt has unsupported schema')
+    python_executable = document['python']
+    if (
+        not isinstance(python_executable, str)
+        or not python_executable
+        or not os.path.isabs(python_executable)
+        or re.search(
+            r'(?i)[\\/]Microsoft[\\/]WindowsApps[\\/]', python_executable
+        )
+    ):
+        raise LifecycleError('active context receipt has an unsafe Python path')
+    version = document['version']
+    if (
+        not isinstance(version, str)
+        or re.fullmatch(r'3(?:\.\d+){1,3}(?:[^\s]*)?', version) is None
+    ):
+        raise LifecycleError('active context receipt requires Python 3')
+    invocation_id = _canonical_uuid(
+        document['invocation_id'], 'active context invocation_id'
+    )
+    run_start_pt = _canonical_run_start_pt(
+        document['run_start_pt'], 'active context run_start_pt'
+    )
+    artifact_stamp = _run_stamp(run_start_pt)
+    if document['artifact_stamp'] != artifact_stamp:
+        raise LifecycleError('active context artifact stamp is inconsistent')
+    expected = {
+        'expected_report_file': f'rhmra-log-{artifact_stamp}.md',
+        'expected_gate_file': f'rhmra-gates-{artifact_stamp}.json',
+        'expected_status_file': f'rhmra-status-{artifact_stamp}.json',
+    }
+    for name, value in expected.items():
+        if document[name] != value:
+            raise LifecycleError(f'active context {name} is inconsistent')
+    digest = document['lease_token_sha256']
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        raise LifecycleError('active context lease digest is malformed')
+    return document
+
+
+def _load_context_receipt(path: str) -> dict[str, Any]:
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            document = json.load(
+                handle,
+                object_pairs_hook=_object_no_duplicates,
+                parse_constant=_reject_constant,
+            )
+    except LifecycleError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LifecycleError(f'cannot read active context receipt: {exc}') from exc
+    return _validate_context_receipt(document)
+
+
+def _atomic_write_context(path: str, document: Mapping[str, Any]) -> None:
+    _validate_context_receipt(dict(document))
+    absolute = os.path.abspath(path)
+    directory = os.path.dirname(absolute)
+    if not directory:
+        raise LifecycleError('active context path must have a parent directory')
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix='.rhmra-active-context-', suffix='.tmp', dir=directory
+    )
+    try:
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(
+                document, handle, ensure_ascii=False, allow_nan=False,
+                sort_keys=True, indent=2,
+            )
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        descriptor = -1
+        if _load_context_receipt(temporary) != document:
+            raise LifecycleError('active context readback did not match')
+        os.replace(temporary, absolute)
+        temporary = ''
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def _context_result(action: str, document: Mapping[str, Any],
+                    lifecycle: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'action': action,
+        'ok': True,
+        'python': document['python'],
+        'version': document['version'],
+        'invocation_id': document['invocation_id'],
+        'classification': lifecycle['classification'],
+        'phase': lifecycle['phase'],
+        'run_start_pt': document['run_start_pt'],
+        'artifact_stamp': document['artifact_stamp'],
+        'expected_report_file': document['expected_report_file'],
+        'expected_gate_file': document['expected_gate_file'],
+        'expected_status_file': document['expected_status_file'],
+    }
+
+
+def bind_active_context(
+    *, invocation_id: str, run_token: str,
+    state_file: str = DEFAULT_STATE_FILE,
+    projection_file: str = DEFAULT_PROJECTION_FILE,
+    context_file: str = DEFAULT_CONTEXT_FILE,
+    lock_file: str = DEFAULT_LOCK_FILE,
+    now_utc: str | None = None,
+) -> dict[str, Any]:
+    """Persist the resolver and artifact bindings for compaction recovery."""
+    if not isinstance(run_token, str) or not run_token.strip():
+        raise LifecycleError('bind-context requires a non-empty run token')
+    lifecycle = invocation_status(
+        invocation_id=invocation_id,
+        state_file=state_file,
+        projection_file=projection_file,
+    )
+    owner = _active_lease_token(lock_file, now_utc)
+    if owner != run_token:
+        raise LifecycleConflict('run token does not own the active lease')
+    python_executable = os.path.abspath(sys.executable)
+    document = {
+        'schema_version': SCHEMA_VERSION,
+        'python': python_executable,
+        'version': sys.version.split()[0],
+        'invocation_id': lifecycle['invocation_id'],
+        'run_start_pt': lifecycle['run_start_pt'],
+        'artifact_stamp': lifecycle['artifact_stamp'],
+        'expected_report_file': lifecycle['expected_report_file'],
+        'expected_gate_file': lifecycle['expected_gate_file'],
+        'expected_status_file': lifecycle['expected_status_file'],
+        'lease_token_sha256': _token_digest(run_token),
+    }
+    _atomic_write_context(context_file, document)
+    return _context_result('bind-context', document, lifecycle)
+
+
+def recover_active_context(
+    *, state_file: str = DEFAULT_STATE_FILE,
+    projection_file: str = DEFAULT_PROJECTION_FILE,
+    context_file: str = DEFAULT_CONTEXT_FILE,
+    lock_file: str = DEFAULT_LOCK_FILE,
+    now_utc: str | None = None,
+) -> dict[str, Any]:
+    """Recover an active invocation without a remembered UUID or launcher."""
+    document = _load_context_receipt(context_file)
+    current_python = os.path.abspath(sys.executable)
+    if os.path.normcase(current_python) != os.path.normcase(document['python']):
+        raise LifecycleConflict(
+            'active context must be opened by its resolver-bound Python'
+        )
+    if sys.version.split()[0] != document['version']:
+        raise LifecycleConflict('active context Python version no longer matches')
+    lifecycle = invocation_status(
+        invocation_id=document['invocation_id'],
+        state_file=state_file,
+        projection_file=projection_file,
+    )
+    for name in (
+        'invocation_id', 'run_start_pt', 'artifact_stamp',
+        'expected_report_file', 'expected_gate_file', 'expected_status_file',
+    ):
+        if lifecycle[name] != document[name]:
+            raise LifecycleConflict(
+                f'active context {name} no longer matches lifecycle'
+            )
+    owner = _active_lease_token(lock_file, now_utc)
+    if _token_digest(owner) != document['lease_token_sha256']:
+        raise LifecycleConflict('active context no longer owns the run lease')
+    return _context_result('recover-context', document, lifecycle)
+
+
 def _invocation_rows(
     connection: sqlite3.Connection, invocation_id: str
 ) -> list[sqlite3.Row]:
@@ -1585,6 +1866,7 @@ def finish_invocation(
 def _reject_unused(args: argparse.Namespace, allowed: set[str]) -> None:
     optional = {
         "invocation_id",
+        "run_token",
         "run_start_pt",
         "classification",
         "phase",
@@ -1606,9 +1888,13 @@ def main() -> int:
     )
     parser.add_argument(
         "action",
-        choices=("start", "event", "finish", "status", "export", "validate"),
+        choices=(
+            "start", "event", "finish", "status", "bind-context",
+            "recover-context", "export", "validate",
+        ),
     )
     parser.add_argument("--invocation-id")
+    parser.add_argument("--run-token")
     parser.add_argument("--run-start-pt")
     parser.add_argument("--classification", choices=CLASSIFICATIONS)
     parser.add_argument("--phase", choices=PHASES)
@@ -1618,6 +1904,10 @@ def main() -> int:
     parser.add_argument("--report-dir", help=argparse.SUPPRESS)
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--projection-file", default=DEFAULT_PROJECTION_FILE)
+    parser.add_argument("--context-file", default=DEFAULT_CONTEXT_FILE,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         "--now-utc", help="test/diagnostic override, canonical ISO-8601 UTC"
     )
@@ -1692,6 +1982,30 @@ def main() -> int:
                 invocation_id=args.invocation_id,
                 state_file=args.state_file,
                 projection_file=args.projection_file,
+            )
+        elif args.action == "bind-context":
+            _reject_unused(args, {"invocation_id", "run_token"})
+            if args.invocation_id is None or args.run_token is None:
+                raise LifecycleError(
+                    "bind-context requires --invocation-id and --run-token"
+                )
+            result = bind_active_context(
+                invocation_id=args.invocation_id,
+                run_token=args.run_token,
+                state_file=args.state_file,
+                projection_file=args.projection_file,
+                context_file=args.context_file,
+                lock_file=args.lock_file,
+                now_utc=args.now_utc,
+            )
+        elif args.action == "recover-context":
+            _reject_unused(args, set())
+            result = recover_active_context(
+                state_file=args.state_file,
+                projection_file=args.projection_file,
+                context_file=args.context_file,
+                lock_file=args.lock_file,
+                now_utc=args.now_utc,
             )
         elif args.action == "export":
             _reject_unused(args, set())

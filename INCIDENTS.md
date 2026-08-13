@@ -837,13 +837,30 @@ the lease was released, the account remained flat, and there was no order review
 cancellation, or other broker mutation. The incident affected instruction adherence, artifact
 presentation, and benchmark timing quality rather than trading or state integrity.
 
-**Rules confirmed:** compaction summaries are not invocation-state authorities. The existing
-runtime rules already require the exact bound launcher and phase timestamps to survive compaction
-unchanged (or the run to stop), limit lifecycle recovery to the invocation-scoped read-only
-`status` command, require report write/read-back before status publication, require replacement
-rather than append for automation memory, and make `record-internal` the final tool call. This run
-is therefore excluded from fair runner/model comparisons; adding another overlapping prose rule
-would not make these already-explicit contracts more deterministic.
+**Deterministic hardening produced:** compaction summaries are not invocation-state authorities.
+The resolver/lifecycle layer now owns a private active-context recovery receipt so a compacted
+native Windows run can rebind the exact validated interpreter and lifecycle artifact names rather
+than switch to `py -3` or guess. FIRST and REPORT write fixed, host-stamped lifecycle markers;
+`run_performance.py` derives the strategy interval from the unique marker pair and refuses a
+conflicting caller value. `status_snapshot.py` now requires and strictly reads back the exact
+lifecycle-bound report before it can publish or verify status, so status cannot precede the report.
+Automation memory is now disabled for this stateless routine, eliminating the contradictory
+post-telemetry memory tool call and leaving `record-internal` as the final tool call. Missing or
+ambiguous recovery/timing state produces an unavailable metric or a safe halt, never a
+reconstructed value. This run remains excluded from fair comparisons.
+
+**2026-08-12 16:44 follow-up, a successful daily-loss result was redundantly reopened through
+interpolated Python source.** The deterministic evaluator completed successfully, wrote a valid
+`daily-loss-A.json`, and reported a clear breaker. Claude then made an unnecessary diagnostic
+`python -c` call whose source text embedded the native `C:\Users\...` path. Python interpreted
+the path's `\U` as the start of a Unicode escape and rejected the command. The unchanged JSON read
+successfully through the framework file reader immediately afterward, so the false error changed
+neither the breaker verdict nor broker state.
+
+**Rule produced:** calculation-mode `daily_loss.py` now emits its complete authoritative result as
+one compact JSON object on stdout after the atomic output write. The routine consumes that object
+directly and treats the scratch file as audit-only; it explicitly forbids a second file-read tool,
+shell command, or Python command and therefore never interpolates a Windows path into `-c` source.
 
 ## PERFORMANCE TELEMETRY — completed run without an external run-duration observation
 

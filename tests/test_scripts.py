@@ -464,7 +464,10 @@ class DailyLossTests(unittest.TestCase):
                 return proc
             self.assertEqual(proc.returncode, 0, proc.stderr)
             with open(output_path, encoding="utf-8") as f:
-                return json.load(f)
+                result = json.load(f)
+            self.assertEqual(json.loads(proc.stdout), result)
+            self.assertEqual(proc.stdout.count("\n"), 1)
+            return result
 
     def test_avir_overnight_winner_is_a_real_day_loss_and_old_order_is_included(self):
         avir = self.order(
@@ -930,6 +933,22 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("at most 15 minutes old", block)
         self.assertIn(
             "`as_of_utc` exactly DAILY-LOSS FINAL's `utc`",
+            block,
+        )
+        self.assertIn(
+            "stdout is exactly one compact JSON object containing the "
+            "complete authoritative result",
+            block,
+        )
+        self.assertIn("Bind and validate that stdout object directly", block)
+        self.assertIn("retained only as a scratch audit artifact", block)
+        self.assertIn(
+            "do not read it with a file tool, shell command, or second "
+            "Python command",
+            block,
+        )
+        self.assertIn(
+            "never embed its Windows path in `-c` source",
             block,
         )
         self.assertIn("`schema_version` exactly `1`", block)
@@ -4081,6 +4100,176 @@ class RunLifecycleTests(unittest.TestCase):
             handle.write('\n')
         return report_dir
 
+    def write_active_lease(
+        self, lock_file, token,
+        *, acquired=1785859201.0, renewed=1785859201.0,
+        expires=1785860401.0,
+    ):
+        connection = sqlite3.connect(lock_file)
+        try:
+            connection.execute(
+                'CREATE TABLE run_lease ('
+                'singleton INTEGER PRIMARY KEY CHECK (singleton = 1), '
+                'token TEXT NOT NULL, acquired_at REAL NOT NULL, '
+                'renewed_at REAL NOT NULL, expires_at REAL NOT NULL)'
+            )
+            connection.execute(
+                'INSERT INTO run_lease VALUES (1, ?, ?, ?, ?)',
+                (token, acquired, renewed, expires),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_active_context_recovers_launcher_and_binding_without_memory(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            binding = self.bind(state_file, projection_file, invocation_id)
+            run_token = 'lease-owner-token'
+            self.write_active_lease(lock_file, run_token)
+
+            proc, bound = self.invoke(
+                state_file, projection_file, 'bind-context',
+                '--invocation-id', invocation_id,
+                '--run-token', run_token,
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, (bound, proc.stderr))
+            self.assertEqual(bound['action'], 'bind-context')
+            self.assertEqual(bound['python'], os.path.abspath(sys.executable))
+            self.assertEqual(bound['invocation_id'], invocation_id)
+            for name in (
+                'run_start_pt', 'artifact_stamp', 'expected_report_file',
+                'expected_gate_file', 'expected_status_file',
+            ):
+                self.assertEqual(bound[name], binding[name])
+
+            with open(context_file, encoding='utf-8') as handle:
+                private_receipt = json.load(handle)
+            self.assertEqual(
+                set(private_receipt),
+                {
+                    'schema_version', 'python', 'version', 'invocation_id',
+                    'run_start_pt', 'artifact_stamp', 'expected_report_file',
+                    'expected_gate_file', 'expected_status_file',
+                    'lease_token_sha256',
+                },
+            )
+            self.assertNotIn(run_token, json.dumps(private_receipt))
+            self.assertEqual(
+                private_receipt['lease_token_sha256'],
+                hashlib.sha256(run_token.encode()).hexdigest(),
+            )
+
+            with open(state_file, 'rb') as handle:
+                before_state = handle.read()
+            with open(projection_file, 'rb') as handle:
+                before_projection = handle.read()
+            proc, recovered = self.invoke(
+                state_file, projection_file, 'recover-context',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:03Z',
+            )
+            self.assertEqual(proc.returncode, 0, (recovered, proc.stderr))
+            self.assertEqual(recovered['action'], 'recover-context')
+            self.assertEqual(recovered['classification'], 'running')
+            self.assertEqual(recovered['invocation_id'], invocation_id)
+            self.assertEqual(recovered['python'], os.path.abspath(sys.executable))
+            with open(state_file, 'rb') as handle:
+                self.assertEqual(handle.read(), before_state)
+            with open(projection_file, 'rb') as handle:
+                self.assertEqual(handle.read(), before_projection)
+
+    def test_active_context_fails_closed_for_wrong_or_replaced_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            self.bind(state_file, projection_file, invocation_id)
+            self.write_active_lease(lock_file, 'owner')
+
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'bind-context',
+                '--invocation-id', invocation_id,
+                '--run-token', 'not-owner',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 2, rejected)
+            self.assertIn('does not own', rejected['detail'])
+            self.assertFalse(os.path.exists(context_file))
+
+            proc, _bound = self.invoke(
+                state_file, projection_file, 'bind-context',
+                '--invocation-id', invocation_id,
+                '--run-token', 'owner',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, _bound)
+            connection = sqlite3.connect(lock_file)
+            try:
+                connection.execute(
+                    "UPDATE run_lease SET token = 'replacement' WHERE singleton = 1"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'recover-context',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:03Z',
+            )
+            self.assertEqual(proc.returncode, 2, rejected)
+            self.assertIn('no longer owns', rejected['detail'])
+
+    def test_active_context_strictly_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            invocation_id = started['invocation_id']
+            self.bind(state_file, projection_file, invocation_id)
+            self.write_active_lease(lock_file, 'owner')
+            proc, _bound = self.invoke(
+                state_file, projection_file, 'bind-context',
+                '--invocation-id', invocation_id,
+                '--run-token', 'owner',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+            self.assertEqual(proc.returncode, 0, _bound)
+            with open(context_file, encoding='utf-8') as handle:
+                receipt = json.load(handle)
+            receipt['expected_report_file'] = 'rhmra-log-2099_01_01-00_00.md'
+            with open(context_file, 'w', encoding='utf-8') as handle:
+                json.dump(receipt, handle)
+            proc, rejected = self.invoke(
+                state_file, projection_file, 'recover-context',
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:03Z',
+            )
+            self.assertEqual(proc.returncode, 1, rejected)
+            self.assertIn('expected_report_file is inconsistent', rejected['detail'])
+
     def test_concurrent_same_second_starts_create_unique_invocations(self):
         with tempfile.TemporaryDirectory() as td:
             state_file = os.path.join(td, 'lifecycle.sqlite3')
@@ -5756,6 +5945,11 @@ class MarketClockTests(unittest.TestCase):
             "status_snapshot.py verify --invocation-id '<INVOCATION_ID>' "
             "--scratch", status
         )
+        self.assertIn(
+            "--report '<absolute project>\\run-reports\\"
+            "<EXPECTED_REPORT_FILE>'",
+            status,
+        )
         self.assertIn("the already-bound `PYTHON_EXE`", status)
         self.assertIn("Every path is a separate opaque argument", status)
         self.assertIn("byte-identical to this invocation's valid scratch candidate", status)
@@ -5901,6 +6095,130 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Programs\\Python\\Python*\\python.exe", resolver)
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"),
+                         "Windows PowerShell context recovery contract")
+    def test_windows_resolver_recovers_active_context_without_remembered_uuid(self):
+        with tempfile.TemporaryDirectory() as td:
+            for name in (
+                'resolve_python.ps1', 'run_lifecycle.py', 'market_clock.py',
+                'market_calendar.py', 'validate_constants.py',
+            ):
+                shutil.copy2(os.path.join(ROOT, name), os.path.join(td, name))
+            report_dir = os.path.join(td, 'run-reports')
+            os.makedirs(report_dir)
+            state_file = os.path.join(report_dir, 'rhmra-run-lifecycle.sqlite3')
+            projection_file = os.path.join(report_dir, 'rhmra-run-lifecycle.json')
+            context_file = os.path.join(report_dir, 'rhmra-active-context.json')
+            lock_file = os.path.join(report_dir, 'rhmra-run-lock.sqlite3')
+
+            now = lifecycle_module.datetime.now(
+                lifecycle_module.timezone.utc
+            ).replace(microsecond=0)
+            start_text = now.isoformat().replace('+00:00', 'Z')
+            preflight_time = now + lifecycle_module.timedelta(seconds=1)
+            preflight_text = preflight_time.isoformat().replace('+00:00', 'Z')
+            pt_naive, _name, offset = lifecycle_module.zone_time(
+                preflight_time,
+                lifecycle_module.PACIFIC_STD_OFFSET,
+                'PST',
+                'PDT',
+            )
+            run_start_pt = pt_naive.replace(
+                tzinfo=lifecycle_module.timezone(
+                    lifecycle_module.timedelta(hours=offset)
+                )
+            ).isoformat()
+            started = lifecycle_module.start_invocation(
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc=start_text,
+            )
+            lifecycle_module.record_event(
+                invocation_id=started['invocation_id'],
+                phase='preflight',
+                run_start_pt=run_start_pt,
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc=preflight_text,
+            )
+            connection = sqlite3.connect(lock_file)
+            try:
+                connection.execute(
+                    'CREATE TABLE run_lease ('
+                    'singleton INTEGER PRIMARY KEY CHECK (singleton = 1), '
+                    'token TEXT NOT NULL, acquired_at REAL NOT NULL, '
+                    'renewed_at REAL NOT NULL, expires_at REAL NOT NULL)'
+                )
+                connection.execute(
+                    'INSERT INTO run_lease VALUES (1, ?, ?, ?, ?)',
+                    ('owner', now.timestamp(), now.timestamp(),
+                     now.timestamp() + 1200),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            lifecycle_module.bind_active_context(
+                invocation_id=started['invocation_id'],
+                run_token='owner',
+                state_file=state_file,
+                projection_file=projection_file,
+                context_file=context_file,
+                lock_file=lock_file,
+                now_utc=preflight_text,
+            )
+
+            proc = subprocess.run(
+                [
+                    'powershell.exe', '-NoProfile', '-NonInteractive',
+                    '-ExecutionPolicy', 'Bypass', '-File',
+                    os.path.join(td, 'resolve_python.ps1'),
+                    '-RecoverActiveContext',
+                ],
+                text=True,
+                capture_output=True,
+                cwd=td,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            recovered = json.loads(proc.stdout)
+            self.assertEqual(
+                set(recovered),
+                {
+                    'schema_version', 'status', 'python', 'version',
+                    'invocation_id', 'classification', 'phase',
+                    'run_start_pt', 'artifact_stamp', 'expected_report_file',
+                    'expected_gate_file', 'expected_status_file',
+                },
+            )
+            self.assertEqual(recovered['status'], 'recovered')
+            self.assertEqual(recovered['invocation_id'], started['invocation_id'])
+            self.assertEqual(recovered['python'], os.path.abspath(sys.executable))
+            self.assertEqual(recovered['run_start_pt'], run_start_pt)
+
+            connection = sqlite3.connect(lock_file)
+            try:
+                connection.execute(
+                    "UPDATE run_lease SET token = 'replacement' WHERE singleton = 1"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            rejected = subprocess.run(
+                [
+                    'powershell.exe', '-NoProfile', '-NonInteractive',
+                    '-ExecutionPolicy', 'Bypass', '-File',
+                    os.path.join(td, 'resolve_python.ps1'),
+                    '-RecoverActiveContext',
+                ],
+                text=True,
+                capture_output=True,
+                cwd=td,
+                timeout=20,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(rejected.stdout, '')
+            self.assertIn('failed closed', rejected.stderr)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"),
                          "Windows PowerShell status verifier contract")
     def test_windows_status_verifier_passes_native_path_as_argv(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5953,6 +6271,7 @@ class MarketClockTests(unittest.TestCase):
             '`market_clock.py --json --expected-constants-sha256',
             '`run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>`',
             '`run_lock.py acquire`',
+            '`run_lifecycle.py bind-context --invocation-id <INVOCATION_ID> --run-token <RUN_LOCK_TOKEN>`',
             '`create one NEW session-scoped scratch directory`',
             '`broker_snapshot.py preflight --scratch <scratch>`',
             '`order_intents.py check`',
@@ -5967,8 +6286,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('before successful lease acquisition', startup)
         self.assertIn('Never invent a placeholder token', startup)
         self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
-        self.assertIn('Items 1–11 normally succeed before `get_accounts`', startup)
-        self.assertIn('If item 9 or 10 fails', startup)
+        self.assertIn('Items 1–12 normally succeed before `get_accounts`', startup)
+        self.assertIn('If item 10 or 11 fails', startup)
         self.assertIn('named read-only positions/orders calls', startup)
         self.assertIn('is the sole exception', startup)
         self.assertIn('no broker mutation is permitted', startup)
@@ -6046,25 +6365,19 @@ class MarketClockTests(unittest.TestCase):
         coordination = routine.split(
             '### RUN COORDINATION — fenced single-flight lease', 1
         )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
-        first_boundary = coordination.index(
-            'first successful renewal at the start of FIRST'
-        )
-        report_boundary = coordination.index(
-            'successful renewal at the start of REPORT'
-        )
-        self.assertLess(first_boundary, report_boundary)
         for required in (
-            'unchanged `renewed_at` as `STRATEGY_STARTED_AT_UTC`',
-            'later order-boundary renewals must never overwrite it',
-            'unchanged `renewed_at` as `STRATEGY_FINISHED_AT_UTC`',
-            'Retain both values through report/status persistence, '
-            'read-back, release, and lifecycle finish',
-            'If FIRST or REPORT is never reached',
-            'leave the corresponding boundary unavailable',
-            'never substitute acquisition time, START CLOCK, lifecycle '
-            'timestamps, a later renewal, report time, or a guessed value',
-            'must not add a timing-only lease renewal, lifecycle event, '
-            'clock read, broker call, or other phase call',
+            'FIRST and REPORT strategy timing is helper-owned, never '
+            'model-owned',
+            'Immediately after the successful FIRST phase-entry renewal',
+            'host-stamped lifecycle `position-management` event',
+            'immediately after the successful REPORT phase-entry renewal',
+            'host-stamped lifecycle `report` event',
+            'pass no timestamp, and never retry either marker',
+            'A missing, failed, partial, or duplicate marker makes Strategy '
+            'execution and Routine overhead unavailable',
+            'Never retain, reconstruct, or pass a renewal timestamp to '
+            'performance telemetry',
+            'refuses conflicting caller values',
         ):
             self.assertIn(required, coordination)
 
@@ -6101,11 +6414,10 @@ class MarketClockTests(unittest.TestCase):
             '--model \'<TIMING_MODEL>\'',
             '--configuration \'<TIMING_CONFIG>\'',
             '--identity-source <run-metadata|declared|unknown>',
-            '--strategy-start-utc <STRATEGY_STARTED_AT_UTC>',
-            '--strategy-end-utc <STRATEGY_FINISHED_AT_UTC>',
-            'only as a pair when both retained FIRST/REPORT renewal '
-            'boundaries are available',
-            'if either is unavailable, omit both',
+            'Never pass strategy timestamps',
+            'derives the unique host-stamped `position-management` through '
+            '`report` lifecycle pair',
+            'missing, partial, or duplicated',
             'START CLOCK\'s `session` unchanged',
             '`unknown` only when the invocation finished without a '
             'successful START CLOCK',
@@ -6251,7 +6563,8 @@ class MarketClockTests(unittest.TestCase):
             '**Strategy execution**',
             '**Routine overhead**',
             '`lifecycle finished_at_utc - lifecycle started_at_utc`',
-            '`REPORT renewal renewed_at - first FIRST renewal renewed_at`',
+            'unique host-stamped lifecycle `report - position-management` '
+            'interval',
             '`Routine total - Strategy execution`',
             '`Reference run duration - Routine total`',
             'single host-clock reading reused by `record-internal`',
@@ -6478,6 +6791,13 @@ class MarketClockTests(unittest.TestCase):
             "Never use `run_lifecycle.py export`, a second START CLOCK, "
             "direct SQLite/projection access, a context summary",
             "Never pass the test-only lifecycle path overrides",
+            "-RecoverActiveContext",
+            "exact raw `RUN_LOCK_TOKEN` remains retained",
+            "exactly these thirteen fields",
+            '`status: "recovered"`, classification `running`',
+            "The receipt cannot recover a lost raw lease token",
+            "make no further broker call or artifact write and stop "
+            "fail-closed",
         ):
             self.assertIn(required, lifecycle)
 
@@ -6487,7 +6807,9 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             "PYTHON_EXE` is retained invocation state",
             "MUST survive context compaction unchanged",
-            "if the exact binding is lost, stop",
+            "If the exact binding is lost before the lease-bound "
+            "active-context receipt exists, stop",
+            "sole exception is the explicit `-RecoverActiveContext` path",
             "never execute a literal `py`, `python`, or `python3` command "
             "later in the run",
         ):
@@ -6517,6 +6839,15 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             "status_file` exactly equal to `EXPECTED_STATUS_FILE", status
         )
+        self.assertIn(
+            "--report '<absolute project>\\run-reports\\"
+            "<EXPECTED_REPORT_FILE>'",
+            status,
+        )
+        self.assertIn(
+            "report is the nonempty, strict-UTF-8 lifecycle-bound file",
+            status,
+        )
         self.assertLess(
             status.index("Before any candidate rewrite or second publish"),
             status.index("replace the scratch candidate once"),
@@ -6536,9 +6867,18 @@ class MarketClockTests(unittest.TestCase):
             "never release and then create, rename, rewrite, or repair",
             coordination,
         )
+        for required in (
+            "run_lifecycle.py bind-context --invocation-id "
+            "'<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'",
+            '`action: "bind-context"`',
+            "`python` exactly equal to `PYTHON_EXE`",
+            "stores only a SHA-256 ownership binding, never the raw token",
+            "stop before scratch creation or any broker call",
+        ):
+            self.assertIn(required, coordination)
         lifecycle_finish = report.split(
             "**Finalize lifecycle after persistence and release:**", 1
-        )[1].split("**AUTOMATION MEMORY", 1)[0]
+        )[1].split("**AUTOMATION MEMORY IS DISABLED", 1)[0]
         self.assertIn("--report-file <EXPECTED_REPORT_FILE>", lifecycle_finish)
         self.assertIn("--status-file <EXPECTED_STATUS_FILE>", lifecycle_finish)
         self.assertIn(
@@ -6612,23 +6952,35 @@ class MarketClockTests(unittest.TestCase):
             "summary", evaluator
         )
 
-        coordination = routine.split(
-            "### RUN COORDINATION", 1
-        )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
+        first = routine.split("**FIRST phase-entry fence:**", 1)[1].split(
+            "**PRE-SECOND", 1
+        )[0]
         self.assertIn(
-            "lifecycle `finish` time is never the strategy end boundary",
-            coordination,
+            "run_lifecycle.py event --invocation-id <INVOCATION_ID> "
+            "--phase position-management",
+            first,
+        )
+        report_phase = routine.split("**REPORT phase-entry fence:**", 1)[1].split(
+            "**FINAL STATUS REFRESH", 1
+        )[0]
+        self.assertIn(
+            "run_lifecycle.py event --invocation-id <INVOCATION_ID> "
+            "--phase report",
+            report_phase,
+        )
+        self.assertIn(
+            "Lifecycle `finish` is never a strategy boundary", report_phase
         )
         telemetry = routine.split(
             "### PERFORMANCE TELEMETRY", 1
         )[1].split("The filename is exactly:", 1)[0]
         self.assertIn(
-            "both retained FIRST/REPORT renewal boundaries are available",
+            "derives the unique host-stamped `position-management` through "
+            "`report` lifecycle pair",
             telemetry,
         )
         self.assertIn(
-            "Never use lifecycle `finish`, report completion, or any other "
-            "later timestamp as `--strategy-end-utc`",
+            "Never pass strategy timestamps",
             telemetry,
         )
 
@@ -6640,18 +6992,22 @@ class MarketClockTests(unittest.TestCase):
             routine = f.read()
 
         memory_policy = routine.split(
-            "**AUTOMATION MEMORY IS BOUNDED AND NEVER AUTHORITATIVE:**", 1
+            "**AUTOMATION MEMORY IS DISABLED AND NEVER AUTHORITATIVE:**", 1
         )[1].split("**Scratch hygiene:**", 1)[0]
-        self.assertIn("every run is stateless with respect to `memory.md`", memory_policy)
-        self.assertIn("Never use its contents for trading decisions", memory_policy)
-        self.assertIn("replace its entire contents; never append", memory_policy)
-        self.assertIn("Write exactly one line", memory_policy)
-        self.assertIn("Store no candidates, scan counts, balances", memory_policy)
+        self.assertIn("every run is stateless", memory_policy)
+        self.assertIn(
+            "Never read, create, edit, append to, or replace `memory.md`",
+            memory_policy,
+        )
+        self.assertIn("never call a framework memory tool", memory_policy)
+        self.assertIn("Memory is not a recovery channel", memory_policy)
+        self.assertIn("verified report/status artifacts", memory_policy)
 
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
             readme = f.read()
         self.assertIn("Treat every run as stateless", readme)
-        self.assertIn("never append scan or account details", readme)
+        self.assertEqual(readme.count("do not call a framework memory tool"), 2)
+        self.assertNotIn("never append scan or account details", readme)
     def test_routine_uses_machine_readable_scan_handoff(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
