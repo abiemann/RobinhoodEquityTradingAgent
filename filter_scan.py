@@ -8,7 +8,7 @@ screen: price band, relative-volume floor, minimum absolute day move, then
 ranks by relative volume and keeps the top N.
 
 Usage:
-  python3 filter_scan.py --scan-file <run_scan result file> \
+  python3 filter_scan.py --scratch <preflighted scratch> --scan-file <run_scan result file> \
       --price-min 2.50 --price-max 5 --min-rel-volume 2 \
       --min-abs-pct-change 3 --top-n 15 [--json-out working_list.json]
 
@@ -35,6 +35,9 @@ import argparse
 import json
 import math
 import sys
+from decimal import Decimal
+
+from broker_snapshot import validate_bound_external_json_sources
 
 
 def _reject_nonfinite_json(token):
@@ -59,9 +62,7 @@ def finite_float_arg(value):
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def load_result(path):
-    with open(path, "r", encoding="utf-8") as f:
-        doc = json.load(f, parse_constant=_reject_nonfinite_json)
+def load_result(doc, path):
     if isinstance(doc, dict) and "isError" in doc:
         if not isinstance(doc["isError"], bool):
             raise ValueError(f"{path}: isError: expected a boolean")
@@ -84,6 +85,8 @@ def load_result(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scratch", required=True,
+                    help="absolute preflighted scratch whose transport binding owns --scan-file")
     ap.add_argument("--scan-file", required=True, help="raw run_scan JSON result file")
     ap.add_argument("--price-min", type=finite_float_arg, required=True)
     ap.add_argument("--price-max", type=finite_float_arg, required=True)
@@ -94,9 +97,16 @@ def main():
     ap.add_argument("--json-out", help="optional path for the machine-readable working list")
     args = ap.parse_args()
 
-    result = load_result(args.scan_file)
+    [(_scan_path, scan_document, _scan_bytes)] = validate_bound_external_json_sources(
+        args.scratch, [args.scan_file]
+    )
+    result = load_result(scan_document, args.scan_file)
     rows = result.get("results", [])
     total_items = result.get("total_items", len(rows))
+    if isinstance(total_items, Decimal):
+        if total_items != total_items.to_integral_value():
+            raise ValueError("total_items: expected an integer")
+        total_items = int(total_items)
 
     survivors = []
     skipped_fields = 0

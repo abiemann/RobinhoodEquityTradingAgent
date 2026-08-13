@@ -25,7 +25,7 @@ live-verified; if an intentional behavior change breaks one, update the
 expectation deliberately — never delete a test to go green.
 
 Usage:
-  python evaluate_candidates.py --bars hist1.json [hist2.json ...] \
+  python evaluate_candidates.py --scratch <preflighted scratch> --bars hist1.json [hist2.json ...] \
       --quotes quotes.json \
       --volume-lookback-days 20 --high-lookback-days 5 \
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
@@ -59,6 +59,8 @@ import json
 import math
 import statistics
 import sys
+
+from broker_snapshot import validate_bound_external_json_sources
 
 
 def _reject_nonfinite_json(token):
@@ -112,8 +114,8 @@ def unwrap_historicals_result(doc, path):
     return doc
 
 
-def load_results(path):
-    doc = unwrap_historicals_result(load_json(path), path)
+def load_results(doc, path):
+    doc = unwrap_historicals_result(doc, path)
     if isinstance(doc, list):
         return doc
     if isinstance(doc, dict):
@@ -202,7 +204,7 @@ def _rsi_series(val, period):
     return []
 
 
-def load_rsi_map(paths, period):
+def load_rsi_map(documents, period):
     """Map SYMBOL -> ascending RSI values, merged across one or more files.
 
     Each file is EITHER a raw get_equity_technical_indicators response for a
@@ -214,8 +216,7 @@ def load_rsi_map(paths, period):
     The raw-file form exists because hand-assembling the keyed map is exactly
     what produced a malformed-JSON run failure; see INCIDENTS.md."""
     out = {}
-    for path in ([paths] if isinstance(paths, str) else paths):
-        doc = load_json(path)
+    for path, doc in documents:
         if isinstance(doc, dict) and isinstance(doc.get("data"), dict) and "symbol" in doc["data"]:
             doc = {doc["data"]["symbol"]: doc}          # raw single-symbol response
         for sym, val in doc.items():
@@ -269,6 +270,8 @@ def rsi_gate(values, oversold, lookback, confirm, max_entry=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scratch", required=True,
+                    help="absolute preflighted scratch whose transport binding owns every input")
     ap.add_argument("--bars", nargs="+", required=True, help="raw get_equity_historicals JSON file(s)")
     ap.add_argument("--quotes", required=True, help="JSON map of SYMBOL -> current price")
     ap.add_argument("--volume-lookback-days", type=int, required=True)
@@ -286,6 +289,13 @@ def main():
                     help="RSI_PERIOD, required with --rsi-file so the closes fallback uses the configured period")
     args = ap.parse_args()
 
+    input_paths = [*args.bars, args.quotes, *(args.rsi_file or [])]
+    validated = validate_bound_external_json_sources(args.scratch, input_paths)
+    documents = [(str(path), document) for path, document, _raw in validated]
+    bar_documents = documents[:len(args.bars)]
+    _quote_path, quote_document = documents[len(args.bars)]
+    rsi_documents = documents[len(args.bars) + 1:]
+
     rsi_map = None
     if args.rsi_file:
         if (args.rsi_period is None or args.rsi_oversold is None
@@ -293,13 +303,14 @@ def main():
                 or args.rsi_max_entry is None):
             ap.error("--rsi-file requires --rsi-period, --rsi-oversold, "
                      "--rsi-lookback-bars, --rsi-confirm-bars, and --rsi-max-entry")
-        rsi_map = load_rsi_map(args.rsi_file, args.rsi_period)
+        rsi_map = load_rsi_map(rsi_documents, args.rsi_period)
 
-    quotes = {sym.upper(): parse_quote(sym, val) for sym, val in load_json(args.quotes).items()}
+    quotes = {sym.upper(): parse_quote(sym, val)
+              for sym, val in quote_document.items()}
 
     bars_by_symbol = {}
-    for path in args.bars:
-        for result in load_results(path):
+    for path, document in bar_documents:
+        for result in load_results(document, path):
             sym = result["symbol"].upper()
             if sym in bars_by_symbol:
                 print(f"WARNING: {sym} appears in more than one --bars file; using the later one", file=sys.stderr)
@@ -418,9 +429,11 @@ def main():
     print("Buy candidates:", [r["symbol"] for r in rows if r["buy_candidate"]] or "none")
 
     if args.json_out:
+        params = {key: value for key, value in vars(args).items()
+                  if key != "scratch"}
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "rsi_gate_enabled": rsi_map is not None,
-                       "params": vars(args), "results": rows},
+                       "params": params, "results": rows},
                       f, indent=2, allow_nan=False)
         print(f"JSON written to {args.json_out}")
 

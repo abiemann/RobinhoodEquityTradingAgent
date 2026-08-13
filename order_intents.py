@@ -18,7 +18,7 @@ Commands (all emit one JSON object):
   order_intents.py prepare --intent FILE
   order_intents.py begin --intent-id UUID --run-token UUID
   order_intents.py retry --intent-id UUID --run-token UUID
-  order_intents.py acknowledge --intent-id UUID --response FILE
+  order_intents.py acknowledge --intent-id UUID --response FILE --transport-scratch SCRATCH
   order_intents.py mark-unknown --intent-id UUID --code CODE
   order_intents.py observe --intent-id UUID --orders FILE... \
       [--order-request-cursors FIRST CURSOR...] --positions FILE... \
@@ -49,6 +49,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
+
+from broker_snapshot import validate_bound_external_json_source
 
 
 SCHEMA_VERSION = 1
@@ -1785,9 +1787,15 @@ def _save_broker_observation(
 
 
 def acknowledge(
-    state_file: str, intent_id: str, response_file: str, now: str
+    state_file: str,
+    intent_id: str,
+    response_file: str,
+    transport_scratch: str,
+    now: str,
 ) -> dict[str, Any]:
-    response = load_json(response_file, "place response")
+    _resolved_response, response, _raw_response = (
+        validate_bound_external_json_source(transport_scratch, response_file)
+    )
     raw_order = _extract_place_order(response)
     connection = connect(state_file)
     try:
@@ -2340,6 +2348,10 @@ def main() -> int:
     parser.add_argument("--intent-id")
     parser.add_argument("--run-token")
     parser.add_argument("--response", help="raw place_equity_order JSON response")
+    parser.add_argument(
+        "--transport-scratch",
+        help="preflighted scratch whose binding owns --response",
+    )
     parser.add_argument("--code")
     parser.add_argument("--detail")
     parser.add_argument("--orders", nargs="+")
@@ -2375,12 +2387,21 @@ def main() -> int:
                 retrying=action == "retry",
             )
         elif action == "acknowledge":
-            if not args.intent_id or not args.response:
+            if (
+                not args.intent_id
+                or not args.response
+                or not args.transport_scratch
+            ):
                 raise OrderIntentError(
-                    "acknowledge requires --intent-id and --response"
+                    "acknowledge requires --intent-id, --response, and "
+                    "--transport-scratch"
                 )
             result = acknowledge(
-                args.state_file, args.intent_id, args.response, now
+                args.state_file,
+                args.intent_id,
+                args.response,
+                args.transport_scratch,
+                now,
             )
         elif action == "mark-unknown":
             if not args.intent_id or not args.code:

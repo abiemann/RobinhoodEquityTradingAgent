@@ -21,6 +21,8 @@ Complete Robinhood's official authorization flow, then restart the app and open 
 
 Open this project in **ChatGPT Desktop in Codex mode or Codex**, or in a brand-new Claude Desktop **Code** session whose **Environment** selector above the prompt is **Local** with native Windows project access, then paste the prompt below. Do not treat an ordinary ChatGPT chat as equivalent to Codex mode. In Claude Code, select the exact main checkout and keep worktree isolation **off** so the session sees its local uncommitted configuration and shared gitignored runtime state; the sidebar's Local filter alone is insufficient. Do not use Claude Cowork/local-agent, Remote/Cloud, or WSL access to this Windows checkout for the live routine: those environments can interpose filesystem semantics that are unsafe for the project's SQLite coordination state. The assistant handles the repository, a verified available Python runtime, validation, tests, and setup; you should need to act only for an unavoidable safety decision.
 
+**Local sensitive-temp data:** each run creates one invocation-bound native-temp `SOURCE_ROOT` containing broker, scan, and historical JSON. The first successful saved `get_accounts` response is consumed by `broker_snapshot.py bind-transport --account-name <validated AGENTIC_ACCOUNT_NAME>`; that helper returns the matched account scope in its receipt and privacy-deletes the canary, so the routine never re-derives an account number from model-visible text or makes a second lookup. Other source files are local-only, never served or committed, but can remain after a Local run or crash. Remove them only through the future deterministic cleanup/helper, or manually after every runner is stopped and the exact current-run paths have been verified. Never ask a model to improvise a recursive temp deletion.
+
 ```text
 Set up RobinhoodEquityTradingAgent and perform one safe first test for me:
 https://github.com/abiemann/RobinhoodEquityTradingAgent.git
@@ -61,7 +63,7 @@ Only after the safe first test succeeds and you separately consent to scheduling
 When you later create a scheduled task, copy exactly one matching declaration into its task prompt:
 
 - Codex: `TIMING_IDENTITY: runner=codex model=gpt-5.6-luna config=reasoning=high`
-- Claude Desktop Code Local: `TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 config=effort=high`
+- Claude Desktop Code Local (current Sonnet 5 setup): `TIMING_IDENTITY: runner=claude model=claude-sonnet-5 config=effort=high`
 
 Keep that one line synchronized with the runner, model, and configuration actually selected in the task settings; if a selection changes, update the line before the next run. It records what ran and does not select or switch the model. The routine records Routine total, Strategy execution, and Routine overhead. Immediately before its final on-screen Run Summary, the same `record-internal` host-clock reading also records **Comparable run duration** from lifecycle-bound START CLOCK through `final-summary-boundary` and prints exact Run start/Run end timestamps plus the helper-formatted duration. Those automatic boundaries are identical on Claude and Codex and do not change the saved report or status schema. A source-specific **Reference run duration** can still be attached with the optional post-run observation below.
 
@@ -76,7 +78,7 @@ After the run is complete, resolve and bind the checked-in resolver's exact Pyth
 For Claude's recorded run duration:
 
 ```powershell
-& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-4-6' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
+& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-5' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
 ```
 
 Use these `manual-ui` templates only for the named human-observed source; do not relabel runner metadata. The attached value is displayed as **Reference run duration** and remains secondary to the automatic **Comparable run duration**; it is fallback/context for historical or incomplete runs. Fair performance comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version. Keep runner/model identity explicit as the comparison dimension. See [README Tested On](README.md#tested-on) for the formulas, source rules, POSIX-shell form, and local comparison dashboard.

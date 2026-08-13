@@ -12,7 +12,7 @@ Use all of the following together:
 - **Routines → New routine → Local**.
 - The native Windows main checkout, for example `D:\Projects\RobinhoodEquityTradingAgent`.
 - **Worktree off** so every run sees the maintainer's local `constants.md` and the shared gitignored lifecycle, lease, intent, report, and status files.
-- Claude Sonnet 4.6, or the currently documented supported replacement.
+- Claude Sonnet 5 with effort high for the current comparison cohort. Sonnet 4.6 remains an exact supported historical alternative only when deliberately selected and declared as `claude-sonnet-4-6`.
 - The authorized Robinhood account connector, verified with `get_accounts`.
 
 Do not use Cowork/local-agent, Cloud/Remote, WSL, or a POSIX/FUSE view of this Windows checkout. A Cloud form shows a GitHub repository and cloud environment such as **Default**. A Local execution-environment form says **New local routine**, shows a local folder and current branch, and offers a **Worktree** checkbox.
@@ -22,6 +22,10 @@ The screenshot below is an **execution-environment example only**. Use it to dis
 ![Execution-environment example: Claude Desktop New local routine form showing a local folder, current branch, and Worktree control](images/claude-local-routine-form.png)
 
 Changing the Code sidebar filter to **Local**, or choosing Local for a new chat, does not migrate an existing scheduled task. To stop a legacy Cowork/local-agent schedule, return to the original **Cowork/Scheduled** interface that created it, pause it there, and verify that no further legacy firing occurs. The Code **Routines** list does not control that legacy task. Create a new, uniquely named Local task and delete the legacy task only after the replacement succeeds under supervision.
+
+Keep every replacement task Manual with `DRY_RUN = true`; enable it only after both supervised **Run now** proofs succeed. Selecting Sonnet 5 does not change that activation gate.
+
+**Local sensitive-temp data:** every invocation binds one native-temp `SOURCE_ROOT` that contains sensitive broker, scan, and historical JSON. These files are local-only, are not served or committed, and can persist after a Local run or crash. Remove them only through the future deterministic cleanup/helper, or manually after all Local runners and schedules are stopped and the exact current-run paths are verified. Never let a model improvise recursive deletion in the temp directory.
 
 ## 1. Prove the session is native Windows
 
@@ -36,21 +40,21 @@ Also verify the Robinhood connector in `/mcp` and require a read-only `get_accou
 Use the same instructions in each task:
 
 ```text
-TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 config=effort=high
+TIMING_IDENTITY: runner=claude model=claude-sonnet-5 config=effort=high
 
 Treat every run as stateless. Do not read, create, or update memory.md, and do not call a framework memory tool; the verified report/status artifacts are the durable record.
 
 Read ./robinhood-momentum-routine-autonomous.md and execute the trading routine exactly as written, following every instruction in that file from start to finish. Produce the full report as specified in the file. All constants and detailed step-by-step instructions are in the file — follow the file.
 ```
 
-Select the exact repository folder, **Current branch**, Sonnet 4.6 with effort high (`claude-sonnet-4-6`, `effort=high`), and **Worktree off**. Keep exactly one `TIMING_IDENTITY` line in each task and keep it synchronized with the model and effort actually selected in that task's settings. If either selection changes, update the line before the next run; the declaration records the selection and does not switch it.
+Select the exact repository folder, **Current branch**, Sonnet 5 with effort high (`claude-sonnet-5`, `effort=high`), and **Worktree off**. Keep exactly one `TIMING_IDENTITY` line in each task and keep it synchronized with the model and effort actually selected in that task's settings. If either selection changes, update the line before the next run; the declaration records the selection and does not switch it. When migrating an existing Part A/Part B pair, change each task's model selector and `TIMING_IDENTITY` line together before that task's next run. Do not leave a task selected as Sonnet 5 while it declares Sonnet 4.6, or vice versa. An intentionally retained Sonnet 4.6 task must use `model=claude-sonnet-4-6 config=effort=high` and remains a separate performance cohort.
 
 Before START CLOCK, the routine also asks the running model for one structured self-report using only identity explicitly exposed by the framework, then resolves it through the checked-in exact-match registry. Direct task metadata remains strongest and this complete declaration is next. If neither is available, the Python resolver itself reads only `CLAUDECODE` and `CLAUDE_EFFORT` through exact `os.environ.get` calls and may combine their runner/configuration evidence with the exact model supplied to Claude in its system prompt. The routine/model never enumerates, copies, echoes, stores, or passes environment values. The inherited environment can be spoofed, so it is corroboration rather than authentication; it also does not supply the exact model. Such a combined result is field-level `composite`, with the model still `self-reported`, and is unverified. Any unknown field, self-reported field, or conflict excludes the run from primary fair-comparison cohorts until independent evidence replaces it. Keep the synchronized `TIMING_IDENTITY` declaration because it is the strongest symmetric source across Claude and Codex and records the selected effort that the model may not know. The resolver is observational only and cannot affect trading.
 
 The routine records Routine total, Strategy execution, and Routine overhead after lifecycle finish. Its same `record-internal` host-clock reading automatically records **Comparable run duration** from lifecycle-bound START CLOCK through `final-summary-boundary`, then the on-screen Run Summary prints exact Run start/Run end timestamps and the helper-formatted duration. Those boundaries are identical on Claude and Codex. It does not rewrite the saved report or add a field to the status snapshot. An optional source-specific **Reference run duration** can be recorded after the run from an explicit source such as Claude's recorded run duration. After the task is complete, resolve and bind the checked-in resolver's exact Python path as `PYTHON_EXE`, replace `<INVOCATION_ID>` and `<DURATION_MS>`, and copy this PowerShell command exactly:
 
 ```powershell
-& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-4-6' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
+& '<PYTHON_EXE>' run_performance.py observe-task --invocation-id '<INVOCATION_ID>' --task-duration-ms <DURATION_MS> --runner claude --model 'claude-sonnet-5' --configuration 'effort=high' --identity-source manual-ui --clock-source claude-run-duration
 ```
 
 This template is only for a human reading Claude's recorded duration and confirming the selected task settings; do not use `manual-ui` or `claude-run-duration` for runner metadata. The value is displayed as **Reference run duration** and remains secondary to the automatic **Comparable run duration**. Fair Claude-versus-Codex and future-model comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version; keep runner/model identity explicit as the comparison dimension. The formulas, other source rules, and comparison dashboard are documented in [README Tested On](README.md#tested-on).
@@ -78,6 +82,10 @@ These are the Custom crons to add only after both proofs pass. Each task runs at
 | Part A | `Robinhood automated momentum trader PART A` | `0 6-13 * * 1-5` | 6:00 AM, 7:00 AM, …, 1:00 PM |
 | Part B | `Robinhood automated momentum trader PART B` | `30 6-13 * * 1-5` | 6:30 AM, 7:30 AM, …, 1:30 PM |
 
+![Claude Desktop Local Part A scheduler showing matching TIMING_IDENTITY, Sonnet 5, Current branch, Worktree off, Auto, and the hourly weekday cron](images/claude-automation-part-a-setup.png)
+
+This is a **post-validation Part A settings/identity reference**, not the initial creation recipe. It shows **Sonnet 5** matching `model=claude-sonnet-5`, effort high matching `config=effort=high`, the native local folder, **Current branch**, **Worktree off**, and Part A's hourly weekday cron. Copy the complete maintained prompt in section 2 instead of transcribing the screenshot. The pictured Custom cron must be added only after both Manual `DRY_RUN = true` proofs pass. The **Auto** label does not prove mutation safety: inspect **Allowed permissions** and require both order placement and cancellation to remain approval-gated. Confirm that the schedule preview resolves the pictured cron to the intended Pacific hours.
+
 The cron fields use the local machine/app timezone. Before activating either Custom schedule, require its preview to show the intended Pacific bounds: Part A from 6:00 AM through 1:00 PM and Part B from 6:30 AM through 1:30 PM on weekdays. If the machine or app is not using Pacific time, convert the cron hours and verify the preview rather than assuming the examples are Pacific. If the final 1:30 PM Pacific run is not wanted, use the correctly converted equivalent of `30 6-12 * * 1-5` for Part B.
 
 Claude adds a randomized delay of several minutes to scheduled starts, so actual spacing will not be exactly 30 minutes. Claude Desktop must remain open, and the computer must remain awake and online.
@@ -89,7 +97,7 @@ Task permissions and connector loading are scoped to each task, so test **both**
 1. Set the local `DRY_RUN` row in `constants.md` to `true` and validate it. Never commit or push `DRY_RUN = false`.
 2. In the original Cowork/Scheduled interface, keep any legacy task paused and verify that it does not fire. The Code Routines list is not the control surface for that legacy task.
 3. The task form's permission control is currently labeled **Auto**. Choose or verify a mode that does not auto-approve `place_equity_order` or `cancel_equity_order`. Do not infer from the label alone that mutation approval is safe.
-4. While Part A still has **Schedule: Manual**, open it and click **Run now**. Confirm native PowerShell and the resolver-bound Windows Python, a successful `get_accounts`, lifecycle classification `completed`, a report and status snapshot, lease release, and a healthy dashboard.
+4. While Part A still has **Schedule: Manual**, open it and click **Run now**. Confirm native PowerShell and the resolver-bound Windows Python, one successful `get_accounts`, a successful `bind-transport --account-name` receipt that supplies account scope without a second lookup, lifecycle classification `completed`, a report and status snapshot, lease release, and a healthy dashboard.
 5. Inspect Part A's task detail and **Allowed permissions** after the run. Verify that neither mutation tool was auto-approved.
 6. Repeat **Run now** for Part B while it is still Manual, require the same result, then inspect Part B's Allowed permissions too.
 7. Confirm there is no lifecycle error banner and no unexpected `.sqlite3-journal`, `-wal`, or `-shm` sidecar.

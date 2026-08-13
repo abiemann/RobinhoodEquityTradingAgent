@@ -10,9 +10,11 @@ Typical use::
 
     python broker_snapshot.py preflight --scratch C:\\path\\to\\session-scratch
 
-    python broker_snapshot.py source-preflight \
+    python broker_snapshot.py bind-transport \
         --scratch C:\\path\\to\\session-scratch \
-        --source C:\\tool-results\\source-probe.json
+        --source-root C:\\path\\to\\temp\\rhmra-source-UUID \
+        --canary C:\\path\\to\\temp\\rhmra-source-UUID\\get-accounts.json \
+        --account-name Agentic
 
     python broker_snapshot.py stage --kind portfolio \
         --generation A \
@@ -53,6 +55,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import uuid
@@ -65,8 +68,14 @@ from urllib.parse import parse_qs, urlsplit
 
 SCHEMA_VERSION = 1
 SCRATCH_MARKER = '.rhmra-broker-snapshot-scratch.json'
+TRANSPORT_MARKER = '.rhmra-broker-response-transport.json'
+TRANSPORT_MARKER_NAME = 'rhmra-broker-response-transport'
+TRANSPORT_ATTEMPT_MARKER = '.rhmra-broker-response-transport-attempt.json'
+TRANSPORT_ATTEMPT_MARKER_NAME = 'rhmra-broker-response-transport-attempt'
+TRANSPORT_ROOT_MARKER = '.rhmra-broker-response-source-root.json'
+TRANSPORT_ROOT_MARKER_NAME = 'rhmra-broker-response-source-root'
+TRANSPORT_KIND = 'file-change'
 SNAPSHOT_KINDS = ("portfolio", "positions", "orders", "quotes")
-SOURCE_PROBE_PURPOSE = "rhmra-broker-response-source-probe"
 ORDER_STATES = frozenset(
     {
         "new",
@@ -695,6 +704,44 @@ def _scratch_marker_document(scratch_id: str) -> dict[str, Any]:
     }
 
 
+def _transport_marker_document(
+    *, scratch_id: str, source_root: str, source_root_id: str,
+    canary_sha256: str
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': TRANSPORT_MARKER_NAME,
+        'scratch_id': scratch_id,
+        'transport': TRANSPORT_KIND,
+        'source_root': source_root,
+        'source_root_id': source_root_id,
+        'canary_sha256': canary_sha256,
+    }
+
+
+def _transport_attempt_marker_document(
+    *, scratch_id: str, source_root: str
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': TRANSPORT_ATTEMPT_MARKER_NAME,
+        'scratch_id': scratch_id,
+        'transport': TRANSPORT_KIND,
+        'source_root': source_root,
+    }
+
+
+def _transport_root_marker_document(
+    *, scratch_id: str, source_root_id: str
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': TRANSPORT_ROOT_MARKER_NAME,
+        'scratch_id': scratch_id,
+        'source_root_id': source_root_id,
+    }
+
+
 def validate_scratch_directory(
     scratch_path: os.PathLike[str] | str,
 ) -> tuple[Path, Mapping[str, Any]]:
@@ -735,6 +782,168 @@ def _validated_output_scratch(
     if len(parents) != 1:
         raise SnapshotError('all staged outputs must share one scratch directory')
     return validate_scratch_directory(next(iter(parents)))
+
+
+def _validated_transport_attempt_marker(
+    scratch: Path, scratch_marker: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    marker_path = scratch / TRANSPORT_ATTEMPT_MARKER
+    document, raw = _read_source(str(marker_path))
+    document = _mapping(document, str(marker_path))
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'transport', 'source_root',
+    } or raw != _canonical_bytes(document):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response transport-attempt marker'
+        )
+
+    source_root = document.get('source_root')
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != TRANSPORT_ATTEMPT_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or document.get('transport') != TRANSPORT_KIND
+        or not isinstance(source_root, str)
+        or not os.path.isabs(source_root)
+    ):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response transport-attempt marker'
+        )
+    return document
+
+
+def _validated_transport_marker(
+    scratch: Path, scratch_marker: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    attempt = _validated_transport_attempt_marker(scratch, scratch_marker)
+    marker_path = scratch / TRANSPORT_MARKER
+    document, raw = _read_source(str(marker_path))
+    document = _mapping(document, str(marker_path))
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'transport',
+        'source_root', 'source_root_id', 'canary_sha256',
+    } or raw != _canonical_bytes(document):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response transport marker'
+        )
+
+    source_root = document.get('source_root')
+    source_root_id = document.get('source_root_id')
+    canary_sha256 = document.get('canary_sha256')
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != TRANSPORT_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or document.get('transport') != TRANSPORT_KIND
+        or not isinstance(source_root, str)
+        or not os.path.isabs(source_root)
+        or source_root != attempt['source_root']
+        or not isinstance(source_root_id, str)
+        or _UUID_RE.fullmatch(source_root_id) is None
+        or not isinstance(canary_sha256, str)
+        or re.fullmatch(r'[0-9a-f]{64}', canary_sha256) is None
+    ):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response transport marker'
+        )
+
+    source_root_path = Path(source_root)
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    if (
+        source_root_path.is_symlink()
+        or source_root_path.resolve(strict=True) != source_root_path
+        or source_root_path.parent != temp_root
+        or not source_root_path.is_dir()
+    ):
+        raise SnapshotError(f'{marker_path}: invalid bound response-source root')
+    root_marker = _validated_transport_root_marker(source_root_path, scratch_marker)
+    if root_marker['source_root_id'] != source_root_id:
+        raise SnapshotError(f'{marker_path}: response-source root instance changed')
+    return document
+
+
+def _validated_transport_root_marker(
+    source_root: Path, scratch_marker: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    marker_path = source_root / TRANSPORT_ROOT_MARKER
+    document, raw = _read_source(str(marker_path))
+    document = _mapping(document, str(marker_path))
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'source_root_id',
+    } or raw != _canonical_bytes(document):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response source-root marker'
+        )
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != TRANSPORT_ROOT_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or not isinstance(document.get('source_root_id'), str)
+        or _UUID_RE.fullmatch(document['source_root_id']) is None
+    ):
+        raise SnapshotError(
+            f'{marker_path}: invalid broker-response source-root marker'
+        )
+    return document
+
+
+def _read_bound_external_json_source(
+    source_arg: str, bound_source_root: Path
+) -> tuple[Path, Any, bytes]:
+    if not os.path.isabs(source_arg):
+        raise SnapshotError('broker-response source must be an absolute path')
+    source_input = Path(source_arg)
+    try:
+        source_stat = os.lstat(source_input)
+    except OSError as exc:
+        raise SnapshotError(
+            f'{source_input}: cannot inspect broker-response source: {exc}'
+        ) from exc
+    source_path = source_input.resolve(strict=True)
+    if (
+        stat.S_ISLNK(source_stat.st_mode)
+        or not stat.S_ISREG(source_stat.st_mode)
+        or source_path.parent != bound_source_root
+    ):
+        raise SnapshotError(
+            f'{source_arg}: external source must be a non-symlink regular '
+            'direct child of the invocation-bound response-source root'
+        )
+    document, raw = _read_source(str(source_path))
+    return source_path, document, raw
+
+
+def validate_bound_external_json_source(
+    scratch_path: os.PathLike[str] | str,
+    source_path: os.PathLike[str] | str,
+) -> tuple[Path, Any, bytes]:
+    '''Read one strict-JSON source only if it belongs to the bound temp root.
+
+    The returned tuple is ``(resolved_path, parsed_document, original_bytes)``.
+    Callers can consume those exact bytes without reopening the path after its
+    transport provenance has been checked.
+    '''
+
+    scratch, scratch_marker = validate_scratch_directory(scratch_path)
+    transport_marker = _validated_transport_marker(scratch, scratch_marker)
+    return _read_bound_external_json_source(
+        os.fspath(source_path), Path(transport_marker['source_root'])
+    )
+
+
+def validate_bound_external_json_sources(
+    scratch_path: os.PathLike[str] | str,
+    source_paths: Sequence[os.PathLike[str] | str],
+) -> list[tuple[Path, Any, bytes]]:
+    '''Validate and read several external JSON files against one binding.'''
+
+    scratch, scratch_marker = validate_scratch_directory(scratch_path)
+    transport_marker = _validated_transport_marker(scratch, scratch_marker)
+    source_root = Path(transport_marker['source_root'])
+    return [
+        _read_bound_external_json_source(os.fspath(path), source_root)
+        for path in source_paths
+    ]
 
 
 def _stage_metadata_path(path: str) -> str:
@@ -996,8 +1205,18 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     sources, outputs, scratch, marker = _absolute_distinct_paths(
         args.source, args.output
     )
+    transport_marker = _validated_transport_marker(scratch, marker)
+    bound_source_root = Path(transport_marker['source_root'])
+    external_documents: dict[str, tuple[Any, bytes]] = {}
     for source in sources:
-        source_path = Path(source).resolve(strict=True)
+        source_input = Path(source)
+        try:
+            os.lstat(source_input)
+        except OSError as exc:
+            raise SnapshotError(
+                f'{source_input}: cannot inspect broker-response source: {exc}'
+            ) from exc
+        source_path = source_input.resolve(strict=True)
         if source_path.parent == scratch:
             _validated_stage_metadata(
                 source,
@@ -1006,11 +1225,19 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
                 expected_generation=args.generation,
                 expected_kind=args.kind,
             )
+        else:
+            _resolved, document, raw = _read_bound_external_json_source(
+                source, bound_source_root
+            )
+            external_documents[source] = (document, raw)
     payloads: list[Mapping[str, Any]] = []
     envelopes: list[str] = []
     source_hashes: list[str] = []
     for source in sources:
-        document, source_raw = _read_source(source)
+        if source in external_documents:
+            document, source_raw = external_documents[source]
+        else:
+            document, source_raw = _read_source(source)
         payload, envelope = _unwrap_source(document, source)
         payloads.append(payload)
         envelopes.append(envelope)
@@ -1145,43 +1372,278 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _source_preflight(args: argparse.Namespace) -> dict[str, Any]:
-    """Verify the harness-owned response-source path before broker capture."""
-
-    if not os.path.isabs(args.scratch):
-        raise SnapshotError("--scratch must be an absolute path")
-    scratch = Path(args.scratch).resolve(strict=True)
-    _scratch, marker = _validated_output_scratch(
-        [str(scratch / ".rhmra-source-preflight-unused.json")]
-    )
-
-    if not os.path.isabs(args.source):
-        raise SnapshotError("--source must be an absolute path")
-    source = Path(args.source).resolve(strict=True)
+def _validated_transport_paths(
+    source_root_arg: str, canary_arg: str, scratch: Path
+) -> tuple[Path, Path]:
+    if not os.path.isabs(source_root_arg):
+        raise SnapshotError('--source-root must be an absolute path')
+    source_root_input = Path(source_root_arg)
+    try:
+        source_root_stat = os.lstat(source_root_input)
+    except OSError as exc:
+        raise SnapshotError(
+            f'{source_root_input}: cannot inspect response-source root: {exc}'
+        ) from exc
+    if stat.S_ISLNK(source_root_stat.st_mode) or not stat.S_ISDIR(
+        source_root_stat.st_mode
+    ):
+        raise SnapshotError('response-source root must be a non-symlink directory')
+    source_root = source_root_input.resolve(strict=True)
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    if source_root.parent != temp_root:
+        raise SnapshotError(
+            'response-source root must be a direct child of the runtime temp directory'
+        )
     project = Path(__file__).resolve().parent
-    if source == project or project in source.parents:
-        raise SnapshotError("response-source probe must remain outside the project folder")
-    if source == scratch or scratch in source.parents:
-        raise SnapshotError("response-source probe must remain outside the marked scratch directory")
+    if (
+        source_root == project
+        or project in source_root.parents
+        or source_root in project.parents
+    ):
+        raise SnapshotError(
+            'response-source root must be disjoint from the project folder'
+        )
+    if not os.path.isabs(canary_arg):
+        raise SnapshotError('--canary must be an absolute path')
+    canary_input = Path(canary_arg)
+    try:
+        canary_stat = os.lstat(canary_input)
+    except OSError as exc:
+        raise SnapshotError(
+            f'{canary_input}: cannot inspect transport canary: {exc}'
+        ) from exc
+    if stat.S_ISLNK(canary_stat.st_mode) or not stat.S_ISREG(
+        canary_stat.st_mode
+    ):
+        raise SnapshotError('transport canary must be a non-symlink regular file')
+    canary = canary_input.resolve(strict=True)
+    if canary.parent != source_root:
+        raise SnapshotError(
+            'transport canary must be a direct child of the response-source root'
+        )
+    return source_root, canary
 
-    document, raw = _read_source(str(source))
-    expected = {
-        "schema_version": Decimal(SCHEMA_VERSION),
-        "purpose": SOURCE_PROBE_PURPOSE,
-    }
-    if document != expected:
-        raise SnapshotError(f"{source}: invalid broker-response source probe")
 
+def _safe_transport_canary_cleanup_candidate(
+    source_root_arg: str, canary_arg: str
+) -> Path | None:
+    if not os.path.isabs(source_root_arg) or not os.path.isabs(canary_arg):
+        return None
+    source_root_input = Path(source_root_arg)
+    canary_input = Path(canary_arg)
+    try:
+        source_root_stat = os.lstat(source_root_input)
+        canary_stat = os.lstat(canary_input)
+        if stat.S_ISLNK(source_root_stat.st_mode):
+            return None
+        if not stat.S_ISDIR(source_root_stat.st_mode):
+            return None
+        if stat.S_ISLNK(canary_stat.st_mode):
+            return None
+        if not stat.S_ISREG(canary_stat.st_mode):
+            return None
+    except OSError:
+        return None
+    try:
+        source_root = source_root_input.resolve(strict=True)
+        canary = canary_input.resolve(strict=True)
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    except OSError:
+        return None
+    if source_root == temp_root or temp_root not in source_root.parents:
+        return None
+    if canary.parent != source_root:
+        return None
+    project = Path(__file__).resolve().parent
+    if source_root == project or project in source_root.parents:
+        return None
+    return canary_input
+
+
+def _remove_transport_canary(canary: Path | None) -> None:
+    if canary is None or not os.path.lexists(canary):
+        return
+    try:
+        os.unlink(canary)
+    except OSError as exc:
+        raise SnapshotError(
+            f'{canary}: transport canary privacy cleanup failed: {exc}'
+        ) from exc
+
+
+def _record_transport_attempt(
+    scratch: Path, scratch_id: str, source_root: Path
+) -> None:
+    marker_path = scratch / TRANSPORT_ATTEMPT_MARKER
+    if os.path.lexists(marker_path):
+        raise SnapshotError(
+            f'{marker_path}: broker-response transport binding was already attempted'
+        )
+    marker = _transport_attempt_marker_document(
+        scratch_id=scratch_id, source_root=str(source_root)
+    )
+    raw = _canonical_bytes(marker)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, 'O_BINARY'):
+        flags |= os.O_BINARY
+    descriptor = -1
+    try:
+        descriptor = os.open(marker_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise SnapshotError(
+            f'{marker_path}: broker-response transport binding was already attempted'
+        ) from exc
+    except OSError as exc:
+        raise SnapshotError(
+            f'{marker_path}: cannot create irreversible transport-attempt marker: {exc}'
+        ) from exc
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise SnapshotError(
+                    f'{marker_path}: incomplete transport-attempt marker write'
+                )
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        persisted, persisted_raw = _read_source(str(marker_path))
+        if persisted != marker or persisted_raw != raw:
+            raise SnapshotError(
+                f'{marker_path}: transport-attempt marker read-back mismatch'
+            )
+    except Exception as exc:
+        if os.path.lexists(marker_path):
+            raise SnapshotError(
+                f'{marker_path}: irreversible transport-attempt marker was created '
+                'but could not be verified'
+            ) from exc
+        raise
+
+
+def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind one proven file-change source root for the entire invocation."""
+
+    cleanup_candidate = _safe_transport_canary_cleanup_candidate(
+        args.source_root, args.canary
+    )
+    if not os.path.isabs(args.scratch):
+        _remove_transport_canary(cleanup_candidate)
+        raise SnapshotError('--scratch must be an absolute path')
+    try:
+        scratch, scratch_marker = validate_scratch_directory(args.scratch)
+    except Exception:
+        _remove_transport_canary(cleanup_candidate)
+        raise
+    attempt_source_root = Path(os.path.abspath(args.source_root))
+    source_root: Path | None = None
+    validation_error: Exception | None = None
+    raw = b''
+    resolved_account: Mapping[str, Any] | None = None
+    account_name: str | None = None
+    try:
+        account_name = _text(args.account_name, '--account-name')
+        _record_transport_attempt(
+            scratch, scratch_marker['scratch_id'], attempt_source_root
+        )
+        source_root, canary = _validated_transport_paths(
+            args.source_root, args.canary, scratch
+        )
+        if source_root == scratch:
+            raise SnapshotError(
+                'response-source root must be a sibling of the marked scratch '
+                'directory'
+            )
+        root_entries = list(source_root.iterdir())
+        if len(root_entries) != 1 or root_entries[0] != canary:
+            raise SnapshotError(
+                'response-source root must contain exactly the transport '
+                'canary before binding'
+            )
+        document, raw = _read_source(str(canary))
+        payload, _envelope = _unwrap_source(document, str(canary))
+        data = _mapping(payload.get('data'), f'{canary}.data')
+        accounts = data.get('accounts')
+        if not isinstance(accounts, list):
+            raise SnapshotError(
+                f'{canary}.data.accounts: expected the get_accounts array'
+            )
+        matches: list[Mapping[str, Any]] = []
+        for index, value in enumerate(accounts):
+            account = _mapping(value, f'{canary}.data.accounts[{index}]')
+            labels: list[str] = []
+            for field in ('nickname', 'name'):
+                label = account.get(field)
+                if label is not None:
+                    labels.append(
+                        _text(label, f'{canary}.data.accounts[{index}].{field}')
+                    )
+            if account_name in labels:
+                matches.append(account)
+        if len(matches) != 1:
+            raise SnapshotError(
+                f'{canary}.data.accounts: expected exactly one account named '
+                f'{account_name!r}; found {len(matches)}'
+            )
+        resolved_account = matches[0]
+        account_number = _text(
+            resolved_account.get('account_number'),
+            f'{canary}.data.accounts matching {account_name!r}.account_number',
+        )
+        agentic_enabled = resolved_account.get('agentic_enabled')
+        if not isinstance(agentic_enabled, bool):
+            raise SnapshotError(
+                f'{canary}.data.accounts matching '
+                f'{account_name!r}.agentic_enabled: expected a boolean'
+            )
+        if not agentic_enabled:
+            raise SnapshotError(
+                f'{canary}.data.accounts matching {account_name!r}: '
+                'account is not agentic-enabled'
+            )
+    except Exception as exc:
+        validation_error = exc
+    _remove_transport_canary(cleanup_candidate)
+    if validation_error is not None:
+        raise validation_error
+
+    assert source_root is not None
+    assert resolved_account is not None
+    assert account_name is not None
+
+    canary_sha256 = _sha256(raw)
+    source_root_id = str(uuid.uuid4())
+    marker = _transport_marker_document(
+        scratch_id=scratch_marker['scratch_id'],
+        source_root=str(source_root),
+        source_root_id=source_root_id,
+        canary_sha256=canary_sha256,
+    )
+    root_marker = _transport_root_marker_document(
+        scratch_id=scratch_marker['scratch_id'], source_root_id=source_root_id
+    )
+    prepared = _prepare_atomic_files(
+        [str(source_root / TRANSPORT_ROOT_MARKER), str(scratch / TRANSPORT_MARKER)],
+        [root_marker, marker],
+    )
+    _commit_atomic_files(prepared)
     return {
-        "schema_version": SCHEMA_VERSION,
-        "action": "source-preflight",
-        "ok": True,
-        "scratch": str(scratch),
-        "scratch_id": marker["scratch_id"],
-        "source": str(source),
-        "source_sha256": _sha256(raw),
-        "strict_json": True,
-        "outside_scratch": True,
+        'schema_version': SCHEMA_VERSION,
+        'action': 'bind-transport',
+        'ok': True,
+        'transport': TRANSPORT_KIND,
+        'scratch': str(scratch),
+        'scratch_id': scratch_marker['scratch_id'],
+        'source_root': str(source_root),
+        'canary_sha256': canary_sha256,
+        'canary_removed': True,
+        'account_name': account_name,
+        'account_number': account_number,
+        'agentic_enabled': agentic_enabled,
     }
 
 
@@ -1194,11 +1656,13 @@ def _parser() -> JsonArgumentParser:
     preflight = subparsers.add_parser("preflight", help="verify session scratch I/O")
     preflight.add_argument("--scratch", required=True)
 
-    source_preflight = subparsers.add_parser(
-        "source-preflight", help="verify the harness response-source transport"
+    bind_transport = subparsers.add_parser(
+        'bind-transport', help='bind one invocation-wide response-source transport'
     )
-    source_preflight.add_argument("--scratch", required=True)
-    source_preflight.add_argument("--source", required=True)
+    bind_transport.add_argument('--scratch', required=True)
+    bind_transport.add_argument('--source-root', required=True)
+    bind_transport.add_argument('--canary', required=True)
+    bind_transport.add_argument('--account-name', required=True)
 
     stage = subparsers.add_parser("stage", help="unwrap, validate, and stage snapshots")
     stage.add_argument("--kind", choices=SNAPSHOT_KINDS, required=True)
@@ -1239,15 +1703,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     action = (
         arguments[0]
-        if arguments and arguments[0] in {"preflight", "source-preflight", "stage"}
+        if arguments and arguments[0] in {
+            'preflight', 'bind-transport', 'stage',
+        }
         else "unknown"
     )
     try:
         args = _parser().parse_args(arguments)
         if args.action == "preflight":
             result = _preflight(args)
-        elif args.action == "source-preflight":
-            result = _source_preflight(args)
+        elif args.action == 'bind-transport':
+            result = _bind_transport(args)
         else:
             result = _stage(args)
         _print_json(result)

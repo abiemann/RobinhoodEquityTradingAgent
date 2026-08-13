@@ -721,6 +721,8 @@ or broker access in an append-only journal and publishes a strict safe projectio
 dashboard distinguish real risk halt, snapshot failure, overlap, lease loss, configuration halt,
 coordination halt, and final-status unavailability without exposing account or credential data.
 
+**Superseded on 2026-08-13:** the source-selection rule above is retained as incident history, but the runtime no longer prefers a harness tool-result file or permits a fallback transport. The first successful real `get_accounts` response now binds one native-temp `SOURCE_ROOT` and one file-change method for the entire invocation; deterministic consumers reject every other source root.
+
 **2026-08-04 22:35 follow-up.** A manual closed-session run reproduced `snapshot failure` even
 though every Robinhood read succeeded. The run searched for an automatically mirrored tool-result
 file, invented two nonexistent portfolio source paths, and then passed `--request-cursor FIRST` to
@@ -743,6 +745,8 @@ tomorrow's end-to-end automation run remain the defenses for that residual tool-
 dashboard maps a completed structured closed session to `market closed` while retaining red
 `snapshot failure` for a genuinely eligible run whose breaker capture fails.
 
+**Superseded on 2026-08-13:** the static probe and residual writable-source-area rule above are historical. The real sensitive `get_accounts` canary now performs the sole transport test, and its invocation-bound native-temp root is reused mechanically for broker, scan, and historical inputs; there is no later probe, guessed path, alternate writer, or transport retry.
+
 **2026-08-07 15:35 recurrence.** An eligible scheduled run constructed one generic staging
 wrapper that unconditionally appended `--request-cursor FIRST` for every response kind. The
 portfolio helper correctly rejected that pagination flag, so generation A was discarded before
@@ -759,6 +763,56 @@ and forbids a polymorphic cursor-bearing wrapper. Regression tests verify the co
 that both portfolio and quote staging reject either pagination flag. The deterministic helper
 remains strict; weakening its rejection would hide orchestration mistakes and compromise snapshot
 provenance.
+
+**2026-08-13 11:34, harmless probe passed but the real sensitive save was denied.** Generation A
+wrote and validated a tiny synthetic probe under the Codex visualizations directory, then called
+`get_portfolio`. The same file-change facility could create a file at that location, but policy
+replaced the sensitive portfolio payload with an `isError: true` denial envelope because a
+visualization path is not trusted for brokerage data. `broker_snapshot.py` correctly rejected the
+envelope. An unrelated `TextEncoder is not defined` experiment then obscured the real failure.
+
+Generation B repeated another harmless probe in that same irrelevant directory, but wrote its real
+responses under the native runtime `%TEMP%` directory instead; those files staged successfully and
+the run completed coherently. The account remained flat, every candidate was rejected, and no
+intent or order was created. The recovery nevertheless duplicated one discovery portfolio call,
+used two probes, and added roughly 1 minute 43 seconds between the failed A capture and B capture
+(about 2 minutes 9 seconds including the first probe). This was destination-sensitive policy, not
+a Robinhood response-shape problem and not an OS filesystem ACL failure.
+
+**Rules produced:** a harmless probe cannot prove that the same destination will accept sensitive
+brokerage content. Startup now uses the first successful `get_accounts` response itself as the one
+real save canary and account-resolution source. The complete unchanged response is written once as
+the sole entry in a unique native-temp `SOURCE_ROOT`; `broker_snapshot.py bind-transport`
+validates it, privacy-deletes it, permanently records that the invocation spent its one binding
+attempt, and atomically binds that exact resolved root plus a helper-owned identity marker to the
+invocation scratch ID. A failed first attempt cannot be retried. Every later broker, scan,
+historicals, quote-map, and JSON handoff must reuse the same file-change facility and a fresh
+direct-child filename in that root; the deterministic consumers mechanically reject an alternate,
+nested, symlinked, replaced, or unbound root. A later denial, missing file, or path/method mismatch
+is terminal—no save retry, path experiment, visualization fallback, or generation B. Generation B
+remains available only when a fully persisted generation A later fails semantic or coherence
+validation, and it must reuse the startup-bound transport. Native Local temp directories can
+persist after a run; the routine neither falsely claims they evaporate nor improvises risky
+recursive cleanup.
+
+**2026-08-13 13:33 follow-up, the real canary succeeded but account scope was discarded with it.**
+The first successful `get_accounts` response was saved in the bound native-temp source root, and
+`bind-transport` correctly validated and privacy-deleted it. The runner had retained only the
+file-change receipt—not the response data needed to resolve the configured account name. Because
+the new contract also correctly forbade a second `get_accounts` call, the run halted fail-closed
+after transport binding. It made no later broker call or order, created no normal report/status,
+and released its lease and lifecycle cleanly. The transport protection worked; the account-scope
+handoff was incomplete.
+
+**Rule produced:** `bind-transport` now accepts the exact validated `AGENTIC_ACCOUNT_NAME`,
+exact-matches it while strictly reading the saved canary, requires one agentic-enabled match, and
+returns `account_name`, `account_number`, and `agentic_enabled` in its ephemeral success receipt
+before privacy-deleting the canary. The run binds account scope only from that validated receipt;
+raw/model-visible response data, narration, memory, and prior runs are never authorities. The
+persistent attempt, transport, and source-root markers remain account-number-free. A missing,
+duplicate, disabled, or malformed match is `coordination-halt` / `account-scope-failed`; a real
+save/path/envelope failure remains `snapshot-failure` / `snapshot-write-failed`. Neither permits a
+second save path or a second `get_accounts` call.
 
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 

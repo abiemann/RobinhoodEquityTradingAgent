@@ -24,10 +24,12 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVALUATE = os.path.join(ROOT, "evaluate_candidates.py")
@@ -47,7 +49,13 @@ RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 sys.path.insert(0, ROOT)
 from evaluate_candidates import spread_gate
 import validate_constants as constants_validator
-from broker_snapshot import SnapshotError, validate_generation_inputs
+import broker_snapshot as broker_snapshot_module
+from broker_snapshot import (
+    SnapshotError,
+    validate_bound_external_json_source,
+    validate_bound_external_json_sources,
+    validate_generation_inputs,
+)
 from market_calendar import (CALENDAR_YEARS, CLOSED_DATES,
                              EARLY_CLOSE_MINUTES_BY_DATE,
                              NORMAL_REGULAR_CLOSE_MINUTE,
@@ -98,6 +106,38 @@ def run_cli(script, args):
     if proc.returncode != 0:
         raise AssertionError(f"{os.path.basename(script)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
+
+
+@contextmanager
+def bound_source_root(scratch):
+    """Preflight scratch, bind one accounts canary, then yield its source root."""
+    run_cli(BROKER_SNAPSHOT, ["preflight", "--scratch", scratch])
+    source_root = tempfile.mkdtemp(prefix="rhmra-response-source-")
+    try:
+        canary = os.path.join(source_root, "get-accounts-canary.json")
+        with open(canary, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "data": {
+                        "accounts": [
+                            {
+                                "nickname": "Agentic",
+                                "account_number": "test-account",
+                                "agentic_enabled": True,
+                            }
+                        ]
+                    }
+                },
+                handle,
+            )
+        run_cli(BROKER_SNAPSHOT, [
+            "bind-transport", "--scratch", scratch,
+            "--source-root", source_root, "--canary", canary,
+            "--account-name", "Agentic",
+        ])
+        yield source_root
+    finally:
+        shutil.rmtree(source_root, ignore_errors=True)
 
 
 class ConstantsValidatorTests(unittest.TestCase):
@@ -854,6 +894,11 @@ class DailyLossTests(unittest.TestCase):
             "final-status-unavailable",
         ):
             self.assertIn(classification, lifecycle)
+        self.assertIn(
+            'save-transport failure = `snapshot-failure` / '
+            '`snapshot-write-failed`',
+            lifecycle,
+        )
         self.assertIn("MUST NOT be emitted", lifecycle)
         block = routine.split("### DAILY-LOSS CIRCUIT BREAKER", 1)[1].split(
             "### RUN THESE STEPS IN ORDER", 1
@@ -877,11 +922,18 @@ class DailyLossTests(unittest.TestCase):
             "--portfolio <sealed FINAL portfolio file>",
             block,
         )
-        self.assertIn("harness-created tool-result file/resource", block)
-        self.assertIn("`fileChange` / file-edit / apply-patch", block)
-        self.assertIn("Do not require a tool literally named `Write`", block)
-        self.assertIn("NEVER invent a filename, guess a temp location", block)
-        self.assertIn("broker_snapshot.py source-preflight", block)
+        self.assertIn("startup SAVE TRANSPORT BINDING", block)
+        self.assertIn("startup-bound file-change facility", block)
+        self.assertIn("Never invent or search for a result filename", block)
+        self.assertNotIn("broker_snapshot.py source-preflight", routine)
+        self.assertEqual(routine.count("broker_snapshot.py bind-transport"), 1)
+        self.assertIn("same bound `SOURCE_ROOT`", block)
+        self.assertIn("same bound `SOURCE_ROOT` and file-change facility", block)
+        self.assertNotIn("start of EACH generation", block)
+        self.assertNotIn("fresh source area and probe", block)
+        self.assertIn("immediate terminal transport failure", block)
+        self.assertIn("MUST NOT start B", block)
+        self.assertIn("Generation B is reserved only", block)
         self.assertIn("including all `data`, pagination, transport-envelope, and `guide` fields", block)
         matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
             "For positions and orders, stage each returned page", 1
@@ -927,6 +979,10 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("aggregate-seal", block)
         self.assertIn("abandon ALL of A", block)
         self.assertIn("exactly one whole generation B", block)
+        self.assertIn(
+            "SAME startup-bound `SOURCE_ROOT` and file-change facility",
+            block,
+        )
         self.assertIn("never combine generations", block)
         self.assertIn("never run generation C", block)
         self.assertIn("`snapshot-failure` / `snapshot-second-attempt-failed`", block)
@@ -1083,19 +1139,120 @@ class DailyLossTests(unittest.TestCase):
 
 
 class EvaluateCandidatesTests(unittest.TestCase):
+    @staticmethod
+    def evaluate_proc(args):
+        return subprocess.run(
+            [sys.executable, EVALUATE, *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+
+    @staticmethod
+    def evaluation_args(hist, quotes, output, scratch=None):
+        args = [] if scratch is None else ["--scratch", scratch]
+        return args + [
+            "--bars", hist,
+            "--quotes", quotes,
+            "--volume-lookback-days", "20",
+            "--high-lookback-days", "5",
+            "--min-median-dollar-volume", "175000",
+            "--dip-entry-pct", "5",
+            "--json-out", output,
+        ]
+
+    def test_cli_requires_scratch_and_writes_no_output(self):
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ) as source_root:
+            hist = self.write_json(
+                source_root, "hist.json", {"data": {"results": []}}
+            )
+            quotes = self.write_json(source_root, "quotes.json", {})
+            output = os.path.join(scratch, "missing-scratch-output.json")
+            proc = self.evaluate_proc(
+                self.evaluation_args(hist, quotes, output)
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--scratch", proc.stderr)
+            self.assertFalse(os.path.exists(output))
+
+    def test_cli_rejects_alternate_and_mixed_roots_without_output(self):
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ) as source_root, tempfile.TemporaryDirectory() as alternate:
+            bound_hist = self.write_json(
+                source_root, "hist.json", {"data": {"results": []}}
+            )
+            alternate_hist = self.write_json(
+                alternate, "hist.json", {"data": {"results": []}}
+            )
+            alternate_quotes = self.write_json(alternate, "quotes.json", {})
+            for name, hist in (
+                ("alternate", alternate_hist),
+                ("mixed", bound_hist),
+            ):
+                output = os.path.join(scratch, f"{name}-root-output.json")
+                proc = self.evaluate_proc(
+                    self.evaluation_args(
+                        hist, alternate_quotes, output, scratch=scratch
+                    )
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(os.path.exists(output))
+
+    def test_cli_rejects_tampered_transport_marker_without_output(self):
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ) as source_root:
+            hist = self.write_json(
+                source_root, "hist.json", {"data": {"results": []}}
+            )
+            quotes = self.write_json(source_root, "quotes.json", {})
+            marker = os.path.join(
+                scratch, ".rhmra-broker-response-transport.json"
+            )
+            with open(marker, "w", encoding="utf-8") as handle:
+                json.dump({}, handle)
+            output = os.path.join(scratch, "tampered-marker-output.json")
+            proc = self.evaluate_proc(
+                self.evaluation_args(
+                    hist, quotes, output, scratch=scratch
+                )
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(os.path.exists(output))
+
+    @staticmethod
+    def write_json(directory, name, value):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        return path
+
     def run_eval(self, hist_payload, quotes, extra=None, return_document=False):
-        with tempfile.TemporaryDirectory() as td:
-            hist = os.path.join(td, "hist.json")
-            qts = os.path.join(td, "quotes.json")
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            hist = os.path.join(source_root, "hist.json")
+            qts = os.path.join(source_root, "quotes.json")
             out = os.path.join(td, "out.json")
             with open(hist, "w", encoding="utf-8") as f:
                 json.dump(hist_payload, f)
             with open(qts, "w", encoding="utf-8") as f:
                 json.dump(quotes, f)
-            run_cli(EVALUATE, ["--bars", hist, "--quotes", qts,
+            cli_extra = list(extra or [])
+            if "--rsi-file" in cli_extra:
+                first = cli_extra.index("--rsi-file") + 1
+                last = first
+                while last < len(cli_extra) and not cli_extra[last].startswith("--"):
+                    last += 1
+                for index in range(first, last):
+                    bound_rsi = os.path.join(source_root, f"rsi-{index - first}.json")
+                    shutil.copyfile(cli_extra[index], bound_rsi)
+                    cli_extra[index] = bound_rsi
+            run_cli(EVALUATE, ["--scratch", td, "--bars", hist, "--quotes", qts,
                                "--volume-lookback-days", "20", "--high-lookback-days", "5",
                                "--min-median-dollar-volume", "175000", "--dip-entry-pct", "5",
-                               "--json-out", out] + (extra or []))
+                               "--json-out", out] + cli_extra)
             with open(out, encoding="utf-8") as f:
                 document = json.load(f)
             if return_document:
@@ -1280,7 +1437,12 @@ class EvaluateCandidatesTests(unittest.TestCase):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
         command = next(line for line in routine.splitlines()
-                       if "python3 evaluate_candidates.py" in line)
+                       if "`& '<PYTHON_EXE>' evaluate_candidates.py --scratch" in line
+                       and "--bars" in line)
+        self.assertIn('<PYTHON_EXE>', command)
+        self.assertIn('--scratch', command)
+        self.assertNotIn('py -3 evaluate_candidates.py', command)
+        self.assertNotIn('python3 evaluate_candidates.py', command)
         self.assertIn("--rsi-period <RSI_PERIOD>", command)
 
     def run_eval_spread(self, quote, max_spread="2.0"):
@@ -1569,9 +1731,64 @@ class PriceBandScannerTests(unittest.TestCase):
 
 
 class FilterScanTests(unittest.TestCase):
+    @staticmethod
+    def filter_proc(args):
+        return subprocess.run(
+            [sys.executable, FILTER, *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+
+    @staticmethod
+    def filter_args(scan, output, scratch=None):
+        args = [] if scratch is None else ["--scratch", scratch]
+        return args + [
+            "--scan-file", scan,
+            "--price-min", "2.50",
+            "--price-max", "5",
+            "--min-rel-volume", "2",
+            "--min-abs-pct-change", "3",
+            "--top-n", "15",
+            "--json-out", output,
+        ]
+
+    def test_cli_requires_scratch_and_writes_no_output(self):
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ) as source_root:
+            scan = os.path.join(source_root, "scan.json")
+            with open(scan, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"data": {"result": {"results": [], "total_items": 0}}},
+                    handle,
+                )
+            output = os.path.join(scratch, "missing-scratch-output.json")
+            proc = self.filter_proc(self.filter_args(scan, output))
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--scratch", proc.stderr)
+            self.assertFalse(os.path.exists(output))
+
+    def test_cli_rejects_alternate_root_without_output(self):
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ), tempfile.TemporaryDirectory() as alternate:
+            scan = os.path.join(alternate, "scan.json")
+            with open(scan, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"data": {"result": {"results": [], "total_items": 0}}},
+                    handle,
+                )
+            output = os.path.join(scratch, "alternate-root-output.json")
+            proc = self.filter_proc(
+                self.filter_args(scan, output, scratch=scratch)
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(os.path.exists(output))
+
     def run_filter(self, rows, top_n=15, mcp_envelope=False, mcp_error=False):
-        with tempfile.TemporaryDirectory() as td:
-            scan = os.path.join(td, "scan.json")
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            scan = os.path.join(source_root, "scan.json")
             out = os.path.join(td, "out.json")
             document = {
                 "data": {"result": {"results": rows, "total_items": len(rows)}}
@@ -1585,7 +1802,8 @@ class FilterScanTests(unittest.TestCase):
 
             with open(scan, "w", encoding="utf-8") as f:
                 json.dump(document, f)
-            run_cli(FILTER, ["--scan-file", scan, "--price-min", "2.50", "--price-max", "5",
+            run_cli(FILTER, ["--scratch", td, "--scan-file", scan,
+                             "--price-min", "2.50", "--price-max", "5",
                              "--min-rel-volume", "2", "--min-abs-pct-change", "3",
                              "--top-n", str(top_n), "--json-out", out])
             with open(out, encoding="utf-8") as f:
@@ -1698,6 +1916,9 @@ class OrderIntentTests(unittest.TestCase):
             "--state-file",
             state_file,
         ]
+        if action == "acknowledge" and "--transport-scratch" not in args:
+            transport_scratch, _source_root = self.ack_transport()
+            command += ["--transport-scratch", transport_scratch]
         if now is not None:
             command += ["--now-utc", now]
         command += list(args)
@@ -1727,6 +1948,22 @@ class OrderIntentTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(value, handle)
         return path
+
+    def ack_transport(self):
+        if not hasattr(self, "_ack_transport_scratch"):
+            scratch_context = tempfile.TemporaryDirectory()
+            scratch = scratch_context.__enter__()
+            self.addCleanup(scratch_context.cleanup)
+            source_context = bound_source_root(scratch)
+            source_root = source_context.__enter__()
+            self.addCleanup(source_context.__exit__, None, None, None)
+            self._ack_transport_scratch = scratch
+            self._ack_transport_source_root = source_root
+        return self._ack_transport_scratch, self._ack_transport_source_root
+
+    def write_ack_response(self, name, value):
+        _scratch, source_root = self.ack_transport()
+        return self.write_json(source_root, name, value)
 
     def intent(
         self,
@@ -1986,8 +2223,7 @@ class OrderIntentTests(unittest.TestCase):
                     "fees": "0.01",
                 },
             ]
-            response = self.write_json(
-                td,
+            response = self.write_ack_response(
                 "response.json",
                 {
                     "data": {
@@ -2047,8 +2283,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:05Z",
             )
-            stop_response = self.write_json(
-                td,
+            stop_response = self.write_ack_response(
                 "stop-response.json",
                 {
                     "data": {
@@ -2079,6 +2314,61 @@ class OrderIntentTests(unittest.TestCase):
             self.assertEqual(stop_ack["status"], "resolved")
             self.assertEqual(stop_ack["outcome"], "active_stop")
             self.assertEqual(stop_ack["stop_coverage_quantity"], "67.000000")
+
+    def test_acknowledge_rejects_alternate_root_without_state_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            transport_scratch, _source_root = self.ack_transport()
+            before_sha256 = hashlib.sha256(Path(state).read_bytes()).hexdigest()
+            with tempfile.TemporaryDirectory(
+                prefix="rhmra-unbound-response-"
+            ) as alternate_root:
+                response = self.write_json(
+                    alternate_root,
+                    "response.json",
+                    {"data": {"order": self.broker_order()}},
+                )
+                rejected = self.invoke(
+                    state,
+                    "acknowledge",
+                    "--intent-id",
+                    intent_id,
+                    "--response",
+                    response,
+                    "--transport-scratch",
+                    transport_scratch,
+                    expected_success=False,
+                    now="2026-07-31T16:00:03Z",
+                )
+            self.assertIn(
+                "direct child of the invocation-bound response-source root",
+                rejected["detail"],
+            )
+            self.assertEqual(
+                hashlib.sha256(Path(state).read_bytes()).hexdigest(),
+                before_sha256,
+            )
+            connection = sqlite3.connect(state)
+            try:
+                row = connection.execute(
+                    "SELECT status, submit_attempts, broker_order_id "
+                    "FROM intents WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(row, ("submitting", 1, None))
 
     def test_crash_recovery_can_record_no_match_from_submitting(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2158,8 +2448,8 @@ class OrderIntentTests(unittest.TestCase):
                 dollar_amount=None,
                 cumulative="3.000000",
             )
-            partial_response = self.write_json(
-                td, "partial.json", {"data": {"order": partial}}
+            partial_response = self.write_ack_response(
+                "partial.json", {"data": {"order": partial}}
             )
             ack = self.invoke(
                 state,
@@ -2555,8 +2845,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:02Z",
             )
-            response = self.write_json(
-                td,
+            response = self.write_ack_response(
                 "partial-response.json",
                 {"data": {"order": self.broker_order(
                     state="partially_filled", cumulative="5"
@@ -2662,8 +2951,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:02Z",
             )
-            response = self.write_json(
-                td,
+            response = self.write_ack_response(
                 "terminal-response.json",
                 {"data": {"order": self.broker_order(
                     quantity="5",
@@ -2752,8 +3040,7 @@ class OrderIntentTests(unittest.TestCase):
                         self.RUN_TOKEN,
                         now="2026-07-31T16:00:02Z",
                     )
-                    response = self.write_json(
-                        td,
+                    response = self.write_ack_response(
                         f"{name}-response.json",
                         {"data": {"order": self.broker_order(
                             state=broker_state,
@@ -2800,8 +3087,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:02Z",
             )
-            response = self.write_json(
-                td,
+            response = self.write_ack_response(
                 "cancelled-parent.json",
                 {"data": {"order": self.broker_order(
                     side="sell", order_type="market", trigger="stop",
@@ -2913,8 +3199,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:02Z",
             )
-            working_response = self.write_json(
-                td,
+            working_response = self.write_ack_response(
                 "working-stop-response.json",
                 {"data": {"order": self.broker_order(
                     side="sell",
@@ -2977,8 +3262,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:02Z",
             )
-            chain_parent_response = self.write_json(
-                td,
+            chain_parent_response = self.write_ack_response(
                 "chain-parent-response.json",
                 {"data": {"order": self.broker_order(
                     side="sell",
@@ -3022,8 +3306,7 @@ class OrderIntentTests(unittest.TestCase):
                 self.RUN_TOKEN,
                 now="2026-07-31T16:00:04Z",
             )
-            chain_child_response = self.write_json(
-                td,
+            chain_child_response = self.write_ack_response(
                 "chain-child-response.json",
                 {"data": {"order": self.broker_order(
                     order_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -3162,6 +3445,13 @@ class OrderIntentTests(unittest.TestCase):
 
 
 class BrokerSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self._transport_roots = {}
+
+    def tearDown(self):
+        for source_root in self._transport_roots.values():
+            shutil.rmtree(source_root, ignore_errors=True)
+
     def invoke(self, *args):
         proc = subprocess.run(
             [sys.executable, BROKER_SNAPSHOT, *args],
@@ -3193,7 +3483,24 @@ class BrokerSnapshotTests(unittest.TestCase):
             handle.write(value)
         return path
 
-    def preflight(self, scratch):
+    @staticmethod
+    def valid_accounts_document(
+        *, account_number='test-account', label_field='nickname',
+        account_name='Agentic', agentic_enabled=True,
+    ):
+        return {
+            'data': {
+                'accounts': [
+                    {
+                        label_field: account_name,
+                        'account_number': account_number,
+                        'agentic_enabled': agentic_enabled,
+                    }
+                ]
+            }
+        }
+
+    def preflight(self, scratch, *, bind_transport=True):
         proc, document = self.invoke('preflight', '--scratch', scratch)
         self.assertEqual(proc.returncode, 0, (document, proc.stderr))
         self.assertEqual(
@@ -3204,46 +3511,667 @@ class BrokerSnapshotTests(unittest.TestCase):
             },
         )
         self.assertTrue(document['ok'])
+        if bind_transport:
+            source_root = tempfile.mkdtemp(
+                prefix='rhmra-response-source-' + document['scratch_id'] + '-'
+            )
+            canary = self.write_json(
+                source_root,
+                'get-accounts-canary.json',
+                self.valid_accounts_document(),
+            )
+            bound, receipt = self.invoke(
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertEqual(bound.returncode, 0, (receipt, bound.stderr))
+            self.assertEqual(receipt['action'], 'bind-transport')
+            self.assertTrue(receipt['ok'])
+            self.assertTrue(receipt['canary_removed'])
+            self.assertFalse(os.path.exists(canary))
+            self._transport_roots[os.path.abspath(scratch)] = source_root
         return document
 
-    def test_source_preflight_proves_external_file_change_transport(self):
+    def source_root(self, scratch):
+        return self._transport_roots[os.path.abspath(scratch)]
+
+    def test_attempt_tombstone_survives_post_create_readback_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = Path(td)
+            scratch_id = '00000000-0000-4000-8000-000000000001'
+            source_root = Path(tempfile.gettempdir()) / 'rhmra-response-source-test'
+            with mock.patch.object(
+                broker_snapshot_module,
+                '_read_source',
+                side_effect=SnapshotError('simulated readback failure'),
+            ):
+                with self.assertRaises(SnapshotError):
+                    broker_snapshot_module._record_transport_attempt(
+                        scratch, scratch_id, source_root
+                    )
+            marker = scratch / '.rhmra-broker-response-transport-attempt.json'
+            self.assertTrue(marker.exists())
+            with self.assertRaisesRegex(SnapshotError, 'already attempted'):
+                broker_snapshot_module._record_transport_attempt(
+                    scratch, scratch_id, source_root
+                )
+
+    def test_failed_bind_consumes_one_shot_and_removes_accounts_canary(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
-            scratch_result = self.preflight(scratch)
-            source = self.write_json(
-                td,
-                'source-probe.json',
+            scratch_result = self.preflight(scratch, bind_transport=False)
+            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self._transport_roots[os.path.abspath(scratch)] = source_root
+            rejected_canary = self.write_json(
+                source_root,
+                'errored-get-accounts-canary.json',
                 {
-                    'schema_version': 1,
-                    'purpose': 'rhmra-broker-response-source-probe',
-                },
-            )
-
-            proc, result = self.invoke(
-                'source-preflight', '--scratch', scratch, '--source', source
-            )
-            self.assertEqual(proc.returncode, 0, (result, proc.stderr))
-            self.assertEqual(result['action'], 'source-preflight')
-            self.assertTrue(result['ok'])
-            self.assertEqual(result['scratch_id'], scratch_result['scratch_id'])
-            self.assertEqual(result['source'], os.path.abspath(source))
-            self.assertTrue(result['strict_json'])
-            self.assertTrue(result['outside_scratch'])
-
-            inside = self.write_json(
-                scratch,
-                'inside-probe.json',
-                {
-                    'schema_version': 1,
-                    'purpose': 'rhmra-broker-response-source-probe',
+                    'isError': True,
+                    'structuredContent': {'data': {'accounts': []}},
                 },
             )
             rejected, error = self.invoke(
-                'source-preflight', '--scratch', scratch, '--source', inside
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', rejected_canary,
+                '--account-name', 'Agentic',
             )
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn('outside the marked scratch directory', error['error']['message'])
+            self.assertFalse(error['ok'])
+            self.assertFalse(os.path.exists(rejected_canary))
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport.json'
+            )))
+            self.assertTrue(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )))
+
+            attempt_path = os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )
+            with open(attempt_path, 'rb') as handle:
+                original_attempt = handle.read()
+            self.assertEqual(
+                json.loads(original_attempt),
+                {
+                    'schema_version': 1,
+                    'marker': 'rhmra-broker-response-transport-attempt',
+                    'scratch_id': scratch_result['scratch_id'],
+                    'transport': 'file-change',
+                    'source_root': os.path.realpath(source_root),
+                },
+            )
+
+            retry_canary = self.write_json(
+                source_root, 'valid-retry.json', {'data': {'accounts': []}}
+            )
+            rejected, error = self.invoke(
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', retry_canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(error['ok'])
+            self.assertIn('already attempted', error['error']['message'])
+            self.assertFalse(os.path.exists(retry_canary))
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport.json'
+            )))
+            with open(attempt_path, 'rb') as handle:
+                self.assertEqual(handle.read(), original_attempt)
+
+    def test_invalid_scratch_does_not_consume_attempt_or_cleanup_canary(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self.addCleanup(shutil.rmtree, source_root, True)
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
+            rejected, error = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', source_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(error['ok'])
+            self.assertFalse(os.path.exists(canary))
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )))
+
+            self.preflight(scratch, bind_transport=False)
+            canary = self.write_json(
+                source_root, 'accounts-after-preflight.json',
+                self.valid_accounts_document(),
+            )
+            bound, receipt = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', source_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertEqual(bound.returncode, 0, (receipt, bound.stderr))
+            self.assertFalse(os.path.exists(canary))
+
+    def test_path_validation_failures_consume_attempt_and_cleanup_canary(self):
+        for layout in ('nested-root', 'nested-canary', 'extra-entry'):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch, bind_transport=False)
+                outer = tempfile.mkdtemp(prefix='rhmra-response-source-')
+                self.addCleanup(shutil.rmtree, outer, True)
+                source_root = outer
+                if layout == 'nested-root':
+                    source_root = os.path.join(outer, 'nested')
+                    os.mkdir(source_root)
+                canary_parent = source_root
+                if layout == 'nested-canary':
+                    canary_parent = os.path.join(source_root, 'nested')
+                    os.mkdir(canary_parent)
+                canary = self.write_json(
+                    canary_parent, 'accounts.json',
+                    self.valid_accounts_document(),
+                )
+                if layout == 'extra-entry':
+                    self.write_text(source_root, 'unexpected.txt', 'extra')
+
+                rejected, error = self.invoke(
+                    'bind-transport', '--scratch', scratch,
+                    '--source-root', source_root, '--canary', canary,
+                    '--account-name', 'Agentic',
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse(error['ok'])
+                self.assertEqual(
+                    os.path.exists(canary), layout == 'nested-canary'
+                )
+                self.assertTrue(os.path.exists(os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport-attempt.json',
+                )))
+                self.assertFalse(os.path.exists(os.path.join(
+                    scratch, '.rhmra-broker-response-transport.json'
+                )))
+
+                retry_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+                self.addCleanup(shutil.rmtree, retry_root, True)
+                retry_canary = self.write_json(
+                    retry_root, 'retry.json', {'data': {'accounts': []}}
+                )
+                retry, retry_error = self.invoke(
+                    'bind-transport', '--scratch', scratch,
+                    '--source-root', retry_root, '--canary', retry_canary,
+                    '--account-name', 'Agentic',
+                )
+                self.assertNotEqual(retry.returncode, 0)
+                self.assertIn('already attempted', retry_error['error']['message'])
+                self.assertFalse(os.path.exists(retry_canary))
+
+    def test_successful_bind_uses_separate_scratch_and_is_one_shot(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            scratch_result = self.preflight(scratch, bind_transport=False)
+            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self._transport_roots[os.path.abspath(scratch)] = source_root
+            canary_document = {
+                'structuredContent': {
+                    'data': {
+                        'accounts': [
+                            {
+                                'account_number': 'sensitive-account',
+                                'nickname': 'Agentic',
+                                'agentic_enabled': True,
+                            }
+                        ]
+                    }
+                }
+            }
+            canary = self.write_json(
+                source_root, 'get-accounts-canary.json', canary_document
+            )
+            with open(canary, 'rb') as handle:
+                expected_digest = hashlib.sha256(handle.read()).hexdigest()
+
+            proc, receipt = self.invoke(
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertEqual(proc.returncode, 0, (receipt, proc.stderr))
+            self.assertEqual(
+                set(receipt),
+                {
+                    'schema_version', 'action', 'ok', 'transport', 'scratch',
+                    'scratch_id', 'source_root', 'canary_sha256',
+                    'canary_removed', 'account_name', 'account_number',
+                    'agentic_enabled',
+                },
+            )
+            self.assertEqual(receipt['schema_version'], 1)
+            self.assertEqual(receipt['action'], 'bind-transport')
+            self.assertTrue(receipt['ok'])
+            self.assertEqual(receipt['scratch'], os.path.realpath(scratch))
+            self.assertEqual(receipt['scratch_id'], scratch_result['scratch_id'])
+            self.assertEqual(receipt['transport'], 'file-change')
+            self.assertEqual(receipt['source_root'], os.path.realpath(source_root))
+            self.assertEqual(receipt['canary_sha256'], expected_digest)
+            self.assertTrue(receipt['canary_removed'])
+            self.assertFalse(os.path.exists(canary))
+            self.assertEqual(receipt['account_name'], 'Agentic')
+            self.assertEqual(receipt['account_number'], 'sensitive-account')
+            self.assertIs(receipt['agentic_enabled'], True)
+
+            marker_path = os.path.join(
+                scratch, '.rhmra-broker-response-transport.json'
+            )
+            with open(marker_path, 'rb') as handle:
+                original_marker = handle.read()
+            marker_document = json.loads(original_marker)
+            self.assertRegex(
+                marker_document['source_root_id'],
+                r'^[0-9a-f]{8}-[0-9a-f-]{27}$',
+            )
+            self.assertEqual(
+                set(marker_document),
+                {
+                    'schema_version', 'marker', 'scratch_id', 'transport',
+                    'source_root', 'source_root_id', 'canary_sha256',
+                },
+            )
+            self.assertEqual(marker_document['scratch_id'], scratch_result['scratch_id'])
+            self.assertEqual(marker_document['source_root'], os.path.realpath(source_root))
+            self.assertEqual(marker_document['canary_sha256'], expected_digest)
+            persistent_marker_paths = [
+                os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport-attempt.json',
+                ),
+                marker_path,
+                os.path.join(
+                    source_root,
+                    '.rhmra-broker-response-source-root.json',
+                ),
+            ]
+            persistent_markers = ''
+            for persistent_marker_path in persistent_marker_paths:
+                with open(persistent_marker_path, encoding='utf-8') as handle:
+                    persistent_markers += handle.read()
+            for private_value in (
+                'sensitive-account', 'Agentic', 'account_name',
+                'account_number', 'agentic_enabled',
+            ):
+                self.assertNotIn(private_value, persistent_markers)
+
+            for label, retry_root in (
+                ('same-root', source_root),
+                ('alternate-root', tempfile.mkdtemp(prefix='rhmra-response-source-')),
+            ):
+                if retry_root != source_root:
+                    self.addCleanup(shutil.rmtree, retry_root, True)
+                retry_canary = self.write_json(
+                    retry_root, f'{label}.json', {'data': {'accounts': []}}
+                )
+                rejected, error = self.invoke(
+                    'bind-transport',
+                    '--scratch', scratch,
+                    '--source-root', retry_root,
+                    '--canary', retry_canary,
+                    '--account-name', 'Agentic',
+                )
+                with self.subTest(second_bind=label):
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertFalse(error['ok'])
+                    self.assertFalse(os.path.exists(retry_canary))
+                    with open(marker_path, 'rb') as handle:
+                        self.assertEqual(handle.read(), original_marker)
+
+    def test_bind_resolves_account_name_field_before_canary_deletion(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self.addCleanup(shutil.rmtree, source_root, True)
+            canary = self.write_json(
+                source_root,
+                'accounts.json',
+                self.valid_accounts_document(
+                    label_field='name', account_number='name-field-account'
+                ),
+            )
+            proc, receipt = self.invoke(
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertEqual(proc.returncode, 0, (receipt, proc.stderr))
+            self.assertFalse(os.path.exists(canary))
+            self.assertEqual(receipt['account_name'], 'Agentic')
+            self.assertEqual(receipt['account_number'], 'name-field-account')
+            self.assertIs(receipt['agentic_enabled'], True)
+
+    def test_bind_rejects_unresolved_duplicate_disabled_or_malformed_account(self):
+        valid = {
+            'nickname': 'Agentic',
+            'account_number': 'test-account',
+            'agentic_enabled': True,
+        }
+        cases = {
+            'no-match': [
+                {
+                    'nickname': 'Other',
+                    'account_number': 'other-account',
+                    'agentic_enabled': True,
+                }
+            ],
+            'duplicate-match': [
+                valid,
+                {
+                    'name': 'Agentic',
+                    'account_number': 'duplicate-account',
+                    'agentic_enabled': True,
+                },
+            ],
+            'disabled': [
+                {
+                    **valid,
+                    'agentic_enabled': False,
+                }
+            ],
+            'empty-account-number': [
+                {
+                    **valid,
+                    'account_number': '',
+                }
+            ],
+            'nonboolean-agentic-enabled': [
+                {
+                    **valid,
+                    'agentic_enabled': 'true',
+                }
+            ],
+            'malformed-account-entry': ['not-an-account-object'],
+            'malformed-account-label': [
+                {
+                    **valid,
+                    'nickname': 123,
+                }
+            ],
+        }
+        for label, accounts in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch, bind_transport=False)
+                source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+                self.addCleanup(shutil.rmtree, source_root, True)
+                canary = self.write_json(
+                    source_root,
+                    'accounts.json',
+                    {'data': {'accounts': accounts}},
+                )
+                proc, error = self.invoke(
+                    'bind-transport',
+                    '--scratch', scratch,
+                    '--source-root', source_root,
+                    '--canary', canary,
+                    '--account-name', 'Agentic',
+                )
+                self.assertNotEqual(proc.returncode, 0, error)
+                self.assertFalse(error['ok'])
+                self.assertFalse(os.path.exists(canary))
+                self.assertTrue(os.path.exists(os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport-attempt.json',
+                )))
+                self.assertFalse(os.path.exists(os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport.json',
+                )))
+                self.assertFalse(os.path.exists(os.path.join(
+                    source_root,
+                    '.rhmra-broker-response-source-root.json',
+                )))
+
+    def test_stage_requires_bound_transport_and_reuses_exact_root_for_a_and_b(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            unbound_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self.addCleanup(shutil.rmtree, unbound_root, True)
+            source = self.write_json(
+                unbound_root,
+                'unbound.json',
+                {
+                    'data': {
+                        'total_value': '1500.01',
+                        'cash': '100',
+                        'buying_power': '100',
+                    }
+                },
+            )
+            output = os.path.join(scratch, 'unbound-output.json')
+            rejected, error = self.stage(
+                'portfolio', [source], [output], generation='A'
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(error['ok'])
+            self.assertFalse(os.path.exists(output))
+
+            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self._transport_roots[os.path.abspath(scratch)] = source_root
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
+            bound, receipt = self.invoke(
+                'bind-transport',
+                '--scratch', scratch,
+                '--source-root', source_root,
+                '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertEqual(bound.returncode, 0, (receipt, bound.stderr))
+            payload = {
+                'data': {
+                    'total_value': '1500.01',
+                    'cash': '100',
+                    'buying_power': '100',
+                }
+            }
+            for generation in ('A', 'B'):
+                generation_source = self.write_json(
+                    source_root, f'portfolio-{generation}.json', payload
+                )
+                generation_output = os.path.join(
+                    scratch, f'portfolio-{generation}-out.json'
+                )
+                staged, result = self.stage(
+                    'portfolio',
+                    [generation_source],
+                    [generation_output],
+                    generation=generation,
+                )
+                with self.subTest(generation=generation):
+                    self.assertEqual(staged.returncode, 0, result)
+                    self.assertTrue(result['ok'])
+                    self.assertEqual(result['generation'], generation)
+
+            alternate_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self.addCleanup(shutil.rmtree, alternate_root, True)
+            alternate_source = self.write_json(
+                alternate_root, 'alternate.json', payload
+            )
+            nested_root = os.path.join(source_root, 'nested')
+            os.mkdir(nested_root)
+            nested_source = self.write_json(nested_root, 'nested.json', payload)
+            for label, rejected_source in (
+                ('alternate-root', alternate_source),
+                ('nested-child', nested_source),
+            ):
+                rejected_output = os.path.join(scratch, f'{label}-out.json')
+                proc, result = self.stage(
+                    'portfolio', [rejected_source], [rejected_output]
+                )
+                with self.subTest(path=label):
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertFalse(result['ok'])
+                    self.assertFalse(os.path.exists(rejected_output))
+
+            real_source = self.write_json(source_root, 'real.json', payload)
+            link_source = os.path.join(source_root, 'linked.json')
+            try:
+                os.symlink(real_source, link_source)
+            except (OSError, NotImplementedError):
+                link_source = None
+            if link_source is not None:
+                linked_output = os.path.join(scratch, 'linked-out.json')
+                proc, result = self.stage(
+                    'portfolio', [link_source], [linked_output]
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(result['ok'])
+                self.assertFalse(os.path.exists(linked_output))
+
+    def test_recreated_source_root_with_new_instance_marker_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            source_root = self.source_root(scratch)
+            shutil.rmtree(source_root)
+            os.mkdir(source_root)
+            marker_path = os.path.join(
+                source_root, '.rhmra-broker-response-source-root.json'
+            )
+            with open(
+                os.path.join(scratch, '.rhmra-broker-snapshot-scratch.json'),
+                encoding='utf-8',
+            ) as handle:
+                scratch_id = json.load(handle)['scratch_id']
+            self.write_json(
+                source_root,
+                '.rhmra-broker-response-source-root.json',
+                {
+                    'schema_version': 1,
+                    'marker': 'rhmra-broker-response-source-root',
+                    'scratch_id': scratch_id,
+                    'source_root_id': '00000000-0000-4000-8000-000000000001',
+                },
+            )
+            source = self.write_json(source_root, 'scan.json', {'data': {}})
+            with self.assertRaises(SnapshotError):
+                validate_bound_external_json_source(scratch, source)
+
+    def test_concurrent_bind_attempts_produce_exactly_one_bound_transport(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            roots = [
+                tempfile.mkdtemp(prefix='rhmra-response-source-')
+                for _ in range(2)
+            ]
+            for root in roots:
+                self.addCleanup(shutil.rmtree, root, True)
+            canaries = [
+                self.write_json(
+                    root, 'accounts.json', self.valid_accounts_document()
+                )
+                for root in roots
+            ]
+
+            def bind(index):
+                return self.invoke(
+                    'bind-transport',
+                    '--scratch', scratch,
+                    '--source-root', roots[index],
+                    '--canary', canaries[index],
+                    '--account-name', 'Agentic',
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(bind, range(2)))
+            successes = [
+                document for proc, document in outcomes if proc.returncode == 0
+            ]
+            failures = [
+                document for proc, document in outcomes if proc.returncode != 0
+            ]
+            self.assertEqual(len(successes), 1, outcomes)
+            self.assertEqual(len(failures), 1, outcomes)
+            self.assertTrue(successes[0]['ok'])
+            self.assertFalse(failures[0]['ok'])
+            self.assertIn('already attempted', failures[0]['error']['message'])
+            self.assertFalse(any(os.path.exists(path) for path in canaries))
+
+    def test_exported_validator_reads_only_direct_children_of_bound_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            source_root = self.source_root(scratch)
+            document = {'data': {'result': 'preserve-exactly'}}
+            source = self.write_json(source_root, 'handoff.json', document)
+
+            resolved, parsed, raw = validate_bound_external_json_source(
+                scratch, source
+            )
+            self.assertEqual(resolved, Path(os.path.realpath(source)))
+            self.assertEqual(parsed, document)
+            with open(source, 'rb') as handle:
+                self.assertEqual(raw, handle.read())
+            self.assertEqual(
+                validate_bound_external_json_sources(scratch, [source]),
+                [(resolved, parsed, raw)],
+            )
+
+            alternate_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            self.addCleanup(shutil.rmtree, alternate_root, True)
+            alternate = self.write_json(
+                alternate_root, 'alternate.json', document
+            )
+            nested_root = os.path.join(source_root, 'nested-validator')
+            os.mkdir(nested_root)
+            nested = self.write_json(nested_root, 'nested.json', document)
+            for label, rejected_source in (
+                ('alternate', alternate),
+                ('nested', nested),
+            ):
+                with self.subTest(source=label):
+                    with self.assertRaises(SnapshotError):
+                        validate_bound_external_json_source(
+                            scratch, rejected_source
+                        )
+
+            root_marker = os.path.join(
+                source_root, '.rhmra-broker-response-source-root.json'
+            )
+            os.unlink(root_marker)
+            with self.assertRaises(SnapshotError):
+                validate_bound_external_json_source(scratch, source)
+
+    def test_legacy_source_preflight_action_is_not_available(self):
+        proc, result = self.invoke(
+            'source-preflight', '--scratch', 'unused', '--source', 'unused'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['action'], 'unknown')
 
     def stage(self, kind, sources, outputs, *extra, generation='A'):
         args = ['stage', '--kind', kind, '--generation', generation]
@@ -3259,6 +4187,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
 
             raw = {
                 'data': {
@@ -3267,7 +4196,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'buying_power': '100',
                 }
             }
-            raw_source = self.write_json(td, 'raw.json', raw)
+            raw_source = self.write_json(source_root, 'raw.json', raw)
             raw_output = os.path.join(scratch, 'raw-out.json')
             proc, result = self.stage('portfolio', [raw_source], [raw_output])
             self.assertEqual(proc.returncode, 0, result)
@@ -3275,7 +4204,7 @@ class BrokerSnapshotTests(unittest.TestCase):
 
             positions = {'data': {'positions': [], 'next': None}}
             structured_source = self.write_json(
-                td,
+                source_root,
                 'structured.json',
                 {'structuredContent': positions},
             )
@@ -3288,7 +4217,7 @@ class BrokerSnapshotTests(unittest.TestCase):
 
             orders = {'data': {'orders': [], 'next': None}}
             text_source = self.write_json(
-                td,
+                source_root,
                 'text.json',
                 {
                     'content': [
@@ -3317,6 +4246,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             shapes = (
                 (
                     'current',
@@ -3338,7 +4268,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     }
                 }
                 source = self.write_json(
-                    td,
+                    source_root,
                     f'{label}-portfolio.json',
                     {'structuredContent': payload},
                 )
@@ -3358,6 +4288,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             malformed = (
                 ('missing', {'display_currency': 'USD'}),
                 ('null', {'buying_power': None}),
@@ -3367,7 +4298,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             for label, buying_power in malformed:
                 source = self.write_json(
-                    td,
+                    source_root,
                     f'{label}-buying-power.json',
                     {
                         'data': {
@@ -3392,13 +4323,14 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             malformed = (
                 ('missing', {}),
                 ('null', {'buying_power': None}),
             )
             for label, fields in malformed:
                 source = self.write_json(
-                    td,
+                    source_root,
                     f'{label}-outer-buying-power.json',
                     {
                         'data': {
@@ -3423,6 +4355,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             payloads = {
                 'portfolio': {
                     'data': {
@@ -3438,7 +4371,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 ('allow-more', ('--allow-more',)),
             )
             for kind, payload in payloads.items():
-                source = self.write_json(td, f'{kind}.json', payload)
+                source = self.write_json(source_root, f'{kind}.json', payload)
                 for label, extra in pagination_flags:
                     output = os.path.join(
                         scratch, f'{kind}-{label}-rejected.json'
@@ -3459,6 +4392,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             quote = chr(34)
             duplicate = (
                 '{' + quote + 'data' + quote + ':{' + quote + 'total_value' +
@@ -3472,20 +4406,29 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             malformed = '{'
             cases = [
-                ('portfolio', self.write_text(td, 'duplicate.json', duplicate)),
-                ('portfolio', self.write_text(td, 'nonfinite.json', nonfinite)),
-                ('portfolio', self.write_text(td, 'malformed.json', malformed)),
+                (
+                    'portfolio',
+                    self.write_text(source_root, 'duplicate.json', duplicate),
+                ),
+                (
+                    'portfolio',
+                    self.write_text(source_root, 'nonfinite.json', nonfinite),
+                ),
+                (
+                    'portfolio',
+                    self.write_text(source_root, 'malformed.json', malformed),
+                ),
                 (
                     'positions',
                     self.write_json(
-                        td, 'positions-shape.json',
+                        source_root, 'positions-shape.json',
                         {'data': {'positions': {}, 'next': None}},
                     ),
                 ),
                 (
                     'orders',
                     self.write_json(
-                        td,
+                        source_root,
                         'orders-shape.json',
                         {
                             'data': {
@@ -3515,14 +4458,14 @@ class BrokerSnapshotTests(unittest.TestCase):
                 (
                     'quotes',
                     self.write_json(
-                        td, 'quotes-shape.json',
+                        source_root, 'quotes-shape.json',
                         {'data': {'results': [{}] * 21}},
                     ),
                 ),
                 (
                     'portfolio',
                     self.write_json(
-                        td,
+                        source_root,
                         'ambiguous-envelope.json',
                         {
                             'content': [
@@ -3535,7 +4478,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 (
                     'portfolio',
                     self.write_json(
-                        td,
+                        source_root,
                         'tool-error.json',
                         {
                             'isError': True,
@@ -3548,7 +4491,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 (
                     'portfolio',
                     self.write_json(
-                        td,
+                        source_root,
                         'invalid-error-flag.json',
                         {
                             'isError': 'false',
@@ -3579,6 +4522,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             os.mkdir(sibling)
             os.mkdir(nested)
             preflight = self.preflight(scratch)
+            source_root = self.source_root(scratch)
             self.assertTrue(preflight['write_read_parse'])
             self.assertTrue(preflight['cleanup_verified'])
             marker = os.path.join(
@@ -3611,7 +4555,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'buying_power': '100',
                 }
             }
-            source = self.write_json(td, 'portfolio.json', payload)
+            source = self.write_json(source_root, 'portfolio.json', payload)
             output = os.path.join(scratch, 'portfolio-staged.json')
             proc, result = self.stage('portfolio', [source], [output])
             self.assertEqual(proc.returncode, 0, result)
@@ -3643,9 +4587,10 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             next_url = 'https://agent.robinhood.com/positions?cursor=cursor-two'
             page_one_source = self.write_json(
-                td,
+                source_root,
                 'positions-one.json',
                 {
                     'data': {
@@ -3662,7 +4607,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 },
             )
             page_two_source = self.write_json(
-                td,
+                source_root,
                 'positions-two.json',
                 {
                     'data': {
@@ -3744,12 +4689,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch)
+            source_root = self.source_root(scratch)
             positions_source = self.write_json(
-                td, 'positions.json',
+                source_root, 'positions.json',
                 {'data': {'positions': [], 'next': None}},
             )
             orders_source = self.write_json(
-                td, 'orders.json',
+                source_root, 'orders.json',
                 {'data': {'orders': [], 'next': None}},
             )
             positions_a = os.path.join(scratch, 'positions-a.json')
@@ -5947,12 +6893,15 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("`& '<PYTHON_EXE>' run_lifecycle.py start`", lifecycle)
         self.assertIn("already-bound launcher", lifecycle)
         self.assertIn("already-bound `PYTHON_EXE` is the sole launcher", routine)
-        self.assertIn(
+        self.assertNotIn(
             "[json.load(open(p, encoding='utf-8')) for p in sys.argv[1:]]",
             routine,
         )
-        self.assertIn("'<file1>' '<file2>'", routine)
-        self.assertIn("each native path as its own quoted argument", routine)
+        self.assertNotIn("'<file1>' '<file2>'", routine)
+        self.assertNotIn(
+            '**Validate every derived JSON before running the script',
+            routine,
+        )
         self.assertNotIn("<file1> <file2> …", routine)
 
         status_start = routine.index("**Publish the STATUS SNAPSHOT")
@@ -6301,7 +7250,7 @@ class MarketClockTests(unittest.TestCase):
             '`order_intents.py check`',
             '`order_intents.py pending --run-token <RUN_LOCK_TOKEN>`',
             'Resolve `rules_version`',
-            'Call `get_accounts`',
+            'Call `get_accounts` as the first broker operation',
         )
         startup_positions = [startup.index(marker) for marker in startup_markers]
         self.assertEqual(startup_positions, sorted(startup_positions))
@@ -6310,11 +7259,81 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('before successful lease acquisition', startup)
         self.assertIn('Never invent a placeholder token', startup)
         self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
-        self.assertIn('Items 1–13 normally succeed before `get_accounts`', startup)
+        self.assertIn(
+            'Items 1–13 normally succeed before the one `get_accounts` '
+            'transport canary',
+            startup,
+        )
         self.assertIn('If item 11 or 12 fails', startup)
         self.assertIn('named read-only positions/orders calls', startup)
         self.assertIn('is the sole exception', startup)
         self.assertIn('no broker mutation is permitted', startup)
+        self.assertIn('first successful response', startup)
+        self.assertIn(
+            'An errored connector call may use the routine\'s one generic '
+            'read retry',
+            startup,
+        )
+        self.assertIn(
+            'after the first successful response never call it again',
+            startup,
+        )
+        self.assertIn('one mandatory SAVE TRANSPORT BINDING', startup)
+        self.assertIn(
+            'save that COMPLETE unchanged successful response exactly once',
+            startup,
+        )
+        self.assertIn(
+            'pass the exact validated `AGENTIC_ACCOUNT_NAME` from item 3',
+            startup,
+        )
+        self.assertIn(
+            'bind both the transport and account scope only from the helper\'s validated receipt',
+            startup,
+        )
+        self.assertIn('receipt-issued account scope', startup)
+        transport_binding = routine.split(
+            '**SAVE TRANSPORT BINDING', 1
+        )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
+        self.assertEqual(
+            transport_binding.count('broker_snapshot.py bind-transport'),
+            1,
+        )
+        self.assertIn('invocation\'s ONE save-path test', transport_binding)
+        self.assertIn(
+            'first broker operation under the generic read-retry rule',
+            transport_binding,
+        )
+        self.assertIn(
+            'Never call `get_accounts` again after that success',
+            transport_binding,
+        )
+        self.assertIn("--account-name '<validated AGENTIC_ACCOUNT_NAME>'", transport_binding)
+        self.assertIn('exactly these twelve fields', transport_binding)
+        for field in (
+            '`account_name`', '`account_number`', '`agentic_enabled`',
+        ):
+            self.assertIn(field, transport_binding)
+        self.assertIn(
+            'Bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ENABLED` '
+            'only from this validated receipt',
+            transport_binding,
+        )
+        self.assertIn('raw response', transport_binding)
+        self.assertIn('model memory', transport_binding)
+        self.assertIn(
+            '`coordination-halt` / `account-scope-failed`',
+            transport_binding,
+        )
+        self.assertIn(
+            '`snapshot-failure` / `snapshot-write-failed`',
+            transport_binding,
+        )
+        self.assertIn('make no additional broker call', transport_binding)
+        self.assertIn('do not try another directory or writer', transport_binding)
+        self.assertIn('do not create a second probe', transport_binding)
+        self.assertIn('do not start generation A or B', transport_binding)
+        self.assertIn('do not retry the save', transport_binding)
 
         coordination = routine.split(
             "### RUN COORDINATION — fenced single-flight lease", 1
@@ -6683,7 +7702,7 @@ class MarketClockTests(unittest.TestCase):
             '& \'<PYTHON_EXE>\' run_performance.py observe-task '
             '--invocation-id \'<INVOCATION_ID>\' '
             '--task-duration-ms <DURATION_MS> --runner claude '
-            '--model \'claude-sonnet-4-6\' '
+            '--model \'claude-sonnet-5\' '
             '--configuration \'effort=high\' '
             '--identity-source manual-ui '
             '--clock-source claude-run-duration'
@@ -6738,6 +7757,21 @@ class MarketClockTests(unittest.TestCase):
     def test_scheduler_prompts_declare_exact_timing_identity(self):
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             readme = f.read()
+        self.assertIn(
+            'current preferred models are **Claude Sonnet 5 '
+            '(effort high)** and **Codex Luna 5.6 (reasoning high)**',
+            readme,
+        )
+        self.assertIn(
+            '| Claude Desktop Code tab, Environment Local, native Windows '
+            'checkout | `claude-sonnet-4-6`; `effort=high` |',
+            readme,
+        )
+        self.assertIn(
+            'New Sonnet 5 runs use a separate `claude-sonnet-5` '
+            'comparison cohort; never relabel old 4.6 timings as Sonnet 5',
+            readme,
+        )
         scheduling = readme.split('### Scheduling', 1)[1].split(
             '### View on Phone setup', 1
         )[0]
@@ -6752,18 +7786,97 @@ class MarketClockTests(unittest.TestCase):
             'config=reasoning=high'
         )
         claude_declaration = (
-            'TIMING_IDENTITY: runner=claude model=claude-sonnet-4-6 '
+            'TIMING_IDENTITY: runner=claude model=claude-sonnet-5 '
             'config=effort=high'
         )
         self.assertEqual(codex_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertEqual(claude_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertIn(codex_declaration, codex_prompt)
         self.assertIn(claude_declaration, claude_prompt)
+        codex_setup_image = os.path.join(
+            ROOT, 'images', 'codex-automation-setup.png'
+        )
+        self.assertTrue(os.path.isfile(codex_setup_image))
+        self.assertGreater(os.path.getsize(codex_setup_image), 0)
+        self.assertIn(
+            '![ChatGPT/Codex automation identity example showing '
+            'matching TIMING_IDENTITY, GPT-5.6 Luna, and High '
+            'reasoning](images/codex-automation-setup.png)',
+            codex_prompt,
+        )
+        self.assertIn(
+            '**Model: GPT-5.6 Luna** maps to '
+            '`model=gpt-5.6-luna`', codex_prompt
+        )
+        self.assertIn(
+            '**Reasoning: High** maps to '
+            '`config=reasoning=high`', codex_prompt
+        )
+        self.assertIn(
+            '**Identity-mapping reference only:** use the complete '
+            'maintained prompt above as the copyable source of truth',
+            codex_prompt,
+        )
+        self.assertIn(
+            'UI layout, task name/date, project/path, schedule, '
+            'notifications, and other settings may vary', codex_prompt
+        )
+        claude_setup_image = os.path.join(
+            ROOT, 'images', 'claude-automation-part-a-setup.png'
+        )
+        self.assertTrue(os.path.isfile(claude_setup_image))
+        self.assertGreater(os.path.getsize(claude_setup_image), 0)
+        self.assertIn(
+            '![Claude Desktop Local Part A scheduler showing matching '
+            'TIMING_IDENTITY, Sonnet 5, Current branch, Worktree off, '
+            'Auto, and the hourly weekday cron]'
+            '(images/claude-automation-part-a-setup.png)',
+            claude_prompt,
+        )
+        self.assertIn(
+            '**Sonnet 5** maps to `model=claude-sonnet-5`',
+            claude_prompt,
+        )
+        self.assertIn(
+            '**effort high** maps to `config=effort=high`',
+            claude_prompt,
+        )
+        for required in (
+            '**post-validation Part A settings reference**',
+            'Use the complete maintained prompt above rather than '
+            'transcribing the screenshot',
+            'Do not activate this Custom cron until both tasks pass the '
+            'supervised Manual `DRY_RUN = true` checks',
+            '**Auto** is only the form label',
+            'Confirm Allowed permissions and the Pacific-time schedule '
+            'preview',
+        ):
+            self.assertIn(required, claude_prompt)
         self.assertIn(
             'synchronized with the runner, model, and configuration '
             'actually selected', scheduling
         )
         self.assertIn('does not switch the model', scheduling)
+        self.assertIn(
+            'identity formats are runner-specific and are not '
+            'interchangeable', scheduling
+        )
+        self.assertIn(
+            'Codex automation in the ChatGPT/Codex app uses the exact '
+            'OpenAI model ID `gpt-5.6-luna` and '
+            '`config=reasoning=high`', scheduling
+        )
+        self.assertIn(
+            'current Claude Desktop Code setup uses '
+            '`claude-sonnet-5` and `config=effort=high`', scheduling
+        )
+        self.assertIn(
+            'one exact, all-or-nothing tuple', scheduling
+        )
+        self.assertIn(
+            'do not use Claude\'s `effort=high` configuration with '
+            'Codex', scheduling
+        )
         for required in (
             'one pre-helper self-report',
             'only framework-explicit identity',
@@ -7035,6 +8148,11 @@ class MarketClockTests(unittest.TestCase):
             "must never trigger a post-release rewrite or a second `finish`",
             lifecycle_finish,
         )
+        self.assertIn(
+            'save-transport failure uses `snapshot-failure` / '
+            '`snapshot-write-failed`',
+            lifecycle_finish,
+        )
 
     def test_routine_repeats_phase_fences_and_serializes_final_refresh(self):
         with open(
@@ -7090,13 +8208,17 @@ class MarketClockTests(unittest.TestCase):
         )
 
         evaluator = routine.split(
-            "Then RE-RUN `evaluate_candidates.py`", 1
+            "Then RE-RUN with", 1
         )[1].split(
             "**FINAL machine-readable handoff", 1
         )[0]
         self.assertIn(
             "--json-out run-reports/<EXPECTED_GATE_FILE>", evaluator
         )
+        self.assertIn('<PYTHON_EXE>', evaluator)
+        self.assertIn('--scratch', evaluator)
+        self.assertNotIn('py -3 evaluate_candidates.py', evaluator)
+        self.assertNotIn('python3 evaluate_candidates.py', evaluator)
         self.assertIn(
             "never rebuild it from current time, another clock, or a context "
             "summary", evaluator
@@ -7162,7 +8284,30 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
 
+        for forbidden in (
+            'find /sessions',
+            'locate it by basename',
+            'harness-created tool-result file/resource',
+            'broker_snapshot.py source-preflight',
+            're-`Write`',
+            're-Write',
+            'The sandbox evaporates',
+        ):
+            self.assertNotIn(forbidden, routine)
+        self.assertIn(
+            'Never use a harness-advertised path, search for a result file',
+            routine,
+        )
+
         scan_phase = routine.split("6. `run_scan`", 1)[1].split("**FOURTH", 1)[0]
+        filter_command = next(
+            line for line in scan_phase.splitlines()
+            if 'filter_scan.py --' in line
+        )
+        self.assertIn('<PYTHON_EXE>', filter_command)
+        self.assertIn('--scratch', filter_command)
+        self.assertNotIn('py -3 filter_scan.py', filter_command)
+        self.assertNotIn('python3 filter_scan.py', filter_command)
         self.assertIn("--json-out <scratch>/working-list.json", scan_phase)
         self.assertIn("NEW session-scoped scratch directory", scan_phase)
         self.assertIn("Machine-readable handoff (REQUIRED)", scan_phase)
@@ -7173,24 +8318,82 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("finite JSON-number", scan_phase)
         self.assertIn("no duplicate symbols", scan_phase)
         self.assertIn("skip the entry phase (Steps 8–12)", scan_phase)
-        self.assertIn("any schema/value check fails", scan_phase)
+        self.assertIn("deterministic output schema/value checks fail", scan_phase)
         self.assertIn("do NOT fall back to formatted stdout, a stale file, or ad-hoc filtering", scan_phase)
         self.assertIn("empty `working_list: []` is valid", scan_phase)
         self.assertIn("standard MCP envelope at `structuredContent.data.result`", scan_phase)
         self.assertIn("never call `run_scan` again", scan_phase)
-        self.assertIn("successful SECOND generation's proven external source area", scan_phase)
+        self.assertIn("startup-bound `SOURCE_ROOT`", scan_phase)
+        self.assertIn("same bound file-change capability", scan_phase)
         self.assertIn("same composed tool operation", scan_phase)
         self.assertIn("tools.apply_patch", scan_phase)
         self.assertIn("any `text(...)`, `yield_control`", scan_phase)
-        self.assertIn("compact receipt containing the saved path, UTF-8 byte count, and write status", scan_phase)
+        self.assertIn(
+            "compact receipt containing the saved path and write status",
+            scan_phase,
+        )
+        self.assertIn(
+            "do not run `TextEncoder`, an ad-hoc byte counter, or another "
+            "path/save experiment",
+            scan_phase,
+        )
+        self.assertIn(
+            "A save denial or path mismatch is terminal for the entire run as "
+            "`snapshot-failure` / `snapshot-write-failed`",
+            scan_phase,
+        )
         self.assertIn("Never emit, print, or yield `JSON.stringify(scanResult)`", scan_phase)
-        self.assertIn("Do not infer that persistence is unavailable", scan_phase)
-        self.assertIn("Only an actual failed file-change operation", scan_phase)
+        self.assertIn(
+            'An actual failed write, failed strict read of that just-written '
+            'file',
+            scan_phase,
+        )
+        self.assertIn(
+            'invocation-bound source-validation failure is run-level '
+            '`snapshot-failure` / `snapshot-write-failed`',
+            scan_phase,
+        )
+        self.assertIn(
+            'semantic/output failure after a successful bound read remains '
+            'the entry-only `scan handoff failure`',
+            scan_phase,
+        )
+        self.assertIn(
+            'do not retry the save, locate another copy, or switch paths or '
+            'transports',
+            scan_phase,
+        )
         self.assertNotIn("under the current scratch directory", scan_phase)
         prefilter = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split("**The next three bullets", 1)[0]
         self.assertIn("unrounded `volume` × `last`", prefilter)
         self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)
         self.assertIn("Transient JSON handoffs are deliberately different", routine)
+        self.assertIn(
+            "A save denial or unreadable bound file is terminal for the entire "
+            "run as `snapshot-failure` / `snapshot-write-failed`",
+            routine,
+        )
+        self.assertIn(
+            "Any unbound, alternate-root, nested, missing, changed, or "
+            "unreadable input is run-level `snapshot-failure` / "
+            "`snapshot-write-failed`",
+            routine,
+        )
+        self.assertIn(
+            "correctly bound and strictly read input that later fails "
+            "deterministic schema, semantic, or evaluator-output validation "
+            "is instead terminal only for that candidate or entry phase",
+            routine,
+        )
+        pre_rsi_command = next(
+            line for line in routine.splitlines()
+            if "`& '<PYTHON_EXE>' evaluate_candidates.py --scratch" in line
+            and '--bars' in line
+        )
+        self.assertIn('<PYTHON_EXE>', pre_rsi_command)
+        self.assertIn('--scratch', pre_rsi_command)
+        self.assertNotIn('py -3 evaluate_candidates.py', pre_rsi_command)
+        self.assertNotIn('python3 evaluate_candidates.py', pre_rsi_command)
 
     def test_routine_surfaces_missing_mcp_tools_with_reconnection_help(self):
         with open(
@@ -7381,6 +8584,16 @@ class MarketClockTests(unittest.TestCase):
             'no order-mutation tool call',
             'bind the exact returned `python` value as `PYTHON_EXE`',
             'Never substitute a bare `py`, `python`, or `python3`',
+            'Sonnet 5 with effort high (`claude-sonnet-5`, '
+            '`effort=high`)',
+            'change each task\'s model selector and `TIMING_IDENTITY` '
+            'line together',
+            'An intentionally retained Sonnet 4.6 task must use '
+            '`model=claude-sonnet-4-6 config=effort=high`',
+            '**post-validation Part A settings/identity reference**',
+            'pictured Custom cron must be added only after both Manual '
+            '`DRY_RUN = true` proofs pass',
+            '**Auto** label does not prove mutation safety',
         ):
             self.assertIn(required, claude_guide)
         self.assertNotIn(
@@ -7413,6 +8626,7 @@ class MarketClockTests(unittest.TestCase):
         for relative_image in (
             'images/claude-local-routine-form.png',
             'images/claude-local-hourly-limit.png',
+            'images/claude-automation-part-a-setup.png',
         ):
             with self.subTest(image=relative_image):
                 self.assertIn(f']({relative_image})', claude_guide)
@@ -7868,6 +9082,31 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("there is no third call", journal)
         self.assertIn("unverified_rejection", journal)
         self.assertIn("can never use automatic retry", journal)
+        valid_place_response = journal.split(
+            "- **Valid place response:**", 1
+        )[1].split("- **Connector/request rejection", 1)[0]
+        self.assertIn("fresh unique direct-child JSON file", valid_place_response)
+        self.assertIn("invocation-bound `SOURCE_ROOT`", valid_place_response)
+        self.assertIn("--transport-scratch <absolute scratch>", valid_place_response)
+        self.assertIn("bound response save", valid_place_response)
+        self.assertIn("transport validation", valid_place_response)
+        self.assertIn("strict parse", valid_place_response)
+        self.assertIn("semantic acknowledgement", valid_place_response)
+        self.assertIn("`malformed_response`", valid_place_response)
+        self.assertIn("`acknowledgement_failure`", valid_place_response)
+        self.assertIn("ORDER-STATE HALT", valid_place_response)
+        self.assertIn("never retry the save", valid_place_response)
+        self.assertIn("switch path or writer", valid_place_response)
+        self.assertIn("second placement", valid_place_response)
+        retryable_transient = journal.split(
+            "- **Transient timeout/server/connector failure", 1
+        )[1].split("- **Second transient failure:**", 1)[0]
+        self.assertNotIn("acknowledgement_failure", retryable_transient)
+        self.assertIn(
+            "acknowledgement-rejected response belongs to the "
+            "no-placement-retry HALT above",
+            retryable_transient,
+        )
         self.assertIn("A prior-run unresolved entry must NEVER be resubmitted", journal)
         self.assertIn("A partially filled buy is never submitted again", journal)
         self.assertIn("explicit human recovery", journal)
@@ -7908,9 +9147,17 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("`rsi_gate_enabled` exactly the JSON boolean `false`", phase)
         self.assertIn("SOLE authority for the pre-RSI verdicts", phase)
         self.assertIn("standard MCP envelope at `structuredContent.data.results`", phase)
-        self.assertIn("Never extract `structuredContent`", phase)
+        self.assertIn(
+            'Never use a harness-advertised path, search for a result file, '
+            'extract `structuredContent`',
+            phase,
+        )
         self.assertIn("call `get_equity_historicals` again", phase)
-        self.assertIn("direct-envelope rule applies only to historical `--bars` files", phase)
+        self.assertIn(
+            'Persist historicals and derived handoffs only through the '
+            'startup-bound file-change facility and `SOURCE_ROOT`',
+            phase,
+        )
         self.assertIn("candidate evaluation handoff failure", phase)
         self.assertIn("Do NOT use formatted stdout, a stale gate file, or ad-hoc calculations", phase)
         self.assertIn("final `buy_candidate` is exactly `true`", phase)
