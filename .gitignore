@@ -1,4 +1,6 @@
 run-reports/
+/rhmra-run-lifecycle.sqlite3*
+/rhmra-run-lock.sqlite3*
 tmp_eval/
 tmp_*
 scratch_*
