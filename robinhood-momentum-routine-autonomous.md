@@ -2,9 +2,9 @@
 
 **Description:** Fully automated. Each run, screen stocks in the `PRICE_MIN`–`PRICE_MAX` last-price band that are trading on unusually high **relative volume** AND have actually moved at least `MIN_ABS_PCT_CHANGE`% on the day, take profits on `TAKE_PROFIT_PCT`+ winners, buy screened names more than `DIP_ENTRY_PCT`% below their recent high, and set protective stops. Orders place automatically — no per-order approval — and every buy and sell fires an info notification.
 
-### LAUNCH BOUNDARY — no framework chapter tool
+### LAUNCH BOUNDARY — no framework planning tools
 
-`mark_chapter` is not part of this routine; never call it. Do not call any framework chapter, progress, or phase tool. The checked-in `run_lifecycle.py` helper is the only run-phase recorder. This rule is unconditional and has no dependency on `TIMING_IDENTITY`.
+Planning and progress stay internal. Never call, discover, or load `mark_chapter`, `TaskCreate`, `TaskUpdate`, `TaskList`, or `TaskGet`, and never call any framework chapter, planning, task-list, todo, progress, or phase tool at any point. Do not use `ToolSearch` for any such tool. The checked-in `run_lifecycle.py` helper is the only run-phase recorder. This rule is unconditional.
 
 ## Runtime requirement — model
 Prefer **Claude Sonnet 4.6** (API string `claude-sonnet-4-6`) or **Codex Luna 5.6 (high)** for this routine. If neither preferred model exists in the framework, let it select a **medium-strength** general-purpose model. This is an instruction-following and tool-orchestration workload — explicit ordered steps, simple arithmetic, sequential tool calls — not a deep-reasoning one, so a medium-strength model is sufficient; a larger model buys nothing the design leans on. Model selection is set in the agent platform's configuration, not enforced by this document. Validate the approval-gated test runs on whichever model you deploy, and if you ever change models, re-validate before granting autonomy rather than assuming behavior transfers.

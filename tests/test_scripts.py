@@ -7889,7 +7889,6 @@ class MarketClockTests(unittest.TestCase):
             'robinhood-momentum-routine-autonomous.md',
             'README.md',
             'QUICKSTART.md',
-            'CLAUDE-LOCAL-SCHEDULING.md',
             'INCIDENTS.md',
         ):
             with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
@@ -8063,21 +8062,13 @@ class MarketClockTests(unittest.TestCase):
             '--clock-source claude-run-duration'
         )
         documents = {}
-        for filename in (
-            'README.md', 'QUICKSTART.md', 'CLAUDE-LOCAL-SCHEDULING.md'
-        ):
+        for filename in ('README.md', 'QUICKSTART.md'):
             with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
                 documents[filename] = f.read()
 
         for filename in ('README.md', 'QUICKSTART.md'):
             self.assertEqual(documents[filename].count(codex_observe), 1)
             self.assertEqual(documents[filename].count(claude_observe), 1)
-        self.assertEqual(
-            documents['CLAUDE-LOCAL-SCHEDULING.md'].count(claude_observe), 1
-        )
-        self.assertNotIn(
-            codex_observe, documents['CLAUDE-LOCAL-SCHEDULING.md']
-        )
         for filename in documents:
             for required in (
                 'Comparable run duration',
@@ -8089,10 +8080,6 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             'same `record-internal` host-clock reading',
             documents['QUICKSTART.md'],
-        )
-        self.assertIn(
-            'same `record-internal` host-clock reading',
-            documents['CLAUDE-LOCAL-SCHEDULING.md'],
         )
 
         readme = documents['README.md']
@@ -8131,11 +8118,18 @@ class MarketClockTests(unittest.TestCase):
             '### View on Phone setup', 1
         )[0]
         codex_prompt = scheduling.split(
-            'Use this prompt in Codex:', 1
-        )[1].split('Use this prompt in Claude Desktop Code Local:', 1)[0]
+            'Use this scheduler prompt in Codex:', 1
+        )[1].split(
+            'Use this in the Claude Desktop Code Local scheduler '
+            '**Instructions**:', 1
+        )[0]
         claude_prompt = scheduling.split(
-            'Use this prompt in Claude Desktop Code Local:', 1
-        )[1].split('Keep exactly one `TIMING_IDENTITY` line', 1)[0]
+            'Use this in the Claude Desktop Code Local scheduler '
+            '**Instructions**:', 1
+        )[1].split(
+            'Keep exactly one `TIMING_IDENTITY` line in each '
+            'scheduler\'s **Instructions**.', 1
+        )[0]
         codex_declaration = (
             'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna '
             'config=reasoning=high'
@@ -8148,10 +8142,19 @@ class MarketClockTests(unittest.TestCase):
         self.assertEqual(claude_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertIn(codex_declaration, codex_prompt)
         self.assertIn(claude_declaration, claude_prompt)
+        self.assertIn(
+            'Do not put it in the ordinary Description field, memory, or '
+            'a separate scheduling guide',
+            scheduling,
+        )
         launch_boundary = (
-            '`mark_chapter` is not part of this routine; do not call it. '
-            'Begin directly with the routine-file read below, and make no '
-            'other model-authored tool call before that read completes.'
+            'Planning and progress stay internal. Never call, discover, or '
+            'load `mark_chapter`, `TaskCreate`, `TaskUpdate`, `TaskList`, '
+            'or `TaskGet`, and never call any framework chapter, planning, '
+            'task-list, todo, progress, or phase tool at any point. Do not '
+            'use `ToolSearch` for any such tool. Begin directly with the '
+            'routine-file read below, and make no other model-authored tool '
+            'call before that read completes.'
         )
         for label, prompt in (
             ('README Codex prompt', codex_prompt),
@@ -8165,6 +8168,17 @@ class MarketClockTests(unittest.TestCase):
                 )
         for forbidden in ('TIMING_IDENTITY', 'runner=', 'model='):
             self.assertNotIn(forbidden, launch_boundary)
+        for required in (
+            'Planning and progress stay internal',
+            '`TaskCreate`',
+            '`TaskUpdate`',
+            '`TaskList`',
+            '`TaskGet`',
+            '`mark_chapter`',
+            '`ToolSearch`',
+            'at any point',
+        ):
+            self.assertIn(required, launch_boundary)
         codex_setup_image = os.path.join(
             ROOT, 'images', 'codex-automation-setup.png'
         )
@@ -8264,52 +8278,18 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, scheduling)
 
-        with open(
-            os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md'),
-            encoding='utf-8',
-        ) as f:
-            claude_guide = f.read()
-        task_prompt = claude_guide.split('```text', 1)[1].split('```', 1)[0]
-        self.assertEqual(task_prompt.count('TIMING_IDENTITY:'), 1)
-        self.assertIn(claude_declaration, task_prompt)
-        self.assertEqual(task_prompt.count(launch_boundary), 1)
-        self.assertLess(
-            task_prompt.index(launch_boundary),
-            task_prompt.index('TIMING_IDENTITY:'),
-        )
-        self.assertIn(
-            'launch boundary is unconditional and does not depend on '
-            '`TIMING_IDENTITY`',
-            claude_guide,
-        )
-        self.assertIn(
-            'keep it synchronized with the model and effort actually '
-            'selected', claude_guide
-        )
-        for required in (
-            'one structured self-report',
-            'checked-in exact-match registry',
-            'reads only `CLAUDECODE` and `CLAUDE_EFFORT` through exact '
-            '`os.environ.get` calls',
-            'never enumerates, copies, echoes, stores, or passes environment '
-            'values',
-            'inherited environment can be spoofed',
-            'corroboration rather than authentication',
-            'field-level `composite`',
-            'Any unknown field, self-reported field, or conflict excludes '
-            'the run from primary fair-comparison cohorts',
-            'strongest symmetric source across Claude and Codex',
-            'cannot affect trading',
-        ):
-            self.assertIn(required, claude_guide)
+        guide_path = os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md')
+        self.assertFalse(os.path.exists(guide_path))
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', readme)
 
         with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
             quickstart = f.read().split(
                 '## Timing for later scheduled runs', 1
             )[1]
-        self.assertIn('copy exactly one matching declaration', quickstart)
-        self.assertIn(codex_declaration, quickstart)
-        self.assertIn(claude_declaration, quickstart)
+        self.assertIn('[README scheduling](README.md#scheduling)', quickstart)
+        self.assertIn('scheduler\'s **Instructions**', quickstart)
+        self.assertNotIn('TIMING_IDENTITY: runner=', quickstart)
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', quickstart)
         self.assertIn(
             'source-specific **Reference run duration** can still be '
             'attached',
@@ -8347,6 +8327,11 @@ class MarketClockTests(unittest.TestCase):
             'No such tool available',
             'no order, cancellation, or broker mutation',
             'This launch boundary never branches on',
+            'Claude attempted an invalid bulk `TaskCreate` after reading the',
+            'Claude did not retry',
+            'category wording alone was insufficient',
+            'forbid discovering or loading them through `ToolSearch`',
+            'never depends on `TIMING_IDENTITY`',
         ):
             self.assertIn(required, incident)
 
@@ -8356,10 +8341,14 @@ class MarketClockTests(unittest.TestCase):
         ) as f:
             routine = f.read()
         for required in (
-            '`mark_chapter` is not part of this routine; never call it',
-            'Do not call any framework chapter, progress, or phase tool',
+            'Planning and progress stay internal',
+            'Never call, discover, or load `mark_chapter`, `TaskCreate`, '
+            '`TaskUpdate`, `TaskList`, or `TaskGet`',
+            'never call any framework chapter, planning, task-list, todo, '
+            'progress, or phase tool at any point',
+            'Do not use `ToolSearch` for any such tool',
             '`run_lifecycle.py` helper is the only run-phase recorder',
-            'unconditional and has no dependency on `TIMING_IDENTITY`',
+            'This rule is unconditional.',
         ):
             self.assertIn(required, routine)
 
@@ -8939,7 +8928,7 @@ class MarketClockTests(unittest.TestCase):
             'Read `\\RobinhoodEquityTradingAgent\\robinhood-momentum-routine-autonomous.md`',
             readme,
         )
-        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', readme)
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', readme)
         with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
             quickstart = f.read()
         self.assertIn(
@@ -8950,91 +8939,12 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('Do not use Claude Cowork/local-agent', quickstart)
         self.assertIn('do not fall back to `/usr/bin/python3`', quickstart)
         self.assertIn('genuinely native Linux/macOS checkout', quickstart)
-        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', quickstart)
+        self.assertIn('[README scheduling](README.md#scheduling)', quickstart)
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', quickstart)
 
-        guide_path = os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md')
-        with open(guide_path, encoding='utf-8') as f:
-            claude_guide = f.read()
-        for required in (
-            'execution-environment example only',
-            'copy the prompt, schedule, model, permission mode',
-            'this guide—not from the image',
-            '**Schedule: Manual**',
-            'Saving a Local task with a Custom cron makes it active '
-            'immediately',
-            'Only after both Manual **Run now** proofs pass',
-            'immediately open its task detail, choose **Pause**',
-            'verify that it is disabled and that no run began',
-            'Scheduled tasks must run at most once per hour.',
-            '`0 6-13 * * 1-5`',
-            '`30 6-13 * * 1-5`',
-            'randomized delay',
-            'local machine/app timezone',
-            'intended Pacific bounds',
-            'original **Cowork/Scheduled** interface',
-            'Code **Routines** list does not control that legacy task',
-            'permission control is currently labeled **Auto**',
-            '**Allowed permissions**',
-            'If this Claude build cannot keep both',
-            'do not enable live Claude trading',
-            '**Part A only**',
-            '`DRY_RUN = false`',
-            'Part B was never tested with **Run now**',
-            'after hours with a flat account',
-            'no order-mutation tool call',
-            'bind the exact returned `python` value as `PYTHON_EXE`',
-            'Never substitute a bare `py`, `python`, or `python3`',
-            'Sonnet 5 with effort high (`claude-sonnet-5`, '
-            '`effort=high`)',
-            'change each task\'s model selector and `TIMING_IDENTITY` '
-            'line together',
-            'An intentionally retained Sonnet 4.6 task must use '
-            '`model=claude-sonnet-4-6 config=effort=high`',
-            '**post-validation Part A settings/identity reference**',
-            'pictured Custom cron must be added only after both Manual '
-            '`DRY_RUN = true` proofs pass',
-            '**Auto** label does not prove mutation safety',
-        ):
-            self.assertIn(required, claude_guide)
-        self.assertNotIn(
-            'Schedules must run at most once per hour', claude_guide
-        )
-        self.assertNotIn('deterministic delay', claude_guide)
-        self.assertNotIn(
-            '`py -3 run_lifecycle.py export`', claude_guide
-        )
-
-        manual_creation = claude_guide.index(
-            'Create uniquely named Part A and Part B Local tasks with '
-            '**Schedule: Manual**'
-        )
-        part_a_run = claude_guide.index(
-            'While Part A still has **Schedule: Manual**, open it and '
-            'click **Run now**'
-        )
-        part_b_run = claude_guide.index(
-            'Repeat **Run now** for Part B while it is still Manual'
-        )
-        add_crons = claude_guide.index(
-            'Only after both Manual tests succeed should you edit Part A '
-            'and Part B to their Custom crons'
-        )
-        self.assertLess(manual_creation, part_a_run)
-        self.assertLess(part_a_run, part_b_run)
-        self.assertLess(part_b_run, add_crons)
-
-        for relative_image in (
-            'images/claude-local-routine-form.png',
-            'images/claude-local-hourly-limit.png',
-            'images/claude-automation-part-a-setup.png',
-        ):
-            with self.subTest(image=relative_image):
-                self.assertIn(f']({relative_image})', claude_guide)
-                image_path = os.path.join(
-                    ROOT, *relative_image.split('/')
-                )
-                self.assertTrue(os.path.isfile(image_path), image_path)
-                self.assertGreater(os.path.getsize(image_path), 0, image_path)
+        self.assertFalse(os.path.exists(
+            os.path.join(ROOT, 'CLAUDE-LOCAL-SCHEDULING.md')
+        ))
 
         with open(os.path.join(ROOT, 'INCIDENTS.md'), encoding='utf-8') as f:
             incidents = f.read()
@@ -9203,7 +9113,9 @@ class MarketClockTests(unittest.TestCase):
             'consent to scheduling',
             quickstart,
         )
-        self.assertIn('(CLAUDE-LOCAL-SCHEDULING.md)', quickstart)
+        self.assertIn('[README scheduling](README.md#scheduling)', quickstart)
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', quickstart)
+        self.assertNotIn('TIMING_IDENTITY: runner=', quickstart)
 
         root_real = os.path.realpath(ROOT)
         local_targets = set()
@@ -9229,7 +9141,7 @@ class MarketClockTests(unittest.TestCase):
             self.assertGreater(os.path.getsize(resolved), 0, resolved)
             local_targets.add(path_target.replace('\\', '/'))
         self.assertIn('README.md', local_targets)
-        self.assertIn('CLAUDE-LOCAL-SCHEDULING.md', local_targets)
+        self.assertNotIn('CLAUDE-LOCAL-SCHEDULING.md', local_targets)
 
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             readme = f.read()
@@ -9251,7 +9163,6 @@ class MarketClockTests(unittest.TestCase):
         documents = (
             'robinhood-momentum-routine-autonomous.md',
             'README.md',
-            'CLAUDE-LOCAL-SCHEDULING.md',
         )
 
         for filename in documents:

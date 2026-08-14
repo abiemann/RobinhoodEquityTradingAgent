@@ -185,6 +185,21 @@ other model-authored tool call before that read completes. The routine mirrors t
 keeps `run_lifecycle.py` as the sole run-phase recorder. This launch boundary never branches on
 `TIMING_IDENTITY`; missing, invalid, or unknown identity remains telemetry only.
 
+**2026-08-14 12:41 follow-up, Claude attempted an invalid bulk `TaskCreate` after reading the
+new boundary.** Claude passed one stringified array of seven workflow items through an unsupported
+`tasks` parameter. The client rejected the call before execution because the actual singular
+tool requires top-level `subject` and `description`, rejects `tasks`, and had not been loaded
+through tool discovery. Claude did not retry. The authoritative run continued, completed with
+valid report, status, lifecycle, lease-release, and performance records, and made no order review,
+placement, cancellation, or broker mutation; the SPY red-day gate independently skipped entry.
+
+**Follow-up rule produced:** category wording alone was insufficient because Claude did not treat a
+framework task list as prohibited progress bookkeeping. Planning remains internal. Every maintained
+direct-run prompt and the routine now name `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`,
+and `mark_chapter` explicitly, forbid discovering or loading them through `ToolSearch`, and ban
+all framework planning/task-list/todo/chapter/progress/phase tools at every point. The prohibition
+is runner-neutral and never depends on `TIMING_IDENTITY`.
+
 **2026-08-11, Claude Cowork FUSE transaction left a hot rollback journal that blocked read-only
 lifecycle validation.** A Claude
 Cowork/local-agent run opened the Windows checkout through its isolated Linux VM and a writable
