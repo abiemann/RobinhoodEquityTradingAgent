@@ -8,6 +8,10 @@ summarize, or re-key a response.
 
 Typical use::
 
+    python broker_snapshot.py preflight --create-scratch
+
+Or, for compatibility with an existing caller-owned directory::
+
     python broker_snapshot.py preflight --scratch C:\\path\\to\\session-scratch
 
     python broker_snapshot.py bind-transport \
@@ -108,6 +112,10 @@ class SnapshotError(ValueError):
 
 class CliError(SnapshotError):
     """Raised for command-line usage errors that must remain JSON output."""
+
+
+class ScratchCreateError(SnapshotError):
+    """Raised when helper-owned native-temp scratch creation cannot start."""
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -1326,10 +1334,7 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _preflight(args: argparse.Namespace) -> dict[str, Any]:
-    if not os.path.isabs(args.scratch):
-        raise SnapshotError("--scratch must be an absolute path")
-    scratch = Path(args.scratch).resolve(strict=True)
+def _preflight_directory(scratch: Path) -> dict[str, Any]:
     if not scratch.is_dir():
         raise SnapshotError(f"{scratch}: scratch path is not a directory")
     project = Path(__file__).resolve().parent
@@ -1385,6 +1390,84 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         "write_read_parse": True,
         "cleanup_verified": True,
     }
+
+
+def _cleanup_created_scratch(
+    scratch: Path,
+    temp_root: Path,
+    created_identity: tuple[int, int],
+) -> list[str]:
+    """Remove only the unchanged empty directory created by this invocation."""
+
+    failures: list[str] = []
+    if (
+        scratch.parent != temp_root
+        or not scratch.name.startswith("rhmra-session-")
+    ):
+        return ["refusing cleanup outside the helper-owned native-temp namespace"]
+    try:
+        current = os.lstat(scratch)
+    except OSError as exc:
+        return [f"cannot inspect helper-created scratch directory: {exc}"]
+    is_junction = getattr(scratch, "is_junction", lambda: False)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or is_junction()
+    ):
+        return ["refusing cleanup of a replaced or redirected scratch directory"]
+    if (current.st_dev, current.st_ino) != created_identity:
+        return ["refusing cleanup because scratch directory identity changed"]
+    try:
+        os.rmdir(scratch)
+    except OSError as exc:
+        failures.append(f"cannot remove helper-created scratch directory: {exc}")
+    return failures
+
+
+def _preflight(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.create_scratch:
+        if not os.path.isabs(args.scratch):
+            raise SnapshotError("--scratch must be an absolute path")
+        scratch = Path(args.scratch).resolve(strict=True)
+        return _preflight_directory(scratch)
+
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        created_text = tempfile.mkdtemp(prefix="rhmra-session-", dir=str(temp_root))
+    except OSError as exc:
+        raise ScratchCreateError(
+            f"cannot create native-temp scratch directory: {exc}"
+        ) from exc
+
+    scratch = Path(created_text)
+    created_identity: tuple[int, int] | None = None
+    try:
+        created_stat = os.lstat(scratch)
+        is_junction = getattr(scratch, "is_junction", lambda: False)
+        if (
+            stat.S_ISLNK(created_stat.st_mode)
+            or not stat.S_ISDIR(created_stat.st_mode)
+            or is_junction()
+        ):
+            raise SnapshotError("helper-created scratch path is not a real directory")
+        created_identity = (created_stat.st_dev, created_stat.st_ino)
+        scratch = scratch.resolve(strict=True)
+        if scratch.parent != temp_root:
+            raise SnapshotError(
+                "helper-created scratch directory is not a direct child of native temp"
+            )
+        return _preflight_directory(scratch)
+    except Exception as exc:
+        cleanup_failures = (
+            _cleanup_created_scratch(scratch, temp_root, created_identity)
+            if created_identity is not None
+            else ["scratch identity was not established; no cleanup attempted"]
+        )
+        message = str(exc)
+        if cleanup_failures:
+            message += "; cleanup failed: " + "; ".join(cleanup_failures)
+        raise SnapshotError(message) from exc
 
 
 def _validated_transport_paths(
@@ -1668,8 +1751,12 @@ def _parser() -> JsonArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
-    preflight = subparsers.add_parser("preflight", help="verify session scratch I/O")
-    preflight.add_argument("--scratch", required=True)
+    preflight = subparsers.add_parser(
+        "preflight", help="create or verify session scratch I/O"
+    )
+    scratch_mode = preflight.add_mutually_exclusive_group(required=True)
+    scratch_mode.add_argument("--scratch")
+    scratch_mode.add_argument("--create-scratch", action="store_true")
 
     bind_transport = subparsers.add_parser(
         'bind-transport', help='bind one invocation-wide response-source transport'
@@ -1699,12 +1786,18 @@ def _parser() -> JsonArgumentParser:
 
 
 def _error_result(action: str, exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, CliError):
+        code = "usage_error"
+    elif isinstance(exc, ScratchCreateError):
+        code = "scratch_create_failed"
+    else:
+        code = "invalid_snapshot"
     return {
         "schema_version": SCHEMA_VERSION,
         "action": action,
         "ok": False,
         "error": {
-            "code": "invalid_snapshot" if not isinstance(exc, CliError) else "usage_error",
+            "code": code,
             "message": str(exc),
         },
     }

@@ -13,6 +13,7 @@ import csv
 import hashlib
 import http.client
 import importlib.util
+import io
 import json
 import math
 import os
@@ -24,7 +25,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -1030,18 +1031,14 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn('typeof n === "number" && Number.isFinite(n)', dashboard)
         self.assertIn('"unavailable"', dashboard)
 
-        scratch_creation = routine.index(
-            "create one NEW session-scoped scratch directory"
-        )
         scratch_preflight = routine.index(
-            "broker_snapshot.py preflight --scratch <absolute scratch>"
+            "broker_snapshot.py preflight --create-scratch"
         )
-        self.assertLess(
-            scratch_creation,
-            routine.index("### DAILY-LOSS CIRCUIT BREAKER"),
-        )
-        self.assertLess(scratch_creation, scratch_preflight)
         self.assertLess(scratch_preflight, routine.index("### DAILY-LOSS CIRCUIT BREAKER"))
+        self.assertNotIn(
+            "broker_snapshot.py preflight --scratch <absolute scratch>",
+            routine,
+        )
         scan_phase = routine.split("6. `run_scan`", 1)[1].split(
             "**FOURTH", 1
         )[0]
@@ -3541,6 +3538,143 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def source_root(self, scratch):
         return self._transport_roots[os.path.abspath(scratch)]
+
+    def test_create_scratch_preflights_without_a_caller_supplied_path(self):
+        proc, document = self.invoke('preflight', '--create-scratch')
+        self.assertEqual(proc.returncode, 0, (document, proc.stderr))
+        self.assertEqual(
+            set(document),
+            {
+                'schema_version', 'action', 'ok', 'scratch', 'sentinel_sha256',
+                'scratch_id', 'write_read_parse', 'cleanup_verified',
+            },
+        )
+        self.assertEqual(document['schema_version'], 1)
+        self.assertEqual(document['action'], 'preflight')
+        self.assertTrue(document['ok'])
+        self.assertTrue(document['write_read_parse'])
+        self.assertTrue(document['cleanup_verified'])
+        self.assertRegex(
+            document['scratch_id'],
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
+            r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+        )
+        self.assertRegex(document['sentinel_sha256'], r'^[0-9a-f]{64}$')
+
+        scratch = Path(document['scratch'])
+        marker = scratch / '.rhmra-broker-snapshot-scratch.json'
+        try:
+            self.assertTrue(scratch.is_absolute())
+            self.assertEqual(
+                scratch.parent,
+                Path(tempfile.gettempdir()).resolve(strict=True),
+            )
+            self.assertTrue(scratch.name.startswith('rhmra-session-'))
+            self.assertTrue(scratch.is_dir())
+            self.assertFalse(scratch.is_symlink())
+            self.assertFalse(
+                getattr(scratch, 'is_junction', lambda: False)()
+            )
+            with open(marker, encoding='utf-8') as handle:
+                marker_document = json.load(handle)
+            self.assertEqual(
+                marker_document['scratch_id'],
+                document['scratch_id'],
+            )
+            self.assertFalse(
+                any(
+                    child.name.startswith('.rhmra-scratch-preflight-')
+                    for child in scratch.iterdir()
+                )
+            )
+        finally:
+            marker.unlink(missing_ok=True)
+            if scratch.exists():
+                os.rmdir(scratch)
+
+    def test_preflight_requires_exactly_one_scratch_mode(self):
+        missing, missing_document = self.invoke('preflight')
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(missing_document['action'], 'preflight')
+        self.assertEqual(missing_document['error']['code'], 'usage_error')
+
+        with tempfile.TemporaryDirectory() as td:
+            both, both_document = self.invoke(
+                'preflight', '--scratch', td, '--create-scratch'
+            )
+        self.assertNotEqual(both.returncode, 0)
+        self.assertEqual(both_document['action'], 'preflight')
+        self.assertEqual(both_document['error']['code'], 'usage_error')
+
+    def test_create_scratch_failure_has_stable_error_code(self):
+        stdout = io.StringIO()
+        with mock.patch.object(
+            broker_snapshot_module.tempfile,
+            'mkdtemp',
+            side_effect=OSError('simulated create failure'),
+        ), redirect_stdout(stdout):
+            result = broker_snapshot_module.main(
+                ['preflight', '--create-scratch']
+            )
+        self.assertEqual(result, 2)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document['action'], 'preflight')
+        self.assertFalse(document['ok'])
+        self.assertEqual(
+            document['error']['code'],
+            'scratch_create_failed',
+        )
+
+    def test_failed_created_preflight_removes_only_its_empty_directory(self):
+        captured = {}
+
+        def fail_preflight(path):
+            captured['scratch'] = Path(path)
+            raise SnapshotError('simulated sentinel failure')
+
+        args = mock.Mock(create_scratch=True, scratch=None)
+        with mock.patch.object(
+            broker_snapshot_module,
+            '_preflight_directory',
+            side_effect=fail_preflight,
+        ):
+            with self.assertRaisesRegex(
+                SnapshotError, 'simulated sentinel failure'
+            ):
+                broker_snapshot_module._preflight(args)
+        self.assertFalse(captured['scratch'].exists())
+
+    def test_failed_created_preflight_preserves_unexpected_content(self):
+        captured = {}
+
+        def fail_with_unexpected_file(path):
+            scratch = Path(path)
+            captured['scratch'] = scratch
+            (scratch / 'unexpected.json').write_text(
+                '{}', encoding='utf-8'
+            )
+            raise SnapshotError('simulated primary failure')
+
+        args = mock.Mock(create_scratch=True, scratch=None)
+        try:
+            with mock.patch.object(
+                broker_snapshot_module,
+                '_preflight_directory',
+                side_effect=fail_with_unexpected_file,
+            ):
+                with self.assertRaisesRegex(
+                    SnapshotError,
+                    'simulated primary failure; cleanup failed:',
+                ):
+                    broker_snapshot_module._preflight(args)
+            scratch = captured['scratch']
+            self.assertTrue(scratch.is_dir())
+            self.assertTrue((scratch / 'unexpected.json').is_file())
+        finally:
+            scratch = captured.get('scratch')
+            if scratch is not None and scratch.exists():
+                (scratch / 'unexpected.json').unlink(missing_ok=True)
+                os.rmdir(scratch)
 
     def test_attempt_tombstone_survives_post_create_readback_failure(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7385,8 +7519,7 @@ class MarketClockTests(unittest.TestCase):
             '`run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>`',
             '`run_lock.py acquire`',
             '`run_lifecycle.py bind-context --invocation-id <INVOCATION_ID> --run-token <RUN_LOCK_TOKEN>`',
-            '`create one NEW session-scoped scratch directory`',
-            '`broker_snapshot.py preflight --scratch <scratch>`',
+            '`broker_snapshot.py preflight --create-scratch`',
             '`order_intents.py check`',
             '`order_intents.py pending --run-token <RUN_LOCK_TOKEN>`',
             'Resolve `rules_version`',
@@ -7400,11 +7533,11 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('Never invent a placeholder token', startup)
         self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
         self.assertIn(
-            'Items 1–13 normally succeed before the one `get_accounts` '
+            'Items 1–12 normally succeed before the one `get_accounts` '
             'transport canary',
             startup,
         )
-        self.assertIn('If item 11 or 12 fails', startup)
+        self.assertIn('If item 10 or 11 fails', startup)
         self.assertIn('named read-only positions/orders calls', startup)
         self.assertIn('is the sole exception', startup)
         self.assertIn('no broker mutation is permitted', startup)
@@ -7535,6 +7668,58 @@ class MarketClockTests(unittest.TestCase):
 
         self.assertIn('before scratch creation or preflight', coordination)
         self.assertIn('any order-intent journal command', coordination)
+        self.assertEqual(
+            coordination.count('broker_snapshot.py preflight --create-scratch'),
+            2,
+        )
+        self.assertIn(
+            "`& '<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`",
+            coordination,
+        )
+        self.assertIn(
+            "`'<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`",
+            coordination,
+        )
+        self.assertIn('exactly these eight fields', coordination)
+        for field in (
+            '`schema_version`', '`action`', '`ok`', '`scratch`',
+            '`scratch_id`', '`sentinel_sha256`', '`write_read_parse`',
+            '`cleanup_verified`',
+        ):
+            self.assertIn(field, coordination)
+        self.assertIn('resolved non-symlink direct child', coordination)
+        self.assertIn('canonical lowercase UUIDv4 string', coordination)
+        self.assertIn(
+            'Bind `<scratch>` and `SCRATCH_ID` only from this validated receipt',
+            coordination,
+        )
+        self.assertIn('opaque invocation state', coordination)
+        self.assertIn(
+            'never type, copy, shorten, reconstruct, normalize, or '
+            're-transcribe the path',
+            coordination,
+        )
+        self.assertIn(
+            'Do not separately call `New-Item`, `mkdir`, `mktemp`, `mkdtemp`',
+            coordination,
+        )
+        self.assertIn('Never retry with `--scratch`', coordination)
+        self.assertIn('exactly these four top-level fields', coordination)
+        self.assertIn(
+            'exactly the two nonempty string fields `code` and `message`',
+            coordination,
+        )
+        self.assertIn('`error.code` exactly `"scratch_create_failed"`', coordination)
+        self.assertIn('`error.code` exactly `"invalid_snapshot"`', coordination)
+        self.assertIn('any other code', coordination)
+        self.assertNotIn(
+            'broker_snapshot.py preflight --scratch <absolute scratch>',
+            coordination,
+        )
+        self.assertNotIn(
+            'create one NEW session-scoped scratch directory',
+            coordination,
+        )
 
         journal = routine.split('### ORDER-INTENT JOURNAL', 1)[1].split(
             '### BROKER TIMESTAMPS', 1
@@ -8576,7 +8761,7 @@ class MarketClockTests(unittest.TestCase):
             '### ORDER HANDLING', 1
         )[0]
         for required in (
-            'startup sequence reaches item 14 after items 1–13 have succeeded',
+            'startup sequence reaches item 13 after items 1–12 have succeeded',
             'not exposed or callable',
             'No Robinhood request was attempted',
             '`coordination-halt` / `account-scope-failed`',

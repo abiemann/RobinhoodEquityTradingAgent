@@ -153,6 +153,25 @@ check/pending with the exact acquired token, rules version, then account resolut
 journal work are explicitly forbidden before acquisition, and placeholder, invocation, remembered,
 or otherwise invented fencing tokens are never authoritative.
 
+**2026-08-14 06:03, a model-recopied scratch path lost five characters before preflight.** The
+first scheduled invocation of the day created a valid native-temp session directory whose random
+suffix contained `de758`, then manually authored the path again for `broker_snapshot.py preflight`
+without those five characters. The helper correctly rejected the different nonexistent path and
+the lifecycle closed as a visible snapshot failure. This was not an ACL, broker, scan, or JSON
+problem. No Robinhood call, scan, order review, placement, or cancellation occurred, and later
+scheduled invocations completed startup normally.
+
+**Rule produced:** scratch identity is now helper-owned reserved state. After lease and active-context
+binding, one retained-interpreter `broker_snapshot.py preflight --create-scratch` command creates
+the native-temp directory, performs the full write/fsync/read/strict-parse/remove proof, leaves the
+marker, and returns its exact absolute path plus canonical scratch ID in one strict receipt. The
+runner binds both only from that receipt and passes the retained values programmatically; it never
+calls `New-Item`, `mkdir`, `mktemp`/`mkdtemp`, supplies a startup `--scratch`, or copies, shortens,
+normalizes, reconstructs, or retypes a random path from text or memory. There is no alternate
+directory or retry. A strict `scratch_create_failed` error remains coordination-state failure;
+post-create `invalid_snapshot` or an unprovable/malformed failure remains the dedicated scratch
+preflight snapshot failure.
+
 **2026-08-11, Claude Cowork FUSE transaction left a hot rollback journal that blocked read-only
 lifecycle validation.** A Claude
 Cowork/local-agent run opened the Windows checkout through its isolated Linux VM and a writable
