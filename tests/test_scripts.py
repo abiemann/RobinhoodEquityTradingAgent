@@ -8148,6 +8148,23 @@ class MarketClockTests(unittest.TestCase):
         self.assertEqual(claude_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertIn(codex_declaration, codex_prompt)
         self.assertIn(claude_declaration, claude_prompt)
+        launch_boundary = (
+            '`mark_chapter` is not part of this routine; do not call it. '
+            'Begin directly with the routine-file read below, and make no '
+            'other model-authored tool call before that read completes.'
+        )
+        for label, prompt in (
+            ('README Codex prompt', codex_prompt),
+            ('README Claude prompt', claude_prompt),
+        ):
+            with self.subTest(prompt=label):
+                self.assertEqual(prompt.count(launch_boundary), 1)
+                self.assertLess(
+                    prompt.index(launch_boundary),
+                    prompt.index('TIMING_IDENTITY:'),
+                )
+        for forbidden in ('TIMING_IDENTITY', 'runner=', 'model='):
+            self.assertNotIn(forbidden, launch_boundary)
         codex_setup_image = os.path.join(
             ROOT, 'images', 'codex-automation-setup.png'
         )
@@ -8255,6 +8272,16 @@ class MarketClockTests(unittest.TestCase):
         task_prompt = claude_guide.split('```text', 1)[1].split('```', 1)[0]
         self.assertEqual(task_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertIn(claude_declaration, task_prompt)
+        self.assertEqual(task_prompt.count(launch_boundary), 1)
+        self.assertLess(
+            task_prompt.index(launch_boundary),
+            task_prompt.index('TIMING_IDENTITY:'),
+        )
+        self.assertIn(
+            'launch boundary is unconditional and does not depend on '
+            '`TIMING_IDENTITY`',
+            claude_guide,
+        )
         self.assertIn(
             'keep it synchronized with the model and effort actually '
             'selected', claude_guide
@@ -8315,8 +8342,26 @@ class MarketClockTests(unittest.TestCase):
             'never enumerates or persists the environment',
             'corroboration rather than authentication',
             'Schema v4 records each field\'s provenance',
+            'Claude called unavailable `mark_chapter` before reading the '
+            'routine',
+            'No such tool available',
+            'no order, cancellation, or broker mutation',
+            'This launch boundary never branches on',
         ):
             self.assertIn(required, incident)
+
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+        for required in (
+            '`mark_chapter` is not part of this routine; never call it',
+            'Do not call any framework chapter, progress, or phase tool',
+            '`run_lifecycle.py` helper is the only run-phase recorder',
+            'unconditional and has no dependency on `TIMING_IDENTITY`',
+        ):
+            self.assertIn(required, routine)
 
     def test_routine_full_halts_when_constants_cannot_be_read(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:

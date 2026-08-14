@@ -40,6 +40,8 @@ Also verify the Robinhood connector in `/mcp` and require a read-only `get_accou
 Use the same instructions in each task:
 
 ```text
+`mark_chapter` is not part of this routine; do not call it. Begin directly with the routine-file read below, and make no other model-authored tool call before that read completes.
+
 TIMING_IDENTITY: runner=claude model=claude-sonnet-5 config=effort=high
 
 Treat every run as stateless. Do not read, create, or update memory.md, and do not call a framework memory tool; the verified report/status artifacts are the durable record.
@@ -60,6 +62,8 @@ The routine records Routine total, Strategy execution, and Routine overhead afte
 This template is only for a human reading Claude's recorded duration and confirming the selected task settings; do not use `manual-ui` or `claude-run-duration` for runner metadata. The value is displayed as **Reference run duration** and remains secondary to the automatic **Comparable run duration**. Fair Claude-versus-Codex and future-model comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version; keep runner/model identity explicit as the comparison dimension. The formulas, other source rules, and comparison dashboard are documented in [README Tested On](README.md#tested-on).
 
 Enable either replacement schedule only after both supervised Manual **Run now** proofs succeed.
+
+The launch boundary is unconditional and does not depend on `TIMING_IDENTITY`; identity remains telemetry and never selects tools or run control flow.
 
 ## 3. Create two Manual tasks first
 

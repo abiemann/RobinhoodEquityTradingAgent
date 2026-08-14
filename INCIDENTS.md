@@ -172,6 +172,19 @@ directory or retry. A strict `scratch_create_failed` error remains coordination-
 post-create `invalid_snapshot` or an unprovable/malformed failure remains the dedicated scratch
 preflight snapshot failure.
 
+**2026-08-14 12:02, Claude called unavailable `mark_chapter` before reading the routine.** The
+model emitted a direct `mark_chapter` tool call even though that framework convenience was not
+available. Claude Desktop rejected it immediately with `No such tool available`; no repository
+helper, lifecycle state, broker operation, or artifact was touched. Claude then read the routine,
+completed the authoritative lifecycle and broker-read path normally, published report/status
+artifacts, released the lease, and made no order, cancellation, or broker mutation.
+
+**Rule produced:** every maintained direct-run launch prompt unconditionally says that
+`mark_chapter` is not part of the routine and begins directly with the routine-file read, with no
+other model-authored tool call before that read completes. The routine mirrors the prohibition and
+keeps `run_lifecycle.py` as the sole run-phase recorder. This launch boundary never branches on
+`TIMING_IDENTITY`; missing, invalid, or unknown identity remains telemetry only.
+
 **2026-08-11, Claude Cowork FUSE transaction left a hot rollback journal that blocked read-only
 lifecycle validation.** A Claude
 Cowork/local-agent run opened the Windows checkout through its isolated Linux VM and a writable

@@ -248,6 +248,8 @@ For Claude, follow the illustrated [Claude Desktop Local scheduling guide](CLAUD
 
 Use this prompt in Codex:
 
+> `mark_chapter` is not part of this routine; do not call it. Begin directly with the routine-file read below, and make no other model-authored tool call before that read completes.
+>
 > TIMING_IDENTITY: runner=codex model=gpt-5.6-luna config=reasoning=high
 >
 > Treat every run as stateless. Do not read, create, or update `memory.md`, and do not call a framework memory tool; the verified report/status artifacts are the durable record.
@@ -260,6 +262,8 @@ The ChatGPT/Codex automation form shows the same identity in two representations
 
 Use this prompt in Claude Desktop Code Local:
 
+> `mark_chapter` is not part of this routine; do not call it. Begin directly with the routine-file read below, and make no other model-authored tool call before that read completes.
+>
 > TIMING_IDENTITY: runner=claude model=claude-sonnet-5 config=effort=high
 >
 > Treat every run as stateless. Do not read, create, or update `memory.md`, and do not call a framework memory tool; the verified report/status artifacts are the durable record.
@@ -270,7 +274,7 @@ Use this prompt in Claude Desktop Code Local:
 
 This **post-validation Part A settings reference** shows the same identity in the prompt and model selector: **Sonnet 5** maps to `model=claude-sonnet-5`, and **effort high** maps to `config=effort=high`. It also shows the native local folder, **Current branch**, **Worktree off**, and Part A's `0 6-13 * * 1-5` cron. Use the complete maintained prompt above rather than transcribing the screenshot. Do not activate this Custom cron until both tasks pass the supervised Manual `DRY_RUN = true` checks; **Auto** is only the form label and does not prove that order placement or cancellation remains approval-gated. Confirm Allowed permissions and the Pacific-time schedule preview.
 
-Keep exactly one `TIMING_IDENTITY` line in each task. It must stay synchronized with the runner, model, and configuration actually selected in that task's settings; if any selection changes, update the declaration before the next run. The line records the selection for comparison and does not switch the model.
+Keep exactly one `TIMING_IDENTITY` line in each task. It must stay synchronized with the runner, model, and configuration actually selected in that task's settings; if any selection changes, update the declaration before the next run. The line records the selection for comparison and does not switch the model. The launch boundary in both prompts is unconditional and does not depend on `TIMING_IDENTITY`; identity remains telemetry and never selects tools or run control flow.
 
 The running model also produces one pre-helper self-report from only framework-explicit identity, and the routine resolves it once before START CLOCK through an exact registry. The Python resolver—not the model or routine—also reads only `CLAUDECODE` and `CLAUDE_EFFORT` as field-level corroboration without enumerating the environment. Direct metadata remains strongest, followed by the complete declaration; runtime evidence plus self-report can produce a `composite` identity but remains unverified whenever any field is self-reported. Any unknown field, self-reported field, or conflict excludes the sample from primary fair comparisons until an independent stronger source replaces it. Keep `TIMING_IDENTITY`: it is the strongest symmetric source across Claude and Codex and records the selected configuration that a model may not know. The resolver never changes the configured model and has no trading authority.
 For Codex, choose weekdays at minute `0` and `30`, from `06:00 AM` through `01:30 PM` Pacific time. The Claude Desktop Local form observed on 2026-08-11 rejected a single twice-hourly expression with **“Scheduled tasks must run at most once per hour.”** After both Manual proofs pass, give the same prompt to Part A with `0 6-13 * * 1-5` and Part B with `30 6-13 * * 1-5`. Cron uses the local machine/app timezone: require both previews to show the intended Pacific bounds, and convert the hours if the machine is not on Pacific time. Claude applies randomized start delays. Claude Desktop must remain open, and the computer must remain awake and online. The task-form permission control is currently labeled **Auto**; choose and verify a mode that does not auto-approve `place_equity_order` or `cancel_equity_order`, then inspect each task's Allowed permissions after **Run now**. If both mutation tools cannot remain approval-gated, do not enable live Claude trading.
