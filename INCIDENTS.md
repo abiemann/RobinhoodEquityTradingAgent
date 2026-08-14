@@ -979,6 +979,10 @@ Neither label claims scheduler-start or task-completion boundaries.
 
 ---
 
+**2026-08-13 15:35, RSI handoff was authored in scratch instead of the bound response-source root.** The run had a successful transport binding, valid scan, and valid pre-RSI evaluation with no buy candidates. The final evaluator correctly rejected the RSI-number map because the runner wrote it under the invocation scratch directory, while `evaluate_candidates.py` treats `--rsi-file` as an externally authored input that must be a direct child of the bound `SOURCE_ROOT`. No broker mutation occurred; the account remained flat and the final status snapshot was valid. The lifecycle closed as `snapshot-failure` / `snapshot-write-failed`, the correct fail-closed outcome for an unbound external handoff.
+
+**Rule produced:** the routine now states the destination at both authoring and consumption: write the RSI map through the startup-bound file-change facility as a fresh direct child of `SOURCE_ROOT`; only evaluator-generated outputs belong in scratch or `run-reports/`.
+
 ## The pattern across all of these
 
 Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One
