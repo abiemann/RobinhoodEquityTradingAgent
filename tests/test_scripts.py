@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
@@ -109,11 +110,40 @@ def run_cli(script, args):
     return proc.stdout
 
 
+def prepare_source_root_for_test(scratch, scratch_id=None):
+    """Install the helper-owned source-root marker used by legacy test fixtures."""
+    scratch_path = Path(os.path.realpath(scratch))
+    if scratch_id is None:
+        with open(
+            scratch_path / '.rhmra-broker-snapshot-scratch.json',
+            encoding='utf-8',
+        ) as handle:
+            scratch_id = json.load(handle)['scratch_id']
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    source_root = Path(tempfile.mkdtemp(
+        prefix='rhmra-source-', dir=str(temp_root)
+    )).resolve(strict=True)
+    source_stat = os.lstat(source_root)
+    source_root_id = str(uuid.uuid4())
+    document = broker_snapshot_module._transport_preparation_marker_document(
+        scratch_id=scratch_id,
+        source_root=str(source_root),
+        source_root_id=source_root_id,
+        source_root_identity=(source_stat.st_dev, source_stat.st_ino),
+    )
+    marker = scratch_path / (
+        '.rhmra-broker-response-source-root-prepared.json'
+    )
+    with open(marker, 'xb') as handle:
+        handle.write(broker_snapshot_module._canonical_bytes(document))
+    return str(source_root), source_root_id
+
+
 @contextmanager
 def bound_source_root(scratch):
     """Preflight scratch, bind one accounts canary, then yield its source root."""
     run_cli(BROKER_SNAPSHOT, ["preflight", "--scratch", scratch])
-    source_root = tempfile.mkdtemp(prefix="rhmra-response-source-")
+    source_root, _source_root_id = prepare_source_root_for_test(scratch)
     try:
         canary = os.path.join(source_root, "get-accounts-canary.json")
         with open(canary, "w", encoding="utf-8") as handle:
@@ -3448,6 +3478,7 @@ class OrderIntentTests(unittest.TestCase):
 class BrokerSnapshotTests(unittest.TestCase):
     def setUp(self):
         self._transport_roots = {}
+        self._transport_root_ids = {}
 
     def tearDown(self):
         for source_root in self._transport_roots.values():
@@ -3512,10 +3543,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             },
         )
         self.assertTrue(document['ok'])
+        source_root, source_root_id = prepare_source_root_for_test(
+            scratch, document['scratch_id']
+        )
+        scratch_key = os.path.abspath(scratch)
+        self._transport_roots[scratch_key] = source_root
+        self._transport_root_ids[scratch_key] = source_root_id
         if bind_transport:
-            source_root = tempfile.mkdtemp(
-                prefix='rhmra-response-source-' + document['scratch_id'] + '-'
-            )
             canary = self.write_json(
                 source_root,
                 'get-accounts-canary.json',
@@ -3533,11 +3567,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertTrue(receipt['ok'])
             self.assertTrue(receipt['canary_removed'])
             self.assertFalse(os.path.exists(canary))
-            self._transport_roots[os.path.abspath(scratch)] = source_root
         return document
 
     def source_root(self, scratch):
         return self._transport_roots[os.path.abspath(scratch)]
+
+    def source_root_id(self, scratch):
+        return self._transport_root_ids[os.path.abspath(scratch)]
 
     def test_create_scratch_preflights_without_a_caller_supplied_path(self):
         proc, document = self.invoke('preflight', '--create-scratch')
@@ -3547,6 +3583,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             {
                 'schema_version', 'action', 'ok', 'scratch', 'sentinel_sha256',
                 'scratch_id', 'write_read_parse', 'cleanup_verified',
+                'source_root', 'source_root_id',
             },
         )
         self.assertEqual(document['schema_version'], 1)
@@ -3559,10 +3596,20 @@ class BrokerSnapshotTests(unittest.TestCase):
             r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
             r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
         )
+        self.assertRegex(
+            document['source_root_id'],
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
+            r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+        )
+        self.assertNotEqual(document['scratch_id'], document['source_root_id'])
         self.assertRegex(document['sentinel_sha256'], r'^[0-9a-f]{64}$')
 
         scratch = Path(document['scratch'])
+        source_root = Path(document['source_root'])
         marker = scratch / '.rhmra-broker-snapshot-scratch.json'
+        preparation_marker = scratch / (
+            '.rhmra-broker-response-source-root-prepared.json'
+        )
         try:
             self.assertTrue(scratch.is_absolute())
             self.assertEqual(
@@ -3575,11 +3622,61 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertFalse(
                 getattr(scratch, 'is_junction', lambda: False)()
             )
+            self.assertTrue(source_root.is_absolute())
+            self.assertEqual(source_root.parent, scratch.parent)
+            self.assertNotEqual(source_root, scratch)
+            self.assertTrue(source_root.name.startswith('rhmra-source-'))
+            self.assertTrue(source_root.is_dir())
+            self.assertFalse(source_root.is_symlink())
+            self.assertFalse(
+                getattr(source_root, 'is_junction', lambda: False)()
+            )
+            self.assertEqual(list(source_root.iterdir()), [])
             with open(marker, encoding='utf-8') as handle:
                 marker_document = json.load(handle)
             self.assertEqual(
                 marker_document['scratch_id'],
                 document['scratch_id'],
+            )
+            with open(preparation_marker, 'rb') as handle:
+                preparation_raw = handle.read()
+            preparation_document = json.loads(preparation_raw)
+            self.assertEqual(
+                set(preparation_document),
+                {
+                    'schema_version', 'marker', 'scratch_id', 'transport',
+                    'source_root', 'source_root_id', 'source_root_device',
+                    'source_root_inode',
+                },
+            )
+            self.assertEqual(
+                preparation_raw,
+                broker_snapshot_module._canonical_bytes(
+                    preparation_document
+                ),
+            )
+            self.assertEqual(
+                preparation_document['marker'],
+                'rhmra-broker-response-source-root-prepared',
+            )
+            self.assertEqual(
+                preparation_document['scratch_id'], document['scratch_id']
+            )
+            self.assertEqual(
+                preparation_document['source_root'], str(source_root)
+            )
+            self.assertEqual(
+                preparation_document['source_root_id'],
+                document['source_root_id'],
+            )
+            source_stat = os.lstat(source_root)
+            self.assertEqual(
+                preparation_document['source_root_device'],
+                str(source_stat.st_dev),
+            )
+            self.assertEqual(
+                preparation_document['source_root_inode'],
+                str(source_stat.st_ino),
             )
             self.assertFalse(
                 any(
@@ -3588,9 +3685,8 @@ class BrokerSnapshotTests(unittest.TestCase):
                 )
             )
         finally:
-            marker.unlink(missing_ok=True)
-            if scratch.exists():
-                os.rmdir(scratch)
+            shutil.rmtree(source_root, ignore_errors=True)
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def test_preflight_requires_exactly_one_scratch_mode(self):
         missing, missing_document = self.invoke('preflight')
@@ -3625,11 +3721,38 @@ class BrokerSnapshotTests(unittest.TestCase):
             'scratch_create_failed',
         )
 
-    def test_failed_created_preflight_removes_only_its_empty_directory(self):
+    def test_source_root_create_failure_cleans_scratch_with_stable_error_code(self):
+        created = []
+        real_mkdtemp = broker_snapshot_module.tempfile.mkdtemp
+
+        def fail_second_create(*args, **kwargs):
+            if created:
+                raise OSError('simulated source-root create failure')
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(Path(path))
+            return path
+
+        stdout = io.StringIO()
+        with mock.patch.object(
+            broker_snapshot_module.tempfile,
+            'mkdtemp',
+            side_effect=fail_second_create,
+        ), redirect_stdout(stdout):
+            result = broker_snapshot_module.main(
+                ['preflight', '--create-scratch']
+            )
+        self.assertEqual(result, 2)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document['error']['code'], 'scratch_create_failed')
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists())
+
+    def test_failed_created_preflight_removes_both_empty_directories(self):
         captured = {}
 
-        def fail_preflight(path):
+        def fail_preflight(path, **kwargs):
             captured['scratch'] = Path(path)
+            captured['source_root'] = kwargs['prepared_source_root']
             raise SnapshotError('simulated sentinel failure')
 
         args = mock.Mock(create_scratch=True, scratch=None)
@@ -3643,14 +3766,20 @@ class BrokerSnapshotTests(unittest.TestCase):
             ):
                 broker_snapshot_module._preflight(args)
         self.assertFalse(captured['scratch'].exists())
+        self.assertFalse(captured['source_root'].exists())
 
     def test_failed_created_preflight_preserves_unexpected_content(self):
         captured = {}
 
-        def fail_with_unexpected_file(path):
+        def fail_with_unexpected_file(path, **kwargs):
             scratch = Path(path)
+            source_root = kwargs['prepared_source_root']
             captured['scratch'] = scratch
+            captured['source_root'] = source_root
             (scratch / 'unexpected.json').write_text(
+                '{}', encoding='utf-8'
+            )
+            (source_root / 'unexpected.json').write_text(
                 '{}', encoding='utf-8'
             )
             raise SnapshotError('simulated primary failure')
@@ -3668,10 +3797,17 @@ class BrokerSnapshotTests(unittest.TestCase):
                 ):
                     broker_snapshot_module._preflight(args)
             scratch = captured['scratch']
+            source_root = captured['source_root']
             self.assertTrue(scratch.is_dir())
+            self.assertTrue(source_root.is_dir())
             self.assertTrue((scratch / 'unexpected.json').is_file())
+            self.assertTrue((source_root / 'unexpected.json').is_file())
         finally:
             scratch = captured.get('scratch')
+            source_root = captured.get('source_root')
+            if source_root is not None and source_root.exists():
+                (source_root / 'unexpected.json').unlink(missing_ok=True)
+                os.rmdir(source_root)
             if scratch is not None and scratch.exists():
                 (scratch / 'unexpected.json').unlink(missing_ok=True)
                 os.rmdir(scratch)
@@ -3688,13 +3824,56 @@ class BrokerSnapshotTests(unittest.TestCase):
             ):
                 with self.assertRaises(SnapshotError):
                     broker_snapshot_module._record_transport_attempt(
-                        scratch, scratch_id, source_root
+                        scratch, scratch_id, source_root, None
                     )
             marker = scratch / '.rhmra-broker-response-transport-attempt.json'
             self.assertTrue(marker.exists())
+            with open(marker, encoding='utf-8') as handle:
+                self.assertEqual(
+                    json.load(handle),
+                    {
+                        'schema_version': 1,
+                        'marker': 'rhmra-broker-response-transport-attempt',
+                        'scratch_id': scratch_id,
+                        'transport': 'file-change',
+                        'source_root': str(source_root),
+                        'canary_instance': None,
+                    },
+                )
             with self.assertRaisesRegex(SnapshotError, 'already attempted'):
                 broker_snapshot_module._record_transport_attempt(
-                    scratch, scratch_id, source_root
+                    scratch, scratch_id, source_root, None
+                )
+
+    def test_canary_cleanup_refuses_to_delete_a_replacement_instance(self):
+        with tempfile.TemporaryDirectory(
+            prefix='rhmra-source-', dir=tempfile.gettempdir()
+        ) as source_root:
+            canary = self.write_text(
+                source_root, 'accounts.json', 'original-sensitive-response'
+            )
+            candidate = (
+                broker_snapshot_module._safe_transport_canary_cleanup_candidate(
+                    source_root, canary
+                )
+            )
+            self.assertIsNotNone(candidate)
+            os.unlink(canary)
+            self.write_text(
+                source_root,
+                'accounts.json',
+                'replacement-that-must-not-be-deleted-because-it-is-different',
+            )
+            with self.assertRaisesRegex(
+                SnapshotError,
+                'transport canary instance changed before privacy cleanup',
+            ):
+                broker_snapshot_module._remove_transport_canary(candidate)
+            self.assertTrue(os.path.isfile(canary))
+            with open(canary, encoding='utf-8') as handle:
+                self.assertEqual(
+                    handle.read(),
+                    'replacement-that-must-not-be-deleted-because-it-is-different',
                 )
 
     def test_failed_bind_consumes_one_shot_and_removes_accounts_canary(self):
@@ -3702,8 +3881,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             scratch_result = self.preflight(scratch, bind_transport=False)
-            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-            self._transport_roots[os.path.abspath(scratch)] = source_root
+            source_root = self.source_root(scratch)
             rejected_canary = self.write_json(
                 source_root,
                 'errored-get-accounts-canary.json',
@@ -3711,6 +3889,12 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'isError': True,
                     'structuredContent': {'data': {'accounts': []}},
                 },
+            )
+            rejected_canary_stat = os.lstat(rejected_canary)
+            rejected_canary_instance = (
+                broker_snapshot_module._transport_canary_instance(
+                    Path(rejected_canary), rejected_canary_stat
+                )
             )
             rejected, error = self.invoke(
                 'bind-transport',
@@ -3742,6 +3926,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     'scratch_id': scratch_result['scratch_id'],
                     'transport': 'file-change',
                     'source_root': os.path.realpath(source_root),
+                    'canary_instance': rejected_canary_instance,
                 },
             )
 
@@ -3817,8 +4002,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 scratch = os.path.join(td, 'scratch')
                 os.mkdir(scratch)
                 self.preflight(scratch, bind_transport=False)
-                source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-                self.addCleanup(shutil.rmtree, source_root, True)
+                source_root = self.source_root(scratch)
                 canary = os.path.join(source_root, 'accounts.json')
                 with open(canary, 'wb') as handle:
                     handle.write(raw)
@@ -3860,11 +4044,11 @@ class BrokerSnapshotTests(unittest.TestCase):
                 )
                 self.assertFalse(os.path.exists(retry_canary))
 
-    def test_invalid_scratch_does_not_consume_attempt_or_cleanup_canary(self):
+    def test_invalid_scratch_does_not_consume_attempt_but_cleans_canary(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
-            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
+            source_root = tempfile.mkdtemp(prefix='rhmra-source-')
             self.addCleanup(shutil.rmtree, source_root, True)
             canary = self.write_json(
                 source_root, 'accounts.json', self.valid_accounts_document()
@@ -3882,6 +4066,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             )))
 
             self.preflight(scratch, bind_transport=False)
+            source_root = self.source_root(scratch)
             canary = self.write_json(
                 source_root, 'accounts-after-preflight.json',
                 self.valid_accounts_document(),
@@ -3894,14 +4079,139 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertEqual(bound.returncode, 0, (receipt, bound.stderr))
             self.assertFalse(os.path.exists(canary))
 
+    def test_legacy_preflight_without_prepared_root_cannot_bind(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            preflight, document = self.invoke(
+                'preflight', '--scratch', scratch
+            )
+            self.assertEqual(preflight.returncode, 0, document)
+            source_root = tempfile.mkdtemp(
+                prefix='rhmra-source-', dir=tempfile.gettempdir()
+            )
+            self.addCleanup(shutil.rmtree, source_root, True)
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
+            rejected, error = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', source_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(error['ok'])
+            self.assertIn(
+                '.rhmra-broker-response-source-root-prepared.json',
+                error['error']['message'],
+            )
+            self.assertFalse(os.path.exists(canary))
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )))
+
+    def test_bind_rejects_alternate_prepared_root_and_consumes_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            prepared_root = self.source_root(scratch)
+            alternate_root = tempfile.mkdtemp(
+                prefix='rhmra-source-', dir=tempfile.gettempdir()
+            )
+            self.addCleanup(shutil.rmtree, alternate_root, True)
+            canary = self.write_json(
+                alternate_root, 'accounts.json', self.valid_accounts_document()
+            )
+            rejected, error = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', alternate_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                'must exactly equal the helper-prepared source_root',
+                error['error']['message'],
+            )
+            self.assertFalse(os.path.exists(canary))
+            with open(
+                os.path.join(
+                    scratch,
+                    '.rhmra-broker-response-transport-attempt.json',
+                ),
+                encoding='utf-8',
+            ) as handle:
+                attempt = json.load(handle)
+            self.assertEqual(attempt['source_root'], prepared_root)
+
+    def test_bind_rejects_recreated_prepared_root_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            source_root = self.source_root(scratch)
+            shutil.rmtree(source_root)
+            os.mkdir(source_root)
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
+            rejected, error = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', source_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                'prepared response-source root instance changed',
+                error['error']['message'],
+            )
+            self.assertFalse(os.path.exists(canary))
+            self.assertTrue(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )))
+
+    def test_bind_rejects_tampered_prepared_root_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch, bind_transport=False)
+            source_root = self.source_root(scratch)
+            marker_path = os.path.join(
+                scratch,
+                '.rhmra-broker-response-source-root-prepared.json',
+            )
+            with open(marker_path, encoding='utf-8') as handle:
+                marker = json.load(handle)
+            marker['source_root_inode'] = str(
+                int(marker['source_root_inode']) + 1
+            )
+            with open(marker_path, 'wb') as handle:
+                handle.write(broker_snapshot_module._canonical_bytes(marker))
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
+            rejected, error = self.invoke(
+                'bind-transport', '--scratch', scratch,
+                '--source-root', source_root, '--canary', canary,
+                '--account-name', 'Agentic',
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                'prepared response-source root instance changed',
+                error['error']['message'],
+            )
+            self.assertFalse(os.path.exists(canary))
+            self.assertTrue(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport-attempt.json'
+            )))
+
     def test_path_validation_failures_consume_attempt_and_cleanup_canary(self):
         for layout in ('nested-root', 'nested-canary', 'extra-entry'):
             with self.subTest(layout=layout), tempfile.TemporaryDirectory() as td:
                 scratch = os.path.join(td, 'scratch')
                 os.mkdir(scratch)
                 self.preflight(scratch, bind_transport=False)
-                outer = tempfile.mkdtemp(prefix='rhmra-response-source-')
-                self.addCleanup(shutil.rmtree, outer, True)
+                outer = self.source_root(scratch)
                 source_root = outer
                 if layout == 'nested-root':
                     source_root = os.path.join(outer, 'nested')
@@ -3954,8 +4264,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             scratch_result = self.preflight(scratch, bind_transport=False)
-            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-            self._transport_roots[os.path.abspath(scratch)] = source_root
+            source_root = self.source_root(scratch)
             canary_document = {
                 'content': [
                     {
@@ -3977,7 +4286,15 @@ class BrokerSnapshotTests(unittest.TestCase):
                 },
             }
             canary = self.write_json(
-                source_root, 'get-accounts-canary.json', canary_document
+                source_root,
+                'sensitive-account-get-accounts-canary.json',
+                canary_document,
+            )
+            canary_stat = os.lstat(canary)
+            expected_canary_instance = (
+                broker_snapshot_module._transport_canary_instance(
+                    Path(canary), canary_stat
+                )
             )
             with open(canary, 'rb') as handle:
                 expected_digest = hashlib.sha256(handle.read()).hexdigest()
@@ -4032,12 +4349,33 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(marker_document['scratch_id'], scratch_result['scratch_id'])
             self.assertEqual(marker_document['source_root'], os.path.realpath(source_root))
+            self.assertEqual(
+                marker_document['source_root_id'],
+                self.source_root_id(scratch),
+            )
             self.assertEqual(marker_document['canary_sha256'], expected_digest)
+            attempt_marker_path = os.path.join(
+                scratch,
+                '.rhmra-broker-response-transport-attempt.json',
+            )
+            with open(attempt_marker_path, encoding='utf-8') as handle:
+                attempt_marker = json.load(handle)
+            self.assertEqual(
+                set(attempt_marker),
+                {
+                    'schema_version', 'marker', 'scratch_id', 'transport',
+                    'source_root', 'canary_instance',
+                },
+            )
+            self.assertEqual(
+                attempt_marker['canary_instance'], expected_canary_instance
+            )
             persistent_marker_paths = [
                 os.path.join(
                     scratch,
-                    '.rhmra-broker-response-transport-attempt.json',
+                    '.rhmra-broker-response-source-root-prepared.json',
                 ),
+                attempt_marker_path,
                 marker_path,
                 os.path.join(
                     source_root,
@@ -4082,8 +4420,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch, bind_transport=False)
-            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-            self.addCleanup(shutil.rmtree, source_root, True)
+            source_root = self.source_root(scratch)
             canary = self.write_json(
                 source_root,
                 'accounts.json',
@@ -4176,8 +4513,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                 scratch = os.path.join(td, 'scratch')
                 os.mkdir(scratch)
                 self.preflight(scratch, bind_transport=False)
-                source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-                self.addCleanup(shutil.rmtree, source_root, True)
+                source_root = self.source_root(scratch)
                 canary = self.write_json(
                     source_root,
                     'accounts.json',
@@ -4247,8 +4583,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertFalse(error['ok'])
             self.assertFalse(os.path.exists(output))
 
-            source_root = tempfile.mkdtemp(prefix='rhmra-response-source-')
-            self._transport_roots[os.path.abspath(scratch)] = source_root
+            source_root = self.source_root(scratch)
             canary = self.write_json(
                 source_root, 'accounts.json', self.valid_accounts_document()
             )
@@ -4356,25 +4691,17 @@ class BrokerSnapshotTests(unittest.TestCase):
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
             self.preflight(scratch, bind_transport=False)
-            roots = [
-                tempfile.mkdtemp(prefix='rhmra-response-source-')
-                for _ in range(2)
-            ]
-            for root in roots:
-                self.addCleanup(shutil.rmtree, root, True)
-            canaries = [
-                self.write_json(
-                    root, 'accounts.json', self.valid_accounts_document()
-                )
-                for root in roots
-            ]
+            source_root = self.source_root(scratch)
+            canary = self.write_json(
+                source_root, 'accounts.json', self.valid_accounts_document()
+            )
 
-            def bind(index):
+            def bind(_index):
                 return self.invoke(
                     'bind-transport',
                     '--scratch', scratch,
-                    '--source-root', roots[index],
-                    '--canary', canaries[index],
+                    '--source-root', source_root,
+                    '--canary', canary,
                     '--account-name', 'Agentic',
                 )
 
@@ -4391,7 +4718,10 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertTrue(successes[0]['ok'])
             self.assertFalse(failures[0]['ok'])
             self.assertIn('already attempted', failures[0]['error']['message'])
-            self.assertFalse(any(os.path.exists(path) for path in canaries))
+            self.assertFalse(os.path.exists(canary))
+            self.assertTrue(os.path.exists(os.path.join(
+                scratch, '.rhmra-broker-response-transport.json'
+            )))
 
     def test_exported_validator_reads_only_direct_children_of_bound_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7588,8 +7918,8 @@ class MarketClockTests(unittest.TestCase):
             1,
         )
         target_declaration = (
-            'const targetPath = "<fresh absolute SOURCE_ROOT direct-child '
-            'path using / separators>";'
+            'const targetPath = "<exact receipt-issued SOURCE_ROOT using / '
+            'separators>/<fresh direct-child basename>.json";'
         )
         self.assertIn(target_declaration, transport_binding)
         self.assertLess(
@@ -7634,7 +7964,25 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn('make no additional broker call', transport_binding)
         self.assertIn('do not try another directory or writer', transport_binding)
-        self.assertIn('do not create a second probe', transport_binding)
+        self.assertIn(
+            'do not create a nested/session fallback, second source root, '
+            'or second probe',
+            transport_binding,
+        )
+        self.assertIn(
+            'exact `SOURCE_ROOT` and `SOURCE_ROOT_ID` issued by startup '
+            'preflight',
+            transport_binding,
+        )
+        self.assertIn(
+            'Pass `--source-root` as the exact `SOURCE_ROOT` from the startup '
+            'preflight receipt',
+            transport_binding,
+        )
+        self.assertIn(
+            'rejects every caller-created, replaced, or alternate root',
+            transport_binding,
+        )
         self.assertIn('do not start generation A or B', transport_binding)
         self.assertIn('do not retry the save', transport_binding)
 
@@ -7680,23 +8028,29 @@ class MarketClockTests(unittest.TestCase):
             "`'<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`",
             coordination,
         )
-        self.assertIn('exactly these eight fields', coordination)
+        self.assertIn('exactly these ten fields', coordination)
         for field in (
             '`schema_version`', '`action`', '`ok`', '`scratch`',
-            '`scratch_id`', '`sentinel_sha256`', '`write_read_parse`',
-            '`cleanup_verified`',
+            '`scratch_id`', '`source_root`', '`source_root_id`',
+            '`sentinel_sha256`', '`write_read_parse`', '`cleanup_verified`',
         ):
             self.assertIn(field, coordination)
-        self.assertIn('resolved non-symlink direct child', coordination)
-        self.assertIn('canonical lowercase UUIDv4 string', coordination)
+        self.assertIn('distinct resolved non-symlink direct children', coordination)
+        self.assertIn('canonical lowercase UUIDv4 strings', coordination)
         self.assertIn(
-            'Bind `<scratch>` and `SCRATCH_ID` only from this validated receipt',
+            'Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and '
+            '`SOURCE_ROOT_ID` only from this validated receipt',
             coordination,
         )
         self.assertIn('opaque invocation state', coordination)
         self.assertIn(
             'never type, copy, shorten, reconstruct, normalize, or '
-            're-transcribe the path',
+            're-transcribe either path or identifier',
+            coordination,
+        )
+        self.assertIn(
+            'do not author, randomize, predict, or pass either a scratch path '
+            'or response-source path',
             coordination,
         )
         self.assertIn(
@@ -7704,6 +8058,9 @@ class MarketClockTests(unittest.TestCase):
             coordination,
         )
         self.assertIn('Never retry with `--scratch`', coordination)
+        self.assertIn(
+            'create another scratch or source directory', coordination
+        )
         self.assertIn('exactly these four top-level fields', coordination)
         self.assertIn(
             'exactly the two nonempty string fields `code` and `message`',
@@ -7882,6 +8239,30 @@ class MarketClockTests(unittest.TestCase):
                 '### PERFORMANCE TELEMETRY', 1
             )[0],
         )
+
+    def test_claude_local_temp_permissions_keep_helper_markers_denied(self):
+        source_allow = (
+            'Edit(//c/Users/<Windows-user>/AppData/Local/Temp/'
+            'rhmra-source-*/*.json)'
+        )
+        status_allow = (
+            'Edit(//c/Users/<Windows-user>/AppData/Local/Temp/'
+            'rhmra-session-*/rhmra-status-candidate.json)'
+        )
+        source_marker_deny = (
+            'Edit(//c/Users/<Windows-user>/AppData/Local/Temp/'
+            'rhmra-source-*/.rhmra-broker-response-source-root.json)'
+        )
+        for filename in ('README.md', 'QUICKSTART.md'):
+            with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
+                document = f.read()
+            with self.subTest(document=filename):
+                self.assertEqual(document.count(source_allow), 1)
+                self.assertEqual(document.count(status_allow), 1)
+                self.assertEqual(document.count(source_marker_deny), 1)
+                self.assertIn('exact protective deny', document)
+                self.assertIn('helper-owned dot marker', document)
+                self.assertIn('grant all-temp', document.lower())
 
     def test_timing_identity_and_metric_names_do_not_guess(self):
         documents = {}

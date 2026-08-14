@@ -884,6 +884,28 @@ the one attempt and fails closed. Account selection now validates the connector'
 both forbidden prefixes, deletion, permanent no-retry fencing, missing/wrong/false eligibility, and
 account-free persistent markers.
 
+**2026-08-14 13:41, Claude's real canary write was denied at the required root and it improvised a
+nested fallback.** Startup completed through scratch preflight and the empty order-intent check, then
+the invocation's one `get_accounts` call succeeded. Claude Desktop's unattended permission
+classifier denied the file tool's write to the new direct child of native `%TEMP%`. Instead of
+stopping, the runner created a different source directory one level below its pre-approved session
+scratchpad and saved the response there. `broker_snapshot.py bind-transport` correctly rejected that
+directory because it was not a direct child of the runtime temp directory. The lifecycle closed as
+`snapshot-failure` / `snapshot-write-failed`, the lease released cleanly, and the previous truthful
+status remained untouched. No position was examined, no scan or entry guard ran, and no order was
+reviewed, placed, or cancelled.
+
+**Rule produced:** source-root identity now follows the same reserved-state rule as scratch identity.
+The retained `broker_snapshot.py preflight --create-scratch` operation creates both helper-owned
+native-temp directories and returns their exact paths and IDs in one validated receipt. That receipt
+is the sole path authority: the runner never creates, chooses, randomizes, copies, retypes,
+normalizes, relocates, or replaces `SOURCE_ROOT`. The first successful `get_accounts` response
+remains the single real sensitive save canary and may not be called or saved again. A Claude Local
+scheduler must be granted narrow file-edit access to the helper-owned `rhmra-session-*` and
+`rhmra-source-*` temp namespaces before its supervised test; that host capability is unconditional
+and never selected by `TIMING_IDENTITY`. A denied canary write remains terminal, with no nested path,
+alternate writer, second root, or generation B.
+
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 
 **2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The

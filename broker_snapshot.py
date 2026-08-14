@@ -10,15 +10,19 @@ Typical use::
 
     python broker_snapshot.py preflight --create-scratch
 
-Or, for compatibility with an existing caller-owned directory::
-
-    python broker_snapshot.py preflight --scratch C:\\path\\to\\session-scratch
-
     python broker_snapshot.py bind-transport \
-        --scratch C:\\path\\to\\session-scratch \
-        --source-root C:\\path\\to\\temp\\rhmra-source-UUID \
+        --scratch C:\\path\\from\\preflight\\rhmra-session-UUID \
+        --source-root C:\\path\\from\\preflight\\rhmra-source-UUID \
         --canary C:\\path\\to\\temp\\rhmra-source-UUID\\get-accounts.json \
         --account-name Agentic
+
+The bind command must receive the exact scratch and source_root values from
+the same successful create receipt.  For compatibility, an existing
+caller-owned directory can still receive a scratch-only I/O preflight, but
+that legacy mode does not prepare a response-source root and cannot establish
+a transport binding::
+
+    python broker_snapshot.py preflight --scratch C:\\path\\to\\session-scratch
 
     python broker_snapshot.py stage --kind portfolio \
         --generation A \
@@ -76,6 +80,12 @@ TRANSPORT_MARKER = '.rhmra-broker-response-transport.json'
 TRANSPORT_MARKER_NAME = 'rhmra-broker-response-transport'
 TRANSPORT_ATTEMPT_MARKER = '.rhmra-broker-response-transport-attempt.json'
 TRANSPORT_ATTEMPT_MARKER_NAME = 'rhmra-broker-response-transport-attempt'
+TRANSPORT_PREPARATION_MARKER = (
+    '.rhmra-broker-response-source-root-prepared.json'
+)
+TRANSPORT_PREPARATION_MARKER_NAME = (
+    'rhmra-broker-response-source-root-prepared'
+)
 TRANSPORT_ROOT_MARKER = '.rhmra-broker-response-source-root.json'
 TRANSPORT_ROOT_MARKER_NAME = 'rhmra-broker-response-source-root'
 TRANSPORT_KIND = 'file-change'
@@ -116,6 +126,21 @@ class CliError(SnapshotError):
 
 class ScratchCreateError(SnapshotError):
     """Raised when helper-owned native-temp scratch creation cannot start."""
+
+
+class TransportAlreadyAttemptedError(SnapshotError):
+    """Raised when another caller already owns the one-shot transport bind."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        marker_stable: bool = False,
+        canary_instance: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.marker_stable = marker_stable
+        self.canary_instance = canary_instance
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -743,7 +768,8 @@ def _transport_marker_document(
 
 
 def _transport_attempt_marker_document(
-    *, scratch_id: str, source_root: str
+    *, scratch_id: str, source_root: str,
+    canary_instance: str | None,
 ) -> dict[str, Any]:
     return {
         'schema_version': Decimal(SCHEMA_VERSION),
@@ -751,6 +777,23 @@ def _transport_attempt_marker_document(
         'scratch_id': scratch_id,
         'transport': TRANSPORT_KIND,
         'source_root': source_root,
+        'canary_instance': canary_instance,
+    }
+
+
+def _transport_preparation_marker_document(
+    *, scratch_id: str, source_root: str, source_root_id: str,
+    source_root_identity: tuple[int, int],
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': TRANSPORT_PREPARATION_MARKER_NAME,
+        'scratch_id': scratch_id,
+        'transport': TRANSPORT_KIND,
+        'source_root': source_root,
+        'source_root_id': source_root_id,
+        'source_root_device': str(source_root_identity[0]),
+        'source_root_inode': str(source_root_identity[1]),
     }
 
 
@@ -815,12 +858,18 @@ def _validated_transport_attempt_marker(
     document = _mapping(document, str(marker_path))
     if set(document) != {
         'schema_version', 'marker', 'scratch_id', 'transport', 'source_root',
+        'canary_instance',
     } or raw != _canonical_bytes(document):
         raise SnapshotError(
             f'{marker_path}: invalid broker-response transport-attempt marker'
         )
 
     source_root = document.get('source_root')
+    canary_instance = document.get('canary_instance')
+    valid_canary_binding = canary_instance is None or (
+        isinstance(canary_instance, str)
+        and re.fullmatch(r'[0-9a-f]{64}', canary_instance) is not None
+    )
     if (
         document.get('schema_version') != Decimal(SCHEMA_VERSION)
         or document.get('marker') != TRANSPORT_ATTEMPT_MARKER_NAME
@@ -828,6 +877,7 @@ def _validated_transport_attempt_marker(
         or document.get('transport') != TRANSPORT_KIND
         or not isinstance(source_root, str)
         or not os.path.isabs(source_root)
+        or not valid_canary_binding
     ):
         raise SnapshotError(
             f'{marker_path}: invalid broker-response transport-attempt marker'
@@ -835,9 +885,92 @@ def _validated_transport_attempt_marker(
     return document
 
 
+def _validated_transport_preparation_marker(
+    scratch: Path, scratch_marker: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    marker_path = scratch / TRANSPORT_PREPARATION_MARKER
+    document, raw = _read_source(str(marker_path))
+    document = _mapping(document, str(marker_path))
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'transport',
+        'source_root', 'source_root_id', 'source_root_device',
+        'source_root_inode',
+    } or raw != _canonical_bytes(document):
+        raise SnapshotError(
+            f'{marker_path}: invalid prepared broker-response source root'
+        )
+
+    source_root = document.get('source_root')
+    source_root_id = document.get('source_root_id')
+    source_root_device = document.get('source_root_device')
+    source_root_inode = document.get('source_root_inode')
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != TRANSPORT_PREPARATION_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or document.get('transport') != TRANSPORT_KIND
+        or not isinstance(source_root, str)
+        or not os.path.isabs(source_root)
+        or not isinstance(source_root_id, str)
+        or _UUID_RE.fullmatch(source_root_id) is None
+        or not isinstance(source_root_device, str)
+        or re.fullmatch(r'(?:0|[1-9][0-9]*)', source_root_device) is None
+        or not isinstance(source_root_inode, str)
+        or re.fullmatch(r'(?:0|[1-9][0-9]*)', source_root_inode) is None
+    ):
+        raise SnapshotError(
+            f'{marker_path}: invalid prepared broker-response source root'
+        )
+
+    source_root_path = Path(source_root)
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    project = Path(__file__).resolve().parent
+    if (
+        str(source_root_path) != source_root
+        or source_root_path.parent != temp_root
+        or not source_root_path.name.startswith('rhmra-source-')
+        or source_root_path == project
+        or project in source_root_path.parents
+        or source_root_path in project.parents
+    ):
+        raise SnapshotError(
+            f'{marker_path}: invalid prepared broker-response source root'
+        )
+    return document
+
+
+def _validated_prepared_source_root(
+    preparation: Mapping[str, Any],
+) -> Path:
+    source_root = Path(preparation['source_root'])
+    try:
+        current = os.lstat(source_root)
+    except OSError as exc:
+        raise SnapshotError(
+            f'{source_root}: cannot inspect prepared response-source root: {exc}'
+        ) from exc
+    is_junction = getattr(source_root, 'is_junction', lambda: False)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or is_junction()
+        or source_root.resolve(strict=True) != source_root
+        or str(current.st_dev) != preparation['source_root_device']
+        or str(current.st_ino) != preparation['source_root_inode']
+    ):
+        raise SnapshotError(
+            f'{source_root}: prepared response-source root instance changed'
+        )
+    return source_root
+
+
 def _validated_transport_marker(
     scratch: Path, scratch_marker: Mapping[str, Any]
 ) -> Mapping[str, Any]:
+    preparation = _validated_transport_preparation_marker(
+        scratch, scratch_marker
+    )
+    prepared_source_root = _validated_prepared_source_root(preparation)
     attempt = _validated_transport_attempt_marker(scratch, scratch_marker)
     marker_path = scratch / TRANSPORT_MARKER
     document, raw = _read_source(str(marker_path))
@@ -861,8 +994,11 @@ def _validated_transport_marker(
         or not isinstance(source_root, str)
         or not os.path.isabs(source_root)
         or source_root != attempt['source_root']
+        or attempt['canary_instance'] is None
+        or source_root != preparation['source_root']
         or not isinstance(source_root_id, str)
         or _UUID_RE.fullmatch(source_root_id) is None
+        or source_root_id != preparation['source_root_id']
         or not isinstance(canary_sha256, str)
         or re.fullmatch(r'[0-9a-f]{64}', canary_sha256) is None
     ):
@@ -873,7 +1009,8 @@ def _validated_transport_marker(
     source_root_path = Path(source_root)
     temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
     if (
-        source_root_path.is_symlink()
+        source_root_path != prepared_source_root
+        or source_root_path.is_symlink()
         or source_root_path.resolve(strict=True) != source_root_path
         or source_root_path.parent != temp_root
         or not source_root_path.is_dir()
@@ -1334,12 +1471,62 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _preflight_directory(scratch: Path) -> dict[str, Any]:
+def _preflight_directory(
+    scratch: Path,
+    *,
+    prepared_source_root: Path | None = None,
+    prepared_source_root_identity: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     if not scratch.is_dir():
         raise SnapshotError(f"{scratch}: scratch path is not a directory")
     project = Path(__file__).resolve().parent
     if scratch == project or project in scratch.parents:
         raise SnapshotError("scratch directory must be outside the project folder")
+    if (prepared_source_root is None) != (
+        prepared_source_root_identity is None
+    ):
+        raise SnapshotError(
+            'prepared response-source root identity is incomplete'
+        )
+    if prepared_source_root is not None:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        if (
+            scratch.parent != temp_root
+            or not scratch.name.startswith('rhmra-session-')
+            or prepared_source_root.parent != temp_root
+            or not prepared_source_root.name.startswith('rhmra-source-')
+            or prepared_source_root == scratch
+        ):
+            raise SnapshotError(
+                'helper-created scratch and response-source root must be '
+                'distinct direct children of native temp'
+            )
+        try:
+            source_root_stat = os.lstat(prepared_source_root)
+        except OSError as exc:
+            raise SnapshotError(
+                f'{prepared_source_root}: cannot inspect prepared '
+                f'response-source root: {exc}'
+            ) from exc
+        is_junction = getattr(
+            prepared_source_root, 'is_junction', lambda: False
+        )
+        if (
+            stat.S_ISLNK(source_root_stat.st_mode)
+            or not stat.S_ISDIR(source_root_stat.st_mode)
+            or is_junction()
+            or prepared_source_root.resolve(strict=True)
+            != prepared_source_root
+            or (
+                source_root_stat.st_dev,
+                source_root_stat.st_ino,
+            ) != prepared_source_root_identity
+            or any(prepared_source_root.iterdir())
+        ):
+            raise SnapshotError(
+                f'{prepared_source_root}: prepared response-source root is '
+                'not the unchanged empty helper-created directory'
+            )
 
     sentinel = {
         "schema_version": Decimal(SCHEMA_VERSION),
@@ -1377,10 +1564,28 @@ def _preflight_directory(scratch: Path) -> dict[str, Any]:
         raise SnapshotError(f'{marker_path}: scratch marker already exists')
     scratch_id = str(uuid.uuid4())
     marker = _scratch_marker_document(scratch_id)
-    prepared = _prepare_atomic_files([marker_path], [marker])
+    marker_paths = [marker_path]
+    marker_documents: list[Mapping[str, Any]] = [marker]
+    source_root_id: str | None = None
+    if prepared_source_root is not None:
+        preparation_path = str(scratch / TRANSPORT_PREPARATION_MARKER)
+        if os.path.exists(preparation_path):
+            raise SnapshotError(
+                f'{preparation_path}: prepared source-root marker already exists'
+            )
+        source_root_id = str(uuid.uuid4())
+        preparation = _transport_preparation_marker_document(
+            scratch_id=scratch_id,
+            source_root=str(prepared_source_root),
+            source_root_id=source_root_id,
+            source_root_identity=prepared_source_root_identity,
+        )
+        marker_paths.append(preparation_path)
+        marker_documents.append(preparation)
+    prepared = _prepare_atomic_files(marker_paths, marker_documents)
     _commit_atomic_files(prepared)
 
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "action": "preflight",
         "ok": True,
@@ -1390,6 +1595,11 @@ def _preflight_directory(scratch: Path) -> dict[str, Any]:
         "write_read_parse": True,
         "cleanup_verified": True,
     }
+    if prepared_source_root is not None:
+        assert source_root_id is not None
+        result['source_root'] = str(prepared_source_root)
+        result['source_root_id'] = source_root_id
+    return result
 
 
 def _cleanup_created_scratch(
@@ -1425,6 +1635,45 @@ def _cleanup_created_scratch(
     return failures
 
 
+def _cleanup_created_source_root(
+    source_root: Path,
+    temp_root: Path,
+    created_identity: tuple[int, int],
+) -> list[str]:
+    """Remove only the unchanged empty source root created by this invocation."""
+
+    if (
+        source_root.parent != temp_root
+        or not source_root.name.startswith('rhmra-source-')
+    ):
+        return [
+            'refusing response-source cleanup outside the helper-owned '
+            'native-temp namespace'
+        ]
+    try:
+        current = os.lstat(source_root)
+    except OSError as exc:
+        return [f'cannot inspect helper-created response-source root: {exc}']
+    is_junction = getattr(source_root, 'is_junction', lambda: False)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or is_junction()
+    ):
+        return [
+            'refusing cleanup of a replaced or redirected response-source root'
+        ]
+    if (current.st_dev, current.st_ino) != created_identity:
+        return [
+            'refusing cleanup because response-source root identity changed'
+        ]
+    try:
+        os.rmdir(source_root)
+    except OSError as exc:
+        return [f'cannot remove helper-created response-source root: {exc}']
+    return []
+
+
 def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     if not args.create_scratch:
         if not os.path.isabs(args.scratch):
@@ -1434,7 +1683,9 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
-        created_text = tempfile.mkdtemp(prefix="rhmra-session-", dir=str(temp_root))
+        created_text = tempfile.mkdtemp(
+            prefix='rhmra-session-', dir=str(temp_root)
+        )
     except OSError as exc:
         raise ScratchCreateError(
             f"cannot create native-temp scratch directory: {exc}"
@@ -1442,6 +1693,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
 
     scratch = Path(created_text)
     created_identity: tuple[int, int] | None = None
+    source_root: Path | None = None
+    source_root_identity: tuple[int, int] | None = None
     try:
         created_stat = os.lstat(scratch)
         is_junction = getattr(scratch, "is_junction", lambda: False)
@@ -1457,17 +1710,75 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
             raise SnapshotError(
                 "helper-created scratch directory is not a direct child of native temp"
             )
-        return _preflight_directory(scratch)
-    except Exception as exc:
-        cleanup_failures = (
-            _cleanup_created_scratch(scratch, temp_root, created_identity)
-            if created_identity is not None
-            else ["scratch identity was not established; no cleanup attempted"]
+        try:
+            source_root_text = tempfile.mkdtemp(
+                prefix='rhmra-source-', dir=str(temp_root)
+            )
+        except OSError as exc:
+            raise ScratchCreateError(
+                f'cannot create native-temp response-source directory: {exc}'
+            ) from exc
+        source_root = Path(source_root_text)
+        source_root_stat = os.lstat(source_root)
+        source_root_is_junction = getattr(
+            source_root, 'is_junction', lambda: False
         )
+        if (
+            stat.S_ISLNK(source_root_stat.st_mode)
+            or not stat.S_ISDIR(source_root_stat.st_mode)
+            or source_root_is_junction()
+        ):
+            raise SnapshotError(
+                'helper-created response-source path is not a real directory'
+            )
+        source_root_identity = (
+            source_root_stat.st_dev,
+            source_root_stat.st_ino,
+        )
+        source_root = source_root.resolve(strict=True)
+        if source_root.parent != temp_root:
+            raise SnapshotError(
+                'helper-created response-source directory is not a direct '
+                'child of native temp'
+            )
+        return _preflight_directory(
+            scratch,
+            prepared_source_root=source_root,
+            prepared_source_root_identity=source_root_identity,
+        )
+    except Exception as exc:
+        cleanup_failures: list[str] = []
+        if source_root is not None:
+            if source_root_identity is not None:
+                cleanup_failures.extend(
+                    _cleanup_created_source_root(
+                        source_root, temp_root, source_root_identity
+                    )
+                )
+            else:
+                cleanup_failures.append(
+                    'response-source identity was not established; '
+                    'no cleanup attempted'
+                )
+        if created_identity is not None:
+            cleanup_failures.extend(
+                _cleanup_created_scratch(
+                    scratch, temp_root, created_identity
+                )
+            )
+        else:
+            cleanup_failures.append(
+                'scratch identity was not established; no cleanup attempted'
+            )
         message = str(exc)
         if cleanup_failures:
             message += "; cleanup failed: " + "; ".join(cleanup_failures)
-        raise SnapshotError(message) from exc
+        error_type = (
+            ScratchCreateError
+            if isinstance(exc, ScratchCreateError)
+            else SnapshotError
+        )
+        raise error_type(message) from exc
 
 
 def _validated_transport_paths(
@@ -1522,9 +1833,25 @@ def _validated_transport_paths(
     return source_root, canary
 
 
+def _transport_canary_instance(
+    canary: Path, canary_stat: os.stat_result
+) -> str:
+    identity = {
+        'path': str(canary),
+        'device': str(canary_stat.st_dev),
+        'inode': str(canary_stat.st_ino),
+        'ctime_ns': str(canary_stat.st_ctime_ns),
+        'mtime_ns': str(canary_stat.st_mtime_ns),
+        'size': str(canary_stat.st_size),
+        'mode': str(canary_stat.st_mode),
+        'links': str(canary_stat.st_nlink),
+    }
+    return _sha256(_canonical_bytes(identity))
+
+
 def _safe_transport_canary_cleanup_candidate(
     source_root_arg: str, canary_arg: str
-) -> Path | None:
+) -> tuple[Path, str] | None:
     if not os.path.isabs(source_root_arg) or not os.path.isabs(canary_arg):
         return None
     source_root_input = Path(source_root_arg)
@@ -1535,6 +1862,11 @@ def _safe_transport_canary_cleanup_candidate(
         if stat.S_ISLNK(source_root_stat.st_mode):
             return None
         if not stat.S_ISDIR(source_root_stat.st_mode):
+            return None
+        source_root_is_junction = getattr(
+            source_root_input, 'is_junction', lambda: False
+        )
+        if source_root_is_junction():
             return None
         if stat.S_ISLNK(canary_stat.st_mode):
             return None
@@ -1555,12 +1887,43 @@ def _safe_transport_canary_cleanup_candidate(
     project = Path(__file__).resolve().parent
     if source_root == project or project in source_root.parents:
         return None
-    return canary_input
+    try:
+        current_canary_stat = os.lstat(canary)
+    except OSError:
+        return None
+    if (
+        stat.S_ISLNK(current_canary_stat.st_mode)
+        or not stat.S_ISREG(current_canary_stat.st_mode)
+        or _transport_canary_instance(canary, current_canary_stat)
+        != _transport_canary_instance(canary, canary_stat)
+    ):
+        return None
+    return canary, _transport_canary_instance(canary, current_canary_stat)
 
 
-def _remove_transport_canary(canary: Path | None) -> None:
-    if canary is None or not os.path.lexists(canary):
+def _remove_transport_canary(
+    candidate: tuple[Path, str] | None,
+) -> None:
+    if candidate is None:
         return
+    canary, expected_instance = candidate
+    try:
+        canary_stat = os.lstat(canary)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SnapshotError(
+            f'{canary}: transport canary privacy cleanup inspection failed: {exc}'
+        ) from exc
+    if (
+        stat.S_ISLNK(canary_stat.st_mode)
+        or not stat.S_ISREG(canary_stat.st_mode)
+        or canary.resolve(strict=True) != canary
+        or _transport_canary_instance(canary, canary_stat) != expected_instance
+    ):
+        raise SnapshotError(
+            f'{canary}: transport canary instance changed before privacy cleanup'
+        )
     try:
         os.unlink(canary)
     except OSError as exc:
@@ -1570,15 +1933,32 @@ def _remove_transport_canary(canary: Path | None) -> None:
 
 
 def _record_transport_attempt(
-    scratch: Path, scratch_id: str, source_root: Path
+    scratch: Path, scratch_id: str, source_root: Path,
+    canary_candidate: tuple[Path, str] | None,
 ) -> None:
     marker_path = scratch / TRANSPORT_ATTEMPT_MARKER
+    already_attempted_message = (
+        f'{marker_path}: broker-response transport binding was already attempted'
+    )
     if os.path.lexists(marker_path):
-        raise SnapshotError(
-            f'{marker_path}: broker-response transport binding was already attempted'
+        try:
+            existing = _validated_transport_attempt_marker(
+                scratch, {'scratch_id': scratch_id}
+            )
+        except SnapshotError:
+            raise TransportAlreadyAttemptedError(already_attempted_message)
+        raise TransportAlreadyAttemptedError(
+            already_attempted_message,
+            marker_stable=True,
+            canary_instance=existing['canary_instance'],
         )
+    canary_instance = (
+        canary_candidate[1] if canary_candidate is not None else None
+    )
     marker = _transport_attempt_marker_document(
-        scratch_id=scratch_id, source_root=str(source_root)
+        scratch_id=scratch_id,
+        source_root=str(source_root),
+        canary_instance=canary_instance,
     )
     raw = _canonical_bytes(marker)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1588,8 +1968,8 @@ def _record_transport_attempt(
     try:
         descriptor = os.open(marker_path, flags, 0o600)
     except FileExistsError as exc:
-        raise SnapshotError(
-            f'{marker_path}: broker-response transport binding was already attempted'
+        raise TransportAlreadyAttemptedError(
+            already_attempted_message
         ) from exc
     except OSError as exc:
         raise SnapshotError(
@@ -1637,20 +2017,50 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
     except Exception:
         _remove_transport_canary(cleanup_candidate)
         raise
-    attempt_source_root = Path(os.path.abspath(args.source_root))
+    try:
+        preparation = _validated_transport_preparation_marker(
+            scratch, scratch_marker
+        )
+    except Exception:
+        _remove_transport_canary(cleanup_candidate)
+        raise
+    attempt_source_root = Path(preparation['source_root'])
+    attempt_canary_candidate = (
+        cleanup_candidate
+        if (
+            cleanup_candidate is not None
+            and args.source_root == preparation['source_root']
+            and cleanup_candidate[0].parent == attempt_source_root
+        )
+        else None
+    )
     source_root: Path | None = None
     validation_error: Exception | None = None
     raw = b''
     resolved_account: Mapping[str, Any] | None = None
     account_name: str | None = None
     try:
-        account_name = _text(args.account_name, '--account-name')
         _record_transport_attempt(
-            scratch, scratch_marker['scratch_id'], attempt_source_root
+            scratch,
+            scratch_marker['scratch_id'],
+            attempt_source_root,
+            attempt_canary_candidate,
         )
+        account_name = _text(args.account_name, '--account-name')
+        if args.source_root != preparation['source_root']:
+            raise SnapshotError(
+                '--source-root must exactly equal the helper-prepared '
+                'source_root from this invocation preflight'
+            )
+        prepared_source_root = _validated_prepared_source_root(preparation)
         source_root, canary = _validated_transport_paths(
             args.source_root, args.canary, scratch
         )
+        if source_root != prepared_source_root:
+            raise SnapshotError(
+                'response-source root does not match the helper-prepared '
+                'directory instance'
+            )
         if source_root == scratch:
             raise SnapshotError(
                 'response-source root must be a sibling of the marked scratch '
@@ -1703,6 +2113,20 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
                 f'{canary}.data.accounts matching {account_name!r}: '
                 'account is not accessible to this agent'
             )
+    except TransportAlreadyAttemptedError as exc:
+        same_live_canary = (
+            cleanup_candidate is not None
+            and exc.marker_stable
+            and exc.canary_instance == cleanup_candidate[1]
+        )
+        if not exc.marker_stable or same_live_canary:
+            # An O_EXCL loser cannot inspect a marker that may still be in the
+            # winner's write/fsync window.  A stable marker can identify the
+            # exact live canary instance owned by an earlier caller.  Neither
+            # case may unlink that shared file.  A later, different instance
+            # is a prohibited sequential retry and is privacy-cleaned below.
+            cleanup_candidate = None
+        validation_error = exc
     except Exception as exc:
         validation_error = exc
     _remove_transport_canary(cleanup_candidate)
@@ -1714,7 +2138,7 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
     assert account_name is not None
 
     canary_sha256 = _sha256(raw)
-    source_root_id = str(uuid.uuid4())
+    source_root_id = preparation['source_root_id']
     marker = _transport_marker_document(
         scratch_id=scratch_marker['scratch_id'],
         source_root=str(source_root),
@@ -1729,6 +2153,7 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
         [root_marker, marker],
     )
     _commit_atomic_files(prepared)
+    _validated_transport_marker(scratch, scratch_marker)
     return {
         'schema_version': SCHEMA_VERSION,
         'action': 'bind-transport',
