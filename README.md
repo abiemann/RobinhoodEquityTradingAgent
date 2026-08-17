@@ -30,6 +30,11 @@ Each run, the agent:
 
 All trading is scoped to a single account, resolved **by name** at runtime.
 
+## Requirements
+
+- A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
+- An agent runner/scheduler that loads the routine and honors per-tool approval settings.
+
 ## Strategy in one line
 
 *Liquid, in-band, unusually-active movers that have pulled back off their recent high and just begun to turn back up — bought only when they can be exited cleanly, held with a stop, and trimmed for profit.*
@@ -64,23 +69,23 @@ All tunable values live in **`constants.md`** next to the routine document — m
 | `REGULAR_HOURS_BUY_ONLY` | If `true` (the default), no extended-hours entries; selling and stop protection still run in every session. If `false`, ordinary pre-/after-hours entries remain possible only when the exchange-calendar gate permits them; it never overrides a holiday, an early-close session restriction, or an unknown-calendar block. Raising `MAX_SPREAD_BUY_PCT` is also required because extended-hours spreads are far wider. |
 | `EXT_HOURS_LIMIT_BUFFER_PCT` | Limit buffer for extended-hours buys. |
 
-## Requirements
-
-- A Robinhood account with **agentic trading enabled**, connected via the Robinhood MCP server (`https://agent.robinhood.com/mcp/trading`).
-- An agent runner/scheduler that loads the routine and honors per-tool approval settings.
-
 ## Tested On
 
 The current preferred models are **Claude Sonnet 5 (effort high)** and **Codex Luna 5.6 (reasoning high)**. If neither is available, let the framework select a **medium-strength** general-purpose model.
 
 | Runner | Model / configuration | After-hours timing record | Market-hours timing record | Status |
 |---|---|---|---|---|
+| Claude Desktop Code tab, Environment Local, native Windows checkout | `claude-sonnet-5`; `effort=high` | Pending — no Sonnet 5 after-hours sample recorded | 2026-08-17 flat-account SPY-red smoke sample: 3m50 Comparable run duration; 4m18 Routine total; 0m47 Strategy execution; 3m31 Routine overhead | Post-fix broker reads, response transport, report/status publication, and finalization completed; the run used `DRY_RUN = false`, so prescribed per-task `DRY_RUN = true` acceptance and entry-eligible/protection/order paths remain untested |
 | Claude Desktop Code tab, Environment Local, native Windows checkout | `claude-sonnet-4-6`; `effort=high` | 4m40 Reference run duration (Claude transcript); 4m05 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | Pending — measure during a market-hours run | Part A native bootstrap/MCP reads/lifecycle+lease/artifacts/dashboard observed 2026-08-11; prescribed per-task `DRY_RUN` acceptance still required before entry-eligible or live use |
-| Codex | `gpt-5.6-luna`; `reasoning=high` | 6m03 Reference run duration (Codex app UI); 4m16 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | 17m41 Reference run duration (Codex runner metadata); 14m24 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | Historical path tested; supervised post-2026-08-17 transport acceptance pending before schedule resume |
+| Codex | `gpt-5.6-luna`; `reasoning=high` | 6m03 Reference run duration (Codex app UI); 4m16 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation | 17m41 Reference run duration (Codex runner metadata); 14m24 Routine total (lifecycle); Strategy execution and Routine overhead unavailable before instrumentation. 2026-08-17 flat-account SPY-red smoke sample: 5m26 Comparable run duration; 5m40 Routine total; 1m44 Strategy execution; 3m56 Routine overhead | Post-repair broker reads, response transport, report/status publication, and finalization completed; the run used `DRY_RUN = false`, so prescribed per-task `DRY_RUN = true` acceptance and entry-eligible/protection/order paths remain untested |
 
-These are historical wall-clock records from this installation, not controlled benchmarks. The 4m40 Claude and 6m03 Codex values use different reference sources, so they are useful context but not the canonical fair comparison. Their supporting Routine total durations were 4m05 and 4m16. Likewise, Codex's market-hours reference was 17m41, while its representative 2026-08-10 full market-hours Routine total with a 15-candidate scan was 14m24. Market-hours workloads can include the daily-loss snapshot, scan, and candidate/order evaluation; Claude's market-hours timing has not yet been measured. Future Claude-versus-Codex and model-version comparisons use **Comparable run duration**, whose START CLOCK and final-summary boundaries are identical on both runners. Compare only runs with the same session class, workload path, and configuration cohort, and preferably the same rules version; keep runner/model identity explicit as the comparison dimension. Exclude any record with a non-null identity warning, any unknown identity field, or any field whose provenance is `self-reported` from primary cohorts. A later independent source can replace weaker field provenance at projection time. Repeated samples are preferable to a single run.
+These are historical wall-clock records from this installation, not controlled benchmarks. The 4m40 Claude and 6m03 Codex values use different reference sources, so they are useful context but not the canonical fair comparison. Their supporting Routine total durations were 4m05 and 4m16. Likewise, Codex's market-hours reference was 17m41, while its representative 2026-08-10 full market-hours Routine total with a 15-candidate scan was 14m24. Claude 4.6's market-hours timing has not yet been measured.
 
-The Claude row above deliberately remains labeled `claude-sonnet-4-6`: it is historical evidence from the model that actually produced those measurements. New Sonnet 5 runs use a separate `claude-sonnet-5` comparison cohort; never relabel old 4.6 timings as Sonnet 5.
+The 2026-08-17 Codex and Claude Sonnet 5 samples use the same automatic timing boundaries and the same abbreviated workload class: regular session, flat account, and SPY red. Both completed the repaired real-response transport, broker reads, lifecycle, report/status publication, and finalization without an order mutation. SPY blocked the entry path before the daily-loss snapshot, stop-count guard, scan, historicals, RSI/candidate evaluation, or orders; the flat account also left position protection untested. Both ran with `DRY_RUN = false`, so neither replaces the prescribed per-task `DRY_RUN = true` acceptance. They were not identical Git-state runs: Codex exercised the repaired worktree before fix commit `0e8a118`, while Claude ran after that commit.
+
+Future Claude-versus-Codex and model-version comparisons use **Comparable run duration**, whose START CLOCK and final-summary boundaries are identical on both runners. Compare only runs with the same session class, workload path, and configuration cohort, and preferably the same rules version; keep runner/model identity explicit as the comparison dimension. Exclude any record with a non-null identity warning, any unknown identity field, or any field whose provenance is `self-reported` from primary cohorts. A later independent source can replace weaker field provenance at projection time. Repeated samples are preferable to a single run.
+
+The historical Claude row deliberately remains labeled `claude-sonnet-4-6`: it is evidence from the model that actually produced those measurements. New Sonnet 5 runs use a separate `claude-sonnet-5` comparison cohort; never relabel old 4.6 timings as Sonnet 5.
 
 Use these names consistently in future comparisons:
 
