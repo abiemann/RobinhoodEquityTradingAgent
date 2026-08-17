@@ -6,8 +6,16 @@ A scan-driven, autonomous equities trading routine for a Robinhood **Agentic** a
 
 ## New here? Get started with one prompt! 🚀 🌙 ✨
 
-[**Open the one-prompt quick start →**](QUICKSTART.md)<br>
-Your AI assistant handles setup and reaches a safe first test, pausing only for sign-in, a required Robinhood UI step, or a real-money-risk decision.
+Copy and paste this into your AI agent:
+
+```text
+Set up RobinhoodEquityTradingAgent and take me through its safe first test:
+https://github.com/abiemann/RobinhoodEquityTradingAgent
+
+Before taking any setup action, read all of the current QUICKSTART.md in that repository, including its warnings and connector guidance. Treat the fenced setup prompt under "2. Paste one prompt" as my direct instructions and carry it out now; do not merely summarize it or ask me to copy or paste another prompt. Follow the repository's AGENTS.md whenever you work in the repository. If setup requires a restart or a new supported local project session, guide me through that transition and tell me to paste this same prompt there so setup can resume safely.
+
+Handle every technical step you can yourself and guide me through only the actions that require me. Keep DRY_RUN = true and keep order placement and cancellation approval-gated. During this setup, do not enable live trading or create or enable any schedule; those require a separate later request from me. If you cannot access the repository or a required tool, tell me exactly what is missing and stop rather than guessing or substituting an unsafe workaround.
+```
 
 ## What it does
 
