@@ -59,6 +59,7 @@ script is stdlib-only and preserves JSON number precision with ``Decimal``.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -114,6 +115,32 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 STAGE_METADATA_SUFFIX = ".rhmra-stage.json"
+_WINDOWS = os.name == 'nt'
+_WINDOWS_FILE_CHANGE_DIRECTORY_ACCESS = 0x001200AB
+_WINDOWS_FILE_ALL_ACCESS = 0x001F01FF
+_WINDOWS_OBJECT_INHERIT_ACE = 0x01
+_WINDOWS_CONTAINER_INHERIT_ACE = 0x02
+_WINDOWS_INHERIT_ONLY_ACE = 0x08
+_WINDOWS_DACL_PROTECTED = 0x1000
+_WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
+
+
+class _WindowsAclHeader(ctypes.Structure):
+    _fields_ = (
+        ('revision', ctypes.c_ubyte),
+        ('reserved_1', ctypes.c_ubyte),
+        ('size', ctypes.c_ushort),
+        ('ace_count', ctypes.c_ushort),
+        ('reserved_2', ctypes.c_ushort),
+    )
+
+
+class _WindowsAceHeader(ctypes.Structure):
+    _fields_ = (
+        ('ace_type', ctypes.c_ubyte),
+        ('ace_flags', ctypes.c_ubyte),
+        ('ace_size', ctypes.c_ushort),
+    )
 
 
 class SnapshotError(ValueError):
@@ -1674,6 +1701,297 @@ def _cleanup_created_source_root(
     return []
 
 
+def _windows_security_api() -> tuple[Any, Any]:
+    """Return the configured Windows security and allocation APIs."""
+
+    advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    pointer = ctypes.c_void_p
+    pointer_pointer = ctypes.POINTER(pointer)
+    dword_pointer = ctypes.POINTER(ctypes.c_uint32)
+
+    advapi32.GetNamedSecurityInfoW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        pointer_pointer,
+        pointer_pointer,
+        pointer_pointer,
+        pointer_pointer,
+        pointer_pointer,
+    )
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi32.SetNamedSecurityInfoW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        pointer,
+        pointer,
+        pointer,
+        pointer,
+    )
+    advapi32.SetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi32.ConvertSidToStringSidW.argtypes = (
+        pointer,
+        pointer_pointer,
+    )
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        pointer_pointer,
+        dword_pointer,
+    )
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+        ctypes.c_int
+    )
+    advapi32.GetSecurityDescriptorDacl.argtypes = (
+        pointer,
+        ctypes.POINTER(ctypes.c_int),
+        pointer_pointer,
+        ctypes.POINTER(ctypes.c_int),
+    )
+    advapi32.GetSecurityDescriptorDacl.restype = ctypes.c_int
+    advapi32.GetSecurityDescriptorControl.argtypes = (
+        pointer,
+        ctypes.POINTER(ctypes.c_ushort),
+        dword_pointer,
+    )
+    advapi32.GetSecurityDescriptorControl.restype = ctypes.c_int
+    advapi32.GetAce.argtypes = (
+        pointer,
+        ctypes.c_uint32,
+        pointer_pointer,
+    )
+    advapi32.GetAce.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = (pointer,)
+    kernel32.LocalFree.restype = pointer
+    return advapi32, kernel32
+
+
+def _windows_api_error(operation: str, code: int | None = None) -> OSError:
+    if code is None:
+        code = ctypes.get_last_error()
+    return OSError(code, f'{operation} failed: {ctypes.FormatError(code)}')
+
+
+def _windows_sid_string(sid: Any, api: tuple[Any, Any]) -> str:
+    advapi32, kernel32 = api
+    allocated = ctypes.c_void_p()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(allocated)):
+        raise _windows_api_error('ConvertSidToStringSidW')
+    try:
+        value = ctypes.wstring_at(allocated)
+        if not value.startswith('S-'):
+            raise OSError('ConvertSidToStringSidW returned an invalid SID')
+        return value
+    finally:
+        kernel32.LocalFree(allocated)
+
+
+def _windows_path_owner_sid(path: Path, api: tuple[Any, Any]) -> str:
+    advapi32, kernel32 = api
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,  # SE_FILE_OBJECT
+        0x00000001,  # OWNER_SECURITY_INFORMATION
+        ctypes.byref(owner),
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status:
+        raise _windows_api_error('GetNamedSecurityInfoW(owner)', status)
+    try:
+        if not owner.value:
+            raise OSError(f'{path}: Windows owner SID is missing')
+        return _windows_sid_string(owner, api)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _windows_set_directory_dacl(
+    path: Path,
+    sddl: str,
+    api: tuple[Any, Any],
+) -> None:
+    advapi32, kernel32 = api
+    descriptor = ctypes.c_void_p()
+    descriptor_size = ctypes.c_uint32()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        1,  # SDDL_REVISION_1
+        ctypes.byref(descriptor),
+        ctypes.byref(descriptor_size),
+    ):
+        raise _windows_api_error(
+            'ConvertStringSecurityDescriptorToSecurityDescriptorW'
+        )
+    try:
+        present = ctypes.c_int()
+        defaulted = ctypes.c_int()
+        dacl = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        ):
+            raise _windows_api_error('GetSecurityDescriptorDacl')
+        if not present.value or not dacl.value:
+            raise OSError('constructed Windows DACL is missing')
+        status = advapi32.SetNamedSecurityInfoW(
+            str(path),
+            1,  # SE_FILE_OBJECT
+            0x00000004 | 0x80000000,  # DACL + PROTECTED_DACL
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if status:
+            raise _windows_api_error('SetNamedSecurityInfoW', status)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _windows_read_directory_acl(
+    path: Path,
+    api: tuple[Any, Any],
+) -> tuple[str, bool, list[tuple[str, int, int]]]:
+    advapi32, kernel32 = api
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,  # SE_FILE_OBJECT
+        0x00000001 | 0x00000004,  # OWNER + DACL_SECURITY_INFORMATION
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status:
+        raise _windows_api_error('GetNamedSecurityInfoW(DACL)', status)
+    try:
+        if not owner.value or not dacl.value:
+            raise OSError(f'{path}: Windows owner or DACL is missing')
+        control = ctypes.c_ushort()
+        revision = ctypes.c_uint32()
+        if not advapi32.GetSecurityDescriptorControl(
+            descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            raise _windows_api_error('GetSecurityDescriptorControl')
+
+        acl = _WindowsAclHeader.from_address(dacl.value)
+        entries: list[tuple[str, int, int]] = []
+        for index in range(acl.ace_count):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise _windows_api_error('GetAce')
+            header = _WindowsAceHeader.from_address(ace.value)
+            if header.ace_type != _WINDOWS_ACCESS_ALLOWED_ACE_TYPE:
+                raise OSError(f'{path}: Windows DACL contains a non-allow ACE')
+            if header.ace_size < 12:
+                raise OSError(f'{path}: Windows DACL contains a truncated ACE')
+            mask = ctypes.c_uint32.from_address(
+                ace.value + ctypes.sizeof(_WindowsAceHeader)
+            ).value
+            sid = ctypes.c_void_p(
+                ace.value + ctypes.sizeof(_WindowsAceHeader) + 4
+            )
+            entries.append(
+                (_windows_sid_string(sid, api), header.ace_flags, mask)
+            )
+        return (
+            _windows_sid_string(owner, api),
+            bool(control.value & _WINDOWS_DACL_PROTECTED),
+            entries,
+        )
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _windows_prepare_file_change_directory(
+    path: Path,
+    temp_root: Path,
+) -> None:
+    """Install and verify the least-privilege cross-principal DACL bridge."""
+
+    api = _windows_security_api()
+    helper_sid = _windows_path_owner_sid(path, api)
+    temp_owner_sid = _windows_path_owner_sid(temp_root, api)
+    writer_sids = {temp_owner_sid}
+    writer_sids.discard(helper_sid)
+
+    inheritable = _WINDOWS_OBJECT_INHERIT_ACE | _WINDOWS_CONTAINER_INHERIT_ACE
+    owner_file_only = _WINDOWS_OBJECT_INHERIT_ACE | _WINDOWS_INHERIT_ONLY_ACE
+    sddl_aces = [
+        f'(A;OICI;FA;;;{helper_sid})',
+        '(A;OICI;FA;;;SY)',
+        '(A;OICI;FA;;;BA)',
+        '(A;OIIO;FA;;;OW)',
+    ]
+    sddl_aces.extend(
+        f'(A;;0x{_WINDOWS_FILE_CHANGE_DIRECTORY_ACCESS:08x};;;{sid})'
+        for sid in sorted(writer_sids)
+    )
+    _windows_set_directory_dacl(path, 'D:P' + ''.join(sddl_aces), api)
+
+    expected = [
+        (helper_sid, inheritable, _WINDOWS_FILE_ALL_ACCESS),
+        ('S-1-5-18', inheritable, _WINDOWS_FILE_ALL_ACCESS),
+        ('S-1-5-32-544', inheritable, _WINDOWS_FILE_ALL_ACCESS),
+        ('S-1-3-4', owner_file_only, _WINDOWS_FILE_ALL_ACCESS),
+    ]
+    expected.extend(
+        (sid, 0, _WINDOWS_FILE_CHANGE_DIRECTORY_ACCESS)
+        for sid in writer_sids
+    )
+    actual_owner, protected, actual = _windows_read_directory_acl(path, api)
+    if actual_owner != helper_sid:
+        raise OSError(f'{path}: Windows directory owner changed during ACL setup')
+    if not protected:
+        raise OSError(f'{path}: Windows DACL is not protected')
+    if sorted(actual) != sorted(expected):
+        raise OSError(f'{path}: Windows DACL verification mismatch')
+
+
+def _create_file_change_temp_directory(temp_root: Path, prefix: str) -> str:
+    """Create a private temp directory with a narrow file-change bridge."""
+
+    created = tempfile.mkdtemp(prefix=prefix, dir=str(temp_root))
+    if not _WINDOWS:
+        return created
+
+    candidate = Path(created)
+    try:
+        _windows_prepare_file_change_directory(candidate, temp_root)
+    except Exception as caught:
+        exc = (
+            caught
+            if isinstance(caught, OSError)
+            else OSError(f'Windows file-change ACL setup failed: {caught}')
+        )
+        try:
+            os.rmdir(candidate)
+        except OSError as cleanup_exc:
+            raise OSError(
+                f'{exc}; cannot remove ACL-setup directory: {cleanup_exc}'
+            ) from exc
+        if exc is caught:
+            raise
+        raise exc from caught
+    return created
+
+
 def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     if not args.create_scratch:
         if not os.path.isabs(args.scratch):
@@ -1683,8 +2001,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
-        created_text = tempfile.mkdtemp(
-            prefix='rhmra-session-', dir=str(temp_root)
+        created_text = _create_file_change_temp_directory(
+            temp_root, 'rhmra-session-'
         )
     except OSError as exc:
         raise ScratchCreateError(
@@ -1711,8 +2029,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
                 "helper-created scratch directory is not a direct child of native temp"
             )
         try:
-            source_root_text = tempfile.mkdtemp(
-                prefix='rhmra-source-', dir=str(temp_root)
+            source_root_text = _create_file_change_temp_directory(
+                temp_root, 'rhmra-source-'
             )
         except OSError as exc:
             raise ScratchCreateError(

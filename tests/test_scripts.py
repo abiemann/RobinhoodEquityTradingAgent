@@ -3575,6 +3575,309 @@ class BrokerSnapshotTests(unittest.TestCase):
     def source_root_id(self, scratch):
         return self._transport_root_ids[os.path.abspath(scratch)]
 
+    def test_windows_file_change_temp_directory_prepares_narrow_acl(self):
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        expected = str(temp_root / 'rhmra-session-private')
+
+        with mock.patch.object(
+            broker_snapshot_module, '_WINDOWS', True
+        ), mock.patch.object(
+            broker_snapshot_module.tempfile,
+            'mkdtemp',
+            return_value=expected,
+        ) as mkdtemp, mock.patch.object(
+            broker_snapshot_module, '_windows_prepare_file_change_directory'
+        ) as prepare:
+            created = broker_snapshot_module._create_file_change_temp_directory(
+                temp_root, 'rhmra-session-'
+            )
+
+        self.assertEqual(created, expected)
+        mkdtemp.assert_called_once_with(
+            prefix='rhmra-session-', dir=str(temp_root)
+        )
+        prepare.assert_called_once_with(Path(expected), temp_root)
+
+    def test_windows_file_change_acl_is_exact_and_non_inheriting_for_writers(self):
+        path = Path(r'C:\Temp\rhmra-session-private')
+        temp_root = path.parent
+        helper_sid = 'S-1-5-21-300'
+        temp_owner_sid = 'S-1-5-21-100'
+        inheritable = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_CONTAINER_INHERIT_ACE
+        )
+        owner_file_only = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_INHERIT_ONLY_ACE
+        )
+        entries = [
+            (
+                helper_sid,
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-18',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-32-544',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-3-4',
+                owner_file_only,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                temp_owner_sid,
+                0,
+                broker_snapshot_module._WINDOWS_FILE_CHANGE_DIRECTORY_ACCESS,
+            ),
+        ]
+        api = (mock.Mock(), mock.Mock())
+        with mock.patch.object(
+            broker_snapshot_module,
+            '_windows_security_api',
+            return_value=api,
+        ), mock.patch.object(
+            broker_snapshot_module,
+            '_windows_path_owner_sid',
+            side_effect=[helper_sid, temp_owner_sid],
+        ), mock.patch.object(
+            broker_snapshot_module, '_windows_set_directory_dacl'
+        ) as set_dacl, mock.patch.object(
+            broker_snapshot_module,
+            '_windows_read_directory_acl',
+            return_value=(helper_sid, True, entries),
+        ):
+            broker_snapshot_module._windows_prepare_file_change_directory(
+                path, temp_root
+            )
+
+        set_dacl.assert_called_once_with(
+            path,
+            'D:P'
+            f'(A;OICI;FA;;;{helper_sid})'
+            '(A;OICI;FA;;;SY)'
+            '(A;OICI;FA;;;BA)'
+            '(A;OIIO;FA;;;OW)'
+            f'(A;;0x001200ab;;;{temp_owner_sid})',
+            api,
+        )
+
+    def test_windows_file_change_acl_rejects_readback_mismatches(self):
+        path = Path(r'C:\Temp\rhmra-session-private')
+        temp_root = path.parent
+        helper_sid = 'S-1-5-21-300'
+        temp_owner_sid = 'S-1-5-21-100'
+        inheritable = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_CONTAINER_INHERIT_ACE
+        )
+        owner_file_only = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_INHERIT_ONLY_ACE
+        )
+        entries = [
+            (
+                helper_sid,
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-18',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-32-544',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-3-4',
+                owner_file_only,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                temp_owner_sid,
+                0,
+                broker_snapshot_module._WINDOWS_FILE_CHANGE_DIRECTORY_ACCESS,
+            ),
+        ]
+        cases = (
+            (
+                'owner',
+                ('S-1-5-21-999', True, entries),
+                'owner changed',
+            ),
+            ('protection', (helper_sid, False, entries), 'not protected'),
+            (
+                'entries',
+                (helper_sid, True, [*entries, entries[-1]]),
+                'verification mismatch',
+            ),
+        )
+        for name, readback, message in cases:
+            with self.subTest(name=name), mock.patch.object(
+                broker_snapshot_module,
+                '_windows_security_api',
+                return_value=(mock.Mock(), mock.Mock()),
+            ), mock.patch.object(
+                broker_snapshot_module,
+                '_windows_path_owner_sid',
+                side_effect=[helper_sid, temp_owner_sid],
+            ), mock.patch.object(
+                broker_snapshot_module, '_windows_set_directory_dacl'
+            ), mock.patch.object(
+                broker_snapshot_module,
+                '_windows_read_directory_acl',
+                return_value=readback,
+            ):
+                with self.assertRaisesRegex(OSError, message):
+                    broker_snapshot_module._windows_prepare_file_change_directory(
+                        path, temp_root
+                    )
+
+    def test_windows_file_change_acl_needs_no_bridge_for_same_owner(self):
+        path = Path(r'C:\Temp\rhmra-session-private')
+        temp_root = path.parent
+        helper_sid = 'S-1-5-21-300'
+        inheritable = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_CONTAINER_INHERIT_ACE
+        )
+        owner_file_only = (
+            broker_snapshot_module._WINDOWS_OBJECT_INHERIT_ACE
+            | broker_snapshot_module._WINDOWS_INHERIT_ONLY_ACE
+        )
+        entries = [
+            (
+                helper_sid,
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-18',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-5-32-544',
+                inheritable,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+            (
+                'S-1-3-4',
+                owner_file_only,
+                broker_snapshot_module._WINDOWS_FILE_ALL_ACCESS,
+            ),
+        ]
+        api = (mock.Mock(), mock.Mock())
+        with mock.patch.object(
+            broker_snapshot_module,
+            '_windows_security_api',
+            return_value=api,
+        ), mock.patch.object(
+            broker_snapshot_module,
+            '_windows_path_owner_sid',
+            side_effect=[helper_sid, helper_sid],
+        ), mock.patch.object(
+            broker_snapshot_module, '_windows_set_directory_dacl'
+        ) as set_dacl, mock.patch.object(
+            broker_snapshot_module,
+            '_windows_read_directory_acl',
+            return_value=(helper_sid, True, entries),
+        ):
+            broker_snapshot_module._windows_prepare_file_change_directory(
+                path, temp_root
+            )
+
+        set_dacl.assert_called_once_with(
+            path,
+            'D:P'
+            f'(A;OICI;FA;;;{helper_sid})'
+            '(A;OICI;FA;;;SY)'
+            '(A;OICI;FA;;;BA)'
+            '(A;OIIO;FA;;;OW)',
+            api,
+        )
+
+    def test_windows_acl_preparation_failure_removes_created_directory(self):
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        created = Path(tempfile.mkdtemp(prefix='rhmra-acl-failure-'))
+        try:
+            with mock.patch.object(
+                broker_snapshot_module, '_WINDOWS', True
+            ), mock.patch.object(
+                broker_snapshot_module.tempfile,
+                'mkdtemp',
+                return_value=str(created),
+            ), mock.patch.object(
+                broker_snapshot_module,
+                '_windows_prepare_file_change_directory',
+                side_effect=OSError('simulated ACL failure'),
+            ):
+                with self.assertRaisesRegex(OSError, 'simulated ACL failure'):
+                    broker_snapshot_module._create_file_change_temp_directory(
+                        temp_root, 'rhmra-session-'
+                    )
+            self.assertFalse(created.exists())
+        finally:
+            shutil.rmtree(created, ignore_errors=True)
+
+    def test_non_windows_file_change_temp_directory_remains_owner_private(self):
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        expected = str(temp_root / 'rhmra-session-private')
+        with mock.patch.object(
+            broker_snapshot_module, '_WINDOWS', False
+        ), mock.patch.object(
+            broker_snapshot_module.tempfile,
+            'mkdtemp',
+            return_value=expected,
+        ) as mkdtemp, mock.patch.object(
+            broker_snapshot_module, '_windows_prepare_file_change_directory'
+        ) as prepare:
+            created = broker_snapshot_module._create_file_change_temp_directory(
+                temp_root, 'rhmra-session-'
+            )
+
+        self.assertEqual(created, expected)
+        mkdtemp.assert_called_once_with(
+            prefix='rhmra-session-', dir=str(temp_root)
+        )
+        prepare.assert_not_called()
+
+    def test_created_preflight_uses_file_change_creator_for_both_directories(self):
+        real_creator = broker_snapshot_module._create_file_change_temp_directory
+        args = mock.Mock(create_scratch=True, scratch=None)
+        with mock.patch.object(
+            broker_snapshot_module,
+            '_create_file_change_temp_directory',
+            wraps=real_creator,
+        ) as creator:
+            document = broker_snapshot_module._preflight(args)
+
+        scratch = Path(document['scratch'])
+        source_root = Path(document['source_root'])
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        try:
+            self.assertEqual(
+                creator.call_args_list,
+                [
+                    mock.call(temp_root, 'rhmra-session-'),
+                    mock.call(temp_root, 'rhmra-source-'),
+                ],
+            )
+            self.assertNotEqual(scratch, source_root)
+        finally:
+            shutil.rmtree(source_root, ignore_errors=True)
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def test_create_scratch_preflights_without_a_caller_supplied_path(self):
         proc, document = self.invoke('preflight', '--create-scratch')
         self.assertEqual(proc.returncode, 0, (document, proc.stderr))
@@ -3705,8 +4008,8 @@ class BrokerSnapshotTests(unittest.TestCase):
     def test_create_scratch_failure_has_stable_error_code(self):
         stdout = io.StringIO()
         with mock.patch.object(
-            broker_snapshot_module.tempfile,
-            'mkdtemp',
+            broker_snapshot_module,
+            '_create_file_change_temp_directory',
             side_effect=OSError('simulated create failure'),
         ), redirect_stdout(stdout):
             result = broker_snapshot_module.main(
@@ -3723,19 +4026,19 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def test_source_root_create_failure_cleans_scratch_with_stable_error_code(self):
         created = []
-        real_mkdtemp = broker_snapshot_module.tempfile.mkdtemp
+        real_creator = broker_snapshot_module._create_file_change_temp_directory
 
-        def fail_second_create(*args, **kwargs):
+        def fail_second_create(temp_root, prefix):
             if created:
                 raise OSError('simulated source-root create failure')
-            path = real_mkdtemp(*args, **kwargs)
+            path = real_creator(temp_root, prefix)
             created.append(Path(path))
             return path
 
         stdout = io.StringIO()
         with mock.patch.object(
-            broker_snapshot_module.tempfile,
-            'mkdtemp',
+            broker_snapshot_module,
+            '_create_file_change_temp_directory',
             side_effect=fail_second_create,
         ), redirect_stdout(stdout):
             result = broker_snapshot_module.main(
@@ -8028,6 +8331,15 @@ class MarketClockTests(unittest.TestCase):
             "`'<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`",
             coordination,
         )
+        self.assertIn(
+            'prepares and verifies the least-privilege OS capability needed '
+            'for the separate file-change facility to create fresh '
+            'direct-child files in both directories',
+            coordination,
+        )
+        self.assertIn(
+            'added cross-principal writer-only capability', coordination
+        )
         self.assertIn('exactly these ten fields', coordination)
         for field in (
             '`schema_version`', '`action`', '`ok`', '`scratch`',
@@ -8048,13 +8360,19 @@ class MarketClockTests(unittest.TestCase):
             're-transcribe either path or identifier',
             coordination,
         )
+        self.assertIn('`icacls`, an ACL API, or any file tool', coordination)
         self.assertIn(
-            'do not author, randomize, predict, or pass either a scratch path '
-            'or response-source path',
+            'Do not author, randomize, predict, set permissions on, or repair '
+            'either path, and do not pass either path to this command',
             coordination,
         )
         self.assertIn(
             'Do not separately call `New-Item`, `mkdir`, `mktemp`, `mkdtemp`',
+            coordination,
+        )
+        self.assertIn(
+            'the one real `get_accounts` canary below remains the sole '
+            'end-to-end sensitive-write proof',
             coordination,
         )
         self.assertIn('Never retry with `--scratch`', coordination)
@@ -8239,6 +8557,11 @@ class MarketClockTests(unittest.TestCase):
                 '### PERFORMANCE TELEMETRY', 1
             )[0],
         )
+        self.assertIn(
+            'The Windows preflight prepared this directory for that exact '
+            'cross-facility direct-child creation',
+            routine,
+        )
 
     def test_claude_local_temp_permissions_keep_helper_markers_denied(self):
         source_allow = (
@@ -8263,6 +8586,14 @@ class MarketClockTests(unittest.TestCase):
                 self.assertIn('exact protective deny', document)
                 self.assertIn('helper-owned dot marker', document)
                 self.assertIn('grant all-temp', document.lower())
+                self.assertIn('OS bridge', document)
+                self.assertIn('separate', document)
+                if filename == 'README.md':
+                    self.assertIn(
+                        'runner/model must never author ACL commands', document
+                    )
+                else:
+                    self.assertIn('never ask a model', document.lower())
 
     def test_timing_identity_and_metric_names_do_not_guess(self):
         documents = {}
@@ -9457,10 +9788,11 @@ class MarketClockTests(unittest.TestCase):
             'same bound `PYTHON_EXE`',
             '`\'<PYTHON_EXE>\' -m unittest discover -s tests`',
             'Do not use a bare launcher or invent an ad-hoc '
-            'serializer, path, or extra broker call',
+            'serializer, path, ACL repair, or extra broker call',
             'first supervised entry-eligible run with '
-            '`DRY_RUN = true` remains the end-to-end proof of '
-            'broker-response staging',
+            '`DRY_RUN = true` remains the runner-specific end-to-end '
+            'proof of the real accounts canary, broker-response staging, '
+            'and final scratch status candidate',
             'Creating a missing saved scan is a broker-side setup '
             'mutation',
             'obtain my explicit confirmation before creating it',

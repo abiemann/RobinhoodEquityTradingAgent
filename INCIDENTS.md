@@ -906,6 +906,40 @@ scheduler must be granted narrow file-edit access to the helper-owned `rhmra-ses
 and never selected by `TIMING_IDENTITY`. A denied canary write remains terminal, with no nested path,
 alternate writer, second root, or generation B.
 
+**2026-08-17 06:02–09:33, eight Codex schedules could call Robinhood but could not save the
+accounts canary.** Every invocation completed startup through the helper preflight, and the first
+`get_accounts` call itself succeeded. The immediately composed file-change operation then failed
+to create its required direct-child JSON file in the receipt-issued `rhmra-source-*` root. Both
+that root and the matching `rhmra-session-*` scratch had been created by `tempfile.mkdtemp` under
+the command sandbox's Windows identity with a protected DACL granting no create right to Codex's
+separate host file-change identity. All eight source
+roots remained empty. No account binding, later broker read, scan, guard, order review, placement,
+cancellation, or final status refresh ran; every invocation failed closed as `snapshot-failure` /
+`snapshot-write-failed` and the previous truthful status remained untouched.
+
+This was a real Windows cross-principal ACL mismatch, not Robinhood availability, malformed JSON,
+account schema, or the August 13 destination-sensitive policy denial. Friday's helper-owned-root
+change had no successful Codex acceptance run: the earlier successful Codex path let the host file
+facility create its own root, while the post-change success used Claude's different permission
+setup. The first Codex schedules on the new helper-owned contract exposed the incompatible
+assumption that command-created native-temp directories were writable by the host file-change
+facility.
+
+**Rule produced:** `broker_snapshot.py preflight --create-scratch` remains the sole creator and
+identity authority for both random direct-child directories. On Windows it now deterministically
+prepares and verifies a least-privilege per-directory capability bridge: the runner's file-change
+principals can create fresh direct-child payloads and the exact status candidate, the helper can
+consume those writer-owned children, and the added cross-principal writer-only capability does not
+inherit to helper-owned markers. Non-Windows owner-private temp creation is unchanged. The
+runner/model never selects a path, runs `icacls`, repairs an ACL, broadens all of `%TEMP%`, or
+substitutes a fallback. Capability
+preparation failure stays pre-broker `scratch_create_failed`; the first real `get_accounts` save
+remains the sole end-to-end sensitive-write canary, and a denial after that call remains terminal
+`snapshot-write-failed` with no retry, probe, alternate writer/root, second account call, or
+generation B. A supervised `DRY_RUN = true` acceptance must prove both the canary in `SOURCE_ROOT`
+and `rhmra-status-candidate.json` in scratch for each runner separately before its schedule is
+enabled.
+
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 
 **2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The
