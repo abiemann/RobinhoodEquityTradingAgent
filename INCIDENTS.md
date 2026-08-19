@@ -811,6 +811,29 @@ that both portfolio and quote staging reject either pagination flag. The determi
 remains strict; weakening its rejection would hide orchestration mistakes and compromise snapshot
 provenance.
 
+**2026-08-19 11:40, the staging vocabulary was applied to work that is never staged.** During the
+PRE-RSI evaluation pass a run invoked `broker_snapshot.py stage-quotes` once and
+`broker_snapshot.py stage-historicals` twice. All three exited 2 with `usage_error`, cost three
+calls plus a re-read of the command format, and touched no broker or durable state. The mistake
+was one category error with two symptoms: staging belongs to the FINAL STATUS REFRESH snapshot
+generations, while Step 8-9 historicals results, RSI inputs, and quote maps are file-change
+handoffs consumed directly by `evaluate_candidates.py` and are never staged at all. Because the
+routine documented no staging path for historicals, the run invented `stage-historicals`, and that
+invention then contaminated the adjacent quotes call into `stage-quotes` by symmetry. The
+hyphenated shape is itself plausible: the helper really does expose `bind-transport`, so a
+hyphenated compound action is a reasonable guess about a vocabulary that in fact takes the kind as
+a separate `--kind` value.
+
+**Rules produced:** the routine now states the closed set — `broker_snapshot.py` accepts exactly
+`preflight`, `bind-transport`, and `stage`; the only staged kinds are `portfolio`, `positions`,
+`orders`, and `quotes`; the kind is never hyphenated onto the action; and Steps 8-9 call this
+helper for nothing at all. Because prose alone had already failed for the staging wrapper, the
+helper also answers the mistake deterministically: any `stage-<suffix>` action is rejected before
+argument parsing with a message naming the exact correct command, so `stage-quotes` returns
+`use 'stage --kind quotes'` and `stage-historicals` returns the non-staged-kind explanation and
+points at `evaluate_candidates.py`. Regression tests cover every staged kind's hyphenated form and
+were verified to fail with the guard removed.
+
 **2026-08-13 11:34, harmless probe passed but the real sensitive save was denied.** Generation A
 wrote and validated a tiny synthetic probe under the Codex visualizations directory, then called
 `get_portfolio`. The same file-change facility could create a file at that location, but policy
@@ -1000,6 +1023,23 @@ uses one explicit equity/day/timezone payload and an identical retry; artifact c
 before lease release; and strategy timing remains the FIRST renewal through REPORT renewal only.
 The dashboard quarantines otherwise valid snapshots that cannot be linked to the lifecycle
 invocation, preserving the newest truthful linked account state and showing an orphan warning.
+
+**2026-08-19 11:40 recurrence, the realized-P&L payload varied again.** A run's first
+`get_realized_pnl` call in the FINAL STATUS REFRESH sent `account_number`, `start_date`, and
+`end_date` instead of the required payload, and the connector rejected it with
+`InvalidArgument: un-specified asset class`. The immediate retry supplied the asset class and
+succeeded, so the run completed with a correct `$0 (0 trades)` figure and no trading, state, or
+report consequence; the cost was one wasted call and the latency around it. This is the second
+recorded instance of the same omission after the 2026-08-12 11:43 compaction incident, and the
+prohibition it violated was already explicit — the routine named the exact payload twice and
+separately forbade "a start/end date form".
+
+**Rule produced:** the payload is no longer restated in prose at each call site. It is defined once
+as the named REALIZED P&L PAYLOAD, carries the exact backend error string so the failure is
+recognizable, states that `start_date` and `end_date` are not arguments of this call, and the two
+call sites now reference the name rather than repeating a payload that can drift. No deterministic
+guard is possible here: `get_realized_pnl` is a direct connector call with no checked-in helper in
+its path, so unlike the staging vocabulary this rule cannot be enforced by a script.
 
 **2026-08-12 15:10 follow-up, Sonnet 4.6 auto-compaction omitted retained execution state.**
 During a native Claude Code Local market-hours run, automatic context compaction reduced the

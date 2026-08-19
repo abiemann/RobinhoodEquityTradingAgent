@@ -4005,6 +4005,43 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.assertEqual(both_document['action'], 'preflight')
         self.assertEqual(both_document['error']['code'], 'usage_error')
 
+    def test_hyphenated_stage_action_names_the_correct_command(self):
+        proc, document = self.invoke('stage-quotes', '--generation', 'A')
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(document['action'], 'unknown')
+        self.assertFalse(document['ok'])
+        self.assertEqual(document['error']['code'], 'usage_error')
+        self.assertIn('stage --kind quotes', document['error']['message'])
+
+    def test_every_staged_kind_rejects_its_hyphenated_form(self):
+        for kind in broker_snapshot_module.SNAPSHOT_KINDS:
+            with self.subTest(kind=kind):
+                proc, document = self.invoke('stage-' + kind)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(document['error']['code'], 'usage_error')
+                self.assertIn(
+                    'stage --kind ' + kind, document['error']['message']
+                )
+
+    def test_stage_historicals_is_rejected_as_a_non_staged_kind(self):
+        proc, document = self.invoke(
+            'stage-historicals', '--raw-file', 'hist-batch1.json'
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(document['action'], 'unknown')
+        self.assertEqual(document['error']['code'], 'usage_error')
+        message = document['error']['message']
+        self.assertIn('not a staged kind', message)
+        self.assertIn('evaluate_candidates.py', message)
+        self.assertNotIn('stage --kind historicals', message)
+
+    def test_stage_action_still_parses_its_kind_argument(self):
+        proc, document = self.invoke('stage', '--kind', 'quotes')
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(document['action'], 'stage')
+        self.assertEqual(document['error']['code'], 'usage_error')
+        self.assertIn('--generation', document['error']['message'])
+
     def test_create_scratch_failure_has_stable_error_code(self):
         stdout = io.StringIO()
         with mock.patch.object(
@@ -9301,8 +9338,19 @@ class MarketClockTests(unittest.TestCase):
             final_refresh,
         )
         self.assertIn(
-            "retry MUST repeat the identical full payload above", final_refresh
+            "retry MUST repeat the identical REALIZED P&L PAYLOAD above",
+            final_refresh,
         )
+        self.assertIn("REALIZED P&L PAYLOAD", routine)
+        self.assertIn(
+            "`start_date` and `end_date` are NOT arguments of this call",
+            routine,
+        )
+        self.assertIn("InvalidArgument: un-specified asset class", routine)
+        self.assertIn(
+            "`broker_snapshot.py` accepts exactly three actions", routine
+        )
+        self.assertIn("never hyphenate it onto the action", routine)
         self.assertIn(
             "never omit the asset class, substitute a start/end date form, "
             "or change arguments", final_refresh

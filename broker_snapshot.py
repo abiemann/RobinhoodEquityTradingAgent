@@ -2550,6 +2550,26 @@ def _print_json(result: Mapping[str, Any]) -> None:
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
+def _reject_hyphenated_stage_action(arguments: Sequence[str]) -> None:
+    if not arguments or not arguments[0].startswith("stage-"):
+        return
+    candidate = arguments[0]
+    kind = candidate[len("stage-") :]
+    if kind in SNAPSHOT_KINDS:
+        raise CliError(
+            f"invalid action {candidate!r}: the kind is a separate argument, "
+            f"so use 'stage --kind {kind}'"
+        )
+    raise CliError(
+        f"invalid action {candidate!r}: {kind!r} is not a staged kind and "
+        f"the kind is a separate argument. Staged kinds are "
+        f"{', '.join(SNAPSHOT_KINDS)}. Historicals results, RSI inputs, and "
+        "quote maps are never staged through this helper: persist the raw "
+        "response through the bound file-change facility and pass that file "
+        "to evaluate_candidates.py"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     action = (
@@ -2560,6 +2580,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else "unknown"
     )
     try:
+        _reject_hyphenated_stage_action(arguments)
         args = _parser().parse_args(arguments)
         if args.action == "preflight":
             result = _preflight(args)
