@@ -155,6 +155,10 @@ class ScratchCreateError(SnapshotError):
     """Raised when helper-owned native-temp scratch creation cannot start."""
 
 
+class AccountScopeError(SnapshotError):
+    """Raised when a valid accounts payload cannot bind the configured scope."""
+
+
 class TransportAlreadyAttemptedError(SnapshotError):
     """Raised when another caller already owns the one-shot transport bind."""
 
@@ -2398,39 +2402,48 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
             raise SnapshotError(
                 f'{canary}.data.accounts: expected the get_accounts array'
             )
-        matches: list[Mapping[str, Any]] = []
-        for index, value in enumerate(accounts):
-            account = _mapping(value, f'{canary}.data.accounts[{index}]')
-            labels: list[str] = []
-            for field in ('nickname', 'name'):
-                label = account.get(field)
-                if label is not None:
-                    labels.append(
-                        _text(label, f'{canary}.data.accounts[{index}].{field}')
-                    )
-            if account_name in labels:
-                matches.append(account)
-        if len(matches) != 1:
-            raise SnapshotError(
-                f'{canary}.data.accounts: expected exactly one account named '
-                f'{account_name!r}; found {len(matches)}'
-            )
-        resolved_account = matches[0]
-        account_number = _text(
-            resolved_account.get('account_number'),
-            f'{canary}.data.accounts matching {account_name!r}.account_number',
-        )
-        agentic_allowed = resolved_account.get('agentic_allowed')
-        if not isinstance(agentic_allowed, bool):
-            raise SnapshotError(
+        try:
+            matches: list[Mapping[str, Any]] = []
+            for index, value in enumerate(accounts):
+                account = _mapping(value, f'{canary}.data.accounts[{index}]')
+                labels: list[str] = []
+                for field in ('nickname', 'name'):
+                    label = account.get(field)
+                    if label is not None:
+                        labels.append(
+                            _text(
+                                label,
+                                f'{canary}.data.accounts[{index}].{field}',
+                            )
+                        )
+                if account_name in labels:
+                    matches.append(account)
+            if len(matches) != 1:
+                raise AccountScopeError(
+                    f'{canary}.data.accounts: expected exactly one account named '
+                    f'{account_name!r}; found {len(matches)}'
+                )
+            resolved_account = matches[0]
+            account_number = _text(
+                resolved_account.get('account_number'),
                 f'{canary}.data.accounts matching '
-                f'{account_name!r}.agentic_allowed: expected a boolean'
+                f'{account_name!r}.account_number',
             )
-        if not agentic_allowed:
-            raise SnapshotError(
-                f'{canary}.data.accounts matching {account_name!r}: '
-                'account is not accessible to this agent'
-            )
+            agentic_allowed = resolved_account.get('agentic_allowed')
+            if not isinstance(agentic_allowed, bool):
+                raise AccountScopeError(
+                    f'{canary}.data.accounts matching '
+                    f'{account_name!r}.agentic_allowed: expected a boolean'
+                )
+            if not agentic_allowed:
+                raise AccountScopeError(
+                    f'{canary}.data.accounts matching {account_name!r}: '
+                    'account is not accessible to this agent'
+                )
+        except AccountScopeError:
+            raise
+        except SnapshotError as exc:
+            raise AccountScopeError(str(exc)) from exc
     except TransportAlreadyAttemptedError as exc:
         same_live_canary = (
             cleanup_candidate is not None
@@ -2533,6 +2546,8 @@ def _error_result(action: str, exc: Exception) -> dict[str, Any]:
         code = "usage_error"
     elif isinstance(exc, ScratchCreateError):
         code = "scratch_create_failed"
+    elif isinstance(exc, AccountScopeError):
+        code = "account_scope_failed"
     else:
         code = "invalid_snapshot"
     return {

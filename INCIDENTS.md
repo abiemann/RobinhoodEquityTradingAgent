@@ -963,6 +963,65 @@ generation B. A supervised `DRY_RUN = true` acceptance must prove both the canar
 and `rhmra-status-candidate.json` in scratch for each runner separately before its schedule is
 enabled.
 
+**2026-08-20 13:03, Codex truncated the helper-issued `SOURCE_ROOT` during the save/bind
+handoff.** Startup preflight correctly created and issued `rhmra-source-ygsx1eo8`, but the
+composed accounts save and later `bind-transport` arguments used the shortened sibling
+`rhmra-source-ygsx1eo`. The first `get_accounts` request itself succeeded and its complete response
+was written under that alternate root. `broker_snapshot.py bind-transport` correctly rejected
+`--source-root` because it did not exactly equal this invocation's helper-prepared root, consumed
+the one binding attempt, and privacy-deleted the canary. Account scope was never established. No
+position, order, scan, entry guard, review, placement, cancellation, notification, or final status
+refresh followed; the permitted failure report was persisted and read back, the lease released,
+and lifecycle finished `snapshot-failure` / `snapshot-write-failed`. This was a model transcription
+defect after a valid helper receipt, not Robinhood downtime, malformed account data,
+or a failure of the Windows capability bridge.
+
+**Rule produced:** Codex now uses separate executor-local bootstrap and transport state. Bootstrap
+first clears and stores the exact Python-resolver receipt as `launcher-bound`, extends that same
+object with the exact validated-constants receipt as `configuration-bound`, then adds the exact
+active-context receipt as `context-bound` after lease binding. Every later operation loads the
+Python executable, configured account name, invocation, and lifecycle
+artifact names from those receipts; none may be copied from visible output. Every nested Windows
+command explicitly selects `powershell.exe`, even if the outer environment exposes another shell.
+Nested `exec_command.session_id` values are drained inside the still-running isolate with
+`write_stdin`; only an outer `functions.exec` cell ID is continued with `functions.wait`, so a live
+helper is never orphaned or duplicated.
+
+Preflight loads that context, binds the native project root, clears the transport slot, validates
+and stores the exact scratch/source receipt, and emits no random path. The startup accounts cell
+then derives its canary and all bind arguments from loaded state, saves the first successful
+complete response, and invokes `bind-transport` before any model-visible output. Its
+`account-call-started` through `canary-saved` phases are non-retriable fences; successful binding
+stores account scope and enters `transport-bound`, while failure records terminal state and emits
+only a compact path-free envelope. If the final `get_accounts` attempt returns an error or throws
+inside that still-running cell, the state becomes terminal `account-scope-failed`; because no
+successful response/save existed, it is not mislabeled `snapshot-write-failed`. An interrupted
+cell remains fenced because its call outcome is unknown.
+
+Post-bind broker, scan, historicals, quote-map, RSI, placement-response, and other handoffs use one
+monotonic source sequence plus unique purpose keys. Each operation derives only
+`source-<sequence>.json`, records `source-call-started` before the tool and
+`source-response-received` before the save, then returns to `transport-bound` and records the path
+only under its key; no random path is emitted or carried through narration. A later cell that sees
+a transient phase fails closed rather than repeating a possibly successful broker call or save.
+Only a final read/scan connector failure returned or caught in that still-running cell may restore
+`transport-bound` with no handoff before the connector rule's normal consequence; its sequence
+remains consumed, while an uncaught exception or interrupted/lost cell stays fenced. Placement and
+cancellation calls never enter `source-call-started`: their durable intent/cancellation protocols
+own uncertainty, and only an explicit successful placement response may then reserve and save a
+response handoff.
+
+Status derives scratch/candidate from the stored preflight receipt, invocation and expected names
+from the stored lifecycle context, and report/output from the stored project root. Its explicit
+candidate-write and publish phases allow only loaded-path verification after a lost receipt. Exact
+verify success stores `status-published` before output; only exact `status_snapshot_missing` enters
+the one rewrite-authorized reconciliation path. Both state slots are cleared only after the final
+telemetry helper, or on a terminal path after all permitted
+report/status work, lease release, and lifecycle finish. Missing, malformed, cleared, duplicate,
+unknown-phase, or unavailable state is never reconstructed. Other runners must retain equivalent
+opaque structured state. The deterministic helper's exact-root equality, one-attempt tombstone,
+privacy deletion, and no-retry/alternate-root rules remain unchanged.
+
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 
 **2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The

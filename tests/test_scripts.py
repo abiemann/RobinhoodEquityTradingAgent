@@ -4868,6 +4868,9 @@ class BrokerSnapshotTests(unittest.TestCase):
                 )
                 self.assertNotEqual(proc.returncode, 0, error)
                 self.assertFalse(error['ok'])
+                self.assertEqual(
+                    error['error']['code'], 'account_scope_failed'
+                )
                 if label in {
                     'nonboolean-agentic-allowed',
                     'null-agentic-allowed',
@@ -8197,6 +8200,25 @@ class MarketClockTests(unittest.TestCase):
         )
         startup_positions = [startup.index(marker) for marker in startup_markers]
         self.assertEqual(startup_positions, sorted(startup_positions))
+        launcher = routine.split(
+            '### PYTHON LAUNCHER BOOTSTRAP', 1
+        )[1].split('### INVOCATION LIFECYCLE', 1)[0]
+        self.assertIn('`rhmra.bootstrap-state.v1`', launcher)
+        self.assertIn(
+            '{schema_version: 1, phase: "launcher-bound", '
+            'resolver_receipt: resolverReceipt}',
+            launcher,
+        )
+        self.assertIn(
+            'constants_receipt: constantsReceipt',
+            launcher,
+        )
+        self.assertIn('phase: "configuration-bound"', launcher)
+        self.assertIn(
+            'must not paste the returned `python` string into later '
+            'JavaScript',
+            launcher,
+        )
         self.assertIn('Do not create or preflight scratch', startup)
         self.assertIn('touch the order-intent journal', startup)
         self.assertIn('before successful lease acquisition', startup)
@@ -8223,18 +8245,29 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn('one mandatory SAVE TRANSPORT BINDING', startup)
         self.assertIn(
-            'save that COMPLETE unchanged successful response exactly once',
+            'same orchestration call must validate and machine-store the '
+            'exact parsed receipt',
             startup,
         )
         self.assertIn(
-            'pass the exact validated `AGENTIC_ACCOUNT_NAME` from item 3',
+            'Load the exact machine-carried preflight state from item 9',
             startup,
         )
         self.assertIn(
-            'bind both the transport and account scope only from the helper\'s validated receipt',
+            'mechanically derive the canary path from the loaded '
+            '`SOURCE_ROOT`',
             startup,
         )
-        self.assertIn('receipt-issued account scope', startup)
+        self.assertIn(
+            'invoke `bind-transport` in that same operation with `scratch`, '
+            '`source_root`, and `canary` taken only from loaded state',
+            startup,
+        )
+        self.assertIn(
+            'Every later Codex source/status path is likewise formed from '
+            'that loaded state',
+            startup,
+        )
         transport_binding = routine.split(
             '**SAVE TRANSPORT BINDING', 1
         )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
@@ -8257,39 +8290,201 @@ class MarketClockTests(unittest.TestCase):
             ),
             1,
         )
+        startup_recipe = transport_binding.split(
+            '**EXACT CODEX STARTUP SAVE-AND-BIND RECIPE', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
         target_declaration = (
-            'const targetPath = "<exact receipt-issued SOURCE_ROOT using / '
-            'separators>/<fresh direct-child basename>.json";'
+            'const targetPath = receipt.source_root + separator + '
+            '"get-accounts-" + receipt.source_root_id + ".json";'
         )
-        self.assertIn(target_declaration, transport_binding)
+        self.assertIn(target_declaration, startup_recipe)
+        self.assertNotIn(
+            '<exact receipt-issued SOURCE_ROOT using / separators>',
+            transport_binding,
+        )
+        self.assertNotIn(
+            'const targetPath = "<exact receipt-issued SOURCE_ROOT',
+            routine,
+        )
         self.assertLess(
-            transport_binding.index(target_declaration),
-            transport_binding.index('const fullToolResult = await'),
+            startup_recipe.index(
+                'const state = requireState("preflight-bound");'
+            ),
+            startup_recipe.index(target_declaration),
         )
-        self.assertIn('const parsed = JSON.parse(payload);', transport_binding)
-        self.assertIn('payload[0] !== "{"', transport_binding)
-        self.assertIn('payload[payload.length - 1] !== "}"', transport_binding)
+        self.assertLess(
+            startup_recipe.index(target_declaration),
+            startup_recipe.index(
+                'await tools.<resolved_get_accounts_tool>({})'
+            ),
+        )
+        self.assertLess(
+            startup_recipe.index(
+                'phase: "account-call-started", canary_path: targetPath'
+            ),
+            startup_recipe.index(
+                'await tools.<resolved_get_accounts_tool>({})'
+            ),
+        )
+        self.assertIn('const parsed = JSON.parse(payload);', startup_recipe)
+        self.assertIn('payload[0] !== "{"', startup_recipe)
+        self.assertIn('payload[payload.length - 1] !== "}"', startup_recipe)
         self.assertIn(
             '"\\n+" + payload.replaceAll("\\n", "\\n+") + '
             '"\\n*** End Patch"',
+            startup_recipe,
+        )
+        apply_position = startup_recipe.index(
+            'await tools.apply_patch(patch)'
+        )
+        bind_position = startup_recipe.index(
+            'const bindCommand = (isWindows ? "& " : "")'
+        )
+        bind_exec_position = startup_recipe.index(
+            'const bindResult = await drainCommand('
+            'await tools.exec_command(bindArgs));'
+        )
+        text_position = startup_recipe.index(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"transport-state-bound", ok: true}));'
+        )
+        self.assertLess(apply_position, bind_position)
+        self.assertLess(bind_position, bind_exec_position)
+        self.assertLess(bind_exec_position, text_position)
+        for phase in (
+            '"account-call-started"',
+            '"account-retry-started"',
+            '"account-response-received"',
+            '"canary-saved"',
+            '"transport-bound"',
+        ):
+            self.assertIn(phase, startup_recipe)
+        self.assertIn('let firstFailed = false;', startup_recipe)
+        self.assertIn('let retryFailed = false;', startup_recipe)
+        retry_phase_position = startup_recipe.index(
+            'phase: "account-retry-started"'
+        )
+        retry_call_position = startup_recipe.index(
+            'await tools.<same_resolved_get_accounts_tool>({})'
+        )
+        exhausted_position = startup_recipe.index(
+            'canary_path: null, failure_code: "account-scope-failed"'
+        )
+        account_failure_text_position = startup_recipe.index(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"transport-state-failed", ok: false,'
+        )
+        account_failure_exit_position = startup_recipe.index(
+            'exit();', account_failure_text_position
+        )
+        response_position = startup_recipe.index(
+            'phase: "account-response-received"'
+        )
+        self.assertLess(retry_phase_position, retry_call_position)
+        self.assertLess(retry_call_position, exhausted_position)
+        self.assertLess(exhausted_position, account_failure_text_position)
+        self.assertLess(account_failure_text_position, account_failure_exit_position)
+        self.assertLess(account_failure_exit_position, response_position)
+        self.assertNotIn(
+            'throw new Error("get_accounts retry failed")', startup_recipe
+        )
+        self.assertIn(
+            'error: {code: "account-scope-failed"}', startup_recipe
+        )
+        self.assertNotIn('text(fullToolResult', startup_recipe)
+        self.assertNotIn('text(first', startup_recipe)
+        for loaded_argument in (
+            'quote(savedState.python_exe)',
+            'quote(receipt.scratch)',
+            'quote(receipt.source_root)',
+            'quote(targetPath)',
+            'quote(savedState.configured_account_name)',
+            'workdir: savedState.project_root',
+        ):
+            self.assertIn(loaded_argument, startup_recipe)
+        self.assertIn('bindArgs.shell = "powershell.exe"', startup_recipe)
+        self.assertIn(
+            'while (current.session_id !== undefined)',
+            startup_recipe,
+        )
+        self.assertIn('await tools.write_stdin({session_id:', startup_recipe)
+        self.assertNotIn('text(bindResult.output', startup_recipe)
+        self.assertIn(
+            'failureReceipt.error.code === "account_scope_failed"',
+            startup_recipe,
+        )
+        self.assertIn(
+            'failureCode = "account-scope-failed"',
+            startup_recipe,
+        )
+        self.assertIn(
+            'error: {code: failureCode}',
+            startup_recipe,
+        )
+        self.assertIn(
+            'expectedScratchId = state.receipt.scratch_id;',
+            startup_recipe,
+        )
+        self.assertIn(
+            'current.receipt.source_root_id !== expectedSourceRootId',
+            startup_recipe,
+        )
+        self.assertIn(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"transport-state-bound", ok: true}));',
+            startup_recipe,
+        )
+        compact_scope_output = startup_recipe.split(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"transport-state-bound", ok: true}));',
+            1,
+        )[1]
+        self.assertNotIn('account_number:', compact_scope_output)
+        self.assertNotIn('--scratch \'<absolute scratch>\'', startup_recipe)
+        self.assertNotIn('--source-root \'<absolute SOURCE_ROOT>\'', startup_recipe)
+        self.assertIn(
+            'The `account-call-started`, `account-retry-started`, '
+            '`account-response-received`, and `canary-saved` phases are '
+            'non-retriable fences',
+            transport_binding,
+        )
+        self.assertIn(
+            'If that final attempt returns an error or throws inside the '
+            'still-running cell',
+            transport_binding,
+        )
+        self.assertIn(
+            'no successful response or save existed, so this is not '
+            '`snapshot-write-failed`',
+            transport_binding,
+        )
+        self.assertIn(
+            'There must be no `text(...)`, `yield_control()`, assistant '
+            'narration, raw payload output, or saved-path receipt between '
+            'a successful broker call and validated bind result',
+            transport_binding,
+        )
+        self.assertIn(
+            'issue only `functions.wait` for that same cell until it '
+            'finishes',
             transport_binding,
         )
         self.assertIn('Put zero bytes or characters before `{`', transport_binding)
         self.assertIn('literal six-character `\\ufeff`', transport_binding)
         self.assertIn('no real U+FEFF BOM', transport_binding)
         self.assertIn('Never use `String(fullToolResult)`', transport_binding)
-        self.assertIn('never emit the raw result or `payload`', transport_binding)
-        self.assertIn('exact composed JSON save recipe', transport_binding)
+        self.assertIn('Never emit the raw result, `payload`', transport_binding)
+        self.assertIn('POST-BIND COMPOSED JSON SAVE RECIPE', transport_binding)
         self.assertNotIn('"\\n+\\ufeff" + payload', transport_binding)
-        self.assertIn("--account-name '<validated AGENTIC_ACCOUNT_NAME>'", transport_binding)
         self.assertIn('exactly these twelve fields', transport_binding)
         for field in (
             '`account_name`', '`account_number`', '`agentic_allowed`',
         ):
             self.assertIn(field, transport_binding)
         self.assertIn(
-            'Bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ALLOWED` '
-            'only from this validated receipt',
+            'bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ALLOWED` '
+            'only from the validated values stored in machine-carried '
+            '`transport-bound` state',
             transport_binding,
         )
         self.assertIn('raw response', transport_binding)
@@ -8298,6 +8493,8 @@ class MarketClockTests(unittest.TestCase):
             '`coordination-halt` / `account-scope-failed`',
             transport_binding,
         )
+        self.assertIn('strict error code is `account_scope_failed`', transport_binding)
+        self.assertIn('compact, path-free `snapshot-write-failed`', transport_binding)
         self.assertIn(
             '`snapshot-failure` / `snapshot-write-failed`',
             transport_binding,
@@ -8310,14 +8507,74 @@ class MarketClockTests(unittest.TestCase):
             transport_binding,
         )
         self.assertIn(
-            'exact `SOURCE_ROOT` and `SOURCE_ROOT_ID` issued by startup '
-            'preflight',
+            'Each Codex save reloads its exact `SOURCE_ROOT` and '
+            '`SOURCE_ROOT_ID`',
             transport_binding,
         )
         self.assertIn(
-            'Pass `--source-root` as the exact `SOURCE_ROOT` from the startup '
-            'preflight receipt',
+            'a later cell must reload that exact keyed path',
             transport_binding,
+        )
+        self.assertIn(
+            'invoke it inside this same orchestration call with the '
+            'just-saved variable and loaded `state.receipt.scratch`',
+            transport_binding,
+        )
+        post_bind_recipe = transport_binding.split(
+            '**POST-BIND COMPOSED JSON SAVE RECIPE:**', 1
+        )[1].split('If the canary was saved', 1)[0]
+        self.assertIn('loading `rhmra.transport-state.v1`', post_bind_recipe)
+        self.assertIn('requiring `phase: "transport-bound"`', post_bind_recipe)
+        self.assertIn(
+            'Form `targetPath` only as loaded '
+            '`state.receipt.source_root`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'store the same state with `phase: "source-call-started"`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'store `phase: "source-response-received"`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'restore `phase: "transport-bound"`, clear '
+            '`pending_handoff`, and add exactly '
+            '`handoffs[purposeKey] = targetPath`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'REPORT status candidate follows the same rule but forms its '
+            'fixed path from loaded `state.receipt.scratch`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'final read/scan connector failure returned, or a final '
+            'read/scan exception caught, inside that same still-running '
+            'cell may restore `phase: "transport-bound"` and '
+            '`pending_handoff: null`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'An uncaught exception or an interrupted/lost outer cell '
+            'cannot prove that boundary and remains fenced',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'monotonic sequence remains consumed after a proved connector '
+            'failure',
+            post_bind_recipe,
+        )
+        self.assertIn('**Mutation-response exception:**', post_bind_recipe)
+        self.assertIn(
+            'do not enter `source-call-started` before '
+            '`place_equity_order` or `cancel_equity_order`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'must not leave transport in a phase that blocks those reads',
+            post_bind_recipe,
         )
         self.assertIn(
             'rejects every caller-created, replaced, or alternate root',
@@ -8358,7 +8615,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('any order-intent journal command', coordination)
         self.assertEqual(
             coordination.count('broker_snapshot.py preflight --create-scratch'),
-            2,
+            3,
         )
         self.assertIn(
             "`& '<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`",
@@ -8377,6 +8634,101 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             'added cross-principal writer-only capability', coordination
         )
+        self.assertIn(
+            'extend it with the exact parsed result as `context_receipt` '
+            'plus `phase: "context-bound"`',
+            coordination,
+        )
+        preflight_recipe = coordination.split(
+            '**CODEX MACHINE-CARRIED PREFLIGHT STATE — REQUIRED:**', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
+        clear_position = preflight_recipe.index('store(STATE_KEY, null);')
+        command_position = preflight_recipe.index(
+            'const preflightResult = await drainCommand('
+            'await tools.exec_command(preflightArgs));'
+        )
+        parse_position = preflight_recipe.index(
+            'const receipt = JSON.parse(preflightResult.output);'
+        )
+        store_position = preflight_recipe.index(
+            'store(STATE_KEY, {schema_version: 1, phase: "preflight-bound"'
+        )
+        compact_output_position = preflight_recipe.index(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"preflight-state-bound", ok: true}));'
+        )
+        self.assertLess(clear_position, command_position)
+        self.assertLess(command_position, parse_position)
+        self.assertLess(parse_position, store_position)
+        self.assertLess(store_position, compact_output_position)
+        self.assertIn(
+            'const bootstrap = load(BOOTSTRAP_KEY);',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'bootstrap.phase !== "context-bound"',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'const pythonExe = bootstrap.resolver_receipt.python;',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'bootstrap.constants_receipt.values.AGENTIC_ACCOUNT_NAME',
+            preflight_recipe,
+        )
+        self.assertNotIn('const pythonExe = "<exact retained', preflight_recipe)
+        self.assertNotIn('const configuredAccountName = "<exact', preflight_recipe)
+        self.assertIn(
+            '[Console]::Out.Write((Get-Location).Path)',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'workdir: projectRoot',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'preflightArgs.shell = "powershell.exe"',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'while (current.session_id !== undefined)',
+            preflight_recipe,
+        )
+        self.assertIn('await tools.write_stdin({session_id:', preflight_recipe)
+        self.assertIn(
+            'configured_account_name: configuredAccountName, '
+            'project_root: projectRoot',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'const actualKeys = Object.keys(receipt).sort();',
+            preflight_recipe,
+        )
+        self.assertIn(
+            'receipt.scratch === receipt.source_root',
+            preflight_recipe,
+        )
+        self.assertNotIn('tools.store', preflight_recipe)
+        self.assertNotIn('tools.load', preflight_recipe)
+        self.assertNotIn(
+            'source_root: receipt.source_root',
+            preflight_recipe[compact_output_position:],
+        )
+        self.assertIn(
+            'The fixed slot is cleared before the invocation\'s sole '
+            'preflight',
+            coordination,
+        )
+        self.assertIn(
+            'Missing, malformed, cleared, wrong-phase, or unavailable state '
+            'is terminal before another broker call',
+            coordination,
+        )
+        self.assertIn(
+            'an app/task/session boundary that loses the slot fails closed',
+            coordination,
+        )
         self.assertIn('exactly these ten fields', coordination)
         for field in (
             '`schema_version`', '`action`', '`ok`', '`scratch`',
@@ -8388,7 +8740,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('canonical lowercase UUIDv4 strings', coordination)
         self.assertIn(
             'Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and '
-            '`SOURCE_ROOT_ID` only from this validated receipt',
+            '`SOURCE_ROOT_ID` only through the validated machine-carried '
+            'receipt',
             coordination,
         )
         self.assertIn('opaque invocation state', coordination)
@@ -8432,6 +8785,53 @@ class MarketClockTests(unittest.TestCase):
             'create one NEW session-scoped scratch directory',
             coordination,
         )
+
+        status_handoff = routine.split(
+            '**CODEX STATUS MACHINE HANDOFF — REQUIRED:**', 1
+        )[1].split('The Windows preflight prepared this directory', 1)[0]
+        for binding in (
+            '`scratch` from `state.receipt.scratch`',
+            '`invocation_id` from `state.context_receipt.invocation_id`',
+            '`state.context_receipt.expected_report_file`',
+            '`expected_status_file`',
+            '`phase: "status-candidate-write-started"`',
+            '`phase: "status-candidate-saved"`',
+            '`phase: "status-publish-started"`',
+            '`phase: "status-published"`',
+            '`status-rewrite-authorized`',
+            '`status_snapshot_missing`',
+        ):
+            self.assertIn(binding, status_handoff)
+        self.assertIn(
+            'every path placeholder is forbidden in executable cell source',
+            status_handoff,
+        )
+        self.assertIn(
+            'Exact verify success—whether after the initial publish or '
+            'after the permitted second publish—must store '
+            '`phase: "status-published"`',
+            status_handoff,
+        )
+
+        for non_codex_contract in (
+            'another runner, retain the validated receipt as one equivalent '
+            'opaque structured value',
+            'A non-Codex runner must perform the same full-object JSON '
+            'serialization',
+            'A non-Codex runner uses its equivalent structured state for '
+            'every one of these destinations',
+            'In another harness, use the equivalent ordered phase fence',
+            'A non-Codex runner must use its equivalent opaque structured '
+            'state',
+        ):
+            self.assertIn(non_codex_contract, routine)
+        finalization = routine.split(
+            '**FIXED FINALIZATION ORDER', 1
+        )[1].split('### PERFORMANCE TELEMETRY', 1)[0]
+        self.assertIn('`rhmra.transport-state.v1`', finalization)
+        self.assertIn('`rhmra.bootstrap-state.v1`', finalization)
+        self.assertIn('`store(key, null)`', finalization)
+        self.assertIn('after the nested helper completes', finalization)
 
         journal = routine.split('### ORDER-INTENT JOURNAL', 1)[1].split(
             '### BROKER TIMESTAMPS', 1
@@ -9473,14 +9873,39 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("standard MCP envelope at `structuredContent.data.result`", scan_phase)
         self.assertIn("never call `run_scan` again", scan_phase)
         self.assertIn("startup-bound `SOURCE_ROOT`", scan_phase)
+        self.assertIn("machine-loaded `SOURCE_ROOT`", scan_phase)
         self.assertIn("same bound file-change capability", scan_phase)
         self.assertIn("same composed tool operation", scan_phase)
         self.assertIn("tools.apply_patch", scan_phase)
-        self.assertIn("EXACT COMPOSED JSON SAVE RECIPE", scan_phase)
+        self.assertIn("POST-BIND COMPOSED JSON SAVE RECIPE", scan_phase)
+        self.assertIn(
+            "load `rhmra.transport-state.v1`",
+            scan_phase,
+        )
         self.assertIn("COMPLETE `fullToolResult`", scan_phase)
         self.assertIn("zero-prefix/zero-decoration", scan_phase)
         self.assertIn("any `text(...)`, `yield_control`", scan_phase)
-        self.assertIn("compact saved-path receipt", scan_phase)
+        self.assertIn('restore `transport-bound` with `handoffs["run-scan"]`', scan_phase)
+        self.assertIn(
+            "invoke `filter_scan.py` with that just-saved variable plus "
+            "loaded `state.receipt.scratch`",
+            scan_phase,
+        )
+        self.assertIn("never a saved path", scan_phase)
+        scan_save = scan_phase.split(
+            '**Save once, then reuse — atomic transport is REQUIRED:**', 1
+        )[1]
+        scan_order = (
+            'load `rhmra.transport-state.v1`',
+            'store `phase: "source-call-started"`',
+            'only then await `run_scan`',
+            'store `phase: "source-response-received"`',
+            'invoke `tools.apply_patch`',
+            'restore `transport-bound` with `handoffs["run-scan"]`',
+            'invoke `filter_scan.py`',
+        )
+        scan_positions = [scan_save.index(marker) for marker in scan_order]
+        self.assertEqual(scan_positions, sorted(scan_positions))
         self.assertIn(
             "do not run `TextEncoder`, an ad-hoc byte counter, add a "
             "BOM/prefix, or perform another path/save experiment",
