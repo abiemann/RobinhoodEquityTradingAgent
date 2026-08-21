@@ -45,6 +45,9 @@ that the final supplied page has no continuation cursor.  Every staged payload
 gets a canonical provenance sidecar.  ``daily_loss.py --snapshot-generation``
 requires one complete, aggregate-sealed set per kind and rejects changed files,
 broken cursor chains, scratch-session mixing, and generation A/B mixing.
+Portfolio and quotes are intrinsically non-paginated.  Their staging ignores
+stray cursor/allow-more arguments and always emits complete cursor-free
+provenance; positions/orders retain strict cursor-chain semantics.
 
 Accepted source shapes are deliberately narrow:
 
@@ -1393,6 +1396,11 @@ def _commit_atomic_files(prepared: Sequence[tuple[str, str, bytes]]) -> None:
 
 
 def _stage(args: argparse.Namespace) -> dict[str, Any]:
+    # Pagination flags are semantically inert for snapshot kinds that cannot
+    # paginate.  Normalize them before validation and provenance generation.
+    paginated = args.kind in {"positions", "orders"}
+    request_cursors = args.request_cursor if paginated else None
+    allow_more = args.allow_more if paginated else False
     sources, outputs, scratch, marker = _absolute_distinct_paths(
         args.source, args.output
     )
@@ -1435,7 +1443,7 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
         source_hashes.append(_sha256(source_raw))
 
     metadata, request_cursors = _validate_payloads(
-        args.kind, payloads, args.request_cursor, args.allow_more
+        args.kind, payloads, request_cursors, allow_more
     )
     metadata_paths = [_stage_metadata_path(output) for output in outputs]
     for metadata_path in metadata_paths:
@@ -1443,7 +1451,7 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
             raise SnapshotError(f"{metadata_path}: staging provenance already exists")
     payload_raws = [_canonical_bytes(payload) for payload in payloads]
     set_id = str(uuid.uuid4())
-    complete = not args.allow_more
+    complete = not allow_more
     metadata_documents = [
         _stage_metadata_document(
             scratch_id=marker["scratch_id"],
@@ -1496,7 +1504,7 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
         "kind": args.kind,
         "generation": args.generation,
         "set_id": set_id,
-        "complete": not args.allow_more,
+        "complete": not allow_more,
         "file_count": len(files),
         "files": files,
     }

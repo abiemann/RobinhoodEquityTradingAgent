@@ -635,6 +635,39 @@ class DashboardStatusClientContractTests(unittest.TestCase):
         self.assertIn("renderSnapshotFallbackWarning(idx.warning)", refresh)
         self.assertIn(": []", refresh)
 
+    def test_run_timeline_names_evaluator_and_unfinished_lifecycle_failures(self):
+        self.assertIn(
+            "attempts that reached lifecycle; the label shows its outcome; "
+            "* opens validated details",
+            self.source,
+        )
+        self.assertNotIn("every scheduler invocation", self.source)
+        evaluator = self.function_source(
+            "candidateEvaluationFailure", "tradeLabels"
+        )
+        self.assertIn("(?:final )?candidate evaluation handoff failure", evaluator)
+        self.assertIn('["skipped", "halted"]', evaluator)
+        stale = self.function_source("staleRunningLifecycle", "lifecycleLabel")
+        self.assertIn("STALE_RUNNING_AFTER_MS = 30 * 60 * 1000", self.source)
+        self.assertIn('record.classification !== "running"', stale)
+        self.assertIn("record.finished_at_utc !== null", stale)
+        self.assertIn("record.events.map", stale)
+        runs = self.source[
+            self.source.index("async function renderRuns"):
+            self.source.index("function renderEras", self.source.index("async function renderRuns"))
+        ]
+        self.assertIn('parts.push("evaluation failure")', runs)
+        self.assertIn('displayPhase = evaluationFailed ? "halted"', runs)
+        self.assertIn("staleRunningLifecycle(record.lifecycle)", runs)
+        self.assertIn('"unfinished lifecycle"', self.source)
+        self.assertIn('"missing terminal event"', self.source)
+        skip_label = self.function_source("skipLabel", "candidateEvaluationFailure")
+        self.assertIn(
+            "/no eligible candidates remained after Step 8 prefilter/i",
+            skip_label,
+        )
+        self.assertIn('"no candidates"', skip_label)
+
 
 if __name__ == "__main__":
     unittest.main()

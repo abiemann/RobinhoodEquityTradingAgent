@@ -49,7 +49,7 @@ RUN_LIFECYCLE = os.path.join(ROOT, 'run_lifecycle.py')
 RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 
 sys.path.insert(0, ROOT)
-from evaluate_candidates import spread_gate
+from evaluate_candidates import load_quote_documents, load_quotes, spread_gate
 import validate_constants as constants_validator
 import broker_snapshot as broker_snapshot_module
 from broker_snapshot import (
@@ -1003,7 +1003,14 @@ class DailyLossTests(unittest.TestCase):
             "Never use one generic or polymorphic staging wrapper",
             matrix,
         )
-        self.assertIn("inspect the literal argv tokens", matrix)
+        self.assertIn(
+            'deterministically discards `--request-cursor` and '
+            '`--allow-more` when `--kind` is `portfolio` or `quotes`',
+            matrix,
+        )
+        self.assertIn(
+            'Positions/orders retain strict cursor-chain validation', matrix
+        )
         self.assertIn(
             "not a universal first-call, first-response, or first-file marker",
             matrix,
@@ -1328,6 +1335,128 @@ class EvaluateCandidatesTests(unittest.TestCase):
             with self.subTest(wrapper_keys=list(wrapped)):
                 with self.assertRaises(AssertionError):
                     self.run_eval(wrapped, {"FISN": 9.843})
+
+    def test_quotes_accept_complete_saved_response_without_model_rekeying(self):
+        bars = {"data": {"results": [{"symbol": "FISN", "bars": FISN_BARS}]}}
+        result = {
+            "quote": {
+                "symbol": "FISN",
+                "last_trade_price": "9.843",
+                "bid_price": "9.83",
+                "ask_price": "9.85",
+            },
+            "close": {"symbol": "FISN", "price": "9.70"},
+        }
+        shapes = (
+            {
+                "content": [{"type": "text", "text": "saved tool result"}],
+                "structuredContent": {"data": {"results": [result]}},
+                "isError": False,
+            },
+            {"data": {"results": [result]}},
+            {"results": [result]},
+        )
+        for quote_response in shapes:
+            with self.subTest(root_keys=tuple(quote_response)):
+                fisn = self.run_eval(bars, quote_response)["FISN"]
+                self.assertTrue(fisn["buy_candidate"])
+                self.assertAlmostEqual(fisn["current_price"], 9.843)
+
+    def test_quotes_reject_malformed_complete_responses_and_duplicates(self):
+        valid = {
+            "quote": {"symbol": "FISN", "last_trade_price": "9.843"},
+            "close": {"symbol": "FISN", "price": "9.70"},
+        }
+        malformed = (
+            {"isError": True, "structuredContent": {"data": {"results": [valid]}}},
+            {"isError": "false", "structuredContent": {"data": {"results": [valid]}}},
+            {"structuredContent": "not an object"},
+            {"data": None},
+            {"data": {}},
+            {"data": {"results": {}}},
+            {"data": {"results": ["not an object"]}},
+            {"data": {"results": [{"quote": None}]}},
+            {"data": {"results": [{"quote": {"last_trade_price": "9.843"}}]}},
+            {"data": {"results": [{"quote": {"symbol": " BAD ", "last_trade_price": "9.843"}}]}},
+            {"data": {"results": [valid, valid]}},
+        )
+        for document in malformed:
+            with self.subTest(document=document):
+                with self.assertRaises(ValueError):
+                    load_quotes(document, "quotes.json")
+
+    def test_quotes_merge_multiple_complete_batches_and_reject_cross_batch_duplicates(self):
+        fisn = {
+            "quote": {"symbol": "FISN", "last_trade_price": "9.843"},
+            "close": {"symbol": "FISN", "price": "9.70"},
+        }
+        ttrx = {
+            "quote": {"symbol": "TTRX", "last_trade_price": "7.84"},
+            "close": {"symbol": "TTRX", "price": "7.70"},
+        }
+        documents = (
+            ("quotes-1.json", {"data": {"results": [fisn]}}),
+            ("quotes-2.json", {"data": {"results": [ttrx]}}),
+        )
+        merged = load_quote_documents(documents)
+        self.assertEqual(set(merged), {"FISN", "TTRX"})
+        with self.assertRaisesRegex(ValueError, "duplicate quote result across files"):
+            load_quote_documents((documents[0], ("duplicate.json", documents[0][1])))
+
+    def test_cli_accepts_multiple_bound_quote_response_files(self):
+        bars = {
+            "data": {
+                "results": [
+                    {"symbol": "FISN", "bars": FISN_BARS},
+                    {"symbol": "TTRX", "bars": TTRX_BARS},
+                ]
+            }
+        }
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ) as source_root:
+            hist = self.write_json(source_root, "hist.json", bars)
+            q1 = self.write_json(
+                source_root,
+                "quotes-1.json",
+                {"data": {"results": [{"quote": {
+                    "symbol": "FISN", "last_trade_price": "9.843"
+                }}]}},
+            )
+            q2 = self.write_json(
+                source_root,
+                "quotes-2.json",
+                {"data": {"results": [{"quote": {
+                    "symbol": "TTRX", "last_trade_price": "7.84"
+                }}]}},
+            )
+            rsi = self.write_json(
+                source_root,
+                "rsi.json",
+                {
+                    "FISN": [40, 36, 33, 30, 29, 34],
+                    "TTRX": [40, 36, 33, 30, 29, 34],
+                },
+            )
+            output = os.path.join(scratch, "multi-quote-output.json")
+            run_cli(EVALUATE, [
+                "--scratch", scratch, "--bars", hist, "--quotes", q1, q2,
+                "--volume-lookback-days", "20", "--high-lookback-days", "5",
+                "--min-median-dollar-volume", "175000", "--dip-entry-pct", "5",
+                "--rsi-file", rsi, "--rsi-oversold", "35",
+                "--rsi-lookback-bars", "5", "--rsi-confirm-bars", "1",
+                "--rsi-max-entry", "60", "--rsi-period", "14",
+                "--json-out", output,
+            ])
+            with open(output, encoding="utf-8") as handle:
+                document = json.load(handle)
+        self.assertIs(document["rsi_gate_enabled"], True)
+        self.assertEqual(
+            {row["symbol"] for row in document["results"]},
+            {"FISN", "TTRX"},
+        )
+        fisn = next(row for row in document["results"] if row["symbol"] == "FISN")
+        self.assertEqual(fisn["rsi_gate"], "pass")
 
     def test_json_output_identifies_whether_rsi_gate_was_enabled(self):
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
@@ -5297,7 +5426,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     )
                     self.assertFalse(os.path.exists(output))
 
-    def test_non_paginated_stage_rejects_pagination_cursor_flags(self):
+    def test_non_paginated_stage_normalizes_inert_pagination_cursor_flags(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
             os.mkdir(scratch)
@@ -5315,24 +5444,33 @@ class BrokerSnapshotTests(unittest.TestCase):
             }
             pagination_flags = (
                 ('request-cursor', ('--request-cursor', 'FIRST')),
+                ('empty-request-cursor', ('--request-cursor', '')),
                 ('allow-more', ('--allow-more',)),
+                (
+                    'empty-request-cursor-and-allow-more',
+                    ('--request-cursor', '', '--allow-more'),
+                ),
             )
             for kind, payload in payloads.items():
                 source = self.write_json(source_root, f'{kind}.json', payload)
                 for label, extra in pagination_flags:
-                    output = os.path.join(
-                        scratch, f'{kind}-{label}-rejected.json'
-                    )
+                    output = os.path.join(scratch, f'{kind}-{label}.json')
                     proc, result = self.stage(
                         kind, [source], [output], *extra
                     )
                     with self.subTest(kind=kind, flag=label):
-                        self.assertNotEqual(proc.returncode, 0)
-                        self.assertIn(
-                            f'{extra[0]} is not valid for {kind}',
-                            result['error']['message'],
+                        self.assertEqual(proc.returncode, 0, result)
+                        self.assertTrue(result['complete'])
+                        self.assertNotIn(
+                            'request_cursor', result['files'][0]
                         )
-                        self.assertFalse(os.path.exists(output))
+                        self.assertTrue(os.path.exists(output))
+                        with open(
+                            result['files'][0]['provenance'], encoding='utf-8'
+                        ) as handle:
+                            provenance = json.load(handle)
+                        self.assertIsNone(provenance['request_cursor'])
+                        self.assertTrue(provenance['set_complete'])
 
     def test_strict_json_and_malformed_semantic_shapes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7381,9 +7519,16 @@ class DashboardClientContractTests(unittest.TestCase):
         self.assertIn('skipLabel(reason, s.session)', dashboard)
         self.assertIn('skipLabel(reason, status.session)', dashboard)
         self.assertIn(
-            "every scheduler invocation; the label shows its trade or terminal outcome",
+            "attempts that reached lifecycle; the label shows its outcome; "
+            "* opens validated details",
             dashboard,
         )
+        self.assertIn('function candidateEvaluationFailure(phase, reason)', dashboard)
+        self.assertIn('parts.push("evaluation failure")', dashboard)
+        self.assertIn('const STALE_RUNNING_AFTER_MS = 30 * 60 * 1000', dashboard)
+        self.assertIn('function staleRunningLifecycle(record, nowMs = Date.now())', dashboard)
+        self.assertIn('return "unfinished lifecycle"', dashboard)
+        self.assertIn('staleRunning ? "missing terminal event"', dashboard)
 
     def test_position_symbols_link_to_robinhood_safely(self):
         with open(os.path.join(ROOT, "dashboard", "index.html"), encoding="utf-8") as f:
@@ -8210,14 +8355,54 @@ class MarketClockTests(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'constants_receipt: constantsReceipt',
+            'complete unchanged `constants_receipt`',
             launcher,
         )
+        self.assertIn('lifecycle_receipt', launcher)
+        self.assertIn('phase: "lifecycle-bound"', launcher)
         self.assertIn('phase: "configuration-bound"', launcher)
+        self.assertIn(
+            'Only for these three startup receipts—the resolver receipt, '
+            'lifecycle-start receipt, and constants receipt',
+            launcher,
+        )
+        self.assertIn(
+            'This exemption does not apply to lifecycle event, status, or '
+            'bind-context receipts',
+            launcher,
+        )
+        self.assertIn(
+            'Never build a copied expected-key array, compare '
+            '`Object.keys(...)`, or independently revalidate the 31 constants',
+            launcher,
+        )
+        self.assertIn(
+            '`MIN_REL_VOLUME` and `STOP_LOSS_PCT` are intentionally JSON '
+            'strings, not integers',
+            launcher,
+        )
         self.assertIn(
             'must not paste the returned `python` string into later '
             'JavaScript',
             launcher,
+        )
+        lifecycle_start = routine.split(
+            '### INVOCATION LIFECYCLE', 1
+        )[1].split('A failed lifecycle start is terminal', 1)[0]
+        self.assertIn(
+            'For this lifecycle-start receipt only, the checked-in `start` '
+            'action is the complete-schema authority',
+            lifecycle_start,
+        )
+        self.assertIn(
+            "store the entire parsed receipt unchanged as the bootstrap "
+            "state's `lifecycle_receipt` before configuration validation",
+            lifecycle_start,
+        )
+        self.assertIn(
+            'do not count returned fields or compare them with a '
+            'model-authored key array',
+            lifecycle_start,
         )
         self.assertIn('Do not create or preflight scratch', startup)
         self.assertIn('touch the order-intent journal', startup)
@@ -8662,11 +8847,25 @@ class MarketClockTests(unittest.TestCase):
         self.assertLess(parse_position, store_position)
         self.assertLess(store_position, compact_output_position)
         self.assertIn(
+            'must finish by storing `preflight-bound` state before its one '
+            'compact path-free success output',
+            coordination,
+        )
+        self.assertIn(
+            'Only after this cell succeeds may startup continue to the '
+            'order-intent checks and rules-version step',
+            coordination,
+        )
+        self.assertIn(
             'const bootstrap = load(BOOTSTRAP_KEY);',
             preflight_recipe,
         )
         self.assertIn(
             'bootstrap.phase !== "context-bound"',
+            preflight_recipe,
+        )
+        self.assertIn(
+            '!bootstrap.lifecycle_receipt',
             preflight_recipe,
         )
         self.assertIn(
@@ -10651,11 +10850,48 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn("call `get_equity_historicals` again", phase)
         self.assertIn(
-            'Persist historicals and derived handoffs only through the '
-            'startup-bound file-change facility and `SOURCE_ROOT`',
+            'Persist historicals, the complete quote response, and derived '
+            'RSI input only through the startup-bound file-change facility '
+            'and `SOURCE_ROOT`',
             phase,
         )
+        self.assertIn(
+            'save every COMPLETE successful batch response UNMODIFIED under '
+            'unique `candidate-quotes-0`, `candidate-quotes-1`, ... handoffs',
+            phase,
+        )
+        self.assertIn(
+            'Pass all of those same saved response paths directly after the '
+            'single `evaluate_candidates.py --quotes` flag in both evaluator '
+            'passes',
+            phase,
+        )
+        self.assertIn(
+            '`structuredContent.data.results[].quote.symbol`', phase
+        )
+        self.assertIn(
+            'entry evaluation skipped: no eligible candidates remained after '
+            'Step 8 prefilter',
+            phase,
+        )
+        self.assertIn(
+            'make no historicals, candidate-quote, evaluator, RSI, review, or '
+            'entry-order call',
+            phase,
+        )
+        self.assertIn('Do not create placeholder bars, quote, or gate inputs', phase)
+        self.assertIn(
+            'does not rewrite them to the pre-SECOND `not-evaluated` form',
+            phase,
+        )
+        self.assertIn(
+            'Never build, re-key, copy, or repair a ticker→quote map', phase
+        )
+        self.assertNotIn('build a JSON map of ticker', phase)
         self.assertIn("candidate evaluation handoff failure", phase)
+        self.assertGreaterEqual(
+            phase.count('set `entry_phase: "halted"`'), 2
+        )
         self.assertIn("Do NOT use formatted stdout, a stale gate file, or ad-hoc calculations", phase)
         self.assertIn("final `buy_candidate` is exactly `true`", phase)
         self.assertIn("`rsi_gate` is exactly `\"pass\"`", phase)

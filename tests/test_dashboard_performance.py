@@ -639,6 +639,9 @@ class PerformanceClientContractTests(unittest.TestCase):
             self.assertIn(f'"{classification}"', severity)
         self.assertIn('"error"', severity)
         self.assertIn('"running"', severity)
+        self.assertIn("candidateEvaluationFailure", severity)
+        self.assertIn("entry_phase", severity)
+        self.assertIn("entry_skip_reason", severity)
         self.assertIn("return null", severity)
         self.assertNotIn('?? "healthy"', severity)
 
@@ -670,6 +673,17 @@ class PerformanceClientContractTests(unittest.TestCase):
         diagnostic = source[diagnostic_start:diagnostic_end]
         self.assertIn("runDetailStatusLabel", diagnostic)
         self.assertIn("lifecycleTooltip", diagnostic)
+        self.assertIn("candidateEvaluationFailure", diagnostic)
+        self.assertIn(
+            "candidate evaluation failed before an entry could be authorized",
+            diagnostic,
+        )
+        self.assertLess(
+            diagnostic.index("candidateEvaluationFailure"),
+            diagnostic.index(
+                "no valid linked status snapshot is available"
+            ),
+        )
         self.assertIn("esc(", diagnostic)
         self.assertNotIn("getJSON(", diagnostic)
         self.assertNotIn("function timingIdentityDiagnosticMarkup", source)

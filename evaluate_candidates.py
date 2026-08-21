@@ -18,15 +18,15 @@ by hand. Computes, per symbol:
 The script does NOT know about held positions or open orders — overlay those
 skips (Step 10 of the routine) on its output.
 
-TESTED BY tests/test_scripts.py — after ANY edit to this file, run
-`python3 tests/test_scripts.py` (Windows: `py -3 tests\test_scripts.py`)
+TESTED BY the full `tests/` suite — after ANY edit to this file, run
+`python3 -m unittest discover -s tests` (Windows: `py -3 -m unittest discover -s tests`)
 and require all tests to pass before committing. Expected values are
 live-verified; if an intentional behavior change breaks one, update the
 expectation deliberately — never delete a test to go green.
 
 Usage:
   python evaluate_candidates.py --scratch <preflighted scratch> --bars hist1.json [hist2.json ...] \
-      --quotes quotes.json \
+      --quotes quotes1.json [quotes2.json ...] \
       --volume-lookback-days 20 --high-lookback-days 5 \
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
       [--max-spread-buy-pct 2.0] [--json-out results.json]
@@ -39,7 +39,13 @@ Usage:
 --rsi-file: one or more files, each a RAW get_equity_technical_indicators
   response saved verbatim (the symbol is read from data.symbol, so responses
   are never re-keyed or retyped). A symbol-keyed map is still accepted.
---quotes file: JSON map of SYMBOL -> current price, e.g.
+--quotes files: one or more saved get_equity_quotes results. Accepted raw shapes:
+  standard MCP envelope containing structuredContent.data.results
+  {"data": {"results": [{"quote": {...}, "close": {...}}]}}
+  {"results": [{"quote": {...}, "close": {...}}]}
+  The symbol is read from each result's quote.symbol; the complete response is
+  consumed directly, so callers never need to build a derived quote map.
+  Legacy JSON maps of SYMBOL -> current price remain accepted, e.g.
   {"FISN": 9.843, "TTRX": "7.84"}
   To enable the spread gate, give an object per symbol carrying bid and ask —
   either plain keys, or the raw quote object copied verbatim out of a
@@ -99,7 +105,7 @@ def load_json(path):
         return json.load(f, parse_constant=_reject_nonfinite_json)
 
 
-def unwrap_historicals_result(doc, path):
+def unwrap_tool_result(doc, path):
     """Remove one known MCP envelope without transforming broker data."""
     if isinstance(doc, dict) and "isError" in doc:
         if not isinstance(doc["isError"], bool):
@@ -115,7 +121,7 @@ def unwrap_historicals_result(doc, path):
 
 
 def load_results(doc, path):
-    doc = unwrap_historicals_result(doc, path)
+    doc = unwrap_tool_result(doc, path)
     if isinstance(doc, list):
         return doc
     if isinstance(doc, dict):
@@ -140,6 +146,98 @@ def parse_quote(sym, val):
     return (finite_float(price, f"{sym}: quote price"),
             finite_float(bid, f"{sym}: bid") if bid is not None else None,
             finite_float(ask, f"{sym}: ask") if ask is not None else None)
+
+
+def load_quotes(doc, path):
+    """Return SYMBOL -> parsed quote from a complete saved quote response.
+
+    The current connector returns rows at ``data.results[]`` with the ticker
+    nested at ``row.quote.symbol``.  Accepting that response directly removes
+    the model-authored re-keying step that can silently turn valid quotes into
+    an empty map.  The older symbol-keyed map remains supported for existing
+    callers.
+    """
+    doc = unwrap_tool_result(doc, path)
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"{path}: unrecognized shape - expected a get_equity_quotes "
+            "response or symbol-keyed quote map"
+        )
+
+    has_results = False
+    results = None
+    if "data" in doc:
+        data = doc["data"]
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: data: expected an object")
+        if "results" not in data:
+            raise ValueError(f"{path}: data.results: missing")
+        has_results = True
+        results = data["results"]
+    elif "results" in doc:
+        has_results = True
+        results = doc["results"]
+
+    if not has_results:
+        if any(key in doc for key in ("content", "structuredContent", "isError")):
+            raise ValueError(
+                f"{path}: unrecognized tool envelope - expected quote results"
+            )
+        return {
+            sym.upper(): parse_quote(sym, value)
+            for sym, value in doc.items()
+        }
+
+    if results is None:
+        results = []
+    if not isinstance(results, list):
+        raise ValueError(f"{path}: quote results: expected an array or null")
+
+    quotes = {}
+    for index, value in enumerate(results, 1):
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"{path}: quote result {index}: expected an object")
+        quote = value.get("quote")
+        if not isinstance(quote, dict):
+            raise ValueError(
+                f"{path}: quote result {index}.quote: expected an object"
+            )
+        symbol = quote.get("symbol")
+        context = f"{path}: quote result {index}.quote.symbol"
+        if (
+            not isinstance(symbol, str)
+            or not symbol
+            or symbol != symbol.strip()
+            or any(character.isspace() for character in symbol)
+        ):
+            raise ValueError(f"{context}: expected a nonempty ticker string")
+        symbol = symbol.upper()
+        if symbol in quotes:
+            raise ValueError(f"{path}: duplicate quote result for {symbol}")
+        quotes[symbol] = parse_quote(symbol, quote)
+    return quotes
+
+
+def load_quote_documents(documents):
+    """Merge one or more complete quote responses without re-keying them.
+
+    The connector limits a quote request to a bounded symbol batch.  Keeping
+    each complete response in its own file preserves that boundary while this
+    deterministic merge rejects cross-batch duplicates.
+    """
+    merged = {}
+    for path, document in documents:
+        batch = load_quotes(document, path)
+        duplicate = sorted(set(merged) & set(batch))
+        if duplicate:
+            raise ValueError(
+                f"{path}: duplicate quote result across files for "
+                + ", ".join(duplicate)
+            )
+        merged.update(batch)
+    return merged
 
 
 def spread_gate(bid, ask, max_pct):
@@ -273,7 +371,12 @@ def main():
     ap.add_argument("--scratch", required=True,
                     help="absolute preflighted scratch whose transport binding owns every input")
     ap.add_argument("--bars", nargs="+", required=True, help="raw get_equity_historicals JSON file(s)")
-    ap.add_argument("--quotes", required=True, help="JSON map of SYMBOL -> current price")
+    ap.add_argument(
+        "--quotes",
+        nargs="+",
+        required=True,
+        help="one or more saved get_equity_quotes responses (legacy SYMBOL -> quote maps also accepted)",
+    )
     ap.add_argument("--volume-lookback-days", type=int, required=True)
     ap.add_argument("--high-lookback-days", type=int, required=True)
     ap.add_argument("--min-median-dollar-volume", type=finite_float_arg, required=True)
@@ -289,12 +392,13 @@ def main():
                     help="RSI_PERIOD, required with --rsi-file so the closes fallback uses the configured period")
     args = ap.parse_args()
 
-    input_paths = [*args.bars, args.quotes, *(args.rsi_file or [])]
+    input_paths = [*args.bars, *args.quotes, *(args.rsi_file or [])]
     validated = validate_bound_external_json_sources(args.scratch, input_paths)
     documents = [(str(path), document) for path, document, _raw in validated]
     bar_documents = documents[:len(args.bars)]
-    _quote_path, quote_document = documents[len(args.bars)]
-    rsi_documents = documents[len(args.bars) + 1:]
+    quote_start = len(args.bars)
+    quote_documents = documents[quote_start:quote_start + len(args.quotes)]
+    rsi_documents = documents[quote_start + len(args.quotes):]
 
     rsi_map = None
     if args.rsi_file:
@@ -305,8 +409,7 @@ def main():
                      "--rsi-lookback-bars, --rsi-confirm-bars, and --rsi-max-entry")
         rsi_map = load_rsi_map(rsi_documents, args.rsi_period)
 
-    quotes = {sym.upper(): parse_quote(sym, val)
-              for sym, val in quote_document.items()}
+    quotes = load_quote_documents(quote_documents)
 
     bars_by_symbol = {}
     for path, document in bar_documents:

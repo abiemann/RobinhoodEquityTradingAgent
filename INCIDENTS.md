@@ -998,8 +998,9 @@ inside that still-running cell, the state becomes terminal `account-scope-failed
 successful response/save existed, it is not mislabeled `snapshot-write-failed`. An interrupted
 cell remains fenced because its call outcome is unknown.
 
-Post-bind broker, scan, historicals, quote-map, RSI, placement-response, and other handoffs use one
-monotonic source sequence plus unique purpose keys. Each operation derives only
+Post-bind broker, scan, historicals, complete quote-response batches, RSI, placement-response,
+and other handoffs use one monotonic source sequence plus unique purpose keys. Each operation
+derives only
 `source-<sequence>.json`, records `source-call-started` before the tool and
 `source-response-received` before the save, then returns to `transport-bound` and records the path
 only under its key; no random path is emitted or carried through narration. A later cell that sees
@@ -1021,6 +1022,65 @@ report/status work, lease release, and lifecycle finish. Missing, malformed, cle
 unknown-phase, or unavailable state is never reconstructed. Other runners must retain equivalent
 opaque structured state. The deterministic helper's exact-root equality, one-attempt tombstone,
 privacy deletion, and no-retry/alternate-root rules remain unchanged.
+
+**2026-08-21 06:03–10:03, six visible failures among seven lifecycle-recorded Codex invocations,
+plus two pre-lifecycle attempts, exposed recurring model-authored orchestration seams.** The
+06:03 lifecycle start returned its valid ten-field receipt, but a hand-written validator demanded
+six fields and abandoned the lifecycle without a terminal event. The hidden 07:01 and 09:01
+attempts similarly rejected the valid four-field Python-resolver receipt as if it had three
+fields, so they never reached lifecycle and could not appear in its projection. At 08:04 the helper
+created valid scratch/source roots, but the
+runner displayed the preflight result from a standalone cell without storing transport state and
+then halted correctly before `get_accounts`. At 09:33 `validate_constants.py --json` exited zero
+with all 31 values, but an invented JavaScript type bucket incorrectly required exact decimal
+strings such as `MIN_REL_VOLUME` and `STOP_LOSS_PCT` to be integers, producing a false
+configuration halt.
+
+The 07:35 run repeated the generic-staging error for a third time: it appended an empty
+`--request-cursor ""` to a non-paginated portfolio response, and the strict helper stopped the
+daily-loss generation. At 08:34 the scan itself succeeded (270 instruments, 12 survivors), but a
+model-authored quote-map transformation read `result.symbol` even though the connector returns
+`result.quote.symbol`; it persisted `{}`, so the pre-RSI evaluator could not return the required
+rows. At 10:03 the scan and risk checks succeeded and RSI was fetched, but a reversed ternary
+turned an existing absolute quote path into null before the final evaluator. The evaluator rejected
+that non-absolute input and no buy followed. Throughout the day the account remained flat at
+$1,508.97, the trade ledger gained no row, and there was no review, order intent, placement,
+cancellation, notification, or other broker mutation.
+
+**Rules produced:** for the resolver, lifecycle-start, and constants startup receipts, the named
+checked-in producer is the sole complete-schema/type/range authority. Codex stores those complete
+receipts unchanged; runner glue checks only the core discriminator and fields it must consume, and
+may not build `Object.keys` expectations, copied field/name lists, or an independent constant type
+map. Active-context and every later helper receipt retain their explicit exact-field contracts and
+are also stored unchanged when the routine requires it. The sole Codex preflight recipe must store
+`preflight-bound` state before its
+compact path-free success output; after the already-required journal and rules-version steps, the
+accounts operation loads only that stored state and still saves/binds its canary before output.
+These changes remove the three false receipt/configuration rejects without reordering startup or
+weakening the helpers that produced the receipts.
+
+After the third non-paginated cursor recurrence, `broker_snapshot.py` still recommends distinct
+literal command shapes but now deterministically normalizes `--request-cursor` and `--allow-more`
+away for portfolio/quotes before validation and provenance. Those flags carry no meaning for an
+unpaged response; the output remains complete and cursor-free. Positions/orders keep the strict
+cursor chain. This narrowly supersedes the August 7 rule that portfolio/quote cursor flags must
+terminate the generation; every payload, transport-root, schema, generation, hash, and pagination
+check that can affect data remains strict.
+
+`evaluate_candidates.py --quotes` now consumes one or more complete saved `get_equity_quotes`
+batch responses directly, unwraps only the known MCP envelope, merges batches with cross-file
+duplicate rejection, and reads each symbol and whole quote from `data.results[].quote`. The runner
+no longer creates any derived quote map, and both evaluator passes reuse the same bound complete
+batch set. Malformed, duplicate, missing, unbound, or non-absolute inputs still fail closed. A
+pre-RSI or final evaluator handoff failure explicitly publishes `entry_phase: "halted"`. The
+all-prefiltered edge is not an evaluator failure: when Step 8 leaves no eligible name, the runner
+publishes a normal `entry_phase: "skipped"` reason and makes no placeholder historical, quote,
+gate, or evaluator input. The
+dashboard maps both historical skipped-form and current
+halted-form candidate handoff failures to red `evaluation failure`, calls a `running` lifecycle
+record with no activity for 30 minutes `unfinished lifecycle`, and describes the timeline as only
+attempts that reached lifecycle start. The report asterisk remains a validated-details marker,
+not proof of a trade.
 
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 

@@ -247,7 +247,7 @@
 </section>
 
 <section>
-  <h2>Runs today <span class="hint">— every scheduler invocation; the label shows its trade or terminal outcome</span></h2>
+  <h2>Runs today <span class="hint">— attempts that reached lifecycle; the label shows its outcome; * opens validated details</span></h2>
   <div class="runs" id="runs"><span class="empty">no invocations yet</span></div>
 </section>
 
@@ -1558,11 +1558,18 @@ function skipLabel(reason, session) {
   }
   if (session === "calendar-unknown") return "calendar unavailable";
   for (const [re, label] of [[/blackout/i, "blackout"], [/\bSPY\b/i, "spy-red"],
-                             [/pre-market/i, "pre-market"], [/after-hours|extended/i, "after-hours"],
-                             [/buying power|MIN_ORDER_DOLLARS/i, "low buying power"]]) {
+                              [/pre-market/i, "pre-market"], [/after-hours|extended/i, "after-hours"],
+                              [/no eligible candidates remained after Step 8 prefilter/i, "no candidates"],
+                              [/buying power|MIN_ORDER_DOLLARS/i, "low buying power"]]) {
     if (re.test(reason || "")) return label;
   }
   return "no scan";
+}
+
+function candidateEvaluationFailure(phase, reason) {
+  return ["skipped", "halted"].includes(phase) &&
+    /^(?:final )?candidate evaluation handoff failure\b/i.test(
+      typeof reason === "string" ? reason.trim() : "");
 }
 
 function tradeLabels(fills) {
@@ -1677,7 +1684,28 @@ function invocationDay(record) {
   return invocationStart(record)?.slice(0, 10).replace(/-/g, "_") ?? null;
 }
 
-function lifecycleLabel(classification) {
+const STALE_RUNNING_AFTER_MS = 30 * 60 * 1000;
+
+function staleRunningLifecycle(record, nowMs = Date.now()) {
+  if (!record || record.classification !== "running" ||
+      record.finished_at_utc !== null || !Number.isFinite(nowMs)) return false;
+  const timestamps = [record.started_at_utc];
+  if (Array.isArray(record.events)) {
+    timestamps.push(...record.events.map(event => event?.occurred_at_utc));
+  }
+  let latestActivityMs = null;
+  for (const timestamp of timestamps) {
+    const parsed = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
+    if (Number.isFinite(parsed) &&
+        (latestActivityMs === null || parsed > latestActivityMs)) {
+      latestActivityMs = parsed;
+    }
+  }
+  return latestActivityMs !== null && nowMs - latestActivityMs >= STALE_RUNNING_AFTER_MS;
+}
+
+function lifecycleLabel(classification, staleRunning = false) {
+  if (staleRunning) return "unfinished lifecycle";
   return ({
     "risk-halt": "risk halt",
     "snapshot-failure": "snapshot failure",
@@ -1691,17 +1719,20 @@ function lifecycleLabel(classification) {
   })[classification] ?? null;
 }
 
-function lifecycleDisplayPhase(classification, statusPhase) {
+function lifecycleDisplayPhase(classification, statusPhase, staleRunning = false) {
+  if (staleRunning) return "halted";
   if (classification === "completed") return statusPhase;
   if (classification === "overlap" || classification === "runtime-budget" ||
       classification === "running") return "skipped";
   return "halted";
 }
 
-function lifecycleTooltip(record) {
-  const label = lifecycleLabel(record?.classification) ?? record?.classification ?? "invocation";
-  const reason = typeof record?.reason_code === "string"
-    ? record.reason_code.replace(/-/g, " ") : null;
+function lifecycleTooltip(record, staleRunning = false) {
+  const label = lifecycleLabel(record?.classification, staleRunning) ??
+    record?.classification ?? "invocation";
+  const reason = staleRunning ? "missing terminal event" :
+    typeof record?.reason_code === "string"
+      ? record.reason_code.replace(/-/g, " ") : null;
   const phase = typeof record?.latest_phase === "string"
     ? record.latest_phase.replace(/-/g, " ") : null;
   return [label, reason, phase].filter(Boolean).join(" — ");
@@ -2033,6 +2064,10 @@ function runDetailSeverity(detail) {
       lifecycle.classification === "running") return null;
   if (lifecycle.classification === "completed") {
     if (detail.status && !detail.statusRejected && !detail.statusOrphaned) {
+      if (candidateEvaluationFailure(
+        detail.status.guards?.entry_phase,
+        detail.status.guards?.entry_skip_reason,
+      )) return "error";
       return "healthy";
     }
     return "warning";
@@ -2117,6 +2152,12 @@ function runDetailDiagnosticMarkup(detail) {
     message = "The run completed, but its linked status snapshot failed strict validation. No guard outcome was inferred from it.";
   } else if (lifecycle.classification === "completed" && detail.statusOrphaned) {
     message = "The run completed, but its status snapshot did not exactly match the lifecycle binding.";
+  } else if (lifecycle.classification === "completed" && detail.status &&
+      candidateEvaluationFailure(
+        detail.status.guards?.entry_phase,
+        detail.status.guards?.entry_skip_reason,
+      )) {
+    message = "The run completed with a valid linked status snapshot, but candidate evaluation failed before an entry could be authorized.";
   } else if (lifecycle.classification === "completed") {
     message = "The run completed, but no valid linked status snapshot is available.";
   } else {
@@ -2411,20 +2452,24 @@ async function renderRuns(statusNames, gateNames, rows, config, lifecycleDocumen
     const statusPhase = status?.guards?.entry_phase ?? "?";
     const reason = status?.guards?.entry_skip_reason;
     const classification = record.lifecycle?.classification ?? "legacy";
-    let displayPhase = statusPhase;
+    const evaluationFailed = candidateEvaluationFailure(statusPhase, reason);
+    const staleRunning = staleRunningLifecycle(record.lifecycle);
+    let displayPhase = evaluationFailed ? "halted" : statusPhase;
     let tip = "";
 
     if (record.lifecycle && classification !== "completed") {
-      const label = lifecycleLabel(classification) ?? "invocation outcome unavailable";
+      const label = lifecycleLabel(classification, staleRunning) ??
+        "invocation outcome unavailable";
       parts.push(label);
-      displayPhase = lifecycleDisplayPhase(classification, statusPhase);
-      tip = lifecycleTooltip(record.lifecycle);
+      displayPhase = lifecycleDisplayPhase(classification, statusPhase, staleRunning);
+      tip = lifecycleTooltip(record.lifecycle, staleRunning);
       if (status) {
         const statusTip = runTooltip(status, statusPhase, reason, fills, [], config);
         if (statusTip) tip += `; ${statusTip}`;
       }
     } else if (status) {
-      if (statusPhase === "skipped") parts.push(skipLabel(reason, status.session));
+      if (evaluationFailed) parts.push("evaluation failure");
+      else if (statusPhase === "skipped") parts.push(skipLabel(reason, status.session));
       else if (statusPhase === "halted") parts.push("halted");
       else if (!parts.length) parts.push("scanned");
       const rejected = statusPhase === "ran" && record.name
