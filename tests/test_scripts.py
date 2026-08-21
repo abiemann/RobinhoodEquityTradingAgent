@@ -51,7 +51,12 @@ RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 _BOUND_SOURCE_SCRATCHES = {}
 
 sys.path.insert(0, ROOT)
-from evaluate_candidates import load_quote_documents, load_quotes, spread_gate
+from evaluate_candidates import (
+    load_quote_documents,
+    load_quotes,
+    load_rsi_map,
+    spread_gate,
+)
 import validate_constants as constants_validator
 import broker_snapshot as broker_snapshot_module
 from broker_snapshot import (
@@ -791,6 +796,53 @@ class DailyLossTests(unittest.TestCase):
             with open(symbols_path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), ["CLOSED", "HELD"])
 
+    def test_discovery_mode_rejects_unused_calculation_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            positions_path = os.path.join(td, "positions.json")
+            orders_path = os.path.join(td, "orders.json")
+            portfolio_path = os.path.join(td, "portfolio.json")
+            quotes_path = os.path.join(td, "quotes.json")
+            with open(positions_path, "w", encoding="utf-8") as f:
+                json.dump(self.page("positions", []), f)
+            with open(orders_path, "w", encoding="utf-8") as f:
+                json.dump(self.page("orders", []), f)
+            with open(portfolio_path, "w", encoding="utf-8") as f:
+                json.dump({"data": {"total_value": "1000"}}, f)
+            with open(quotes_path, "w", encoding="utf-8") as f:
+                json.dump({"data": {"results": []}}, f)
+
+            cases = (
+                ("--portfolio", portfolio_path),
+                ("--quotes", quotes_path),
+                ("--halt-pct", "5"),
+            )
+            for index, extra in enumerate(cases):
+                output_path = os.path.join(td, f"symbols-{index}.json")
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        DAILY_LOSS,
+                        "--positions", positions_path,
+                        "--orders", orders_path,
+                        "--trading-date", self.TRADING_DATE,
+                        "--as-of-utc", self.AS_OF_UTC,
+                        "--symbols-out", output_path,
+                        *extra,
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(option=extra[0]):
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn(
+                        "discovery mode does not accept unused calculation "
+                        "option(s)",
+                        proc.stderr,
+                    )
+                    self.assertIn(extra[0], proc.stderr)
+                    self.assertFalse(os.path.exists(output_path))
+
     def test_prior_day_execution_is_ignored_but_future_execution_fails(self):
         ignored = self.invoke(
             orders=[self.page("orders", [
@@ -1010,6 +1062,33 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("Null rows/elements are indeterminate", block)
         self.assertIn("DAILY-LOSS DISCOVERY", block)
         self.assertIn("DAILY-LOSS FINAL", block)
+        discovery_step = block.split(
+            "1. Re-fetch every page of `get_equity_positions`", 1
+        )[1].split("2. Immediately after", 1)[0]
+        self.assertNotIn("get_portfolio", discovery_step)
+        self.assertIn("Do not fetch or stage a DISCOVERY portfolio", discovery_step)
+        self.assertIn(
+            "`daily_loss.py --symbols-out` rejects the calculation-only "
+            "`--portfolio`, `--quotes`, and `--halt-pct` options",
+            discovery_step,
+        )
+        self.assertIn(
+            "proved terminal singleton directly or aggregate-seal only a "
+            "multi-page set",
+            discovery_step,
+        )
+        quote_discovery_step = block.split(
+            "3. Ask the helper for the exact quote set", 1
+        )[1].split("4. Immediately after", 1)[0]
+        self.assertIn("use one proved terminal batch directly", quote_discovery_step)
+        self.assertIn(
+            "aggregate-seal only when there are multiple quote batches",
+            quote_discovery_step,
+        )
+        final_step = block.split("5. Now re-fetch", 1)[1].split(
+            "6. Run the authoritative evaluation", 1
+        )[0]
+        self.assertIn("`get_portfolio`", final_step)
         self.assertIn(
             "separate generation-specific FINAL set",
             block,
@@ -1034,6 +1113,16 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn(
             "including all `content`, `structuredContent`, `data`, pagination, "
             "transport-envelope, and `guide` fields",
+            block,
+        )
+        self.assertIn("The field is literally `file_count`, never `count`", block)
+        self.assertIn(
+            "nonnegative integer `file_count` equal to the length of `files`",
+            block,
+        )
+        self.assertIn(
+            "tolerate helper-owned extra bookkeeping fields instead of "
+            "counting object keys",
             block,
         )
         matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
@@ -1085,6 +1174,12 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("shared set ID", block)
         self.assertIn("provenance sidecar", block)
         self.assertIn("aggregate-seal", block)
+        self.assertIn("`complete: true` and `file_count: 1`", block)
+        self.assertIn(
+            "use it directly and do not stage it again under a retry or "
+            "aggregate filename",
+            block,
+        )
         self.assertIn("abandon ALL of A", block)
         self.assertIn("exactly one whole generation B", block)
         self.assertIn(
@@ -1890,8 +1985,9 @@ class EvaluateCandidatesTests(unittest.TestCase):
                 "guide": "Convert begins_at (UTC) to the user's timezone for display."}
 
     def test_rsi_accepts_raw_response_files_without_hand_keying(self):
-        # a run must be able to save each response VERBATIM and pass the files;
-        # hand-building a symbol-keyed map is what broke the 2026-07-28 11:06 run
+        # A run saves the complete response object returned by the tool and
+        # passes it directly; hand-building a symbol-keyed map is what broke
+        # the 2026-07-28 11:06 run.
         bars = [bar("2026-07-01", 4.5, 5.0, 900000), bar("2026-07-02", 4.6, 4.9, 900000),
                 bar("2026-07-03", 4.6, 4.8, 900000), bar("2026-07-06", 4.6, 4.9, 900000),
                 bar("2026-07-07", 4.6, 4.9, 900000)]
@@ -1900,7 +1996,13 @@ class EvaluateCandidatesTests(unittest.TestCase):
             p1 = os.path.join(td, "rsi1.json")
             p2 = os.path.join(td, "rsi2.json")
             with open(p1, "w", encoding="utf-8") as f:
-                json.dump(self.raw_rsi_response("SYNX", [40, 36, 33, 30, 29, 34]), f)
+                json.dump({
+                    "content": [{"type": "text", "text": "saved tool result"}],
+                    "structuredContent": self.raw_rsi_response(
+                        "SYNX", [40, 36, 33, 30, 29, 34]
+                    ),
+                    "isError": False,
+                }, f)
             with open(p2, "w", encoding="utf-8") as f:
                 json.dump(self.raw_rsi_response("OTHR", [42, 39, 36, 33, 31, 29]), f)
             res = self.run_eval(payload, {"SYNX": 4.0, "OTHR": 4.0},
@@ -1915,6 +2017,116 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertEqual(res["OTHR"]["rsi_gate"], "block")
         self.assertIn("still falling", res["OTHR"]["rsi_reason"])
         self.assertEqual(res["SYNX"]["rsi_series"], [40, 36, 33, 30, 29, 34])
+
+    def test_cli_accepts_complete_rsi_envelope_by_committed_purpose(self):
+        bars = [
+            bar("2026-07-01", 4.5, 5.0, 900000),
+            bar("2026-07-02", 4.6, 4.9, 900000),
+            bar("2026-07-03", 4.6, 4.8, 900000),
+            bar("2026-07-06", 4.6, 4.9, 900000),
+            bar("2026-07-07", 4.6, 4.9, 900000),
+        ]
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ):
+            commit_test_source_purpose(
+                scratch,
+                "historicals-0",
+                {"data": {"results": [{"symbol": "SYNX", "bars": bars}]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "candidate-quotes-0",
+                {"data": {"results": [{"quote": {
+                    "symbol": "SYNX", "last_trade_price": "4.0"
+                }}]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "rsi-0",
+                {
+                    "content": [{"type": "text", "text": "saved tool result"}],
+                    "structuredContent": self.raw_rsi_response(
+                        "SYNX", [40, 36, 33, 30, 29, 34]
+                    ),
+                    "isError": False,
+                },
+            )
+            output = os.path.join(scratch, "rsi-purpose-output.json")
+            proc = self.evaluate_proc([
+                "--scratch", scratch,
+                "--bars-purpose", "historicals-0",
+                "--quotes-purpose", "candidate-quotes-0",
+                "--volume-lookback-days", "5",
+                "--high-lookback-days", "5",
+                "--min-median-dollar-volume", "0",
+                "--dip-entry-pct", "5",
+                "--rsi-purpose", "rsi-0",
+                "--rsi-oversold", "35",
+                "--rsi-lookback-bars", "5",
+                "--rsi-confirm-bars", "1",
+                "--rsi-max-entry", "60",
+                "--rsi-period", "14",
+                "--json-out", output,
+            ])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(output, encoding="utf-8") as handle:
+                document = json.load(handle)
+
+        self.assertIs(document["rsi_gate_enabled"], True)
+        self.assertEqual(document["params"]["rsi_file"], ["rsi-0"])
+        self.assertEqual(document["results"][0]["rsi_gate"], "pass")
+
+    def test_rsi_rejects_malformed_raw_responses_and_tool_envelopes(self):
+        valid = self.raw_rsi_response("SYNX", [40, 36, 33, 30, 29, 34])
+        malformed = (
+            {"structuredContent": valid, "isError": True},
+            {"structuredContent": valid, "isError": "false"},
+            {"structuredContent": "not an object", "isError": False},
+            {"content": [{"type": "text", "text": json.dumps(valid)}]},
+            {"content": [], "data": valid["data"], "isError": False},
+            {"data": None},
+            {"data": {"indicators": valid["data"]["indicators"]}},
+            {"data": {"symbol": " BAD ", "indicators": valid["data"]["indicators"]}},
+            {"data": {"symbol": "SYNX", "indicators": []}},
+            {"data": {"symbol": "SYNX", "indicators": {}}},
+            {"data": {"symbol": "SYNX", "indicators": [None]}},
+            {"data": {"symbol": "SYNX", "indicators": [{"type": "macd", "series": []}]}},
+            {"data": {"symbol": "SYNX", "indicators": [{"type": "rsi"}]}},
+            {"data": {"symbol": "SYNX", "indicators": [{"type": "rsi", "series": {}}]}},
+            {"data": {"symbol": "SYNX", "indicators": [{"type": "rsi", "series": [{}]}]}},
+            {"data": {"symbol": "SYNX", "indicators": [{"type": "rsi", "series": [True]}]}},
+        )
+        for index, document in enumerate(malformed):
+            with self.subTest(index=index, root_keys=list(document)):
+                with self.assertRaises(ValueError):
+                    load_rsi_map(((f"rsi-{index}", document),), 14)
+
+    def test_rsi_rejects_duplicate_symbols_across_raw_and_legacy_inputs(self):
+        raw = self.raw_rsi_response("synx", [40, 36, 33, 30, 29, 34])
+        with self.assertRaisesRegex(
+            ValueError, "duplicate RSI symbol across inputs for SYNX"
+        ):
+            load_rsi_map((
+                ("raw", raw),
+                ("legacy", {"SYNX": [40, 36, 33, 30, 29, 34]}),
+            ), 14)
+
+        with self.assertRaisesRegex(
+            ValueError, "duplicate RSI symbol across inputs for SYNX"
+        ):
+            load_rsi_map((("legacy", {
+                "SYNX": [40, 36, 33, 30, 29, 34],
+                "synx": [40, 36, 33, 30, 29, 34],
+            }),), 14)
+
+    def test_rsi_legacy_map_rejects_nested_symbol_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "nested RSI symbol is OTHR"):
+            load_rsi_map((("legacy", {
+                "SYNX": self.raw_rsi_response(
+                    "OTHR", [40, 36, 33, 30, 29, 34]
+                ),
+            }),), 14)
 
     def test_malformed_authored_json_fails_loudly(self):
         # Both real 2026-07-28 failures were MID-document slips in LLM-authored
@@ -6452,6 +6664,66 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertFalse(rejected['ok'])
             self.assertFalse(os.path.exists(incomplete))
 
+    def test_terminal_singleton_page_sets_need_no_second_aggregate_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            source_root = self.source_root(scratch)
+            positions_source = self.write_json(
+                source_root,
+                'positions-singleton.json',
+                {'data': {'positions': [], 'next': None}},
+            )
+            orders_source = self.write_json(
+                source_root,
+                'orders-singleton.json',
+                {'data': {'orders': [], 'next': None}},
+            )
+            positions_output = os.path.join(scratch, 'positions-singleton.json')
+            orders_output = os.path.join(scratch, 'orders-singleton.json')
+
+            positions_proc, positions_receipt = self.stage(
+                'positions', [positions_source], [positions_output],
+                '--request-cursor', 'FIRST',
+            )
+            orders_proc, orders_receipt = self.stage(
+                'orders', [orders_source], [orders_output],
+                '--request-cursor', 'FIRST',
+            )
+            self.assertEqual(positions_proc.returncode, 0, positions_receipt)
+            self.assertEqual(orders_proc.returncode, 0, orders_receipt)
+            for receipt in (positions_receipt, orders_receipt):
+                self.assertTrue(receipt['complete'])
+                self.assertEqual(receipt['file_count'], 1)
+                self.assertEqual(len(receipt['files']), 1)
+
+            validate_generation_inputs(
+                {
+                    'positions': [positions_output],
+                    'orders': [orders_output],
+                },
+                'A',
+            )
+            symbols_output = os.path.join(scratch, 'symbols-singleton.json')
+            proc = subprocess.run(
+                [
+                    sys.executable, DAILY_LOSS,
+                    '--positions', positions_output,
+                    '--orders', orders_output,
+                    '--snapshot-generation', 'A',
+                    '--trading-date', '2026-08-04',
+                    '--as-of-utc', '2026-08-04T19:00:00Z',
+                    '--symbols-out', symbols_output,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(symbols_output, encoding='utf-8') as handle:
+                self.assertEqual(json.load(handle), [])
+
     def test_daily_loss_rejects_cross_generation_staged_inputs(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
@@ -8640,18 +8912,18 @@ class MarketClockTests(unittest.TestCase):
         )
         bootstrap = routine[bootstrap_start:lifecycle_start]
         self.assertIn("ONLY action permitted before invocation lifecycle start", bootstrap)
-        self.assertIn("`load_workspace_dependencies`", bootstrap)
-        self.assertIn("no more than 20 seconds", bootstrap)
+        self.assertIn("go directly to the checked-in Windows resolver", bootstrap)
+        self.assertIn("no preliminary framework dependency lookup or hint argument", bootstrap)
+        self.assertIn("identical for Codex, Claude", bootstrap)
+        self.assertNotIn("load_workspace_dependencies", bootstrap)
+        self.assertNotIn("PreferredPath", bootstrap)
         self.assertIn("-File ./resolve_python.ps1", bootstrap)
         self.assertIn("forward-slash `./resolve_python.ps1`", bootstrap)
         self.assertIn("works in both PowerShell and native Git Bash", bootstrap)
         self.assertNotIn("-File .\\resolve_python.ps1", bootstrap)
-        self.assertIn("`-PreferredPath`", bootstrap)
-        self.assertIn("one-way candidate hint", bootstrap)
-        self.assertIn("displayed escape for one Windows", bootstrap)
         self.assertIn("A valid resolver receipt ends launcher resolution immediately", bootstrap)
         self.assertIn("returned `python` field is already launch-probed", bootstrap)
-        self.assertIn("Bind it without comparing it to the hint", bootstrap)
+        self.assertIn("Bind it without comparing it to another path", bootstrap)
         self.assertIn("Never rerun a successful resolver", bootstrap)
         self.assertIn("sole permitted second invocation", bootstrap)
         self.assertIn("an absolute `python` path outside `Microsoft\\WindowsApps`", bootstrap)
@@ -8721,8 +8993,6 @@ class MarketClockTests(unittest.TestCase):
                 "Bypass",
                 "-File",
                 RESOLVE_PYTHON,
-                "-PreferredPath",
-                sys.executable,
             ],
             text=True,
             capture_output=True,
@@ -8736,6 +9006,33 @@ class MarketClockTests(unittest.TestCase):
         self.assertTrue(os.path.isabs(document["python"]))
         self.assertNotIn("microsoft\\windowsapps", document["python"].lower())
         self.assertEqual(document["version"].split(".", 1)[0], "3")
+
+        hinted = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                RESOLVE_PYTHON,
+                "-PreferredPath",
+                sys.executable,
+            ],
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+            timeout=20,
+        )
+        self.assertEqual(hinted.returncode, 0, hinted.stderr)
+        hinted_document = json.loads(hinted.stdout)
+        self.assertEqual(hinted_document["schema_version"], 1)
+        self.assertEqual(hinted_document["status"], "valid")
+        self.assertTrue(os.path.isabs(hinted_document["python"]))
+        self.assertNotIn(
+            "microsoft\\windowsapps", hinted_document["python"].lower()
+        )
+        self.assertEqual(hinted_document["version"].split(".", 1)[0], "3")
 
         direct = subprocess.run(
             [
@@ -8793,8 +9090,7 @@ class MarketClockTests(unittest.TestCase):
         if git_bash is not None:
             resolver_command = (
                 "powershell.exe -NoProfile -NonInteractive "
-                "-ExecutionPolicy Bypass -File ./resolve_python.ps1 "
-                f"-PreferredPath {posix_literal(sys.executable)}"
+                "-ExecutionPolicy Bypass -File ./resolve_python.ps1"
             )
             through_bash = subprocess.run(
                 [git_bash, "-c", resolver_command],
@@ -9480,7 +9776,8 @@ class MarketClockTests(unittest.TestCase):
             "before lease acquisition",
             coordination,
         )
-        self.assertIn("`python3 run_lock.py acquire`", coordination)
+        self.assertIn("`& '<PYTHON_EXE>' run_lock.py acquire`", coordination)
+        self.assertIn("`'<PYTHON_EXE>' run_lock.py acquire`", coordination)
         self.assertIn("`schema_version` exactly `1`", coordination)
         self.assertIn("`ok` exactly the JSON boolean `true`", coordination)
         self.assertIn("`RUN_LOCK_TOKEN`", coordination)
@@ -9490,10 +9787,21 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('supersede REPORT, its "every run" status-snapshot rule', coordination)
         self.assertIn("expires after 20 minutes", coordination)
         self.assertIn("At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT", coordination)
+        self.assertIn(
+            "`& '<PYTHON_EXE>' run_lock.py renew --token "
+            "'<RUN_LOCK_TOKEN>'`",
+            coordination,
+        )
         self.assertIn("immediately before EVERY `cancel_equity_order` and `place_equity_order`", coordination)
         self.assertIn("ownership is lost: make no further broker calls or order changes", coordination)
-        self.assertIn("`python3 run_lock.py release --token <RUN_LOCK_TOKEN>`", coordination)
+        self.assertIn(
+            "`& '<PYTHON_EXE>' run_lock.py release --token "
+            "'<RUN_LOCK_TOKEN>'`",
+            coordination,
+        )
         self.assertIn("final operational action", coordination)
+        self.assertNotIn("py -3 run_lock.py", coordination)
+        self.assertNotIn("python3 run_lock.py", coordination)
 
         self.assertIn('before scratch creation or preflight', coordination)
         self.assertIn('any order-intent journal command', coordination)
@@ -9728,12 +10036,16 @@ class MarketClockTests(unittest.TestCase):
         )[1].split('### PERFORMANCE TELEMETRY', 1)[0]
         self.assertIn('`rhmra.transport-state.v1`', finalization)
         self.assertIn('`rhmra.bootstrap-state.v1`', finalization)
+        self.assertIn('`rhmra.lease-state.v1`', finalization)
+        self.assertIn('clear all three fixed slots', finalization)
         self.assertIn('`store(key, null)`', finalization)
         self.assertIn('after the nested helper completes', finalization)
 
         journal = routine.split('### ORDER-INTENT JOURNAL', 1)[1].split(
             '### BROKER TIMESTAMPS', 1
         )[0]
+        self.assertIn("Use the retained absolute `PYTHON_EXE`", journal)
+        self.assertIn("Never execute literal `py`, `python`, or `python3`", journal)
         self.assertIn('Only after successful lease acquisition', journal)
         self.assertIn('successful scratch preflight', journal)
         self.assertIn('exact bound lease-issued token', journal)
@@ -9762,6 +10074,267 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("never place a payload reviewed for a different session", pre_buy)
         self.assertIn("Do not fall back to START CLOCK", pre_buy)
         self.assertIn("In DRY RUN", pre_buy)
+
+    def test_routine_machine_carries_exact_private_lease_token(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        coordination = routine.split(
+            "### RUN COORDINATION — fenced single-flight lease", 1
+        )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
+        lease_contract = coordination.split(
+            "**CODEX PRIVATE LEASE STATE — REQUIRED:**", 1
+        )[1].split(
+            "After the active-context receipt succeeds", 1
+        )[0]
+        acquire_bind_code = lease_contract.split(
+            "```javascript", 1
+        )[1].split("```", 1)[0]
+
+        clear_position = acquire_bind_code.index("store(LEASE_KEY, null);")
+        acquire_position = acquire_bind_code.index(
+            "const acquireResult = await drainCommand("
+        )
+        lease_store_position = acquire_bind_code.index(
+            'store(LEASE_KEY, {schema_version: 1, phase: "lease-owned"'
+        )
+        bind_position = acquire_bind_code.index(
+            "const bindContextResult = await drainCommand("
+        )
+        compact_output_position = acquire_bind_code.index(
+            'action: "context-state-bound", ok: true'
+        )
+        self.assertLess(clear_position, acquire_position)
+        self.assertLess(acquire_position, lease_store_position)
+        self.assertLess(lease_store_position, bind_position)
+        self.assertLess(bind_position, compact_output_position)
+        self.assertIn(
+            "run_lock_token: acquireReceipt.token", acquire_bind_code
+        )
+        self.assertLess(
+            acquire_bind_code.index("!uuid4.test(invocationId)"),
+            acquire_bind_code.index("const acquireResult = await drainCommand("),
+        )
+        self.assertIn(
+            'lease.phase !== "lease-owned"', acquire_bind_code
+        )
+        self.assertIn(
+            'lease.invocation_id !== invocationId', acquire_bind_code
+        )
+        self.assertIn(
+            '" --run-token " + quote(lease.run_lock_token)',
+            acquire_bind_code,
+        )
+        for holder_field in ("acquired_at", "renewed_at", "expires_at"):
+            self.assertIn(
+                f"acquireReceipt.holder.{holder_field}", acquire_bind_code
+            )
+        self.assertIn(
+            'reason: activeRun ? "active-run" : "coordination-state"',
+            acquire_bind_code,
+        )
+        self.assertIn("holder: activeRun ?", acquire_bind_code)
+        self.assertIn(
+            "Only the existing checked-in deterministic protocols may "
+            "persist it",
+            lease_contract,
+        )
+        self.assertIn("`run_lock.py` owns the gitignored lease database", lease_contract)
+        self.assertIn("`order_intents.py prepare` scratch intent", lease_contract)
+        self.assertIn("Runner glue performs no other persistence", lease_contract)
+        self.assertNotIn("tool receipt, or filesystem", lease_contract)
+        self.assertNotIn('--run-token \'\'', acquire_bind_code)
+        self.assertNotIn('quote("")', acquire_bind_code)
+        for line in acquire_bind_code.splitlines():
+            if "text(" in line:
+                self.assertNotIn("run_lock_token", line)
+                self.assertNotIn("acquireReceipt.token", line)
+
+        preflight_code = coordination.split(
+            "**CODEX MACHINE-CARRIED PREFLIGHT STATE — REQUIRED:**", 1
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        self.assertIn(
+            'const LEASE_KEY = "rhmra.lease-state.v1";', preflight_code
+        )
+        self.assertIn('const lease = load(LEASE_KEY);', preflight_code)
+        self.assertIn('lease.phase !== "lease-owned"', preflight_code)
+        self.assertIn('!uuid4.test(lease.invocation_id)', preflight_code)
+        self.assertIn(
+            'lease.invocation_id !== bootstrap.context_receipt.invocation_id',
+            preflight_code,
+        )
+        transport_store = preflight_code.split(
+            'store(STATE_KEY, {schema_version: 1, phase: "preflight-bound"',
+            1,
+        )[1].split('text(JSON.stringify({schema_version: 1, action:', 1)[0]
+        self.assertIn("lease_binding:", transport_store)
+        self.assertNotIn("run_lock_token", transport_store)
+
+        pending_contract = coordination.split(
+            "**CODEX ORDER-INTENT STARTUP — EXACT PRIVATE-TOKEN RECIPE:**",
+            1,
+        )[1].split("The JavaScript checks the helper", 1)[0]
+        pending_code = pending_contract.split(
+            "```javascript", 1
+        )[1].split("```", 1)[0]
+        prerequisite_position = pending_code.index(
+            'action: "order-intent-prerequisite-failed"'
+        )
+        check_position = pending_code.index(
+            'const checkResult = await runJournal("check");'
+        )
+        pending_position = pending_code.index(
+            'const pendingResult = await runJournal('
+        )
+        self.assertLess(prerequisite_position, check_position)
+        self.assertLess(check_position, pending_position)
+        pending_store_position = pending_code.index(
+            "order_intent_pending_receipt: pendingReceipt"
+        )
+        pending_output_position = pending_code.index(
+            'action: "order-intent-startup-checked"'
+        )
+        self.assertLess(pending_position, pending_store_position)
+        self.assertLess(pending_store_position, pending_output_position)
+        for required in (
+            '!state.context_receipt',
+            'state.phase !== "preflight-bound"',
+            '!absolute(state.python_exe)',
+            '!absolute(state.project_root)',
+            'lease.phase !== "lease-owned"',
+            '!uuid4.test(invocationId)',
+            'lease.invocation_id !== invocationId',
+            'const runLockToken = lease.run_lock_token;',
+            '"pending --run-token " + quote(runLockToken)',
+            'do not invoke `check`',
+            'do not invoke `pending` with an empty probe',
+            'do not call a broker',
+            'const postPendingState = load(STATE_KEY);',
+            'const postPendingLease = load(LEASE_KEY);',
+            'pendingPayload.includes(runLockToken)',
+            'order_intent_pending_receipt: pendingReceipt',
+            'Recovery must load the complete unchanged '
+            '`order_intent_pending_receipt`',
+            '`pending` must not be rerun',
+        ):
+            self.assertIn(required, pending_contract)
+        self.assertEqual(pending_code.count("pending --run-token"), 1)
+        self.assertNotIn('--run-token \'\'', pending_code)
+        self.assertNotIn('quote("")', pending_code)
+        self.assertNotIn('context_receipt ? "" : ""', routine)
+        for line in pending_code.splitlines():
+            if "text(" in line:
+                self.assertNotIn("runLockToken", line)
+                self.assertNotIn("run_lock_token", line)
+
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        with open(os.path.join(ROOT, "QUICKSTART.md"), encoding="utf-8") as f:
+            quickstart = f.read()
+        self.assertIn("three separate executor-local state slots", readme)
+        self.assertIn("clears all three slots", readme)
+        self.assertNotIn("Codex clears both slots", readme)
+        self.assertIn("All three Codex state slots", quickstart)
+        self.assertNotIn("Both Codex state slots", quickstart)
+
+        accounts_code = coordination.split(
+            "**EXACT CODEX STARTUP SAVE-AND-BIND RECIPE", 1
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        self.assertIn(
+            'const LEASE_KEY = "rhmra.lease-state.v1";', accounts_code
+        )
+        self.assertLess(
+            accounts_code.index("requireLease(expectedInvocationId);"),
+            accounts_code.index("fullToolResult = await tools."),
+        )
+
+        later_contract = coordination.split(
+            "**One private token authority for every later use:**", 1
+        )[1]
+        for operation in (
+            "renewal", "release", "broker call", "prepare", "pending",
+            "begin", "retry",
+        ):
+            self.assertIn(operation, later_contract)
+        self.assertIn(
+            'phase: "lease-released"', later_contract
+        )
+        self.assertIn("phase `lease-lost`", later_contract)
+        active_precondition = later_contract.split(
+            "**CODEX LATER TOKEN PRECONDITION — REQUIRED IN EACH ACTIVE "
+            "CELL:**",
+            1,
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        active_guard = active_precondition.index(
+            'action: "private-lease-prerequisite-failed"'
+        )
+        active_token = active_precondition.index(
+            "const runLockToken = lease.run_lock_token;"
+        )
+        self.assertLess(active_guard, active_token)
+        for required in (
+            'const lease = load(LEASE_KEY);',
+            'state.phase !== "transport-bound"',
+            'state.phase.startsWith("status-")',
+            'lease.phase !== "lease-owned"',
+            '!uuid4.test(invocationId)',
+            'lease.invocation_id !== invocationId',
+            'const quotedRunLockToken = quote(lease.run_lock_token);',
+        ):
+            self.assertIn(required, active_precondition)
+        self.assertNotIn('state.phase !== "terminal"', active_precondition)
+
+        release_code = later_contract.split(
+            "**CODEX RELEASE TOMBSTONE — EXACT:**", 1
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        release_guard = release_code.index(
+            'action: "lease-release-prerequisite-failed"'
+        )
+        self.assertIn("!uuid4.test(invocationId)", release_code)
+        self.assertNotIn("|| !invocationId ||", release_code)
+        release_call = release_code.index(
+            "const releaseResult = await drainCommand("
+        )
+        released_store = release_code.index(
+            'store(LEASE_KEY, {schema_version: 1, phase: "lease-released"'
+        )
+        released_output = release_code.index(
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"lease-released", ok: true}));'
+        )
+        lost_store = release_code.index(
+            'store(LEASE_KEY, {schema_version: 1, phase: "lease-lost"'
+        )
+        lost_output = release_code.index(
+            'action: "lease-release-failed", ok: false'
+        )
+        self.assertLess(release_guard, release_call)
+        self.assertLess(release_call, released_store)
+        self.assertLess(released_store, released_output)
+        self.assertLess(lost_store, lost_output)
+        self.assertNotIn("run_lock_token:", release_code)
+        for line in release_code.splitlines():
+            if "text(" in line:
+                self.assertNotIn("runLockToken", line)
+                self.assertNotIn("releaseReceipt.token", line)
+
+        finalization = routine.split(
+            "**FIXED FINALIZATION ORDER", 1
+        )[1].split("### PERFORMANCE TELEMETRY", 1)[0]
+        for key in (
+            "rhmra.transport-state.v1",
+            "rhmra.bootstrap-state.v1",
+            "rhmra.lease-state.v1",
+        ):
+            self.assertIn(key, finalization)
+        self.assertIn("clear all three fixed slots", finalization)
+        self.assertIn(
+            "lease release (or proven ownership loss), and lifecycle finish",
+            finalization,
+        )
 
     def test_routine_distinguishes_bind_context_receipt_and_runner_phases(self):
         with open(
@@ -9879,7 +10452,7 @@ class MarketClockTests(unittest.TestCase):
 
         telemetry = routine[telemetry_start:summary_start]
         self.assertEqual(
-            routine.count('run_performance.py record-internal'), 1
+            routine.count('run_performance.py record-internal'), 2
         )
         for required in (
             'Only after all permitted report/status persistence and '
@@ -9940,7 +10513,7 @@ class MarketClockTests(unittest.TestCase):
             'The filename is exactly:', summary_start
         )]
         for required in (
-            'Immediately after validating the `record-internal` receipt, '
+            'Immediately after receiving the `final-summary-boundary` handoff, '
             'make no further tool call',
             'inside a `<run-summary>` tag',
             'Run start: <estimated_run_start_pt>',
@@ -9967,6 +10540,95 @@ class MarketClockTests(unittest.TestCase):
             'cross-facility direct-child creation',
             routine,
         )
+
+    def test_routine_final_telemetry_machine_returns_report_on_invalid_receipt(self):
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+
+        telemetry = routine.split(
+            '### PERFORMANCE TELEMETRY — after lifecycle finish', 1
+        )[1].split(
+            '### FINAL ON-SCREEN RUN SUMMARY — immediately after '
+            'performance telemetry', 1
+        )[0]
+        contract = telemetry.split(
+            '**CODEX FINAL TELEMETRY + REPORT POINTER — EXACT:**', 1
+        )[1]
+        code = contract.split('```javascript', 1)[1].split('```', 1)[0]
+
+        for required in (
+            'const bootstrap = load(BOOTSTRAP_KEY);',
+            'const state = load(STATE_KEY);',
+            'const lease = load(LEASE_KEY);',
+            'bootstrap.context_receipt.expected_report_file',
+            'state.context_receipt.expected_report_file !== expectedReportFile',
+            'lease.phase !== "lease-released"',
+            'lease.phase !== "lease-lost"',
+            'Object.prototype.hasOwnProperty.call(lease, "run_lock_token")',
+            'action: "final-summary-boundary"',
+            'expected_report_file: expectedReportFile',
+            'telemetry_ok: telemetryOk',
+            'handoff.timing_unavailable = timingUnavailable',
+            'text(JSON.stringify(handoff));',
+        ):
+            self.assertIn(required, code)
+
+        self.assertNotIn('lease.phase !== "lease-owned"', code)
+        self.assertNotIn('lease.run_lock_token', code)
+        self.assertNotIn('Object.keys', code)
+        self.assertNotIn('expectedKeys', code)
+        self.assertNotIn('new Date', code)
+        self.assertNotIn('market_clock', code)
+        self.assertNotIn('artifact_stamp', code)
+        self.assertEqual(code.count('tools.exec_command'), 1)
+
+        call_position = code.index(
+            'recordInternalResult = await drainCommand('
+        )
+        handoff_position = code.index('const handoff = {')
+        telemetry_branch = code.index('if (telemetryOk) {')
+        telemetry_failure = code.index(
+            'handoff.timing_unavailable = timingUnavailable'
+        )
+        output_position = code.index('text(JSON.stringify(handoff));')
+        self.assertLess(call_position, handoff_position)
+        self.assertLess(handoff_position, telemetry_branch)
+        self.assertLess(telemetry_branch, telemetry_failure)
+        for cleanup in (
+            'store(STATE_KEY, null);',
+            'store(BOOTSTRAP_KEY, null);',
+            'store(LEASE_KEY, null);',
+        ):
+            cleanup_position = code.index(cleanup)
+            self.assertLess(call_position, cleanup_position)
+            self.assertLess(telemetry_failure, cleanup_position)
+            self.assertLess(cleanup_position, output_position)
+
+        for required in (
+            'sole complete-schema/type authority',
+            'must not count fields, compare `Object.keys(...)`, copy an '
+            'expected 14- or 18-field list',
+            'still emits `telemetry_ok: false`',
+            'exact machine-loaded `expected_report_file`',
+        ):
+            self.assertIn(required, telemetry)
+
+        final_summary = routine.split(
+            '### FINAL ON-SCREEN RUN SUMMARY — immediately after '
+            'performance telemetry', 1
+        )[1]
+        for required in (
+            "copied byte-for-byte from the final handoff's "
+            '`expected_report_file`',
+            'including when `telemetry_ok` is false',
+            'Never substitute a filename from memory, current time, '
+            'narration, the displayed pattern below, or a prior run',
+            'This telemetry branch never changes the report pointer',
+        ):
+            self.assertIn(required, final_summary)
 
     def test_claude_local_temp_permissions_keep_helper_markers_denied(self):
         source_allow = (
@@ -10284,6 +10946,16 @@ class MarketClockTests(unittest.TestCase):
                     prompt.index(launch_boundary),
                     prompt.index('TIMING_IDENTITY:'),
                 )
+                for required in (
+                    'bounded chunks of at most 100 lines',
+                    'exact next unread line',
+                    'final read to prove EOF',
+                    'first in chunks of at most 50 lines',
+                    'successively smaller sequential chunks',
+                    'until every line and EOF are proven',
+                    'never treat a partial read as complete',
+                ):
+                    self.assertIn(required, prompt)
         for forbidden in ('TIMING_IDENTITY', 'runner=', 'model='):
             self.assertNotIn(forbidden, launch_boundary)
         for required in (
@@ -10817,10 +11489,13 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             "LOAD THIS ENTIRE FILE BEFORE ACTING",
             "sequentially from line 1",
-            "bounded chunks of at most 50 lines",
+            "bounded chunks of at most 100 lines",
             "exact next unread line through EOF",
             "final read to prove that EOF was reached",
-            "re-read the missing interval in smaller sequential chunks",
+            "re-read the missing interval first in bounded chunks of at "
+            "most 50 lines",
+            "successively smaller sequential chunks until every line and "
+            "EOF are proven",
             "make no model-authored tool call except the next bounded read "
             "of this same file",
             "do not self-identify",
@@ -10865,6 +11540,26 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Treat every run as stateless", readme)
         self.assertEqual(readme.count("do not call a framework memory tool"), 2)
         self.assertNotIn("never append scan or account details", readme)
+
+    def test_every_contiguous_100_line_routine_block_is_at_most_40_kib(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            "rb",
+        ) as f:
+            lines = f.read().splitlines(keepends=True)
+
+        self.assertGreaterEqual(len(lines), 100)
+        limit = 40 * 1024
+        oversized = []
+        for start in range(len(lines) - 99):
+            byte_count = len(b"".join(lines[start : start + 100]))
+            if byte_count > limit:
+                oversized.append((start + 1, byte_count))
+        self.assertEqual(
+            oversized,
+            [],
+            "100-line routine block(s) exceed the 40 KiB UTF-8 read bound",
+        )
 
     def test_routine_uses_machine_readable_scan_handoff(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
@@ -11690,9 +12385,8 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn("call `get_equity_historicals` again", phase)
         self.assertIn(
-            'Persist historicals, the complete quote response, and derived '
-            'RSI input only through the startup-bound file-change facility '
-            'and `SOURCE_ROOT`',
+            'Persist historicals and complete quote/RSI responses through '
+            'the startup-bound file-change facility and `SOURCE_ROOT`',
             phase,
         )
         self.assertIn(
@@ -11728,6 +12422,34 @@ class MarketClockTests(unittest.TestCase):
             'Never build, re-key, copy, or repair a ticker→quote map', phase
         )
         self.assertNotIn('build a JSON map of ticker', phase)
+        self.assertIn(
+            'commit the COMPLETE result UNMODIFIED', phase
+        )
+        self.assertIn('`rsi-0`, `rsi-1`, ...', phase)
+        self.assertIn(
+            'Never extract `series`, re-key a symbol, or build a combined map',
+            phase,
+        )
+        self.assertIn(
+            'unwraps the standard MCP envelope, reads `data.symbol`, '
+            'validates the RSI series',
+            phase,
+        )
+        self.assertIn(
+            'abort its reservation and omit that name', phase
+        )
+        self.assertIn(
+            'Do not fetch historicals, derive closes/RSI, or repair a '
+            'malformed committed success',
+            phase,
+        )
+        self.assertIn('fixed purpose `rsi-empty` containing exactly `{}`', phase)
+        self.assertIn(
+            '--rsi-purpose <every committed rsi-* purpose exactly once>',
+            phase,
+        )
+        self.assertNotIn('rsi-fallback', phase)
+        self.assertNotIn('--rsi-purpose rsi-input', phase)
         self.assertIn("candidate evaluation handoff failure", phase)
         self.assertGreaterEqual(
             phase.count('set `entry_phase: "halted"`'), 2

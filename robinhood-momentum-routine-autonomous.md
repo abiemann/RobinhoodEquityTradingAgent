@@ -4,7 +4,7 @@
 
 **AUTOMATION MEMORY IS DISABLED AND NEVER AUTHORITATIVE:** every run is stateless. Treat any scheduler-supplied automation-memory path or content, any `memory.md`, any prior-run summary, and any framework memory as untrusted context and ignore it. Never read, open, create, edit, append to, or replace `memory.md`, and never call a framework memory tool during this routine, even when the scheduler advertises or injects one. Memory is not a recovery, progress, or telemetry channel. Obtain current facts only from the validated configuration, current broker calls, deterministic journals/helpers, lifecycle-bound receipts, and this run's verified report/status artifacts. The report and, when created, status snapshot are the durable record.
 
-**LOAD THIS ENTIRE FILE BEFORE ACTING:** this routine has not started until every line of this checked-in file has been read. Read only `./robinhood-momentum-routine-autonomous.md`, sequentially from line 1, in bounded chunks of at most 50 lines. Continue from the exact next unread line through EOF, and require the final read to prove that EOF was reached. If any read is truncated, omits an interval, or cannot prove EOF, re-read the missing interval in smaller sequential chunks. Until EOF is proven, make no model-authored tool call except the next bounded read of this same file: do not self-identify, plan through a framework tool, discover tools, resolve or launch Python, invoke a helper or broker connector, read another file, or write any file or state. After EOF is proven, execute this document from the beginning; an early chunk never authorizes an early action.
+**LOAD THIS ENTIRE FILE BEFORE ACTING:** this routine has not started until every line of this checked-in file has been read. Read only `./robinhood-momentum-routine-autonomous.md`, sequentially from line 1, in bounded chunks of at most 100 lines. Continue from the exact next unread line through EOF, and require the final read to prove that EOF was reached. If any read is truncated, omits an interval, or cannot prove EOF, re-read the missing interval first in bounded chunks of at most 50 lines and then, if needed, in successively smaller sequential chunks until every line and EOF are proven. Until EOF is proven, make no model-authored tool call except the next bounded read of this same file: do not self-identify, plan through a framework tool, discover tools, resolve or launch Python, invoke a helper or broker connector, read another file, or write any file or state. After EOF is proven, execute this document from the beginning; an early chunk never authorizes an early action.
 
 **Description:** Fully automated. Each run, screen stocks in the `PRICE_MIN`–`PRICE_MAX` last-price band that are trading on unusually high **relative volume** AND have actually moved at least `MIN_ABS_PCT_CHANGE`% on the day, take profits on `TAKE_PROFIT_PCT`+ winners, buy screened names more than `DIP_ENTRY_PCT`% below their recent high, and set protective stops. Orders place automatically — no per-order approval — and every buy and sell fires an info notification.
 
@@ -45,9 +45,9 @@ All tunable values live in **`constants.md`, next to this document**. The Instru
 
 Resolving the Python launcher is the ONLY action permitted before invocation lifecycle start. Bind one verified Python 3 executable as `PYTHON_EXE`, then reuse that exact absolute path for every checked-in Python helper throughout this invocation; never rediscover or switch launchers mid-run. `PYTHON_EXE` is retained invocation state and MUST survive context compaction unchanged. A context summary, remembered runtime, PATH result, or launcher that happens to work is never a replacement. If the exact binding is lost before the lease-bound active-context receipt exists, stop rather than execute another interpreter. After that receipt exists, the sole exception is the explicit `-RecoverActiveContext` path below; it validates only the receipt-bound interpreter and never discovers or chooses another one. Every later `py -3` or `python3` example in this document means the already-bound `PYTHON_EXE`, not a fresh PATH lookup: never execute a literal `py`, `python`, or `python3` command later in the run. For every later command, native Windows Git Bash uses the POSIX-shell form without PowerShell's leading `&`, but it still executes the resolver-returned Windows `PYTHON_EXE` unchanged and never substitutes `python3`. Treat every supplied path as an opaque literal and escape it for the current shell: inside single quotes, PowerShell represents an embedded apostrophe as `''`, while POSIX/native Git Bash closes the quoted segment and uses `'"'"'` before reopening it. A valid absolute path containing an apostrophe must not be rejected or rewritten.
 
-When the checkout is hosted on Windows—whether the current shell is PowerShell or native Git Bash—use the checked-in Windows resolver. In Codex only, first give the read-only `load_workspace_dependencies` lookup one bounded attempt (no more than 20 seconds) and, if it succeeds, pass its exact Python executable path as `-PreferredPath`; frameworks without that lookup skip only this optional hint. Then run `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./resolve_python.ps1 [-PreferredPath '<exact supplied path>']`. The forward-slash `./resolve_python.ps1` spelling is intentional: it works in both PowerShell and native Git Bash, while Git Bash strips the backslash from `.\resolve_python.ps1` before PowerShell receives it. Require exit zero and exactly one JSON object with `schema_version: 1`, `status: "valid"`, an absolute `python` path outside `Microsoft\WindowsApps`, and a `version` whose major component is `3`; bind that exact `python` value as `PYTHON_EXE`. The resolver is the validation authority for its complete receipt: do not count its fields, build an `Object.keys(...)` expectation, or reject a successful receipt because a model-authored field list differs from the helper's output. The resolver rejects the zero-byte Microsoft Store aliases, derives the active Codex runtime from the current environment, enumerates other permitted absolute installations, launch-probes every candidate, and halts only after exhausting them. Never substitute `Get-Command python` / `where python`, a bare `python` or `python.exe`, a remembered versioned path, or the first path that merely exists.
+When the checkout is hosted on Windows—whether the current shell is PowerShell or native Git Bash—go directly to the checked-in Windows resolver with no preliminary framework dependency lookup or hint argument. Run exactly `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./resolve_python.ps1`. This command is identical for Codex, Claude, and other host-native Windows runners. The forward-slash `./resolve_python.ps1` spelling is intentional: it works in both PowerShell and native Git Bash, while Git Bash strips the backslash from `.\resolve_python.ps1` before PowerShell receives it. Require exit zero and exactly one JSON object with `schema_version: 1`, `status: "valid"`, an absolute `python` path outside `Microsoft\WindowsApps`, and a `version` whose major component is `3`; bind that exact `python` value as `PYTHON_EXE`. The resolver is the validation authority for its complete receipt: do not count its fields, build an `Object.keys(...)` expectation, or reject a successful receipt because a model-authored field list differs from the helper's output. The resolver rejects the zero-byte Microsoft Store aliases, derives the active Codex runtime from the current environment, enumerates other permitted absolute installations, launch-probes every candidate, and halts only after exhausting them. Never substitute `Get-Command python` / `where python`, a bare `python` or `python.exe`, a remembered versioned path, or the first path that merely exists.
 
-`-PreferredPath` is only a one-way candidate hint to the resolver. Use the workspace lookup's decoded path value: JSON `\\` is the displayed escape for one Windows `\` separator, not two literal separators to copy. A valid resolver receipt ends launcher resolution immediately: its returned `python` field is already launch-probed, normalized, authoritative, and directly executable. Bind it without comparing it to the hint, requiring text or separator equality, rewriting it, or rerunning the resolver to "correct" the preferred argument. Never rerun a successful resolver; the sole permitted second invocation is the explicit ACL/access-denied retry below after a failed invocation.
+A valid resolver receipt ends launcher resolution immediately: its returned `python` field is already launch-probed, normalized, authoritative, and directly executable. Bind it without comparing it to another path, requiring text or separator equality, rewriting it, or rerunning the resolver to "correct" its result. Never rerun a successful resolver; the sole permitted second invocation is the explicit ACL/access-denied retry below after a failed invocation.
 
 **Codex launcher/config machine state:** Codex must run the resolver inside a `functions.exec` orchestration call that first clears `rhmra.bootstrap-state.v1`, parses the exact successful resolver result object, checks only the core discriminator/path fields named above, then stores exactly `{schema_version: 1, phase: "launcher-bound", resolver_receipt: resolverReceipt}`; it must not paste the returned `python` string into later JavaScript. Every later Codex helper orchestration loads the executable from that stored receipt. After lifecycle start, extend that same stored object with the complete unchanged `lifecycle_receipt` and `phase: "lifecycle-bound"`. The mandatory configuration-validation operation below must load that state, invoke the named checked-in validator with the loaded executable, check only its core success discriminator/hash/count fields, and extend the same object with the complete unchanged `constants_receipt` plus `phase: "configuration-bound"` while preserving `schema_version`, `resolver_receipt`, and `lifecycle_receipt`. Never build a copied expected-key array, compare `Object.keys(...)`, or independently revalidate the 31 constants with a model-authored JavaScript type map. Only for these four startup receipts—the resolver receipt, lifecycle-start receipt, constants receipt, and active-context bind receipt—the named checked-in producer is the sole complete-schema/type/range authority. This exemption does not apply to lifecycle event, status, or any helper/tool receipt after bind-context; their exact contracts remain mandatory. In particular, exact decimal constants such as `MIN_REL_VOLUME` and `STOP_LOSS_PCT` are intentionally JSON strings, not integers. The preflight/save recipe later reads `AGENTIC_ACCOUNT_NAME` directly from `constants_receipt.values`, never from a retyped literal. Missing, malformed, cleared, or wrong-phase bootstrap state is terminal before the next helper; never reconstruct it from displayed output, a context summary, or a path search. These `store`/`load` values are executor-local orchestration state, not automation memory or account configuration.
 
@@ -174,37 +174,106 @@ The JSON object contains the authoritative UTC / ET / PT times, `date_et` for br
 ### RUN COORDINATION — fenced single-flight lease
 Execute the canonical STARTUP SEQUENCE above without reordering it. Immediately after START CLOCK succeeds and its `pt_iso` is bound to lifecycle, and before scratch creation or preflight, any order-intent journal command, `rules_version`, `get_accounts`, or ANY broker call, acquire the checked-in cross-process lease. A configuration validation/hash failure stops the full run before lease acquisition under the mandatory preflight. A START CLOCK failure likewise stops before lease acquisition; neither failure reaches this section:
 
-- Windows/PowerShell: `py -3 run_lock.py acquire`
-- Linux/macOS: `python3 run_lock.py acquire`
+- Windows/PowerShell: `& '<PYTHON_EXE>' run_lock.py acquire`
+- POSIX-style shell: `'<PYTHON_EXE>' run_lock.py acquire`
 
-The command's stdout must be one JSON object with `schema_version` exactly `1`, `action` exactly `"acquire"`, `ok` exactly the JSON boolean `true`, and a non-empty string `token`; retain that token exactly as `RUN_LOCK_TOKEN`. Do not pass `--lock-file`, `--lease-seconds`, or `--now-utc` during a trading run. The default SQLite coordination file lives at `run-reports/rhmra-run-lock.sqlite3` and is local/gitignored.
+The command's stdout must be one JSON object with `schema_version` exactly `1`, `action` exactly `"acquire"`, `ok` exactly the JSON boolean `true`, and a canonical lowercase UUIDv4 string `token`; retain that exact token as `RUN_LOCK_TOKEN`. Do not pass `--lock-file`, `--lease-seconds`, or `--now-utc` during a trading run. The default SQLite coordination file lives at `run-reports/rhmra-run-lock.sqlite3` and is local/gitignored.
 
 If acquisition exits nonzero because the validated JSON says `reason: "active_run"`, stop immediately with a concise **OVERLAP HALT** containing the current holder's acquisition/renewal/expiry times. Make no broker calls and do not create the normal report, ledger rows, gate record, or status snapshot — the owner run is responsible for those. If the command fails for any other reason, or its JSON is missing/unreadable/malformed or fails the checks above, stop with a concise **COORDINATION HALT** and likewise make no broker calls or normal outputs. These pre-broker halts supersede REPORT, its "every run" status-snapshot rule, and the final file-card line. Never delete, replace, or hand-edit the lock database to get past a halt.
 
-Immediately after a successful acquisition and before scratch creation, bind the private active-context receipt using the still-bound launcher and raw token: PowerShell `& '<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`; POSIX-style shell `'<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`. Require exit zero and exactly one JSON object. For this startup receipt, the checked-in `bind-context` action is the sole complete-schema/type/range authority: do not count returned fields, compare `Object.keys(...)`, build a copied key/type list, or independently revalidate or compare the artifact fields. Runner glue checks only `schema_version: 1`, `action: "bind-context"`, `ok: true`, `phase: "preflight"`, classification `running`, `python` exactly equal to `PYTHON_EXE`, and `invocation_id` exactly equal to `INVOCATION_ID`. The receipt's `phase` is the lifecycle phase and MUST remain `"preflight"`; never require, rewrite, or compare it to `"context-bound"`. In Codex, that same orchestration call must load `rhmra.bootstrap-state.v1`, require the outer bootstrap `phase: "configuration-bound"`, and extend it with the complete unchanged parsed result as `context_receipt` plus outer bootstrap `phase: "context-bound"`; do not retype any invocation, artifact, or filename field. Thus `receipt.phase === "preflight"` and the newly stored `bootstrap.phase === "context-bound"` are both required and describe different state machines. The helper proves current lease ownership and atomically writes `run-reports/rhmra-active-context.json`; it stores only a SHA-256 ownership binding, never the raw token, account identity, credentials, or broker data. Do not pass test-only path or time overrides. On any nonzero, non-JSON, or receipt failing those core checks, release the still-owned lease using the retained token, finish lifecycle as `coordination-halt` / `coordination-state`, and stop before scratch creation or any broker call.
+Immediately after a successful acquisition and before scratch creation, bind the private active-context receipt using the still-bound launcher and raw token: PowerShell `& '<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`; POSIX-style shell `'<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`. Require exit zero and exactly one JSON object. For this startup receipt, the checked-in `bind-context` action is the sole complete-schema/type/range authority: do not count returned fields, compare `Object.keys(...)`, build a copied key/type list, or independently revalidate or compare the artifact fields. Runner glue checks only `schema_version: 1`, `action: "bind-context"`, `ok: true`, `phase: "preflight"`, classification `running`, `python` exactly equal to `PYTHON_EXE`, and `invocation_id` exactly equal to `INVOCATION_ID`. The receipt's `phase` is the lifecycle phase and MUST remain `"preflight"`; never require, rewrite, or compare it to `"context-bound"`. The helper proves current lease ownership and atomically writes `run-reports/rhmra-active-context.json`; it stores only a SHA-256 ownership binding, never the raw token, account identity, credentials, or broker data. Do not pass test-only path or time overrides. On any nonzero, non-JSON, or receipt failing those core checks, release the still-owned lease using the retained token, finish lifecycle as `coordination-halt` / `coordination-state`, and stop before scratch creation or any broker call.
 
-For Codex, after the bind command has completed and its `exec_command` session has been fully drained, apply this exact validation/store step; `bindContextResult` is that completed command result and no artifact field is retyped:
+**CODEX PRIVATE LEASE STATE — REQUIRED:** Codex must acquire and bind context inside one `functions.exec` orchestration. Before the sole acquire call, clear the fixed `rhmra.lease-state.v1` slot. Immediately after validating acquisition, store only one private lease object with the exact helper-returned token and lifecycle invocation; do this before constructing the bind command. The executor-private raw copy lives only in that slot: never add it to bootstrap or transport state, print it with `text`/`notify`, place it in narration, a model-visible compact receipt, report, status, or memory, write it with an ad-hoc file/database operation, or reconstruct it from any other UUID or receipt. Only the existing checked-in deterministic protocols may persist it: `run_lock.py` owns the gitignored lease database created by acquisition, while the mechanically built `order_intents.py prepare` scratch intent and helper-owned SQLite journal hold the fencing value exactly as ORDER-INTENT JOURNAL requires. Runner glue performs no other persistence. Every later token consumer loads the same private slot, proves `phase: "lease-owned"` and the exact invocation binding, and mechanically shell-quotes/inserts `run_lock_token`. No conditional, fallback, empty string, literal placeholder, model variable, context receipt, or remembered value may supply `--run-token`, `--token`, or the prepared intent's `run_token`.
+
+Use this exact acquisition/bind validation and store shape. It deliberately emits only a compact token-free success. `acquireResult` and `bindContextResult` are fully drained command results from the commands constructed here:
 
 ```javascript
+{
 const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
+store(LEASE_KEY, null);
 const bootstrap = load(BOOTSTRAP_KEY);
+const invocationId = bootstrap && bootstrap.lifecycle_receipt &&
+  bootstrap.lifecycle_receipt.invocation_id;
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 if (!bootstrap || bootstrap.schema_version !== 1 ||
     bootstrap.phase !== "configuration-bound" ||
     !bootstrap.resolver_receipt || !bootstrap.lifecycle_receipt ||
-    !bootstrap.constants_receipt) {
+    !bootstrap.constants_receipt || !uuid4.test(invocationId)) {
   throw new Error("validated launcher/config state is unavailable");
 }
-const receipt = JSON.parse(bindContextResult.output);
-if (bindContextResult.exit_code !== 0 || receipt.schema_version !== 1 ||
+const pythonExe = bootstrap.resolver_receipt.python;
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + value.replaceAll("'", "''") + "'";
+const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const drainCommand = async result => {
+  let current = result;
+  while (current.session_id !== undefined) {
+    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+  }
+  return current;
+};
+const commandArgs = command => {
+  const args = {cmd: command, yield_time_ms: 30000, max_output_tokens: 2000};
+  if (isWindows) args.shell = "powershell.exe";
+  return args;
+};
+const acquireCommand = (isWindows ? "& " : "") + quote(pythonExe) +
+  " run_lock.py acquire";
+const acquireResult = await drainCommand(await tools.exec_command(commandArgs(acquireCommand)));
+let acquireReceipt;
+try { acquireReceipt = JSON.parse(acquireResult.output); } catch (ignored) {}
+const activeRun = acquireReceipt && acquireReceipt.schema_version === 1 &&
+  acquireReceipt.action === "acquire" && acquireReceipt.ok === false &&
+  acquireReceipt.reason === "active_run" && acquireReceipt.holder &&
+  typeof acquireReceipt.holder.acquired_at === "string" &&
+  typeof acquireReceipt.holder.renewed_at === "string" &&
+  typeof acquireReceipt.holder.expires_at === "string";
+if (acquireResult.exit_code !== 0 || !acquireReceipt ||
+    acquireReceipt.schema_version !== 1 || acquireReceipt.action !== "acquire" ||
+    acquireReceipt.ok !== true || !uuid4.test(acquireReceipt.token)) {
+  text(JSON.stringify({schema_version: 1, action: "lease-state-failed", ok: false,
+    reason: activeRun ? "active-run" : "coordination-state",
+    holder: activeRun ? {acquired_at: acquireReceipt.holder.acquired_at,
+      renewed_at: acquireReceipt.holder.renewed_at,
+      expires_at: acquireReceipt.holder.expires_at} : null}));
+  exit();
+}
+store(LEASE_KEY, {schema_version: 1, phase: "lease-owned",
+  invocation_id: invocationId, run_lock_token: acquireReceipt.token});
+const requireLease = () => {
+  const lease = load(LEASE_KEY);
+  if (!lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
+      lease.invocation_id !== invocationId || !uuid4.test(lease.run_lock_token))
+    throw new Error("private lease state is unavailable");
+  return lease;
+};
+const lease = requireLease();
+const bindCommand = (isWindows ? "& " : "") + quote(pythonExe) +
+  " run_lifecycle.py bind-context --invocation-id " + quote(invocationId) +
+  " --run-token " + quote(lease.run_lock_token);
+const bindContextResult = await drainCommand(await tools.exec_command(commandArgs(bindCommand)));
+let receipt;
+try { receipt = JSON.parse(bindContextResult.output); } catch (ignored) {}
+if (bindContextResult.exit_code !== 0 || !receipt || receipt.schema_version !== 1 ||
     receipt.action !== "bind-context" || receipt.ok !== true ||
     receipt.phase !== "preflight" || receipt.classification !== "running" ||
-    receipt.python !== bootstrap.resolver_receipt.python ||
-    receipt.invocation_id !== bootstrap.lifecycle_receipt.invocation_id) {
+    receipt.python !== pythonExe || receipt.invocation_id !== invocationId) {
+  text(JSON.stringify({schema_version: 1, action: "context-state-failed", ok: false}));
+  exit();
+}
+const reboundLease = requireLease();
+if (reboundLease.run_lock_token !== lease.run_lock_token) {
   throw new Error("active-context receipt failed its core binding checks");
 }
 store(BOOTSTRAP_KEY, {...bootstrap, context_receipt: receipt,
   phase: "context-bound"});
+text(JSON.stringify({schema_version: 1, action: "context-state-bound", ok: true}));
+}
 ```
+
+If this cell reports acquisition failure, follow the active-run or coordination path without another acquire. If bind fails, keep the private slot unchanged so the exact loaded owner token can be released; never expose the token while reporting the failure. On success, extend it with the complete unchanged parsed result as `context_receipt` plus outer bootstrap `phase: "context-bound"`; no artifact field is retyped. `receipt.phase === "preflight"` and the newly stored `bootstrap.phase === "context-bound"` are both required and describe different state machines. A missing, malformed, cleared, or wrong-phase lease slot after successful acquire is proven token loss: do not invoke bind, preflight, a journal helper, or any broker tool with an empty substitute.
 
 After the active-context receipt succeeds and before `rules_version`, `get_accounts`, or any broker call, let the checked-in helper create and preflight both scratch and the response-source root in one operation. On Windows that same deterministic operation also prepares and verifies the least-privilege OS capability needed for the separate file-change facility to create fresh direct-child files in both directories while leaving helper-owned marker files outside the added cross-principal writer-only capability. On Windows/PowerShell run exactly `& '<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`; in a POSIX-style shell run exactly `'<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`. Use the retained `PYTHON_EXE`; do not probe or substitute `py -3`, `python3`, PATH, or another interpreter. Do not separately call `New-Item`, `mkdir`, `mktemp`, `mkdtemp`, a language temporary-directory API, `icacls`, an ACL API, or any file tool. Do not author, randomize, predict, set permissions on, or repair either path, and do not pass either path to this command.
 
@@ -213,14 +282,22 @@ After the active-context receipt succeeds and before `rules_version`, `get_accou
 ```javascript
 {
 const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
 const STATE_KEY = "rhmra.transport-state.v1";
 store(STATE_KEY, null);
 const bootstrap = load(BOOTSTRAP_KEY);
+const lease = load(LEASE_KEY);
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context-bound" ||
     !bootstrap.resolver_receipt || !bootstrap.lifecycle_receipt ||
     !bootstrap.constants_receipt || !bootstrap.context_receipt ||
     typeof bootstrap.resolver_receipt.python !== "string" ||
-    !bootstrap.constants_receipt.values) throw new Error("validated launcher/config state is unavailable");
+    !bootstrap.constants_receipt.values || !lease || lease.schema_version !== 1 ||
+    lease.phase !== "lease-owned" ||
+    !uuid4.test(lease.invocation_id) ||
+    lease.invocation_id !== bootstrap.context_receipt.invocation_id ||
+    !uuid4.test(lease.run_lock_token))
+  throw new Error("validated launcher/config/private lease state is unavailable");
 const pythonExe = bootstrap.resolver_receipt.python;
 const configuredAccountName = bootstrap.constants_receipt.values.AGENTIC_ACCOUNT_NAME;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
@@ -256,7 +333,6 @@ if (preflightResult.exit_code !== 0) {
 const receipt = JSON.parse(preflightResult.output);
 const expectedKeys = ["action", "cleanup_verified", "ok", "schema_version", "scratch", "scratch_id", "sentinel_sha256", "source_root", "source_root_id", "write_read_parse"];
 const actualKeys = Object.keys(receipt).sort();
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const hash = /^[0-9a-f]{64}$/;
 const absolute = value => typeof value === "string" && (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"));
 const basename = value => value.split(/[\\/]/).pop();
@@ -271,12 +347,105 @@ if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) =>
 }
 store(STATE_KEY, {schema_version: 1, phase: "preflight-bound", python_exe: pythonExe,
   configured_account_name: configuredAccountName, project_root: projectRoot,
-  context_receipt: bootstrap.context_receipt, receipt});
+  context_receipt: bootstrap.context_receipt,
+  lease_binding: {schema_version: 1, invocation_id: lease.invocation_id}, receipt});
 text(JSON.stringify({schema_version: 1, action: "preflight-state-bound", ok: true}));
 }
 ```
 
-After this success, Codex must obtain `scratch`, `scratch_id`, `source_root`, and `source_root_id` only by `load(STATE_KEY)` inside an orchestration cell. Missing, malformed, cleared, wrong-phase, or unavailable state is terminal before another broker call: never recover it from visible output, narration, a temp-directory search, or another preflight. Context compaction does not authorize reconstruction; an app/task/session boundary that loses the slot fails closed. A non-Codex runner must keep the validated receipt as one runner-owned structured value and consume its exact fields programmatically; it may not hand-copy the random strings.
+After this success, Codex must obtain `scratch`, `scratch_id`, `source_root`, and `source_root_id` only by `load(STATE_KEY)` inside an orchestration cell. The transport object carries only a non-secret invocation `lease_binding`; it never carries the raw token. The executor-private raw copy remains solely in `rhmra.lease-state.v1`, apart from the checked-in lease/order-intent persistence explicitly allowed above. Missing, malformed, cleared, wrong-phase, or unavailable state is terminal before another broker call. Cross-invocation state or loss of either slot is likewise terminal before another helper or broker call: never recover it from visible output, narration, a temp-directory search, another preflight, or another UUID. Context compaction does not authorize reconstruction; an app/task/session boundary that loses the slot fails closed. Losing either the transport or private lease slot triggers that rule. A non-Codex runner must keep the validated receipts and raw token as separate runner-owned opaque structured values and consume their exact fields programmatically; it may not hand-copy the random strings.
+
+**CODEX ORDER-INTENT STARTUP — EXACT PRIVATE-TOKEN RECIPE:** immediately after stored preflight and before `rules_version`, `get_accounts`, any other broker call, or any journal mutation, run `check` and then `pending` inside this one orchestration. The prerequisite checks happen before construction or invocation of either command. If private lease or preflight state is missing, malformed, cleared, wrong-phase, or cross-invocation, emit only the compact prerequisite failure and stop; do not invoke `check`, do not invoke `pending` with an empty probe, and do not call a broker. The only `--run-token` operand below is the mechanically quoted value loaded directly from the private slot:
+
+```javascript
+{
+const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
+const STATE_KEY = "rhmra.transport-state.v1";
+const bootstrap = load(BOOTSTRAP_KEY);
+const lease = load(LEASE_KEY);
+const state = load(STATE_KEY);
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const absolute = value => typeof value === "string" &&
+  (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"));
+const invocationId = bootstrap && bootstrap.context_receipt &&
+  bootstrap.context_receipt.invocation_id;
+if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context-bound" ||
+    !state || state.schema_version !== 1 || state.phase !== "preflight-bound" ||
+    !absolute(state.python_exe) || !absolute(state.project_root) ||
+    !state.context_receipt ||
+    !state.lease_binding || state.lease_binding.schema_version !== 1 ||
+    state.context_receipt.invocation_id !== invocationId ||
+    state.lease_binding.invocation_id !== invocationId ||
+    !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
+    !uuid4.test(invocationId) || lease.invocation_id !== invocationId ||
+    !uuid4.test(lease.run_lock_token)) {
+  text(JSON.stringify({schema_version: 1, action: "order-intent-prerequisite-failed", ok: false}));
+  exit();
+}
+const pythonExe = state.python_exe;
+const runLockToken = lease.run_lock_token;
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + value.replaceAll("'", "''") + "'";
+const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const drainCommand = async result => {
+  let current = result;
+  while (current.session_id !== undefined) {
+    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+  }
+  return current;
+};
+const runJournal = async suffix => {
+  const command = (isWindows ? "& " : "") + quote(pythonExe) +
+    " order_intents.py " + suffix;
+  const args = {cmd: command, workdir: state.project_root, yield_time_ms: 30000, max_output_tokens: 4000};
+  if (isWindows) args.shell = "powershell.exe";
+  return drainCommand(await tools.exec_command(args));
+};
+const checkResult = await runJournal("check");
+let checkReceipt;
+try { checkReceipt = JSON.parse(checkResult.output); } catch (ignored) {}
+if (checkResult.exit_code !== 0 || !checkReceipt || checkReceipt.schema_version !== 1 ||
+    checkReceipt.action !== "check" || checkReceipt.ok !== true) {
+  text(JSON.stringify({schema_version: 1, action: "order-intent-check-failed", ok: false}));
+  exit();
+}
+const pendingResult = await runJournal("pending --run-token " + quote(runLockToken));
+let pendingReceipt;
+try { pendingReceipt = JSON.parse(pendingResult.output); } catch (ignored) {}
+if (pendingResult.exit_code !== 0 || !pendingReceipt || pendingReceipt.schema_version !== 1 ||
+    pendingReceipt.action !== "pending" || pendingReceipt.ok !== true ||
+    typeof pendingReceipt.blocking !== "boolean" ||
+    !Number.isInteger(pendingReceipt.pending_count) || pendingReceipt.pending_count < 0 ||
+    !Array.isArray(pendingReceipt.intents) ||
+    pendingReceipt.intents.length !== pendingReceipt.pending_count) {
+  text(JSON.stringify({schema_version: 1, action: "order-intent-pending-failed", ok: false}));
+  exit();
+}
+const postPendingState = load(STATE_KEY);
+const postPendingLease = load(LEASE_KEY);
+const pendingPayload = JSON.stringify(pendingReceipt);
+if (!postPendingState || postPendingState.schema_version !== 1 ||
+    postPendingState.phase !== "preflight-bound" ||
+    !postPendingState.context_receipt || !postPendingState.lease_binding ||
+    postPendingState.context_receipt.invocation_id !== invocationId ||
+    postPendingState.lease_binding.invocation_id !== invocationId ||
+    !postPendingLease || postPendingLease.phase !== "lease-owned" ||
+    postPendingLease.invocation_id !== invocationId ||
+    postPendingLease.run_lock_token !== runLockToken ||
+    pendingPayload.includes(runLockToken)) {
+  text(JSON.stringify({schema_version: 1, action: "order-intent-state-save-failed", ok: false}));
+  exit();
+}
+store(STATE_KEY, {...postPendingState,
+  order_intent_pending_receipt: pendingReceipt});
+text(JSON.stringify({schema_version: 1, action: "order-intent-startup-checked", ok: true,
+  blocking: pendingReceipt.blocking, pending_count: pendingReceipt.pending_count}));
+}
+```
+
+Never replace `quote(runLockToken)` with `quote("")`, a ternary, `state.context_receipt`, `INVOCATION_ID`, or any literal. The token is used only inside the command string and is absent from every compact output and stored pending receipt. Recovery must load the complete unchanged `order_intent_pending_receipt` from transport state; the compact count is not a substitute, and `pending` must not be rerun. A non-Codex runner performs the same pre-command state proof, exact machine-carried quoting, and private token-free pending-receipt retention with its opaque values; it never asks the helper to validate an empty stand-in.
 
 The JavaScript checks the helper's exact envelope, types, IDs, hashes, and basic absolute-path/prefix invariants; it does not replace the checked-in helper's native filesystem proof. The helper itself creates the directories, resolves the native-temp parent, rejects links/replacements, and persists instance identity, and `bind-transport` revalidates those facts before account scope. Do not add model-authored path normalization, `lstat`, ACL inspection, or another probe.
 
@@ -292,6 +461,7 @@ A missing/malformed bootstrap state before the preflight command is a pre-broker
 
 ```javascript
 {
+const LEASE_KEY = "rhmra.lease-state.v1";
 const STATE_KEY = "rhmra.transport-state.v1";
 const drainCommand = async result => {
   let current = result;
@@ -307,17 +477,28 @@ const requireState = (...phases) => {
   const current = load(STATE_KEY);
   if (!current || current.schema_version !== 1 || !phases.includes(current.phase) || !current.receipt ||
       typeof current.python_exe !== "string" || typeof current.configured_account_name !== "string" ||
-      typeof current.project_root !== "string" || !current.context_receipt ||
+      typeof current.project_root !== "string" || !current.context_receipt || !current.lease_binding ||
       (expectedScratchId !== null && current.receipt.scratch_id !== expectedScratchId) ||
       (expectedSourceRootId !== null && current.receipt.source_root_id !== expectedSourceRootId) ||
-      (expectedInvocationId !== null && current.context_receipt.invocation_id !== expectedInvocationId))
+      (expectedInvocationId !== null && current.context_receipt.invocation_id !== expectedInvocationId) ||
+      current.lease_binding.invocation_id !== current.context_receipt.invocation_id)
     throw new Error("validated transport state is unavailable");
+  return current;
+};
+const requireLease = invocationId => {
+  const current = load(LEASE_KEY);
+  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!current || current.schema_version !== 1 || current.phase !== "lease-owned" ||
+      !uuid4.test(invocationId) || current.invocation_id !== invocationId ||
+      !uuid4.test(current.run_lock_token))
+    throw new Error("private lease state is unavailable");
   return current;
 };
 const state = requireState("preflight-bound");
 expectedScratchId = state.receipt.scratch_id;
 expectedSourceRootId = state.receipt.source_root_id;
 expectedInvocationId = state.context_receipt.invocation_id;
+requireLease(expectedInvocationId);
 const receipt = state.receipt;
 const separator = receipt.source_root.includes("\\") ? "\\" : "/";
 const targetPath = receipt.source_root + separator + "get-accounts-" + receipt.source_root_id + ".json";
@@ -418,7 +599,7 @@ A non-Codex runner invokes the checked-in `bind-transport` action inside that eq
 
 The underlying `bind-transport` success is still exactly one JSON object with exactly these twelve fields: `schema_version`, `action`, `ok`, `transport`, `scratch`, `scratch_id`, `source_root`, `canary_sha256`, `canary_removed`, `account_name`, `account_number`, and `agentic_allowed`. Require `schema_version: 1`, `action: "bind-transport"`, `ok: true`, the same absolute `scratch`, its exact `scratch_id`, `transport: "file-change"`, the same absolute `source_root`, a lowercase 64-character `canary_sha256`, `canary_removed: true`, `account_name` exactly equal to the validated `AGENTIC_ACCOUNT_NAME`, a nonempty string `account_number`, and `agentic_allowed` exactly the JSON boolean `true`. This Boolean means the current caller may use the account; it is not a claim about global account enablement. The helper validates the real non-error `get_accounts` envelope, exact-matches the configured account, removes the canary, revalidates the helper-prepared directory instance and `SOURCE_ROOT_ID`, and atomically binds that exact source root to this scratch invocation. It rejects every caller-created, replaced, or alternate root. In Codex, bind `ACCOUNT_NAME`, `ACCOUNT_NUMBER`, and `AGENTIC_ALLOWED` only from the validated values stored in machine-carried `transport-bound` state; every later broker orchestration loads the account scope directly from that state and never exposes or retypes the account number. A non-Codex runner binds those values from the validated helper receipt. Do not inspect, retain, or reconstruct account scope from the raw response, assistant narration, a file-edit receipt, or model memory; do not call `get_accounts` again for the test or lookup.
 
-**POST-BIND COMPOSED JSON SAVE RECIPE:** every later Codex broker read, scan, historicals, complete quote response, derived RSI input, placement response, or other `SOURCE_ROOT` write uses the checked-in append-only source-handoff journal; executor state never allocates a filename, sequence, pending key, or call/response phase. Begin the one composed operation by loading `rhmra.transport-state.v1`, requiring `phase: "transport-bound"`, and choosing one lowercase invocation-local purpose matching `^[a-z0-9][a-z0-9-]{0,47}$`, such as `snapshot-a-positions-0`, `run-scan`, `historicals-0`, `candidate-quotes-0`, `rsi-input`, or `placement-response-0`. Before the broker/read call, invoke `broker_snapshot.py reserve-source --scratch <machine-loaded scratch> --purpose <purpose>` with the loaded Python/project/shell values and validate its success receipt. Use only that receipt's returned `source` variable as the file-change target; never derive, normalize, copy, emit, or retype it. A duplicate purpose is terminal and is never renamed around. The helper also refuses every new reservation while any earlier purpose lacks an immutable committed/aborted terminal marker; every consumer likewise refuses to run while any purpose is pending, so an older committed response cannot bypass uncertainty from a newer call.
+**POST-BIND COMPOSED JSON SAVE RECIPE:** every later Codex broker read, scan, historicals, complete quote or RSI response, placement response, or other `SOURCE_ROOT` write uses the checked-in append-only source-handoff journal; executor state never allocates a filename, sequence, pending key, or call/response phase. Begin the one composed operation by loading `rhmra.transport-state.v1`, requiring `phase: "transport-bound"`, and choosing one lowercase invocation-local purpose matching `^[a-z0-9][a-z0-9-]{0,47}$`, such as `snapshot-a-positions-0`, `run-scan`, `historicals-0`, `candidate-quotes-0`, `rsi-0`, or `placement-response-0`. Before the broker/read call, invoke `broker_snapshot.py reserve-source --scratch <machine-loaded scratch> --purpose <purpose>` with the loaded Python/project/shell values and validate its success receipt. Use only that receipt's returned `source` variable as the file-change target; never derive, normalize, copy, emit, or retype it. A duplicate purpose is terminal and is never renamed around. The helper also refuses every new reservation while any earlier purpose lacks an immutable committed/aborted terminal marker; every consumer likewise refuses to run while any purpose is pending, so an older committed response cannot bypass uncertainty from a newer call.
 
 The four source-handoff actions are checked-in complete-receipt authorities. Do not use `Object.keys`, count returned fields, copy a required-name array, or rebuild their schema/types in model-authored glue. After exit zero, require exactly one parsed JSON object with integer `schema_version: 1`, the requested `action`, JSON-boolean `ok: true`, `scratch` equal to the loaded scratch, and `purpose` equal to the requested purpose, then retain that whole object unchanged. For `reserve-source`, additionally require `status: "reserved"`, `idempotent: false`, a canonical lowercase UUIDv4 `reservation_id`, and a nonempty string `source`; for `commit-source`, require the same reservation ID, `status: "committed"`, a lowercase 64-hex `source_sha256`, and a nonnegative integer `source_size`. For `abort-source`, require the same ID, `status: "aborted"`, the requested fixed `reason`, and JSON null `source`. For `lookup-source`, accept only the documented status/recovery-action pair below and use its unchanged reservation ID/source only for that recovery. Helper-owned extra bookkeeping fields are not a failure and are never copied into a model-authored validator.
 
@@ -434,9 +615,113 @@ If the canary was saved and strictly read but the helper rejects account scope b
 
 This is the invocation's ONE save-path test. A failed file-change, denial envelope, missing/malformed receipt, invalid canary, failed machine-state transition, or failed helper binding is immediately `snapshot-failure` / `snapshot-write-failed`: make no additional broker call, do not try another directory or writer, do not create a nested/session fallback, second source root, or second probe, do not start generation A or B, and do not retry the save. Release the lease and finish through the permitted failure report path. After success, retain the same file-change facility, loaded `transport-bound` account state, and helper-owned source journal for every later broker response, scan result, historicals result, complete quote response, and other JSON handoff. Each save reserves a fresh purpose and uses only its helper-issued source; no runner chooses a filename. Never switch path, purpose, writer, serializer, source root, or journal—even in generation B or after context compaction. The helper enforces the binding and committed identity for every later external source.
 
-The built-in lease expires after 20 minutes unless renewed, shorter than the 30-minute schedule so a crashed run cannot block the next scheduled run. Renewal is also the fencing check that stops an old stalled run after a newer run takes ownership. At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT, run `py -3 run_lock.py renew --token <RUN_LOCK_TOKEN>` on Windows/PowerShell or `python3 run_lock.py renew --token <RUN_LOCK_TOKEN>` on Linux/macOS. Renew again immediately before EVERY `cancel_equity_order` and `place_equity_order`, even if the prior renewal was moments ago. Each renewal must exit zero and return one JSON object with `schema_version: 1`, `action: "renew"`, `ok: true`, the same token, and a future `expires_at`. Missing, malformed, nonzero, expired, or different-token output means ownership is lost: make no further broker calls or order changes. If broker work already occurred, finish only the report from data already held and state `run lease lost`; never use more broker calls to fill gaps. A stale owner must not call release against the newer owner.
+The built-in lease expires after 20 minutes unless renewed, shorter than the 30-minute schedule so a crashed run cannot block the next scheduled run. Renewal is also the fencing check that stops an old stalled run after a newer run takes ownership. At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT, run `& '<PYTHON_EXE>' run_lock.py renew --token '<RUN_LOCK_TOKEN>'` in PowerShell or `'<PYTHON_EXE>' run_lock.py renew --token '<RUN_LOCK_TOKEN>'` in a POSIX-style shell, always through the loaded private-token template below rather than a retyped placeholder. Renew again immediately before EVERY `cancel_equity_order` and `place_equity_order`, even if the prior renewal was moments ago. Each renewal must exit zero and return one JSON object with `schema_version: 1`, `action: "renew"`, `ok: true`, the same token, and a future `expires_at`. Missing, malformed, nonzero, expired, or different-token output means ownership is lost: make no further broker calls or order changes. If broker work already occurred, finish only the report from data already held and state `run lease lost`; never use more broker calls to fill gaps. A stale owner must not call release against the newer owner.
 
-After the report and status snapshot have been written and verified, release ownership as the final operational action: `py -3 run_lock.py release --token <RUN_LOCK_TOKEN>` on Windows/PowerShell or `python3 run_lock.py release --token <RUN_LOCK_TOKEN>` on Linux/macOS. Before release, require the report's bare name to equal `EXPECTED_REPORT_FILE`, any created gate record's bare name to equal `EXPECTED_GATE_FILE`, and any published status receipt's bare name to equal `EXPECTED_STATUS_FILE`. Resolve every artifact-name correction and complete every permitted write/read-back/verify while the lease is still owned; never release and then create, rename, rewrite, or repair a report, gate record, status candidate, or status file. If the FINAL STATUS REFRESH below is unavailable while the REPORT lease remains valid, write and verify the exact expected report, deliberately leave the prior status snapshot untouched, and then release. If the REPORT renewal failed, ownership is lost: follow the stale-owner rule above and do NOT call release. Every normal early-exit path after a successful acquisition must also release its token after completing its permitted report work. Release must return validated JSON with `schema_version: 1`, `action: "release"`, `ok: true`, and the same token; report a release failure, but never delete the database manually.
+**One private token authority for every later use:** in Codex, immediately before every renewal, release, broker call, and `order_intents.py prepare` payload / `pending` / `begin` / `retry` operation, load `rhmra.lease-state.v1`; require `schema_version: 1`, `phase: "lease-owned"`, its `invocation_id` equal to the active context/transport `lease_binding`, and `run_lock_token` remain the canonical UUIDv4 acquired above. Form the helper argument or JSON field only by mechanically quoting/inserting that loaded property. Never cache it in a second state slot or model variable across operations. A missing or mismatched slot stops before the helper and before any broker call—it does not authorize an empty test invocation. Successful renew preserves this same private object unchanged. A validated release replaces it immediately with the token-free tombstone `{schema_version: 1, phase: "lease-released", invocation_id: <same machine-loaded invocation>}`; proven fencing loss likewise removes the token and stores phase `lease-lost`. No later token consumer or broker call is legal from either terminal phase. A non-Codex runner enforces the same single opaque private-value authority.
+
+**CODEX LATER TOKEN PRECONDITION — REQUIRED IN EACH ACTIVE CELL:** paste this precondition at the beginning of every later Codex renewal, order-intent prepare/begin/retry, mutation precheck, and broker-call orchestration, and continue the operation inside the same braces. It requires the active post-bind transport `lease_binding`; terminal or missing transport state cannot use this active template. No command or broker tool may be constructed or awaited before this block succeeds:
+
+```javascript
+{
+const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
+const STATE_KEY = "rhmra.transport-state.v1";
+const bootstrap = load(BOOTSTRAP_KEY);
+const state = load(STATE_KEY);
+const lease = load(LEASE_KEY);
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const invocationId = state && state.lease_binding && state.lease_binding.invocation_id;
+if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.context_receipt ||
+    bootstrap.context_receipt.invocation_id !== invocationId ||
+    !state || state.schema_version !== 1 || !state.lease_binding ||
+    typeof state.python_exe !== "string" || typeof state.project_root !== "string" ||
+    (state.phase !== "transport-bound" &&
+      !(typeof state.phase === "string" && state.phase.startsWith("status-"))) ||
+    !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
+    !uuid4.test(invocationId) || lease.invocation_id !== invocationId ||
+    !uuid4.test(lease.run_lock_token)) {
+  text(JSON.stringify({schema_version: 1, action: "private-lease-prerequisite-failed", ok: false}));
+  exit();
+}
+const pythonExe = state.python_exe;
+const projectRoot = state.project_root;
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + value.replaceAll("'", "''") + "'";
+const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const runLockToken = lease.run_lock_token;
+const quotedRunLockToken = quote(lease.run_lock_token);
+// Continue this one operation here; never emit either token variable.
+}
+```
+
+Within that same cell, renewal appends only `quotedRunLockToken` to `--token`; begin/retry append only `quotedRunLockToken` to `--run-token`; prepare inserts only `runLockToken` into the required scratch JSON `run_token` field through the existing exact intent recipe. A mutation precheck or broker-call cell validates this block before its first helper/broker action even when it does not otherwise consume the token. Do not substitute a placeholder in a generic command builder.
+
+**CODEX RELEASE TOMBSTONE — EXACT:** release uses this separate complete template so permitted early/terminal paths need not pretend transport is active. It loads the same private authority, matches it to the strongest available machine-stored transport/context/lifecycle invocation, and validates the token before constructing the command. No output occurs until the raw token has been removed from private state:
+
+```javascript
+{
+const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
+const STATE_KEY = "rhmra.transport-state.v1";
+const bootstrap = load(BOOTSTRAP_KEY);
+const state = load(STATE_KEY);
+const lease = load(LEASE_KEY);
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const bootstrapInvocation = bootstrap &&
+  ((bootstrap.context_receipt && bootstrap.context_receipt.invocation_id) ||
+   (bootstrap.lifecycle_receipt && bootstrap.lifecycle_receipt.invocation_id));
+const stateInvocation = state && state.lease_binding && state.lease_binding.invocation_id;
+const invocationId = stateInvocation || bootstrapInvocation;
+if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.resolver_receipt ||
+    typeof bootstrap.resolver_receipt.python !== "string" ||
+    !uuid4.test(invocationId) ||
+    (stateInvocation && stateInvocation !== bootstrapInvocation) ||
+    !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
+    lease.invocation_id !== invocationId || !uuid4.test(lease.run_lock_token)) {
+  text(JSON.stringify({schema_version: 1, action: "lease-release-prerequisite-failed", ok: false}));
+  exit();
+}
+const pythonExe = state && typeof state.python_exe === "string"
+  ? state.python_exe : bootstrap.resolver_receipt.python;
+const projectRoot = state && typeof state.project_root === "string"
+  ? state.project_root : undefined;
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + value.replaceAll("'", "''") + "'";
+const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const runLockToken = lease.run_lock_token;
+const quotedRunLockToken = quote(lease.run_lock_token);
+const drainCommand = async result => {
+  let current = result;
+  while (current.session_id !== undefined) {
+    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+  }
+  return current;
+};
+const releaseCommand = (isWindows ? "& " : "") + quote(pythonExe) +
+  " run_lock.py release --token " + quotedRunLockToken;
+const releaseArgs = {cmd: releaseCommand, yield_time_ms: 30000, max_output_tokens: 2000};
+if (projectRoot) releaseArgs.workdir = projectRoot;
+if (isWindows) releaseArgs.shell = "powershell.exe";
+const releaseResult = await drainCommand(await tools.exec_command(releaseArgs));
+let releaseReceipt;
+try { releaseReceipt = JSON.parse(releaseResult.output); } catch (ignored) {}
+if (releaseResult.exit_code !== 0 || !releaseReceipt ||
+    releaseReceipt.schema_version !== 1 || releaseReceipt.action !== "release" ||
+    releaseReceipt.ok !== true || releaseReceipt.token !== runLockToken) {
+  store(LEASE_KEY, {schema_version: 1, phase: "lease-lost",
+    invocation_id: invocationId});
+  text(JSON.stringify({schema_version: 1, action: "lease-release-failed", ok: false}));
+  exit();
+}
+store(LEASE_KEY, {schema_version: 1, phase: "lease-released",
+  invocation_id: invocationId});
+text(JSON.stringify({schema_version: 1, action: "lease-released", ok: true}));
+}
+```
+
+After the report and status snapshot have been written and verified, release ownership as the final operational action: `& '<PYTHON_EXE>' run_lock.py release --token '<RUN_LOCK_TOKEN>'` in PowerShell or `'<PYTHON_EXE>' run_lock.py release --token '<RUN_LOCK_TOKEN>'` in a POSIX-style shell, implemented only by the exact release template above. Before release, require the report's bare name to equal `EXPECTED_REPORT_FILE`, any created gate record's bare name to equal `EXPECTED_GATE_FILE`, and any published status receipt's bare name to equal `EXPECTED_STATUS_FILE`. Resolve every artifact-name correction and complete every permitted write/read-back/verify while the lease is still owned; never release and then create, rename, rewrite, or repair a report, gate record, status candidate, or status file. If the FINAL STATUS REFRESH below is unavailable while the REPORT lease remains valid, write and verify the exact expected report, deliberately leave the prior status snapshot untouched, and then release. If the REPORT renewal failed, ownership is lost: follow the stale-owner rule above and do NOT call release. Every normal early-exit path after a successful acquisition must also release its token after completing its permitted report work. Release must return validated JSON with `schema_version: 1`, `action: "release"`, `ok: true`, and the same token; report a release failure, but never delete the database manually.
 
 Before any pre-broker return from this section, finalize lifecycle: `active_run` becomes `overlap` / `active-run`; acquisition, helper-reported `scratch_create_failed`, or release-state failure becomes `coordination-halt` / `coordination-state`; the post-create scratch-preflight failure uses the dedicated `snapshot-failure` outcome above. These records replace the missing status/report for an invocation that never reached broker work.
 
@@ -445,9 +730,9 @@ FIRST and REPORT strategy timing is helper-owned, never model-owned. Immediately
 ### ORDER-INTENT JOURNAL — persist before placement; reconcile before replay
 `order_intents.py` is the SOLE authority for a placement's client identity and lifecycle. Its default SQLite file is `run-reports/rhmra-order-intents.sqlite3` (local/gitignored). It stores account NAME, order fields, one immutable UUID `ref_id`, broker order ID/state, exact cumulative fill quantity, and an append-only event trail; it never stores an account number. Robinhood remains the source of truth for positions, orders, and fills.
 
-Use the already resolved Python launcher for every command below (`py -3` on Windows/PowerShell; `python3` on Linux/macOS). Do not pass `--state-file` or `--now-utc` during a trading run.
+Use the retained absolute `PYTHON_EXE` for every command below: PowerShell prefixes its mechanically quoted path with `&`; a POSIX-style shell uses the mechanically quoted path without `&`. Never execute literal `py`, `python`, or `python3`. Do not pass `--state-file` or `--now-utc` during a trading run.
 
-**Startup check and recovery happen before FIRST or any broker mutation.** Only after successful lease acquisition and the successful scratch preflight, run `order_intents.py check`, then `order_intents.py pending --run-token <RUN_LOCK_TOKEN>` with the exact bound lease-issued token. Never run either journal command before acquisition, and never use a placeholder, lifecycle/invocation UUID, or remembered token. Require exit zero and exactly one JSON object with `schema_version: 1`, the matching `action`, `ok: true`, and correctly typed fields. A missing journal is initialized empty. An unreadable, corrupt, wrong-schema, malformed-output, or unavailable helper is an **ORDER-STATE HALT**: broker reads may continue for a compact positions/orders report, but make NO cancel/place call, fire HALT, append `ALERTS.md`, and release the lease normally. Never delete, replace, edit, or recreate the database by hand.
+**Startup check and recovery happen before FIRST or any broker mutation.** Only after successful lease acquisition and the successful scratch preflight, run `order_intents.py check`, then `order_intents.py pending --run-token <RUN_LOCK_TOKEN>` with the exact bound lease-issued token. Codex must use the exact CODEX ORDER-INTENT STARTUP recipe above; its private-state proof precedes both commands, and its only token operand is `quote(runLockToken)` loaded from `lease.run_lock_token`. Never run either journal command before acquisition, and never use a placeholder, lifecycle/invocation UUID, empty string, context receipt, or remembered token. Require exit zero and exactly one JSON object with `schema_version: 1`, the matching `action`, `ok: true`, and correctly typed fields. A missing journal is initialized empty. An unreadable, corrupt, wrong-schema, malformed-output, or unavailable helper is an **ORDER-STATE HALT**: broker reads may continue for a compact positions/orders report, but make NO cancel/place call, fire HALT, append `ALERTS.md`, and release the lease normally. Missing private lease state is earlier and stricter: no journal or broker call is made. Never delete, replace, edit, or recreate the database by hand.
 
 Handle every row returned by `pending` before normal FIRST work:
 - `prepared` with `submit_attempts: 0` proves `begin` never authorized a broker call. On a later run, abandon that row with `order_intents.py abandon-prepared --intent-id <id> --note "prior run never began submission; current run will revalidate"`; never execute its stale payload.
@@ -562,7 +847,7 @@ After FIRST has finished all position management, collect one fresh breaker snap
 
 **Deterministic response staging is mandatory.** The startup SAVE TRANSPORT BINDING is the sole authority for where and how every complete broker result crosses into a file. Never use a harness visualization/output path, an arbitrary tool-result path, another temporary directory, or a later path probe—even if the completed broker call advertises one. Never invent or search for a result filename. There is exactly one bound `SOURCE_ROOT`, one proven file-change facility, and zero per-generation transport probes.
 
-For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into a fresh, generation-specific file in the marked machine-loaded `<scratch>` directory using the exact kind-specific command below. Use `A` throughout generation A and `B` throughout generation B. Require exit zero plus its exact schema/action/ok/kind/generation/set-id/count/hash/provenance envelope before making the next dependent call. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
+For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into a fresh, generation-specific file in the marked machine-loaded `<scratch>` directory using the exact kind-specific command below. Use `A` throughout generation A and `B` throughout generation B. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, the exact `kind` and `generation`, a canonical `set_id`, JSON-boolean `complete`, nonnegative integer `file_count` equal to the length of `files`, and a validated hash/provenance object for every requested output. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
 
 The exact recipe always runs through the startup-bound file-change facility; no other serializer or writer is valid after binding.
 
@@ -579,13 +864,13 @@ Portfolio and quotes are NON-PAGINATED staging kinds: use their literal cursor-f
 
 `broker_snapshot.py` accepts exactly seven actions — `preflight`, `bind-transport`, `reserve-source`, `commit-source`, `abort-source`, `lookup-source`, and `stage` — and the ONLY staged kinds are `portfolio`, `positions`, `orders`, and `quotes`. The kind is always a separate `--kind` value: never hyphenate it onto the action, because `stage-quotes`, `stage-historicals` and every similar form are not commands and the helper rejects them. Staging belongs to the snapshot generations in this section only. The four source-handoff actions journal every later external response; they never stage or transform it. Step 8 historicals and complete quote responses plus Step 10 RSI inputs are committed purposes consumed directly by `evaluate_candidates.py`, not staged snapshot kinds.
 
-For positions and orders, stage each returned page immediately. Pass the exact request cursor used for that page; use `FIRST` for page 1 and `--allow-more` only while that page proves a continuation. After the terminal page, run the positions/orders aggregate template with the same `--generation` over all just-staged page files into an entirely fresh set of sealed output filenames, passing the full cursor chain beginning with `FIRST` and omitting `--allow-more`. For quotes, stage each at-most-20-symbol batch immediately, then run the quotes template over all batches into fresh sealed outputs. Only a successful aggregate command's shared set ID proves a complete coherent set; `daily_loss.py` revalidates that set, its cursor chain, kind, hashes, scratch ID, and A/B generation. Never hand-edit a file, marker, provenance sidecar, cursor, envelope, or helper result.
+For positions and orders, stage each returned page immediately. Pass the exact request cursor used for that page; use `FIRST` for page 1 and `--allow-more` only while that page proves a continuation. If that first page is terminal and its stage receipt has exactly `complete: true` and `file_count: 1`, its single staged file already is the complete sealed set; use it directly and do not stage it again under a retry or aggregate filename. If pagination produced more than one page, run the positions/orders aggregate template with the same `--generation` over all just-staged page files into an entirely fresh set of sealed output filenames, passing the full cursor chain beginning with `FIRST` and omitting `--allow-more`. For quotes, a single terminal at-most-20-symbol batch with that same exact singleton receipt is likewise already sealed and is used directly; only multiple batches are aggregate-staged together into fresh sealed outputs. A successful singleton or aggregate command's shared set ID proves one complete coherent set; `daily_loss.py` revalidates that set, its cursor chain, kind, hashes, scratch ID, and A/B generation. Never hand-edit a file, marker, provenance sidecar, cursor, envelope, or helper result.
 
 Run the following steps for generation A:
 
-1. Re-fetch `get_portfolio`, every page of `get_equity_positions`, and every page of `get_equity_orders`; immediately stage each response under this generation's unique DISCOVERY prefix, then aggregate-seal the complete position/order page sets as specified above. For orders, use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter — pass only the account number on the first request and the returned cursor on later pages. An old GTC order created days ago can fill today, a cancelled-rest order can contain a partial execution, and manual/app activity changes the same account-wide loss. Follow `data.next` until it is absent/empty. Missing, failed, malformed, skipped, unstaged, or incomplete pagination fails this entire generation.
+1. Re-fetch every page of `get_equity_positions` and every page of `get_equity_orders`; immediately stage each response under this generation's unique DISCOVERY prefix, then use a proved terminal singleton directly or aggregate-seal only a multi-page set as specified above. Do not fetch or stage a DISCOVERY portfolio: symbol discovery derives its exact quote set only from positions and executions, and `daily_loss.py --symbols-out` rejects the calculation-only `--portfolio`, `--quotes`, and `--halt-pct` options. The authoritative portfolio is still fetched fresh in the separate FINAL set at item 5. For orders, use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter — pass only the account number on the first request and the returned cursor on later pages. An old GTC order created days ago can fill today, a cancelled-rest order can contain a partial execution, and manual/app activity changes the same account-wide loss. Follow `data.next` until it is absent/empty. Missing, failed, malformed, skipped, unstaged, or incomplete pagination fails this entire generation.
 2. Immediately after those discovery sets are staged and sealed, run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` for the DAILY-LOSS DISCOVERY reading. Require valid `utc` and `date_et`, and require this `date_et` to equal START CLOCK's `date_et`; otherwise the breaker is INDETERMINATE. A constants hash/validation failure remains a FULL-RUN CONFIGURATION HALT.
-3. Ask the helper for the exact quote set — Windows/PowerShell: `py -3 daily_loss.py --positions <sealed discovery position-page files> --orders <sealed discovery order-page files> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS DISCOVERY utc> --symbols-out <scratch>/daily-loss-<generation>-symbols.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. The file must parse as one JSON array of unique ticker strings. Fetch `get_equity_quotes` for exactly those symbols in batches of at most 20 (the connector omits official closes above 20), immediately stage every response with that generation, and aggregate-seal all quote batches together. An empty symbol array requires no quote call.
+3. Ask the helper for the exact quote set — Windows/PowerShell: `py -3 daily_loss.py --positions <sealed discovery position-page files> --orders <sealed discovery order-page files> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS DISCOVERY utc> --symbols-out <scratch>/daily-loss-<generation>-symbols.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. The file must parse as one JSON array of unique ticker strings. Fetch `get_equity_quotes` for exactly those symbols in batches of at most 20 (the connector omits official closes above 20), immediately stage every response with that generation, use one proved terminal batch directly, and aggregate-seal only when there are multiple quote batches. An empty symbol array requires no quote call.
 4. Immediately after every quote response is staged and the quote set is sealed (or immediately after discovery when the symbol array is empty), run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` again for the DAILY-LOSS FINAL reading. Validate it exactly like the discovery reading and require its `date_et` to equal START CLOCK's `date_et`. This reading must occur after the quotes so the helper can reject a quote timestamp from the future. A constants hash/validation failure remains a FULL-RUN CONFIGURATION HALT.
 5. Now re-fetch `get_portfolio`, every page of `get_equity_positions`, and every unfiltered page of `get_equity_orders` into a separate generation-specific FINAL set, immediately staging every response and aggregate-sealing position/order pages exactly as in item 1. The FINAL clock is deliberately just before this verification snapshot: an execution that happens during these calls has a timestamp later than the cutoff and makes the helper fail closed; an execution that happened during quote collection is included. Never evaluate with the earlier discovery files. If the account changed enough that the final required quote set differs, the helper's missing/unexpected-symbol check fails this generation instead of mixing snapshots.
 6. Run the authoritative evaluation using ONLY this generation's sealed inputs — Windows/PowerShell: `py -3 daily_loss.py --portfolio <sealed FINAL portfolio file> --positions <all sealed FINAL position-page files> --orders <all sealed FINAL order-page files> --quotes <all sealed quote-batch files, omit this option when the discovery symbol array is empty> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS FINAL utc> --halt-pct <DAILY_LOSS_HALT_PCT> --json-out <scratch>/daily-loss-<generation>.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. On success, stdout is exactly one compact JSON object containing the complete authoritative result, semantically identical to the atomically written `--json-out` document. Bind and validate that stdout object directly. The file is retained only as a scratch audit artifact: do not read it with a file tool, shell command, or second Python command, and never embed its Windows path in `-c` source. Missing, extra, malformed, or non-JSON stdout fails this generation even if a file exists. The evaluator rejects unstaged, unsealed, wrong-kind, hash-changed, cross-scratch, or cross-generation inputs. Do not re-key, summarize, hand-transcribe, repair, or substitute any broker response.
@@ -675,14 +960,14 @@ When ANY pre-SECOND gate skips entry, do NOT run SECOND, do NOT capture/stage a 
    - **Liquidity floor:** require the full configured history, then compute median daily dollar volume = median over the last `VOLUME_LOOKBACK_DAYS` bars of (bar volume × bar close). If history is short or the median is below `MIN_MEDIAN_DOLLAR_VOLUME`, SKIP this name entirely and move on — do not evaluate it for entry. Median (not mean) so a single spike day can't lift a thin name over the floor. This removes names that clear the relative-volume ratio but can't be exited at size.
    - **Recent high:** from the last `HIGH_LOOKBACK_DAYS` bars, find the highest intraday high — using REAL bars only (see next bullet).
    - **Interpolated bars:** the API pads gaps with `interpolated: true` bars — carried-forward or placeholder prices (e.g. an IPO reference price) with zero volume; nobody traded there. Count them as $0 days in the liquidity median (a name that barely trades IS illiquid), but EXCLUDE them from the recent-high lookback — a placeholder "high" is not a price anyone paid, and treating it as one can invent a fake dip and trigger a bogus buy.
-   - **Do the math with the checked-in script — never re-implement it:** save and commit each raw `get_equity_historicals` response UNMODIFIED under a unique `historicals-*` purpose (no hand-transcribing bars). Fetch `get_equity_quotes` for the remaining ticker set in batches of at most 20, and save and commit every COMPLETE successful batch response UNMODIFIED under unique `candidate-quotes-0`, `candidate-quotes-1`, ... purposes. Pass all historical purposes after `evaluate_candidates.py --bars-purpose` and all quote purposes after its single `--quotes-purpose` flag in both evaluator passes. The deterministic loader resolves and verifies each committed purpose, merges quote batches, rejects duplicate symbols across files, reads every ticker from `structuredContent.data.results[].quote.symbol` (or the equivalent raw `data.results` shape), and gives the whole nested quote object to the price/spread checks. Never build, re-key, copy, or repair a ticker→quote map; never inspect `row.symbol` because the connector's symbol is nested under `row.quote.symbol`; and never refetch quotes merely to repair a handoff. Every historicals response, complete quote response, derived RSI input, and other external JSON handoff uses its own reserve/write/commit operation in the already-bound `SOURCE_ROOT`; neither Codex nor another runner forms or carries its path. The RSI input is committed purpose `rsi-input` and MUST NOT be written in `<scratch>`. Never switch to a session OUTPUTS/visualization directory or create another scratch/source area. Script-owned outputs remain in the already-preflighted `<scratch>` when their command specifies it. The single explicit file-change destination exception is REPORT's `rhmra-status-candidate.json`: attempt to author it directly in the already-marked `<scratch>` so `status_snapshot.py` can validate and publish it, using the same file-change facility but that required helper-bound destination. **Only the FINAL RSI-enabled `evaluate_candidates.py --json-out` is the persistent gate-record OUTPUT, not scratch (see below), and is the only thing besides the report a run writes into the project folder.** A file-writing tool unable to reach the explicit status-candidate path is a status-write failure, never permission to relocate it or create the final status directly.
+   - **Do the math with the checked-in script — never re-implement it:** save and commit each raw `get_equity_historicals` response UNMODIFIED under a unique `historicals-*` purpose (no hand-transcribing bars). Fetch `get_equity_quotes` for the remaining ticker set in batches of at most 20, and save and commit every COMPLETE successful batch response UNMODIFIED under unique `candidate-quotes-0`, `candidate-quotes-1`, ... purposes. Pass all historical purposes after `evaluate_candidates.py --bars-purpose` and all quote purposes after its single `--quotes-purpose` flag in both evaluator passes. The deterministic loader resolves and verifies each committed purpose, merges quote batches, rejects duplicate symbols across files, reads every ticker from `structuredContent.data.results[].quote.symbol` (or the equivalent raw `data.results` shape), and gives the whole nested quote object to the price/spread checks. Never build, re-key, copy, or repair a ticker→quote map; never inspect `row.symbol` because the connector's symbol is nested under `row.quote.symbol`; and never refetch quotes merely to repair a handoff. Every historicals or complete quote/RSI response gets its own reserve/write/commit operation in the bound `SOURCE_ROOT`; neither runner forms or carries its path. RSI purposes are `rsi-0`, `rsi-1`, ... or Step 10's fixed `rsi-empty`, never `<scratch>`. Never switch to a session OUTPUTS/visualization directory or create another scratch/source area. Script-owned outputs remain in the already-preflighted `<scratch>` when their command specifies it. The single explicit file-change destination exception is REPORT's `rhmra-status-candidate.json`: attempt to author it directly in the already-marked `<scratch>` so `status_snapshot.py` can validate and publish it, using the same file-change facility but that required helper-bound destination. **Only the FINAL RSI-enabled `evaluate_candidates.py --json-out` is the persistent gate-record OUTPUT, not scratch (see below), and is the only thing besides the report a run writes into the project folder.** A file-writing tool unable to reach the explicit status-candidate path is a status-write failure, never permission to relocate it or create the final status directly.
 
      **Transient JSON handoffs are deliberately different:** `filter_scan.py --json-out` and the first, pre-RSI `evaluate_candidates.py --json-out` write fresh files in `<scratch>`, not project outputs. Only the final evaluator pass may write the persistent gate record in `run-reports/`.
 
      **NEVER put tool-result data inside a shell command — it fails with `spawn E2BIG`.** Do not estimate whether a payload is "small enough" — that reasoning is how this rule gets broken. The ENTIRE bash command text is passed as one argument to `bash -c`, so a heredoc (`cat > f << 'EOF'`), `echo`/`printf` redirection, and `python3 -c "…"` all fail the same way once the payload is large — the limit is on the command, not on how the data is quoted inside it. The startup-bound route is mandatory:
        1. Reserve a unique historicals purpose, persist the successful result immediately to the helper-issued source with the startup-bound file-change facility, commit it, and pass only that purpose to `--bars-purpose`. A failed write, missing/unreadable source, failed commit, or invocation-bound source-validation failure is run-level `snapshot-failure` / `snapshot-write-failed`, with no relocation or retry. `evaluate_candidates.py` accepts both the direct payload at `data.results` and the standard MCP envelope at `structuredContent.data.results`. Never use a harness-advertised path, search for a result file, extract `structuredContent`, create a corrective/`-raw` copy, or call `get_equity_historicals` again to repair the handoff.
        2. Write the complete result EXACTLY as received, including the outer `content`/`structuredContent` MCP envelope when present. A save denial or unreadable bound file is terminal for the entire run as `snapshot-failure` / `snapshot-write-failed`; never retry, switch methods, relocate the payload, or continue with another candidate.
-     Persist historicals, the complete quote response, and derived RSI input only through the startup-bound file-change facility and `SOURCE_ROOT`; never search for, repair, or rewrite a result through another path or writer.
+     Persist historicals and complete quote/RSI responses through the startup-bound file-change facility and `SOURCE_ROOT`; never search for, repair, or rewrite a result through another path or writer.
 
    **Bound-source validation and read-once are deterministic:** `evaluate_candidates.py --scratch` resolves every `--bars-purpose`, `--quotes-purpose`, and `--rsi-purpose` through this invocation's committed journal, verifies its bound source-root markers plus sealed bytes/file identity, strictly parses every input once, and computes from those parsed documents without reopening them. Only script-owned evaluator outputs belong in `<scratch>` or `run-reports/`. Do not pre-read, probe, rewrite, retry, relocate, or switch writers. Any unknown, pending, aborted, unbound, alternate-root, nested, missing, changed, or unreadable input is run-level `snapshot-failure` / `snapshot-write-failed`. A correctly committed and strictly read input that later fails deterministic schema, semantic, or evaluator-output validation is instead terminal only for that candidate or entry phase. Then run the PRE-RSI pass:
      Windows/PowerShell: `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>' --bars-purpose <historicals-purpose> [more purposes ...] --quotes-purpose <candidate-quotes-purpose> [more purposes ...] --volume-lookback-days <VOLUME_LOOKBACK_DAYS> --high-lookback-days <HIGH_LOOKBACK_DAYS> --min-median-dollar-volume <MIN_MEDIAN_DOLLAR_VOLUME> --dip-entry-pct <DIP_ENTRY_PCT> --max-spread-buy-pct <MAX_SPREAD_BUY_PCT> --rsi-period <RSI_PERIOD> --json-out <scratch>/pre-rsi-gates.json`; Linux/macOS: use the same retained `PYTHON_EXE` without `&` with the same arguments — all six constant values from `constants.md`.
@@ -693,17 +978,13 @@ When ANY pre-SECOND gate skips entry, do NOT run SECOND, do NOT capture/stage a 
 
 9. Fetch RSI only for the PRE-RSI LIST. The script has already decided liquidity, recent high, dip percentage, and spread; do not recompute any of them. Re-checking held/open-order/sold-this-run/cooldown state remains a broker-state overlay, never a replacement for a script verdict.
 
-10. **RSI curl-up gate (final AND condition — blocks falling knives):** for each PRE-RSI candidate, fetch its RSI series via `get_equity_technical_indicators` (type `rsi`, interval `RSI_INTERVAL`, period `RSI_PERIOD`, output `last:<RSI_LOOKBACK_BARS + 1>`, start_time ~3 trading days back for warm-up; one call per candidate). **Write ONE file containing ONLY the RSI numbers — do NOT copy the raw responses.** Exact shape, a flat map of symbol → its ascending RSI values, nothing else; if the PRE-RSI LIST is empty, write the valid empty map `{}` and still run the final pass:
+10. **RSI curl-up gate (final AND condition — blocks falling knives):** for each PRE-RSI candidate, call `get_equity_technical_indicators` (type `rsi`, interval `RSI_INTERVAL`, period `RSI_PERIOD`, output `last:<RSI_LOOKBACK_BARS + 1>`, start_time ~3 trading days back; one call per name). Reserve a unique `rsi-0`, `rsi-1`, ... purpose before each call and, after explicit success, commit the COMPLETE result UNMODIFIED. Never extract `series`, re-key a symbol, or build a combined map. The evaluator unwraps the standard MCP envelope, reads `data.symbol`, validates the RSI series, and rejects malformed/error envelopes or duplicate symbols.
 
-   ```json
-   {"EMAT": [41.6, 40.2, 39.1], "GMM": [52.9, 53.4, 54.1]}
-   ```
+   If an indicator read explicitly exhausts the one-retry policy, abort its reservation and omit that name; the deterministic missing-RSI gate BLOCKS it. Do not fetch historicals, derive closes/RSI, or repair a malformed committed success. If the PRE-RSI LIST is empty—or no RSI purpose committed—commit fixed purpose `rsi-empty` containing exactly `{}` so the final RSI-enabled pass still runs.
 
-   One object, one array of numbers per symbol, no nesting beyond that. Take the `value` of each entry of the response's `series` in order and discard everything else — `begins_at`, `params`, `bounds` and `guide` are never read by the script. Copying the raw nested response instead produced malformed JSON on three separate runs: writing a file here regenerates every token either way, so reproducing the response protects nothing and only adds braces to get wrong. One file also means one path to mistype instead of several. If the indicator call fails for a name, fall back to passing its 30-minute closes from `get_equity_historicals` as `{"closes": [...]}` (the script computes Wilder RSI using that same `RSI_PERIOD`); if that also fails, omit the name from the map so the deterministic gate BLOCKS it for missing RSI.
+   Then RE-RUN with `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>'` and the SAME `--bars-purpose`, `--quotes-purpose`, and constant flags as the PRE-RSI pass plus `--rsi-purpose <every committed rsi-* purpose exactly once> --rsi-oversold <RSI_OVERSOLD> --rsi-lookback-bars <RSI_LOOKBACK_BARS> --rsi-confirm-bars <RSI_CONFIRM_BARS> --rsi-max-entry <RSI_MAX_ENTRY> --json-out run-reports/<EXPECTED_GATE_FILE>`; use only the retained `PYTHON_EXE`, never pass an aborted purpose, and use the lifecycle-bound exact bare `EXPECTED_GATE_FILE`; never rebuild it from current time, another clock, or a context summary.
 
-   Then RE-RUN with `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>'` and the SAME `--bars-purpose`, `--quotes-purpose`, and constant flags as the PRE-RSI pass plus `--rsi-purpose rsi-input --rsi-oversold <RSI_OVERSOLD> --rsi-lookback-bars <RSI_LOOKBACK_BARS> --rsi-confirm-bars <RSI_CONFIRM_BARS> --rsi-max-entry <RSI_MAX_ENTRY> --json-out run-reports/<EXPECTED_GATE_FILE>`; use only the retained `PYTHON_EXE`. `EXPECTED_GATE_FILE` is the exact bare name bound by lifecycle preflight; never rebuild it from current time, another clock, or a context summary.
-
-   **FINAL machine-readable handoff and gate record (REQUIRED):** only after that final command exits successfully, read its JSON output. Apply the same root, parameter, symbol, type, finiteness, and completeness checks as the PRE-RSI handoff, except `rsi_gate_enabled` must be exactly the JSON boolean `true` and the `params` object must also match every RSI constant and the current RSI file. A row may reach Step 11 only when its final `buy_candidate` is exactly `true`, `rsi_gate` is exactly `"pass"`, and `insufficient_history` is exactly `false`. The final JSON's unrounded measurements, verdicts, and reason strings are the SOLE authority for Step 11 and the report; stdout remains diagnostic-only.
+   **FINAL machine-readable handoff and gate record (REQUIRED):** only after that final command exits successfully, read its JSON output. Apply the same root, parameter, symbol, type, finiteness, and completeness checks as the PRE-RSI handoff, except `rsi_gate_enabled` must be exactly the JSON boolean `true` and `params` must match every RSI constant plus the exact ordered RSI purpose list supplied. A row may reach Step 11 only when its final `buy_candidate` is exactly `true`, `rsi_gate` is exactly `"pass"`, and `insufficient_history` is exactly `false`. The final JSON's unrounded measurements, verdicts, and reason strings are the SOLE authority for Step 11 and the report; stdout remains diagnostic-only.
 
    If the final command fails, its output is missing/unreadable/non-JSON, `rsi_gate_enabled` is not `true`, an expected symbol is absent, or any schema/value/parameter check fails, set `entry_phase: "halted"`, skip Steps 11–12, and report `final candidate evaluation handoff failure`. NEVER buy from the PRE-RSI JSON, formatted stdout, a prior gate file, or ad-hoc math.
 
@@ -802,31 +1083,130 @@ The sole absence code that permits a candidate rewrite is `status_snapshot_missi
 
 **FIXED FINALIZATION ORDER — no discovery or reordering:** write the exact lifecycle-bound report, read it back, publish/verify the exact lifecycle-bound status when available, release the owned lease, finish lifecycle exactly once, then call `record-internal` exactly once as the final tool call. `status_snapshot.py` enforces that the report already exists and is a nonempty strict-UTF-8 read-back before status publication. Never run a helper with `--help`, inspect helper source to rediscover syntax, publish status before the report, write any run artifact after release, or call a memory tool before or after telemetry. Use only the exact commands printed in this routine.
 
-In Codex, the final `functions.exec` orchestration that awaits `record-internal` must clear both `rhmra.transport-state.v1` and `rhmra.bootstrap-state.v1` with `store(key, null)` after the nested helper completes and before emitting its compact telemetry receipt. A terminal path that does not reach `record-internal` clears both slots in its last orchestration only after all permitted report/status work, lease release, and lifecycle finish are complete. Never clear either slot while a broker call, handoff, reconciliation, status publication, or finalization still depends on it. This executor-local cleanup is not a new helper/tool call and must not change the fixed finalization order.
+In Codex, use the exact final orchestration below. It accepts only a token-free `lease-released` or `lease-lost` tombstone, machine-loads the lifecycle-bound report name before telemetry, attempts `record-internal`, and must clear all three fixed slots—`rhmra.transport-state.v1`, `rhmra.bootstrap-state.v1`, and `rhmra.lease-state.v1`—with `store(key, null)` only after the nested helper completes or its attempt throws, before emitting one compact final-summary handoff. A terminal path that does not reach `record-internal` clears all three slots in its last orchestration only after all permitted report/status work, lease release (or proven ownership loss), and lifecycle finish are complete. Never clear any slot while a broker call, handoff, reconciliation, status publication, release, or finalization still depends on it. A live/malformed lease state is not permission to clear the raw token or run telemetry: stop before this cell and complete the prescribed release/loss path. This executor-local cleanup is not a new helper/tool call and must not change the fixed finalization order.
 
 ### PERFORMANCE TELEMETRY — after lifecycle finish, never authoritative
 
 Only after all permitted report/status persistence and read-back, lease release when still owned, and the single successful lifecycle `finish`, call the checked-in helper exactly once for that invocation with the already-bound launcher: `& '<PYTHON_EXE>' run_performance.py record-internal --invocation-id <INVOCATION_ID> --session '<unchanged START CLOCK session, or unknown when no START CLOCK succeeded>'` in PowerShell, or the same command without `&` in a POSIX-style shell. Do not pass `--runner`, `--model`, `--configuration`, or `--identity-source` from the model: `record-internal` consumes the invocation-bound identity persisted by the sole pre-START-CLOCK `resolve-identity` call. A missing or unusable identity binding becomes all-unknown identity without changing timing or the run result; direct metadata, declaration, self-report, and warning precedence are never reconstructed at finalization. Never pass strategy timestamps: the helper derives the unique host-stamped `position-management` through `report` lifecycle pair, and leaves Strategy execution and Routine overhead unavailable when that pair is missing, partial, or duplicated. Pass START CLOCK's `session` unchanged when it exists and `unknown` only when the invocation finished without a successful START CLOCK.
 
-`record-internal` is the final tool call of a normally reported run. The helper must reuse its one internal-record host-clock reading as the estimate's end boundary; never make a second clock call, ask the model to subtract timestamps, or substitute report-write, status-write, lease-release, lifecycle-finish, or strategy-boundary time. Require the helper's success envelope to contain exactly its documented `schema_version`, `action`, `ok`, `invocation_id`, `sequence`, `routine_total_ms`, `strategy_execution_ms`, `routine_overhead_ms`, `estimated_run_start_pt`, `estimated_run_end_pt`, `estimated_run_total_ms`, `estimated_run_total_display`, `estimate_clock_source`, and `projection_record_count` fields, with `action` equal to `record-internal`; do not retry or call another timing command. When START CLOCK was successfully bound, require `estimated_run_start_pt` to equal `BOUND_RUN_START_PT` byte-for-byte, `estimated_run_end_pt` to be the helper-returned canonical Pacific timestamp, `estimated_run_total_ms` to be a nonnegative integer, `estimated_run_total_display` to be the helper-formatted duration, and `estimate_clock_source` to equal `final-summary-boundary`. When START CLOCK was unavailable, require all five estimate fields to be null. Never invent, repair, round, reformat, or calculate an estimate outside the helper.
+`record-internal` is the final tool call of a normally reported run. The helper must reuse its one internal-record host-clock reading as the estimate's end boundary; never make a second clock call, ask the model to subtract timestamps, or substitute report-write, status-write, lease-release, lifecycle-finish, or strategy-boundary time. The checked-in `record-internal` producer is the sole complete-schema/type authority for its success receipt: runner glue must not count fields, compare `Object.keys(...)`, copy an expected 14- or 18-field list, or recreate the producer's type map. Check only `schema_version: 1`, `action: "record-internal"`, `ok: true`, the exact machine-loaded `invocation_id`, and the five named estimate constraints below; do not retry or call another timing command. When START CLOCK was successfully bound, require `estimated_run_start_pt` to equal `BOUND_RUN_START_PT` byte-for-byte, `estimated_run_end_pt` to be the helper-returned nonempty timestamp, `estimated_run_total_ms` to be a nonnegative safe integer, `estimated_run_total_display` to be the helper-returned nonempty duration, and `estimate_clock_source` to equal `final-summary-boundary`. When START CLOCK was unavailable, require all five estimate fields to be null. Never invent, repair, round, reformat, or calculate an estimate outside the helper.
+
+**CODEX FINAL TELEMETRY + REPORT POINTER — EXACT:** this one `functions.exec` cell is the final tool operation of a normally reported Codex run. Substitute only the already-bound unchanged START CLOCK `session` in the one marked string; every launcher, invocation, project, run-start, and report-name value is loaded from executor state. The report name is validated, never constructed. The cell deliberately machine-returns that same name even when telemetry fails. `recordInternalResult` is the fully drained result of the sole nested command:
+
+```javascript
+{
+const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const LEASE_KEY = "rhmra.lease-state.v1";
+const STATE_KEY = "rhmra.transport-state.v1";
+const bootstrap = load(BOOTSTRAP_KEY);
+const state = load(STATE_KEY);
+const lease = load(LEASE_KEY);
+const invocationId = bootstrap && bootstrap.context_receipt &&
+  bootstrap.context_receipt.invocation_id;
+const expectedReportFile = bootstrap && bootstrap.context_receipt &&
+  bootstrap.context_receipt.expected_report_file;
+const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const bareReport = /^rhmra-log-[0-9]{4}_[0-9]{2}_[0-9]{2}-[0-9]{2}_[0-9]{2}\.md$/;
+if (!bootstrap || bootstrap.schema_version !== 1 ||
+    !bootstrap.resolver_receipt || typeof bootstrap.resolver_receipt.python !== "string" ||
+    !bootstrap.context_receipt || !uuid4.test(invocationId) ||
+    !state || state.schema_version !== 1 || typeof state.project_root !== "string" ||
+    !state.context_receipt || state.context_receipt.invocation_id !== invocationId ||
+    state.context_receipt.expected_report_file !== expectedReportFile ||
+    !state.lease_binding || state.lease_binding.invocation_id !== invocationId ||
+    !lease || lease.schema_version !== 1 ||
+    (lease.phase !== "lease-released" && lease.phase !== "lease-lost") ||
+    lease.invocation_id !== invocationId ||
+    Object.prototype.hasOwnProperty.call(lease, "run_lock_token") ||
+    typeof expectedReportFile !== "string" || !bareReport.test(expectedReportFile) ||
+    expectedReportFile.includes("/") || expectedReportFile.includes("\\")) {
+  throw new Error("final machine state is not safely terminal");
+}
+const pythonExe = bootstrap.resolver_receipt.python;
+const runStartPt = bootstrap.context_receipt.run_start_pt;
+const session = "<unchanged START CLOCK session>";
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + value.replaceAll("'", "''") + "'";
+const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const drainCommand = async result => {
+  let current = result;
+  while (current.session_id !== undefined) {
+    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 4000});
+  }
+  return current;
+};
+const command = (isWindows ? "& " : "") + quote(pythonExe) +
+  " run_performance.py record-internal --invocation-id " + quote(invocationId) +
+  " --session " + quote(session);
+const args = {cmd: command, workdir: state.project_root,
+  yield_time_ms: 30000, max_output_tokens: 4000};
+if (isWindows) args.shell = "powershell.exe";
+let recordInternalResult = null;
+let receipt = null;
+let telemetryOk = false;
+let timingUnavailable = "record-internal call failed";
+try {
+  recordInternalResult = await drainCommand(await tools.exec_command(args));
+  try { receipt = JSON.parse(recordInternalResult.output); } catch (ignored) {}
+  const estimatesValid = receipt &&
+    receipt.estimated_run_start_pt === runStartPt &&
+    typeof receipt.estimated_run_end_pt === "string" &&
+    receipt.estimated_run_end_pt.length > 0 &&
+    Number.isSafeInteger(receipt.estimated_run_total_ms) &&
+    receipt.estimated_run_total_ms >= 0 &&
+    typeof receipt.estimated_run_total_display === "string" &&
+    receipt.estimated_run_total_display.length > 0 &&
+    receipt.estimate_clock_source === "final-summary-boundary";
+  telemetryOk = recordInternalResult.exit_code === 0 && receipt &&
+    receipt.schema_version === 1 && receipt.action === "record-internal" &&
+    receipt.ok === true && receipt.invocation_id === invocationId && estimatesValid;
+  timingUnavailable = recordInternalResult.exit_code !== 0
+    ? "record-internal failed"
+    : !receipt
+      ? "record-internal returned invalid JSON"
+      : "record-internal receipt validation failed";
+} catch (ignored) {}
+const handoff = {schema_version: 1, action: "final-summary-boundary", ok: true,
+  invocation_id: invocationId, expected_report_file: expectedReportFile,
+  telemetry_ok: telemetryOk};
+if (telemetryOk) {
+  handoff.timing = {
+    estimated_run_start_pt: receipt.estimated_run_start_pt,
+    estimated_run_end_pt: receipt.estimated_run_end_pt,
+    estimated_run_total_ms: receipt.estimated_run_total_ms,
+    estimated_run_total_display: receipt.estimated_run_total_display,
+    estimate_clock_source: receipt.estimate_clock_source
+  };
+} else {
+  handoff.timing_unavailable = timingUnavailable;
+}
+store(STATE_KEY, null);
+store(BOOTSTRAP_KEY, null);
+store(LEASE_KEY, null);
+text(JSON.stringify(handoff));
+}
+```
+
+Do not add `Object.keys`, an expected-key array, a second timing call, or a fallback report name to this cell. If the nested helper is nonzero, throws, returns non-JSON, or fails the permitted core/estimate checks, the cell still emits `telemetry_ok: false`, its bounded `timing_unavailable`, and the exact machine-loaded `expected_report_file` after clearing all three terminal state slots. A non-Codex runner must make the equivalent report binding survive telemetry failure and must take the closing filename only from that binding, not from memory or a clock.
 
 This telemetry is observational and non-authoritative: any missing helper, nonzero exit, malformed or invalid envelope, unavailable boundary, or persistence failure must never change trading, broker calls, saved report/status contents, lease handling, lifecycle classification/reason, or the run result. On telemetry failure, add only one concise `Timing unavailable: <diagnostic>` sentence to the final on-screen summary or halt text before the mandatory last output-file line when that line applies. The helper value is **Comparable run duration** because its documented START CLOCK and `final-summary-boundary` are identical on Claude and Codex. A later `observe-task` value from an explicit external or manual source is **Reference run duration** only: retain it as source-labelled fallback/context and never let it displace an available Comparable run duration. Fair performance comparisons require the same automatic boundary, session class, workload path, configuration cohort, and preferably rules version; runner/model identity is the explicit comparison dimension. Neither label claims scheduler-start or task-completion boundaries.
 
 ### FINAL ON-SCREEN RUN SUMMARY — immediately after performance telemetry
 
-Immediately after validating the `record-internal` receipt, make no further tool call. Output a brief on-screen run summary inside a `<run-summary>` tag covering: scan results, orders placed/skipped and why, circuit-breaker status, stop-coverage status, and the token estimate in the form `~N tokens (estimate)`. Keep the narrative to 3–5 sentences. When the receipt contains its five non-null estimate fields, append these three plain-text lines inside the same tag, copying both timestamps and the helper-formatted duration byte-for-byte:
+Immediately after receiving the `final-summary-boundary` handoff, make no further tool call. Output a brief on-screen run summary inside a `<run-summary>` tag covering: scan results, orders placed/skipped and why, circuit-breaker status, stop-coverage status, and the token estimate in the form `~N tokens (estimate)`. Keep the narrative to 3–5 sentences. When `telemetry_ok` is true, append these three plain-text lines inside the same tag, copying the handoff's timing timestamps and helper-formatted duration byte-for-byte:
 
 Run start: <estimated_run_start_pt>
 Run end: <estimated_run_end_pt>
 Comparable run duration: <estimated_run_total_display>
 
-These lines belong only to the final transcript summary. Never add them by rewriting the saved report after release, never add `run_end_pt` or any estimate field to the status snapshot, and never use them as a trading, lifecycle, lease, or artifact authority. If the estimate is unavailable, omit all three lines rather than filling them with guesses; use the single timing-unavailable sentence prescribed above.
+These lines belong only to the final transcript summary. Never add them by rewriting the saved report after release, never add `run_end_pt` or any estimate field to the status snapshot, and never use them as a trading, lifecycle, lease, or artifact authority. If `telemetry_ok` is false, omit all three lines rather than filling them with guesses and use exactly one `Timing unavailable: <timing_unavailable>` sentence. This telemetry branch never changes the report pointer.
 
 **END your final transcript message with this line — verbatim except the filename, every run, no exceptions:**
 
 Output file — open from the file panel on the right: rhmra-log-YYYY_MM_DD-HH_MM.md (run report)
 
-Three things are load-bearing: it must be the **LAST** line (nothing after it — the run-summary goes BEFORE it), the filename must be **BARE** (no `run-reports/` prefix, no directory), and it must be **unformatted text** — no backticks/code span, no markdown link. That exact shape is what makes the scheduler render a file card with a working **"Open in <editor>"** button. A code span, a `run-reports/` prefix, or any text printed after the line each cost the card on a real run. Markdown links never work — they render, but do not respond to a click. If the run created or modified any other USER-FACING file (e.g. `ALERTS.md`), name it the same way on its own line just above this one — but never the telemetry JSONs (`rhmra-gates-*.json`, `rhmra-status-*.json`), which are machine-read and must not produce file cards.
+Three things are load-bearing: it must be the **LAST** line (nothing after it — the run-summary goes BEFORE it), the filename must be copied byte-for-byte from the final handoff's `expected_report_file` and be **BARE** (no `run-reports/` prefix, no directory), and the line must be **unformatted text** — no backticks/code span, no markdown link. Never substitute a filename from memory, current time, narration, the displayed pattern below, or a prior run, including when `telemetry_ok` is false. That exact shape is what makes the scheduler render a file card with a working **"Open in <editor>"** button. A code span, a `run-reports/` prefix, or any text printed after the line each cost the card on a real run. Markdown links never work — they render, but do not respond to a click. If the run created or modified any other USER-FACING file (e.g. `ALERTS.md`), name it the same way on its own line just above this one — but never the telemetry JSONs (`rhmra-gates-*.json`, `rhmra-status-*.json`), which are machine-read and must not produce file cards.
 
 The filename is exactly:
 

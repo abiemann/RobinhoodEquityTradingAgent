@@ -290,39 +290,146 @@ def wilder_rsi(closes, period=14):
     return out
 
 
-def _rsi_series(val, period):
-    """Ascending RSI values from any accepted per-symbol shape."""
-    if isinstance(val, dict) and "data" in val:
-        val = val["data"]
-    if isinstance(val, dict) and "indicators" in val:
-        val = val["indicators"][0]["series"]
-    if isinstance(val, dict) and "rsi" in val:
-        val = val["rsi"]
-    if isinstance(val, dict) and "closes" in val:
-        return wilder_rsi(val["closes"], period)
-    if isinstance(val, list):
-        return [finite_float(x["value"], "RSI value") if isinstance(x, dict)
-                else finite_float(x, "RSI value") for x in val]
-    return []
+def _rsi_symbol(value, context):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(f"{context}: expected a nonempty ticker string")
+    return value.upper()
+
+
+def _rsi_values(series, context):
+    if not isinstance(series, list):
+        raise ValueError(f"{context}: expected an array")
+    values = []
+    for index, item in enumerate(series, 1):
+        if isinstance(item, dict):
+            if "value" not in item:
+                raise ValueError(f"{context} item {index}: missing value")
+            item = item["value"]
+        if isinstance(item, bool):
+            raise ValueError(f"{context} item {index}: invalid number")
+        values.append(finite_float(item, f"{context} item {index}"))
+    return values
+
+
+def _indicator_rsi_series(value, context):
+    if not isinstance(value, dict):
+        raise ValueError(f"{context}: expected an object")
+    indicators = value.get("indicators")
+    if not isinstance(indicators, list) or not indicators:
+        raise ValueError(f"{context}.indicators: expected a nonempty array")
+
+    rsi_indicators = []
+    for index, indicator in enumerate(indicators, 1):
+        if not isinstance(indicator, dict):
+            raise ValueError(f"{context}.indicators item {index}: expected an object")
+        indicator_type = indicator.get("type")
+        if indicator_type is None or indicator_type == "rsi":
+            rsi_indicators.append((index, indicator))
+    if len(rsi_indicators) != 1:
+        raise ValueError(
+            f"{context}.indicators: expected exactly one RSI indicator"
+        )
+    index, indicator = rsi_indicators[0]
+    if "series" not in indicator:
+        raise ValueError(
+            f"{context}.indicators item {index}.series: missing"
+        )
+    return _rsi_values(
+        indicator["series"], f"{context}.indicators item {index}.series"
+    )
+
+
+def _rsi_series(value, period, context):
+    """Ascending RSI values from one accepted legacy per-symbol shape."""
+    if isinstance(value, dict) and "data" in value:
+        data = value["data"]
+        return _indicator_rsi_series(data, f"{context}.data")
+    if isinstance(value, dict) and "indicators" in value:
+        return _indicator_rsi_series(value, context)
+    if isinstance(value, dict) and "rsi" in value:
+        return _rsi_values(value["rsi"], f"{context}.rsi")
+    if isinstance(value, dict) and "closes" in value:
+        closes = value["closes"]
+        if not isinstance(closes, list):
+            raise ValueError(f"{context}.closes: expected an array")
+        return wilder_rsi(closes, period)
+    if isinstance(value, list):
+        return _rsi_values(value, context)
+    raise ValueError(
+        f"{context}: expected a raw RSI response, RSI array, rsi object, "
+        "or closes fallback"
+    )
 
 
 def load_rsi_map(documents, period):
     """Map SYMBOL -> ascending RSI values, merged across one or more files.
 
-    Each file is EITHER a raw get_equity_technical_indicators response for a
-    single symbol -- the symbol is read out of data.symbol, so responses are
-    saved verbatim and nothing is ever re-keyed by hand -- OR a symbol-keyed
-    map whose values are a raw response, a bare series, {"rsi": [...]}, or
-    {"closes": [...]} (Wilder RSI computed here).
+    Each file is EITHER a complete MCP envelope or raw
+    get_equity_technical_indicators response for one symbol -- the symbol is
+    read out of data.symbol, so responses are saved verbatim and nothing is
+    re-keyed by hand -- OR a legacy symbol-keyed map whose values are a raw
+    response, bare series, {"rsi": [...]}, or {"closes": [...]} (Wilder RSI
+    computed here). Raw response structure and cross-input symbol uniqueness
+    are validated before any gate math.
 
     The raw-file form exists because hand-assembling the keyed map is exactly
     what produced a malformed-JSON run failure; see INCIDENTS.md."""
     out = {}
-    for path, doc in documents:
-        if isinstance(doc, dict) and isinstance(doc.get("data"), dict) and "symbol" in doc["data"]:
-            doc = {doc["data"]["symbol"]: doc}          # raw single-symbol response
-        for sym, val in doc.items():
-            out[sym.upper()] = _rsi_series(val, period)
+    for path, original in documents:
+        doc = unwrap_tool_result(original, path)
+        if not isinstance(doc, dict):
+            raise ValueError(
+                f"{path}: unrecognized shape - expected a "
+                "get_equity_technical_indicators response or symbol-keyed map"
+            )
+        if any(key in doc for key in ("content", "structuredContent", "isError")):
+            raise ValueError(
+                f"{path}: unrecognized tool envelope - expected RSI data"
+            )
+
+        entries = []
+        if "data" in doc:
+            data = doc["data"]
+            if not isinstance(data, dict):
+                raise ValueError(f"{path}: data: expected an object")
+            if "symbol" not in data:
+                raise ValueError(f"{path}: data.symbol: missing")
+            symbol = _rsi_symbol(data["symbol"], f"{path}: data.symbol")
+            series = _indicator_rsi_series(data, f"{path}: data")
+            entries.append((symbol, series))
+        else:
+            for symbol_value, value in doc.items():
+                symbol = _rsi_symbol(symbol_value, f"{path}: symbol")
+                if isinstance(value, dict) and "data" in value:
+                    nested = value["data"]
+                    if not isinstance(nested, dict):
+                        raise ValueError(
+                            f"{path}: {symbol}.data: expected an object"
+                        )
+                    if "symbol" in nested:
+                        nested_symbol = _rsi_symbol(
+                            nested["symbol"], f"{path}: {symbol}.data.symbol"
+                        )
+                        if nested_symbol != symbol:
+                            raise ValueError(
+                                f"{path}: {symbol}: nested RSI symbol is "
+                                f"{nested_symbol}"
+                            )
+                entries.append(
+                    (symbol, _rsi_series(value, period, f"{path}: {symbol}"))
+                )
+
+        for symbol, series in entries:
+            if symbol in out:
+                raise ValueError(
+                    f"{path}: duplicate RSI symbol across inputs for {symbol}"
+                )
+            out[symbol] = series
     return out
 
 

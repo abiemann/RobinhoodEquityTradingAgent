@@ -1205,7 +1205,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--portfolio", help="raw get_portfolio JSON file")
+    parser.add_argument(
+        "--portfolio", help="calculation mode: raw get_portfolio JSON file"
+    )
     parser.add_argument(
         "--positions",
         nargs="+",
@@ -1224,7 +1226,7 @@ def _parser() -> argparse.ArgumentParser:
         "--quotes",
         nargs="+",
         metavar="FILE",
-        help="raw get_equity_quotes batches",
+        help="calculation mode: raw get_equity_quotes batches",
     )
     parser.add_argument(
         "--trading-date", required=True, help="trading date in US Eastern, YYYY-MM-DD"
@@ -1235,7 +1237,7 @@ def _parser() -> argparse.ArgumentParser:
         help="calculation cutoff as an ISO-8601 UTC timestamp",
     )
     parser.add_argument(
-        "--halt-pct", help="positive daily-loss halt percentage"
+        "--halt-pct", help="calculation mode: positive daily-loss halt percentage"
     )
     parser.add_argument(
         "--snapshot-generation",
@@ -1267,6 +1269,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.symbols_out or args.json_out
 
     try:
+        if args.symbols_out:
+            unused_discovery_options = []
+            if args.portfolio:
+                unused_discovery_options.append("--portfolio")
+            if args.quotes:
+                unused_discovery_options.append("--quotes")
+            if args.halt_pct is not None:
+                unused_discovery_options.append("--halt-pct")
+            if unused_discovery_options:
+                raise DailyLossError(
+                    "discovery mode does not accept unused calculation "
+                    "option(s): " + ", ".join(unused_discovery_options)
+                )
         _validate_output_not_input(output, inputs)
         paths_by_kind = {
             "positions": list(args.positions),
