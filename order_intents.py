@@ -18,11 +18,15 @@ Commands (all emit one JSON object):
   order_intents.py prepare --intent FILE
   order_intents.py begin --intent-id UUID --run-token UUID
   order_intents.py retry --intent-id UUID --run-token UUID
-  order_intents.py acknowledge --intent-id UUID --response FILE --transport-scratch SCRATCH
+  order_intents.py acknowledge --intent-id UUID \
+      (--response FILE | --response-purpose KEY) --transport-scratch SCRATCH
   order_intents.py mark-unknown --intent-id UUID --code CODE
-  order_intents.py observe --intent-id UUID --orders FILE... \
-      [--order-request-cursors FIRST CURSOR...] --positions FILE... \
-      [--position-request-cursors FIRST CURSOR...] --as-of-utc TIMESTAMP
+  order_intents.py observe --intent-id UUID \
+      (--orders FILE... | --orders-purpose KEY...) \
+      [--order-request-cursors FIRST CURSOR...] \
+      (--positions FILE... | --positions-purpose KEY...) \
+      [--position-request-cursors FIRST CURSOR...] --as-of-utc TIMESTAMP \
+      --transport-scratch SCRATCH
   order_intents.py abandon-prepared --intent-id UUID --note TEXT
   order_intents.py operator-bind --intent-id UUID --order-id UUID --note TEXT
   order_intents.py operator-resolve-not-submitted --intent-id UUID --note TEXT
@@ -50,7 +54,12 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
-from broker_snapshot import validate_bound_external_json_source
+from broker_snapshot import (
+    validate_bound_external_json_purpose,
+    validate_bound_external_json_purposes,
+    validate_bound_external_json_source,
+    validate_bound_external_json_sources,
+)
 
 
 SCHEMA_VERSION = 1
@@ -1789,13 +1798,24 @@ def _save_broker_observation(
 def acknowledge(
     state_file: str,
     intent_id: str,
-    response_file: str,
+    response_input: str,
     transport_scratch: str,
     now: str,
+    *,
+    response_is_purpose: bool = False,
 ) -> dict[str, Any]:
-    _resolved_response, response, _raw_response = (
-        validate_bound_external_json_source(transport_scratch, response_file)
-    )
+    if response_is_purpose:
+        _resolved_response, response, _raw_response = (
+            validate_bound_external_json_purpose(
+                transport_scratch, response_input
+            )
+        )
+    else:
+        _resolved_response, response, _raw_response = (
+            validate_bound_external_json_source(
+                transport_scratch, response_input
+            )
+        )
     raw_order = _extract_place_order(response)
     connection = connect(state_file)
     try:
@@ -1843,28 +1863,48 @@ def acknowledge(
     }
 
 
+def _validated_external_documents(
+    transport_scratch: str,
+    inputs: Sequence[str],
+    *,
+    inputs_are_purposes: bool,
+) -> list[tuple[str, Any]]:
+    if inputs_are_purposes:
+        validated = validate_bound_external_json_purposes(
+            transport_scratch, inputs
+        )
+    else:
+        validated = validate_bound_external_json_sources(
+            transport_scratch, inputs
+        )
+    return [
+        (label, document)
+        for label, (_path, document, _raw) in zip(inputs, validated)
+    ]
+
+
 def _pages(
-    paths: Sequence[str],
+    documents: Sequence[tuple[str, Any]],
     request_cursors: Sequence[str] | None,
     row_key: str,
     context: str,
 ) -> list[Mapping[str, Any]]:
-    if not paths:
+    if not documents:
         raise OrderIntentError(f"{context}: at least one page is required")
     if request_cursors is None:
-        if len(paths) != 1:
+        if len(documents) != 1:
             raise OrderIntentError(
                 f"{context}: multi-page input requires request cursor linkage"
             )
         request_cursors = ["FIRST"]
-    if len(request_cursors) != len(paths) or request_cursors[0] != "FIRST":
+    if len(request_cursors) != len(documents) or request_cursors[0] != "FIRST":
         raise OrderIntentError(
             f"{context}: request cursors must align with pages and start with FIRST"
         )
     rows: list[Mapping[str, Any]] = []
     seen_cursors: set[str] = set()
     expected_request_cursor = "FIRST"
-    for page_index, path in enumerate(paths):
+    for page_index, (label, document) in enumerate(documents):
         request_cursor = request_cursors[page_index]
         if request_cursor != expected_request_cursor:
             raise OrderIntentError(
@@ -1879,7 +1919,7 @@ def _pages(
             if request_cursor in seen_cursors:
                 raise OrderIntentError(f"{context}: repeated request cursor")
             seen_cursors.add(request_cursor)
-        root = _mapping(load_json(path, f"{context} page"), f"{context} page")
+        root = _mapping(document, f"{context} page {page_index + 1} ({label})")
         if "data" in root:
             data = _mapping(root.get("data"), f"{context} page.data")
         elif "structuredContent" in root:
@@ -1922,9 +1962,9 @@ def _pages(
             next_cursor = cursor_values[0]
             if next_cursor in seen_cursors:
                 raise OrderIntentError(f"{context}: repeated next cursor")
-        if page_index < len(paths) - 1 and not has_next:
+        if page_index < len(documents) - 1 and not has_next:
             raise OrderIntentError(f"{context}: nonfinal page has no next cursor")
-        if page_index == len(paths) - 1 and has_next:
+        if page_index == len(documents) - 1 and has_next:
             raise OrderIntentError(f"{context}: final page still has a next cursor")
         if not has_next and next_value is not None and not isinstance(next_value, str):
             raise OrderIntentError(
@@ -2027,19 +2067,36 @@ def _identity_match(
 def observe(
     state_file: str,
     intent_id: str,
-    order_files: Sequence[str],
+    order_inputs: Sequence[str],
     order_request_cursors: Sequence[str] | None,
-    position_files: Sequence[str],
+    position_inputs: Sequence[str],
     position_request_cursors: Sequence[str] | None,
     as_of_text: str,
     now: str,
+    transport_scratch: str,
+    *,
+    order_inputs_are_purposes: bool = False,
+    position_inputs_are_purposes: bool = False,
 ) -> dict[str, Any]:
     as_of = _utc(as_of_text, "--as-of-utc")
+    order_documents = _validated_external_documents(
+        transport_scratch,
+        order_inputs,
+        inputs_are_purposes=order_inputs_are_purposes,
+    )
+    position_documents = _validated_external_documents(
+        transport_scratch,
+        position_inputs,
+        inputs_are_purposes=position_inputs_are_purposes,
+    )
     orders = _dedupe_orders(
-        _pages(order_files, order_request_cursors, "orders", "orders")
+        _pages(order_documents, order_request_cursors, "orders", "orders")
     )
     positions = _pages(
-        position_files, position_request_cursors, "positions", "positions"
+        position_documents,
+        position_request_cursors,
+        "positions",
+        "positions",
     )
 
     connection = connect(state_file)
@@ -2347,16 +2404,27 @@ def main() -> int:
     parser.add_argument("--intent", help="strict prepared-intent JSON file")
     parser.add_argument("--intent-id")
     parser.add_argument("--run-token")
-    parser.add_argument("--response", help="raw place_equity_order JSON response")
+    response_input = parser.add_mutually_exclusive_group()
+    response_input.add_argument(
+        "--response", help="raw place_equity_order JSON response"
+    )
+    response_input.add_argument(
+        "--response-purpose",
+        help="committed response-source purpose for place_equity_order",
+    )
     parser.add_argument(
         "--transport-scratch",
-        help="preflighted scratch whose binding owns --response",
+        help="preflighted scratch whose binding owns broker response inputs",
     )
     parser.add_argument("--code")
     parser.add_argument("--detail")
-    parser.add_argument("--orders", nargs="+")
+    orders_input = parser.add_mutually_exclusive_group()
+    orders_input.add_argument("--orders", nargs="+")
+    orders_input.add_argument("--orders-purpose", nargs="+")
     parser.add_argument("--order-request-cursors", nargs="+")
-    parser.add_argument("--positions", nargs="+")
+    positions_input = parser.add_mutually_exclusive_group()
+    positions_input.add_argument("--positions", nargs="+")
+    positions_input.add_argument("--positions-purpose", nargs="+")
     parser.add_argument("--position-request-cursors", nargs="+")
     parser.add_argument("--as-of-utc")
     parser.add_argument("--note")
@@ -2389,19 +2457,24 @@ def main() -> int:
         elif action == "acknowledge":
             if (
                 not args.intent_id
-                or not args.response
+                or (args.response is None and args.response_purpose is None)
                 or not args.transport_scratch
             ):
                 raise OrderIntentError(
-                    "acknowledge requires --intent-id, --response, and "
-                    "--transport-scratch"
+                    "acknowledge requires --intent-id, exactly one of "
+                    "--response/--response-purpose, and --transport-scratch"
                 )
             result = acknowledge(
                 args.state_file,
                 args.intent_id,
-                args.response,
+                (
+                    args.response_purpose
+                    if args.response_purpose is not None
+                    else args.response
+                ),
                 args.transport_scratch,
                 now,
+                response_is_purpose=args.response_purpose is not None,
             )
         elif action == "mark-unknown":
             if not args.intent_id or not args.code:
@@ -2414,22 +2487,37 @@ def main() -> int:
         elif action == "observe":
             if (
                 not args.intent_id
-                or not args.orders
-                or not args.positions
+                or (args.orders is None and args.orders_purpose is None)
+                or (args.positions is None and args.positions_purpose is None)
                 or not args.as_of_utc
+                or not args.transport_scratch
             ):
                 raise OrderIntentError(
-                    "observe requires --intent-id, --orders, --positions, and --as-of-utc"
+                    "observe requires --intent-id, exactly one of "
+                    "--orders/--orders-purpose, exactly one of "
+                    "--positions/--positions-purpose, --as-of-utc, and "
+                    "--transport-scratch"
                 )
             result = observe(
                 args.state_file,
                 args.intent_id,
-                args.orders,
+                (
+                    args.orders_purpose
+                    if args.orders_purpose is not None
+                    else args.orders
+                ),
                 args.order_request_cursors,
-                args.positions,
+                (
+                    args.positions_purpose
+                    if args.positions_purpose is not None
+                    else args.positions
+                ),
                 args.position_request_cursors,
                 args.as_of_utc,
                 now,
+                args.transport_scratch,
+                order_inputs_are_purposes=args.orders_purpose is not None,
+                position_inputs_are_purposes=args.positions_purpose is not None,
             )
         elif action == "abandon-prepared":
             if not args.intent_id or not args.note:

@@ -25,8 +25,9 @@ live-verified; if an intentional behavior change breaks one, update the
 expectation deliberately — never delete a test to go green.
 
 Usage:
-  python evaluate_candidates.py --scratch <preflighted scratch> --bars hist1.json [hist2.json ...] \
-      --quotes quotes1.json [quotes2.json ...] \
+  python evaluate_candidates.py --scratch <preflighted scratch> \
+      (--bars hist1.json [hist2.json ...] | --bars-purpose KEY [KEY ...]) \
+      (--quotes quotes1.json [quotes2.json ...] | --quotes-purpose KEY [KEY ...]) \
       --volume-lookback-days 20 --high-lookback-days 5 \
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
       [--max-spread-buy-pct 2.0] [--json-out results.json]
@@ -36,7 +37,7 @@ Usage:
   {"data": {"results": [...]}}   (full tool response)
   {"results": [...]}             (data envelope)
   [...]                          (bare results list)
---rsi-file: one or more files, each a RAW get_equity_technical_indicators
+--rsi-file/--rsi-purpose: one or more sources, each a RAW get_equity_technical_indicators
   response saved verbatim (the symbol is read from data.symbol, so responses
   are never re-keyed or retyped). A symbol-keyed map is still accepted.
 --quotes files: one or more saved get_equity_quotes results. Accepted raw shapes:
@@ -66,7 +67,10 @@ import math
 import statistics
 import sys
 
-from broker_snapshot import validate_bound_external_json_sources
+from broker_snapshot import (
+    validate_bound_external_json_purposes,
+    validate_bound_external_json_sources,
+)
 
 
 def _reject_nonfinite_json(token):
@@ -370,42 +374,75 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scratch", required=True,
                     help="absolute preflighted scratch whose transport binding owns every input")
-    ap.add_argument("--bars", nargs="+", required=True, help="raw get_equity_historicals JSON file(s)")
-    ap.add_argument(
+    bars_input = ap.add_mutually_exclusive_group(required=True)
+    bars_input.add_argument(
+        "--bars", nargs="+", help="raw get_equity_historicals JSON file(s)"
+    )
+    bars_input.add_argument(
+        "--bars-purpose",
+        nargs="+",
+        help="committed response-source purpose(s) containing historicals",
+    )
+    quotes_input = ap.add_mutually_exclusive_group(required=True)
+    quotes_input.add_argument(
         "--quotes",
         nargs="+",
-        required=True,
         help="one or more saved get_equity_quotes responses (legacy SYMBOL -> quote maps also accepted)",
+    )
+    quotes_input.add_argument(
+        "--quotes-purpose",
+        nargs="+",
+        help="committed response-source purpose(s) containing quotes",
     )
     ap.add_argument("--volume-lookback-days", type=int, required=True)
     ap.add_argument("--high-lookback-days", type=int, required=True)
     ap.add_argument("--min-median-dollar-volume", type=finite_float_arg, required=True)
     ap.add_argument("--dip-entry-pct", type=finite_float_arg, required=True)
-    ap.add_argument("--max-spread-buy-pct", type=finite_float_arg, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in --quotes")
+    ap.add_argument("--max-spread-buy-pct", type=finite_float_arg, help="MAX_SPREAD_BUY_PCT - enables the bid/ask spread gate; requires bid+ask in quote inputs")
     ap.add_argument("--json-out", help="optional path for machine-readable results")
-    ap.add_argument("--rsi-file", nargs="+", help="one or more RSI files - each a RAW get_equity_technical_indicators response (symbol read from it) or a symbol-keyed map; enables the RSI curl-up entry gate")
-    ap.add_argument("--rsi-oversold", type=finite_float_arg, help="RSI_OVERSOLD (required with --rsi-file)")
-    ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with --rsi-file)")
-    ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with --rsi-file)")
-    ap.add_argument("--rsi-max-entry", type=finite_float_arg, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with --rsi-file)")
+    rsi_input = ap.add_mutually_exclusive_group()
+    rsi_input.add_argument("--rsi-file", nargs="+", help="one or more RSI files - each a RAW get_equity_technical_indicators response (symbol read from it) or a symbol-keyed map; enables the RSI curl-up entry gate")
+    rsi_input.add_argument(
+        "--rsi-purpose",
+        nargs="+",
+        help="committed response-source purpose(s) containing RSI responses; enables the RSI curl-up entry gate",
+    )
+    ap.add_argument("--rsi-oversold", type=finite_float_arg, help="RSI_OVERSOLD (required with an RSI input)")
+    ap.add_argument("--rsi-lookback-bars", type=int, help="RSI_LOOKBACK_BARS (required with an RSI input)")
+    ap.add_argument("--rsi-confirm-bars", type=int, help="RSI_CONFIRM_BARS (required with an RSI input)")
+    ap.add_argument("--rsi-max-entry", type=finite_float_arg, help="RSI_MAX_ENTRY - highest CURRENT RSI still buyable (required with an RSI input)")
     ap.add_argument("--rsi-period", type=int,
-                    help="RSI_PERIOD, required with --rsi-file so the closes fallback uses the configured period")
+                    help="RSI_PERIOD, required with an RSI input so the closes fallback uses the configured period")
     args = ap.parse_args()
 
-    input_paths = [*args.bars, *args.quotes, *(args.rsi_file or [])]
-    validated = validate_bound_external_json_sources(args.scratch, input_paths)
-    documents = [(str(path), document) for path, document, _raw in validated]
-    bar_documents = documents[:len(args.bars)]
-    quote_start = len(args.bars)
-    quote_documents = documents[quote_start:quote_start + len(args.quotes)]
-    rsi_documents = documents[quote_start + len(args.quotes):]
+    def resolve_inputs(paths, purposes):
+        if purposes is not None:
+            validated = validate_bound_external_json_purposes(
+                args.scratch, purposes
+            )
+            labels = purposes
+        else:
+            validated = validate_bound_external_json_sources(args.scratch, paths)
+            labels = paths
+        return [
+            (label, document)
+            for label, (_path, document, _raw) in zip(labels, validated)
+        ]
+
+    bar_documents = resolve_inputs(args.bars, args.bars_purpose)
+    quote_documents = resolve_inputs(args.quotes, args.quotes_purpose)
+    rsi_documents = (
+        resolve_inputs(args.rsi_file, args.rsi_purpose)
+        if args.rsi_file is not None or args.rsi_purpose is not None
+        else []
+    )
 
     rsi_map = None
-    if args.rsi_file:
+    if rsi_documents:
         if (args.rsi_period is None or args.rsi_oversold is None
                 or args.rsi_lookback_bars is None or args.rsi_confirm_bars is None
                 or args.rsi_max_entry is None):
-            ap.error("--rsi-file requires --rsi-period, --rsi-oversold, "
+            ap.error("--rsi-file/--rsi-purpose requires --rsi-period, --rsi-oversold, "
                      "--rsi-lookback-bars, --rsi-confirm-bars, and --rsi-max-entry")
         rsi_map = load_rsi_map(rsi_documents, args.rsi_period)
 
@@ -532,8 +569,20 @@ def main():
     print("Buy candidates:", [r["symbol"] for r in rows if r["buy_candidate"]] or "none")
 
     if args.json_out:
-        params = {key: value for key, value in vars(args).items()
-                  if key != "scratch"}
+        parameter_values = vars(args).copy()
+        if args.bars_purpose is not None:
+            parameter_values["bars"] = args.bars_purpose
+        if args.quotes_purpose is not None:
+            parameter_values["quotes"] = args.quotes_purpose
+        if args.rsi_purpose is not None:
+            parameter_values["rsi_file"] = args.rsi_purpose
+        params = {
+            key: value
+            for key, value in parameter_values.items()
+            if key not in {
+                "scratch", "bars_purpose", "quotes_purpose", "rsi_purpose"
+            }
+        }
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "rsi_gate_enabled": rsi_map is not None,
                        "params": params, "results": rows},

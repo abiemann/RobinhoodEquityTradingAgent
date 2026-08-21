@@ -979,7 +979,8 @@ or a failure of the Windows capability bridge.
 **Rule produced:** Codex now uses separate executor-local bootstrap and transport state. Bootstrap
 first clears and stores the exact Python-resolver receipt as `launcher-bound`, extends that same
 object with the exact validated-constants receipt as `configuration-bound`, then adds the exact
-active-context receipt as `context-bound` after lease binding. Every later operation loads the
+active-context receipt unchanged after lease binding and advances the surrounding bootstrap state
+to `context-bound`. Every later operation loads the
 Python executable, configured account name, invocation, and lifecycle
 artifact names from those receipts; none may be copied from visible output. Every nested Windows
 command explicitly selects `powershell.exe`, even if the outer environment exposes another shell.
@@ -1081,6 +1082,84 @@ halted-form candidate handoff failures to red `evaluation failure`, calls a `run
 record with no activity for 30 minutes `unfinished lifecycle`, and describes the timeline as only
 attempts that reached lifecycle start. The report asterisk remains a validated-details marker,
 not proof of a trade.
+
+**2026-08-21 11:33, Codex rejected a valid active-context receipt as the wrong bootstrap phase and
+then used scheduler memory after an incomplete routine read.** The checked-in active-context bind
+helper exited successfully and returned its valid receipt. That receipt's `phase: "preflight"`
+correctly described the helper-owned lifecycle phase; the surrounding executor-local bootstrap
+state was supposed to store the receipt unchanged and then advance its own phase to
+`context-bound`. The runner instead required the receipt itself to say `context-bound`, conflating
+two separate state namespaces and falsely rejecting the otherwise valid bind.
+
+The halt remained safe and early. No Robinhood request, scratch creation, order-intent work,
+broker read, scan, review, placement, cancellation, report, or status snapshot occurred. The lease
+was released and lifecycle finished `coordination-halt` / `coordination-state`. The same transcript
+showed that the one-shot routine-file read had stopped at roughly 30,000 of roughly 52,000 tokens,
+before EOF. The scheduler header advertised an automation-memory path and provided no earlier
+no-memory launch rule; the routine's stateless rule was beyond the unread boundary. Codex later
+read and added four lines to that `memory.md`. The edit did not affect broker or repository state,
+but it proved that a safety rule located only beyond a truncated read is not an effective launch
+boundary.
+
+**Rules produced:** active-context bind is now the fourth startup receipt whose complete schema is
+owned by its named checked-in producer, alongside the resolver, lifecycle-start action, and
+constants validator. Runner glue stores its complete result unchanged and checks only the core
+fields it consumes; it does not count or independently type-map the receipt. The receipt and its
+enclosing state are named and validated separately: the unchanged helper receipt must retain
+lifecycle `phase: "preflight"`, and only after storing it does the executor-local bootstrap wrapper
+advance to `phase: "context-bound"`. Neither value may be inferred from, substituted for, or
+required to equal the other. Regression coverage pins both phases so a valid helper receipt cannot
+be rejected for failing to claim runner-owned state.
+
+Stateless/no-memory and complete-load requirements now appear at the routine's launch boundary and
+in both maintained scheduler prompts. A scheduled run reads the routine sequentially from line 1
+through EOF in bounded chunks of at most 50 lines before executing any routine step; a truncated
+read continues from the first unread line in smaller chunks and is never completion. The run never
+reads, creates, or updates `memory.md` and never calls a framework memory tool, even when the
+scheduler UI advertises an automation-memory path. Validated report/status artifacts remain the
+only durable run record.
+
+**2026-08-21 12:19, model-authored post-bind state code rejected its own successful positions
+response before attempting the file change.** The revised launch boundary worked: Codex read all
+832 routine lines in bounded chunks through a recorded EOF and did not access automation memory.
+Startup account transport also completed successfully. After one successful
+`get_equity_positions` read, the composed operation correctly entered
+`source-response-received` with pending purpose `first-positions-0`. Its newly factored
+`saveResponse()` function then incorrectly required the *pre-call* state
+`transport-bound` with no pending purpose. That condition was impossible after a successful
+response, so the function threw `transport state unavailable` before constructing or applying a
+file patch. The same generated function contained a latent second source-sequence increment even
+though the sequence had already been consumed before the broker call.
+
+This was not a Robinhood, Windows ACL, source-root, JSON, or file-change failure: no positions
+file write was attempted. Broker access consisted only of the successful account bind and the one
+successful positions read. No order review, intent, placement, cancellation, scan, daily-loss
+decision, status publication, or other broker mutation occurred. The lease was released and
+lifecycle finished `snapshot-failure` / `snapshot-write-failed`; that broad report classification
+did not expose the more precise pre-write orchestration contradiction.
+
+**Rule produced:** the August 20 executor-owned post-bind sequence, pending-purpose, transient
+phase, and path map are superseded. `broker_snapshot.py` now owns an append-only source-handoff
+journal inside the invocation scratch. A unique purpose is reserved before a broker/read call;
+the helper, not the model, chooses and binds the fresh direct-child source filename. After the
+file-change facility writes the complete response, a commit action strictly reads the JSON,
+records its hash and file identity, and atomically seals that purpose. An explicit final connector
+failure can abort only a still-missing reserved file. Immutable reservation and terminal markers
+make allocation, duplicate-purpose rejection, commit-versus-abort, and recovery from a lost helper
+receipt deterministic without any model-authored transition math. Reservation and consumption are
+both refused while any earlier purpose remains unresolved, so renaming a purpose or consuming an
+older committed payload cannot bypass an uncertain broker call. The four helper actions own their
+complete receipt schemas; runner glue checks only the core identity/outcome values and retains the
+whole receipt instead of inventing another field-count/type validator.
+
+Downstream staging, scan filtering, candidate evaluation, and order-intent handling consume
+committed logical purposes through the checked-in validators rather than model-carried random
+paths. A merely reserved, aborted, unregistered, moved, replaced, or modified file is unusable.
+Lookup may recover only a hash- and identity-matching committed handoff, or authorize commit-only
+when the exact reserved file is already present; it never authorizes another broker call or file
+rewrite. Codex and non-Codex runners use the same helper journal. The file-change facility remains
+the sensitive-response writer, and all existing one-call, no-fallback, bound-root, strict-JSON,
+privacy, lease, and order-intent rules remain in force.
 
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 

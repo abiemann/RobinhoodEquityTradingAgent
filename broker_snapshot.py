@@ -93,6 +93,16 @@ TRANSPORT_PREPARATION_MARKER_NAME = (
 TRANSPORT_ROOT_MARKER = '.rhmra-broker-response-source-root.json'
 TRANSPORT_ROOT_MARKER_NAME = 'rhmra-broker-response-source-root'
 TRANSPORT_KIND = 'file-change'
+SOURCE_RESERVATION_MARKER_PREFIX = '.rhmra-broker-response-source-reservation-'
+SOURCE_RESERVATION_MARKER_NAME = 'rhmra-broker-response-source-reservation'
+SOURCE_TERMINAL_MARKER_PREFIX = '.rhmra-broker-response-source-terminal-'
+SOURCE_TERMINAL_MARKER_NAME = 'rhmra-broker-response-source-terminal'
+SOURCE_RESERVE_LOCK = '.rhmra-broker-response-source-reserve-lock.json'
+SOURCE_RESERVE_LOCK_NAME = 'rhmra-broker-response-source-reserve-lock'
+SOURCE_PURPOSE_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,47}$')
+SOURCE_ABORT_REASONS = frozenset(
+    {'connector-failed', 'serialization-failed', 'file-change-failed'}
+)
 SNAPSHOT_KINDS = ("portfolio", "positions", "orders", "quotes")
 ORDER_STATES = frozenset(
     {
@@ -175,6 +185,14 @@ class TransportAlreadyAttemptedError(SnapshotError):
         super().__init__(message)
         self.marker_stable = marker_stable
         self.canary_instance = canary_instance
+
+
+class SourceHandoffError(SnapshotError):
+    """Raised for a deterministic response-source journal violation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -1081,30 +1099,761 @@ def _validated_transport_root_marker(
     return document
 
 
-def _read_bound_external_json_source(
-    source_arg: str, bound_source_root: Path
+def _validated_source_purpose(value: Any, context: str = '--purpose') -> str:
+    if not isinstance(value, str) or SOURCE_PURPOSE_RE.fullmatch(value) is None:
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{context}: expected 1-48 lowercase letters, digits, or hyphens, '
+            'beginning with a letter or digit',
+        )
+    return value
+
+
+def _source_purpose_key(purpose: str) -> str:
+    return hashlib.sha256(purpose.encode('ascii')).hexdigest()
+
+
+def _source_reservation_marker_path(scratch: Path, purpose: str) -> Path:
+    return scratch / (
+        SOURCE_RESERVATION_MARKER_PREFIX + _source_purpose_key(purpose) + '.json'
+    )
+
+
+def _source_terminal_marker_path(scratch: Path, purpose: str) -> Path:
+    return scratch / (
+        SOURCE_TERMINAL_MARKER_PREFIX + _source_purpose_key(purpose) + '.json'
+    )
+
+
+def _source_filename(reservation_id: str) -> str:
+    return f'rhmra-source-{reservation_id}.json'
+
+
+def _source_reservation_document(
+    *, scratch_id: str, source_root_id: str, purpose: str,
+    reservation_id: str,
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': SOURCE_RESERVATION_MARKER_NAME,
+        'scratch_id': scratch_id,
+        'source_root_id': source_root_id,
+        'purpose': purpose,
+        'reservation_id': reservation_id,
+        'source_filename': _source_filename(reservation_id),
+    }
+
+
+def _source_committed_document(
+    *, reservation: Mapping[str, Any], source_sha256: str,
+    source_identity: Mapping[str, str],
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': SOURCE_TERMINAL_MARKER_NAME,
+        'scratch_id': reservation['scratch_id'],
+        'source_root_id': reservation['source_root_id'],
+        'purpose': reservation['purpose'],
+        'reservation_id': reservation['reservation_id'],
+        'source_filename': reservation['source_filename'],
+        'status': 'committed',
+        'source_sha256': source_sha256,
+        'source_device': source_identity['device'],
+        'source_inode': source_identity['inode'],
+        'source_size': source_identity['size'],
+        'source_mtime_ns': source_identity['mtime_ns'],
+        'source_ctime_ns': source_identity['ctime_ns'],
+    }
+
+
+def _source_aborted_document(
+    *, reservation: Mapping[str, Any], reason: str,
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': SOURCE_TERMINAL_MARKER_NAME,
+        'scratch_id': reservation['scratch_id'],
+        'source_root_id': reservation['source_root_id'],
+        'purpose': reservation['purpose'],
+        'reservation_id': reservation['reservation_id'],
+        'source_filename': reservation['source_filename'],
+        'status': 'aborted',
+        'reason': reason,
+    }
+
+
+def _journal_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _source_stat_document(value: os.stat_result) -> dict[str, str]:
+    return {
+        'device': str(value.st_dev),
+        'inode': str(value.st_ino),
+        'size': str(value.st_size),
+        'mtime_ns': str(value.st_mtime_ns),
+        'ctime_ns': str(value.st_ctime_ns),
+    }
+
+
+def _read_immutable_journal_marker(
+    path: Path, scratch: Path,
+) -> tuple[Mapping[str, Any], bytes]:
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: cannot inspect source-handoff journal marker: {exc}',
+        ) from exc
+    if (
+        path.parent != scratch
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+    ):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: source-handoff journal marker must be an immutable '
+            'non-symlink regular direct child of scratch',
+        )
+    try:
+        if path.resolve(strict=True) != path:
+            raise SourceHandoffError(
+                'source_journal_invalid',
+                f'{path}: source-handoff journal marker path changed',
+            )
+        document, raw = _read_source(str(path))
+        after = os.lstat(path)
+    except SourceHandoffError:
+        raise
+    except (OSError, SnapshotError) as exc:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: cannot read source-handoff journal marker: {exc}',
+        ) from exc
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or _journal_stat_identity(before) != _journal_stat_identity(after)
+    ):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: source-handoff journal marker changed while being read',
+        )
+    try:
+        document = _mapping(document, str(path))
+        canonical = _canonical_bytes(document)
+    except SnapshotError as exc:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid source-handoff journal marker: {exc}',
+        ) from exc
+    if raw != canonical:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: source-handoff journal marker is not canonical JSON',
+        )
+    return document, raw
+
+
+def _write_immutable_journal_marker(
+    path: Path, document: Mapping[str, Any], scratch: Path,
+) -> None:
+    raw = _canonical_bytes(document)
+    descriptor = -1
+    temporary = ''
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f'.{path.name}.', suffix='.tmp', dir=str(scratch)
+        )
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise SourceHandoffError(
+                    'source_journal_write_failed',
+                    f'{path}: incomplete immutable source-handoff marker write',
+                )
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        staged, staged_raw = _read_source(temporary)
+        if staged != document or staged_raw != raw:
+            raise SourceHandoffError(
+                'source_journal_write_failed',
+                f'{path}: staged source-handoff marker read-back mismatch',
+            )
+        os.link(temporary, path)
+        try:
+            persisted, persisted_raw = _read_immutable_journal_marker(
+                path, scratch
+            )
+        except Exception as exc:
+            raise SourceHandoffError(
+                'source_journal_write_failed',
+                f'{path}: immutable source-handoff marker was committed but '
+                'could not be verified',
+            ) from exc
+        if persisted != document or persisted_raw != raw:
+            raise SourceHandoffError(
+                'source_journal_write_failed',
+                f'{path}: immutable source-handoff marker read-back mismatch',
+            )
+    except FileExistsError:
+        raise
+    except SourceHandoffError:
+        raise
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_journal_write_failed',
+            f'{path}: cannot atomically commit source-handoff marker: {exc}',
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _source_reserve_lock_document(
+    *, scratch_id: str, lock_id: str,
+) -> dict[str, Any]:
+    return {
+        'schema_version': Decimal(SCHEMA_VERSION),
+        'marker': SOURCE_RESERVE_LOCK_NAME,
+        'scratch_id': scratch_id,
+        'lock_id': lock_id,
+    }
+
+
+def _validated_source_reserve_lock(
+    scratch: Path, scratch_marker: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    path = scratch / SOURCE_RESERVE_LOCK
+    document, _raw = _read_immutable_journal_marker(path, scratch)
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'lock_id',
+    } or (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != SOURCE_RESERVE_LOCK_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or not isinstance(document.get('lock_id'), str)
+        or _UUID_RE.fullmatch(document['lock_id']) is None
+    ):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid source-reservation lock marker',
+        )
+    return document
+
+
+def _acquire_source_reserve_lock(
+    scratch: Path, scratch_marker: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    path = scratch / SOURCE_RESERVE_LOCK
+    document = _source_reserve_lock_document(
+        scratch_id=scratch_marker['scratch_id'], lock_id=str(uuid.uuid4())
+    )
+    try:
+        _write_immutable_journal_marker(path, document, scratch)
+    except FileExistsError as exc:
+        _validated_source_reserve_lock(scratch, scratch_marker)
+        raise SourceHandoffError(
+            'source_journal_busy',
+            'another source reservation is active or was interrupted; '
+            'do not start another broker call',
+        ) from exc
+    return document
+
+
+def _release_source_reserve_lock(
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    path = scratch / SOURCE_RESERVE_LOCK
+    persisted = _validated_source_reserve_lock(scratch, scratch_marker)
+    if persisted != expected:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: source-reservation lock ownership changed',
+        )
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_journal_write_failed',
+            f'{path}: cannot release source-reservation lock: {exc}',
+        ) from exc
+
+
+def _reject_pending_source_handoff(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+) -> None:
+    reservation_re = re.compile(
+        '^' + re.escape(SOURCE_RESERVATION_MARKER_PREFIX)
+        + r'[0-9a-f]{64}\.json$'
+    )
+    terminal_re = re.compile(
+        '^' + re.escape(SOURCE_TERMINAL_MARKER_PREFIX)
+        + r'[0-9a-f]{64}\.json$'
+    )
+    reservations: dict[str, Mapping[str, Any]] = {}
+    terminal_keys: set[str] = set()
+    try:
+        entries = list(scratch.iterdir())
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{scratch}: cannot enumerate source-handoff journal: {exc}',
+        ) from exc
+    for entry in entries:
+        if reservation_re.fullmatch(entry.name):
+            reservation = _validated_source_reservation_at_path(
+                entry,
+                scratch=scratch,
+                scratch_marker=scratch_marker,
+                transport_marker=transport_marker,
+            )
+            key = _source_purpose_key(reservation['purpose'])
+            if key in reservations:
+                raise SourceHandoffError(
+                    'source_journal_invalid',
+                    f'{entry}: duplicate source-reservation purpose hash',
+                )
+            reservations[key] = reservation
+        elif terminal_re.fullmatch(entry.name):
+            terminal_keys.add(
+                entry.name[len(SOURCE_TERMINAL_MARKER_PREFIX):-5]
+            )
+    if terminal_keys - set(reservations):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{scratch}: source journal has an orphan terminal marker',
+        )
+    for key, reservation in reservations.items():
+        terminal = _validated_source_terminal(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            reservation=reservation,
+        )
+        if terminal is None:
+            raise SourceHandoffError(
+                'source_handoff_pending',
+                f"{reservation['purpose']}: an earlier source handoff is "
+                'still pending; do not start another broker call',
+            )
+        source_root = Path(transport_marker['source_root'])
+        source_path = source_root / reservation['source_filename']
+        if terminal['status'] == 'aborted' and os.path.lexists(source_path):
+            raise SourceHandoffError(
+                'source_file_invalid',
+                f'{source_path}: aborted source unexpectedly exists',
+            )
+
+
+def _validated_source_reservation_at_path(
+    path: Path,
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    expected_purpose: str | None = None,
+) -> Mapping[str, Any]:
+    document, _raw = _read_immutable_journal_marker(path, scratch)
+    if set(document) != {
+        'schema_version', 'marker', 'scratch_id', 'source_root_id', 'purpose',
+        'reservation_id', 'source_filename',
+    }:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid source-reservation marker fields',
+        )
+    purpose = document.get('purpose')
+    reservation_id = document.get('reservation_id')
+    source_filename = document.get('source_filename')
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != SOURCE_RESERVATION_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or document.get('source_root_id') != transport_marker['source_root_id']
+        or not isinstance(purpose, str)
+        or SOURCE_PURPOSE_RE.fullmatch(purpose) is None
+        or (expected_purpose is not None and purpose != expected_purpose)
+        or not isinstance(reservation_id, str)
+        or _UUID_RE.fullmatch(reservation_id) is None
+        or source_filename != _source_filename(reservation_id)
+        or path != _source_reservation_marker_path(scratch, purpose)
+    ):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid or foreign source-reservation marker',
+        )
+    return document
+
+
+def _validated_source_reservation(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    purpose: str,
+) -> Mapping[str, Any]:
+    path = _source_reservation_marker_path(scratch, purpose)
+    if not os.path.lexists(path):
+        terminal_path = _source_terminal_marker_path(scratch, purpose)
+        if os.path.lexists(terminal_path):
+            raise SourceHandoffError(
+                'source_journal_invalid',
+                f'{terminal_path}: orphan source-terminal marker',
+            )
+        raise SourceHandoffError(
+            'source_reservation_missing',
+            f'{purpose}: no source handoff was reserved',
+        )
+    return _validated_source_reservation_at_path(
+        path,
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        expected_purpose=purpose,
+    )
+
+
+def _validated_source_terminal(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    purpose = reservation['purpose']
+    path = _source_terminal_marker_path(scratch, purpose)
+    if not os.path.lexists(path):
+        return None
+    document, _raw = _read_immutable_journal_marker(path, scratch)
+    status_value = document.get('status')
+    common = {
+        'schema_version', 'marker', 'scratch_id', 'source_root_id', 'purpose',
+        'reservation_id', 'source_filename', 'status',
+    }
+    if status_value == 'committed':
+        expected_fields = common | {
+            'source_sha256', 'source_device', 'source_inode', 'source_size',
+            'source_mtime_ns', 'source_ctime_ns',
+        }
+    elif status_value == 'aborted':
+        expected_fields = common | {'reason'}
+    else:
+        expected_fields = set()
+    if set(document) != expected_fields:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid source-terminal marker fields',
+        )
+    if (
+        document.get('schema_version') != Decimal(SCHEMA_VERSION)
+        or document.get('marker') != SOURCE_TERMINAL_MARKER_NAME
+        or document.get('scratch_id') != scratch_marker['scratch_id']
+        or document.get('source_root_id') != transport_marker['source_root_id']
+        or document.get('purpose') != purpose
+        or document.get('reservation_id') != reservation['reservation_id']
+        or document.get('source_filename') != reservation['source_filename']
+        or path != _source_terminal_marker_path(scratch, purpose)
+    ):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid or foreign source-terminal marker',
+        )
+    if status_value == 'committed':
+        if (
+            not isinstance(document.get('source_sha256'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', document['source_sha256']) is None
+            or any(
+                not isinstance(document.get(field), str)
+                or re.fullmatch(r'(?:0|[1-9][0-9]*)', document[field]) is None
+                for field in (
+                    'source_device', 'source_inode', 'source_size',
+                    'source_mtime_ns', 'source_ctime_ns',
+                )
+            )
+        ):
+            raise SourceHandoffError(
+                'source_journal_invalid',
+                f'{path}: invalid committed source identity',
+            )
+    elif document.get('reason') not in SOURCE_ABORT_REASONS:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{path}: invalid source-abort reason',
+        )
+    return document
+
+
+def _validated_source_journal_context(
+    scratch_path: os.PathLike[str] | str,
+) -> tuple[Path, Mapping[str, Any], Mapping[str, Any], Path]:
+    scratch, scratch_marker = validate_scratch_directory(scratch_path)
+    transport_marker = _validated_transport_marker(scratch, scratch_marker)
+    source_root = Path(transport_marker['source_root'])
+    return scratch, scratch_marker, transport_marker, source_root
+
+
+def _read_reserved_source(
+    source_root: Path, reservation: Mapping[str, Any],
+) -> tuple[Path, Any, bytes, Mapping[str, str]]:
+    source_path = source_root / reservation['source_filename']
+    try:
+        before = os.lstat(source_path)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_file_missing',
+            f'{source_path}: reserved source file is unavailable: {exc}',
+        ) from exc
+    try:
+        resolved = source_path.resolve(strict=True)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_path}: cannot resolve reserved source file: {exc}',
+        ) from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or resolved != source_path
+        or resolved.parent != source_root
+    ):
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_path}: reserved source must be a non-symlink regular '
+            'direct child of the bound response-source root',
+        )
+    try:
+        document, raw = _read_source(str(source_path))
+        after = os.lstat(source_path)
+    except SnapshotError as exc:
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_path}: reserved source is not strict JSON: {exc}',
+        ) from exc
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_file_changed',
+            f'{source_path}: reserved source changed while being read: {exc}',
+        ) from exc
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or _journal_stat_identity(before) != _journal_stat_identity(after)
+    ):
+        raise SourceHandoffError(
+            'source_file_changed',
+            f'{source_path}: reserved source changed while being read',
+        )
+    return source_path, document, raw, _source_stat_document(after)
+
+
+def _verify_committed_source(
+    source_root: Path,
+    reservation: Mapping[str, Any],
+    terminal: Mapping[str, Any],
 ) -> tuple[Path, Any, bytes]:
+    if terminal.get('status') != 'committed':
+        raise SourceHandoffError(
+            'source_handoff_aborted',
+            f"{reservation['purpose']}: source handoff was aborted",
+        )
+    source_path, document, raw, identity = _read_reserved_source(
+        source_root, reservation
+    )
+    expected_identity = {
+        'device': terminal['source_device'],
+        'inode': terminal['source_inode'],
+        'size': terminal['source_size'],
+        'mtime_ns': terminal['source_mtime_ns'],
+        'ctime_ns': terminal['source_ctime_ns'],
+    }
+    if _sha256(raw) != terminal['source_sha256'] or identity != expected_identity:
+        raise SourceHandoffError(
+            'source_file_changed',
+            f'{source_path}: committed source identity or content changed',
+        )
+    return source_path, document, raw
+
+
+def _validated_bound_source_path(
+    source_arg: str, bound_source_root: Path
+) -> Path:
     if not os.path.isabs(source_arg):
-        raise SnapshotError('broker-response source must be an absolute path')
+        raise SourceHandoffError(
+            'source_file_invalid',
+            'broker-response source must be an absolute path',
+        )
     source_input = Path(source_arg)
     try:
         source_stat = os.lstat(source_input)
     except OSError as exc:
-        raise SnapshotError(
+        raise SourceHandoffError(
+            'source_file_missing',
             f'{source_input}: cannot inspect broker-response source: {exc}'
         ) from exc
-    source_path = source_input.resolve(strict=True)
+    try:
+        source_path = source_input.resolve(strict=True)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_input}: cannot resolve broker-response source: {exc}',
+        ) from exc
     if (
         stat.S_ISLNK(source_stat.st_mode)
         or not stat.S_ISREG(source_stat.st_mode)
         or source_path.parent != bound_source_root
     ):
-        raise SnapshotError(
+        raise SourceHandoffError(
+            'source_file_invalid',
             f'{source_arg}: external source must be a non-symlink regular '
             'direct child of the invocation-bound response-source root'
         )
-    document, raw = _read_source(str(source_path))
-    return source_path, document, raw
+    return source_path
+
+
+def _reservation_for_bound_source_path(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_path: Path,
+) -> Mapping[str, Any]:
+    matches: list[Mapping[str, Any]] = []
+    marker_name_re = re.compile(
+        '^' + re.escape(SOURCE_RESERVATION_MARKER_PREFIX)
+        + r'[0-9a-f]{64}\.json$'
+    )
+    try:
+        entries = sorted(scratch.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{scratch}: cannot enumerate source-handoff journal: {exc}',
+        ) from exc
+    for entry in entries:
+        if marker_name_re.fullmatch(entry.name) is None:
+            continue
+        reservation = _validated_source_reservation_at_path(
+            entry,
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+        )
+        if reservation['source_filename'] == source_path.name:
+            matches.append(reservation)
+    if not matches:
+        raise SourceHandoffError(
+            'source_unregistered',
+            f'{source_path}: source was not reserved by the deterministic '
+            'handoff journal',
+        )
+    if len(matches) != 1:
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{source_path}: source has multiple journal reservations',
+        )
+    return matches[0]
+
+
+def _validated_committed_source_for_path(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    source_arg: str,
+) -> tuple[Path, Any, bytes]:
+    source_path = _validated_bound_source_path(source_arg, source_root)
+    reservation = _reservation_for_bound_source_path(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_path=source_path,
+    )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    if terminal is None:
+        # The file exists and is validly shaped, but an immutable commit marker
+        # has not sealed its bytes and identity.  Consumers must never infer
+        # commitment merely from the path's presence.
+        _read_reserved_source(source_root, reservation)
+        raise SourceHandoffError(
+            'source_commit_required',
+            f"{reservation['purpose']}: reserved source exists but is not "
+            'committed',
+        )
+    return _verify_committed_source(source_root, reservation, terminal)
+
+
+def _validated_committed_source_for_purpose(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    purpose: str,
+) -> tuple[Path, Any, bytes]:
+    purpose = _validated_source_purpose(purpose, 'source purpose')
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=purpose,
+    )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    source_path = source_root / reservation['source_filename']
+    if terminal is None:
+        if os.path.lexists(source_path):
+            _read_reserved_source(source_root, reservation)
+            raise SourceHandoffError(
+                'source_commit_required',
+                f'{purpose}: reserved source exists but is not committed',
+            )
+        raise SourceHandoffError(
+            'source_handoff_pending',
+            f'{purpose}: source handoff is reserved but has no file or terminal '
+            'outcome; the broker call must not be repeated',
+        )
+    if terminal['status'] == 'aborted':
+        if os.path.lexists(source_path):
+            raise SourceHandoffError(
+                'source_file_invalid',
+                f'{source_path}: aborted source unexpectedly exists',
+            )
+        raise SourceHandoffError(
+            'source_handoff_aborted',
+            f"{purpose}: source handoff was aborted ({terminal['reason']})",
+        )
+    return _verify_committed_source(source_root, reservation, terminal)
 
 
 def validate_bound_external_json_source(
@@ -1118,10 +1867,20 @@ def validate_bound_external_json_source(
     transport provenance has been checked.
     '''
 
-    scratch, scratch_marker = validate_scratch_directory(scratch_path)
-    transport_marker = _validated_transport_marker(scratch, scratch_marker)
-    return _read_bound_external_json_source(
-        os.fspath(source_path), Path(transport_marker['source_root'])
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    return _validated_committed_source_for_path(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        source_arg=os.fspath(source_path),
     )
 
 
@@ -1131,12 +1890,72 @@ def validate_bound_external_json_sources(
 ) -> list[tuple[Path, Any, bytes]]:
     '''Validate and read several external JSON files against one binding.'''
 
-    scratch, scratch_marker = validate_scratch_directory(scratch_path)
-    transport_marker = _validated_transport_marker(scratch, scratch_marker)
-    source_root = Path(transport_marker['source_root'])
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
     return [
-        _read_bound_external_json_source(os.fspath(path), source_root)
+        _validated_committed_source_for_path(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            source_arg=os.fspath(path),
+        )
         for path in source_paths
+    ]
+
+
+def validate_bound_external_json_purpose(
+    scratch_path: os.PathLike[str] | str,
+    purpose: str,
+) -> tuple[Path, Any, bytes]:
+    '''Read the immutable committed source registered for one logical purpose.'''
+
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    return _validated_committed_source_for_purpose(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        purpose=purpose,
+    )
+
+
+def validate_bound_external_json_purposes(
+    scratch_path: os.PathLike[str] | str,
+    purposes: Sequence[str],
+) -> list[tuple[Path, Any, bytes]]:
+    '''Read committed sources for several purposes under one binding.'''
+
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    return [
+        _validated_committed_source_for_purpose(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            purpose=purpose,
+        )
+        for purpose in purposes
     ]
 
 
@@ -1401,13 +2220,45 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     paginated = args.kind in {"positions", "orders"}
     request_cursors = args.request_cursor if paginated else None
     allow_more = args.allow_more if paginated else False
-    sources, outputs, scratch, marker = _absolute_distinct_paths(
-        args.source, args.output
-    )
+    prevalidated_documents: dict[str, tuple[Any, bytes]] = {}
+    source_purposes: list[str] | None = args.source_purpose
+    if source_purposes is not None:
+        if len(source_purposes) != len(args.output):
+            raise SnapshotError(
+                "--source-purpose and --output counts must match"
+            )
+        absolute_outputs = [os.path.abspath(path) for path in args.output]
+        scratch, _marker = _validated_output_scratch(absolute_outputs)
+        validated_purposes = validate_bound_external_json_purposes(
+            scratch, source_purposes
+        )
+        purpose_sources = [str(path) for path, _document, _raw in validated_purposes]
+        sources, outputs, scratch, marker = _absolute_distinct_paths(
+            purpose_sources, args.output
+        )
+        prevalidated_documents = {
+            source: (document, raw)
+            for source, (_path, document, raw) in zip(
+                sources, validated_purposes
+            )
+        }
+    else:
+        sources, outputs, scratch, marker = _absolute_distinct_paths(
+            args.source, args.output
+        )
     transport_marker = _validated_transport_marker(scratch, marker)
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=marker,
+        transport_marker=transport_marker,
+    )
     bound_source_root = Path(transport_marker['source_root'])
-    external_documents: dict[str, tuple[Any, bytes]] = {}
+    external_documents: dict[str, tuple[Any, bytes]] = dict(
+        prevalidated_documents
+    )
     for source in sources:
+        if source in external_documents:
+            continue
         source_input = Path(source)
         try:
             os.lstat(source_input)
@@ -1425,19 +2276,28 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
                 expected_kind=args.kind,
             )
         else:
-            _resolved, document, raw = _read_bound_external_json_source(
-                source, bound_source_root
+            _resolved, document, raw = _validated_committed_source_for_path(
+                scratch=scratch,
+                scratch_marker=marker,
+                transport_marker=transport_marker,
+                source_root=bound_source_root,
+                source_arg=source,
             )
             external_documents[source] = (document, raw)
     payloads: list[Mapping[str, Any]] = []
     envelopes: list[str] = []
     source_hashes: list[str] = []
-    for source in sources:
+    for source_index, source in enumerate(sources):
         if source in external_documents:
             document, source_raw = external_documents[source]
         else:
             document, source_raw = _read_source(source)
-        payload, envelope = _unwrap_source(document, source)
+        source_context = (
+            source
+            if source_purposes is None
+            else f"source purpose {source_purposes[source_index]!r}"
+        )
+        payload, envelope = _unwrap_source(document, source_context)
         payloads.append(payload)
         envelopes.append(envelope)
         source_hashes.append(_sha256(source_raw))
@@ -1485,7 +2345,6 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     ):
         entry: dict[str, Any] = {
             "index": index,
-            "source": source,
             "output": output,
             "transport": envelope,
             "source_sha256": source_hash,
@@ -1494,6 +2353,10 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
             "row_count": page["row_count"],
             "next_cursor": page["next_cursor"],
         }
+        if source_purposes is None:
+            entry["source"] = source
+        else:
+            entry["source_purpose"] = source_purposes[index - 1]
         if request_cursors is not None:
             entry["request_cursor"] = request_cursors[index - 1]
         files.append(entry)
@@ -2509,6 +3372,509 @@ def _bind_transport(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _validated_reservation_id(value: Any) -> str:
+    if not isinstance(value, str) or _UUID_RE.fullmatch(value) is None:
+        raise SourceHandoffError(
+            'source_reservation_invalid',
+            '--reservation-id must be the lowercase UUIDv4 from reserve-source',
+        )
+    return value
+
+
+def _source_receipt_base(
+    *,
+    action: str,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    reservation: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'action': action,
+        'ok': True,
+        'scratch': str(scratch),
+        'scratch_id': scratch_marker['scratch_id'],
+        'source_root': str(source_root),
+        'source_root_id': transport_marker['source_root_id'],
+        'purpose': reservation['purpose'],
+        'reservation_id': reservation['reservation_id'],
+        'source': str(source_root / reservation['source_filename']),
+    }
+
+
+def _committed_source_receipt(
+    *,
+    action: str,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    reservation: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+    idempotent: bool,
+) -> dict[str, Any]:
+    receipt = _source_receipt_base(
+        action=action,
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        reservation=reservation,
+    )
+    receipt.update(
+        {
+            'status': 'committed',
+            'source_sha256': terminal['source_sha256'],
+            'source_size': int(terminal['source_size']),
+            'idempotent': idempotent,
+        }
+    )
+    return receipt
+
+
+def _reserve_source(args: argparse.Namespace) -> dict[str, Any]:
+    purpose = _validated_source_purpose(args.purpose)
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    reserve_lock = _acquire_source_reserve_lock(scratch, scratch_marker)
+    active_error = False
+    try:
+        _reject_pending_source_handoff(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+        )
+        return _reserve_source_locked(
+            purpose=purpose,
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+        )
+    except BaseException:
+        active_error = True
+        raise
+    finally:
+        try:
+            _release_source_reserve_lock(
+                scratch, scratch_marker, reserve_lock
+            )
+        except Exception:
+            # Preserve the actionable reservation failure when both the
+            # operation and lock cleanup fail.  A retained lock still fences
+            # every later reservation in this invocation.
+            if not active_error:
+                raise
+
+
+def _reserve_source_locked(
+    *,
+    purpose: str,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+) -> dict[str, Any]:
+    reservation_path = _source_reservation_marker_path(scratch, purpose)
+    terminal_path = _source_terminal_marker_path(scratch, purpose)
+    if os.path.lexists(reservation_path):
+        reservation = _validated_source_reservation_at_path(
+            reservation_path,
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            expected_purpose=purpose,
+        )
+        terminal = _validated_source_terminal(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            reservation=reservation,
+        )
+        state = terminal['status'] if terminal is not None else 'reserved'
+        raise SourceHandoffError(
+            'source_purpose_duplicate',
+            f'{purpose}: source purpose already has immutable state {state!r}',
+        )
+    if os.path.lexists(terminal_path):
+        raise SourceHandoffError(
+            'source_journal_invalid',
+            f'{terminal_path}: orphan source-terminal marker',
+        )
+
+    reservation_id = ''
+    source_path: Path | None = None
+    for _attempt in range(4):
+        candidate = str(uuid.uuid4())
+        candidate_path = source_root / _source_filename(candidate)
+        if not os.path.lexists(candidate_path):
+            reservation_id = candidate
+            source_path = candidate_path
+            break
+    if source_path is None:
+        raise SourceHandoffError(
+            'source_file_conflict',
+            'could not allocate a unique response-source filename',
+        )
+    reservation = _source_reservation_document(
+        scratch_id=scratch_marker['scratch_id'],
+        source_root_id=transport_marker['source_root_id'],
+        purpose=purpose,
+        reservation_id=reservation_id,
+    )
+    try:
+        _write_immutable_journal_marker(
+            reservation_path, reservation, scratch
+        )
+    except FileExistsError as exc:
+        # Another caller won this logical purpose.  Validate its marker so a
+        # malformed collision cannot be mistaken for a normal duplicate.
+        _validated_source_reservation_at_path(
+            reservation_path,
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            expected_purpose=purpose,
+        )
+        raise SourceHandoffError(
+            'source_purpose_duplicate',
+            f'{purpose}: source purpose was reserved concurrently',
+        ) from exc
+    persisted = _validated_source_reservation_at_path(
+        reservation_path,
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        expected_purpose=purpose,
+    )
+    receipt = _source_receipt_base(
+        action='reserve-source',
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        reservation=persisted,
+    )
+    receipt.update({'status': 'reserved', 'idempotent': False})
+    return receipt
+
+
+def _commit_source(args: argparse.Namespace) -> dict[str, Any]:
+    purpose = _validated_source_purpose(args.purpose)
+    reservation_id = _validated_reservation_id(args.reservation_id)
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=purpose,
+    )
+    if reservation['reservation_id'] != reservation_id:
+        raise SourceHandoffError(
+            'source_reservation_mismatch',
+            f'{purpose}: reservation id does not match the immutable journal',
+        )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    if terminal is not None:
+        if terminal['status'] != 'committed':
+            raise SourceHandoffError(
+                'source_handoff_aborted',
+                f"{purpose}: source handoff was already aborted "
+                f"({terminal['reason']})",
+            )
+        _verify_committed_source(source_root, reservation, terminal)
+        return _committed_source_receipt(
+            action='commit-source',
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            reservation=reservation,
+            terminal=terminal,
+            idempotent=True,
+        )
+
+    _source_path, _document, raw, identity = _read_reserved_source(
+        source_root, reservation
+    )
+    intended_terminal = _source_committed_document(
+        reservation=reservation,
+        source_sha256=_sha256(raw),
+        source_identity=identity,
+    )
+    terminal_path = _source_terminal_marker_path(scratch, purpose)
+    created = True
+    try:
+        _write_immutable_journal_marker(
+            terminal_path, intended_terminal, scratch
+        )
+    except FileExistsError:
+        created = False
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    if terminal is None:
+        raise SourceHandoffError(
+            'source_journal_write_failed',
+            f'{terminal_path}: terminal marker was not persisted',
+        )
+    if terminal['status'] != 'committed':
+        raise SourceHandoffError(
+            'source_handoff_aborted',
+            f'{purpose}: an abort won the terminal-state race',
+        )
+    _verify_committed_source(source_root, reservation, terminal)
+    return _committed_source_receipt(
+        action='commit-source',
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        reservation=reservation,
+        terminal=terminal,
+        idempotent=not created,
+    )
+
+
+def _abort_source(args: argparse.Namespace) -> dict[str, Any]:
+    purpose = _validated_source_purpose(args.purpose)
+    reservation_id = _validated_reservation_id(args.reservation_id)
+    reason = args.reason
+    if reason not in SOURCE_ABORT_REASONS:
+        raise SourceHandoffError(
+            'source_abort_reason_invalid',
+            '--reason must be connector-failed, serialization-failed, or '
+            'file-change-failed',
+        )
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=purpose,
+    )
+    if reservation['reservation_id'] != reservation_id:
+        raise SourceHandoffError(
+            'source_reservation_mismatch',
+            f'{purpose}: reservation id does not match the immutable journal',
+        )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    if terminal is not None:
+        if terminal['status'] == 'committed':
+            _verify_committed_source(source_root, reservation, terminal)
+            raise SourceHandoffError(
+                'source_handoff_committed',
+                f'{purpose}: committed source cannot be aborted',
+            )
+        source_path = source_root / reservation['source_filename']
+        if os.path.lexists(source_path):
+            raise SourceHandoffError(
+                'source_file_invalid',
+                f'{source_path}: aborted source unexpectedly exists',
+            )
+        if terminal['reason'] != reason:
+            raise SourceHandoffError(
+                'source_handoff_conflict',
+                f'{purpose}: abort reason does not match the immutable terminal '
+                'marker',
+            )
+        receipt = _source_receipt_base(
+            action='abort-source',
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            reservation=reservation,
+        )
+        receipt.update(
+            {
+                'status': 'aborted',
+                'reason': reason,
+                'source': None,
+                'idempotent': True,
+            }
+        )
+        return receipt
+
+    source_path = source_root / reservation['source_filename']
+    if os.path.lexists(source_path):
+        # Do not permit abort to discard a response that may already have been
+        # written.  Only commit-source may inspect and seal this state.
+        raise SourceHandoffError(
+            'source_commit_required',
+            f'{purpose}: reserved source exists; commit is the only permitted '
+            'terminal action',
+        )
+    intended_terminal = _source_aborted_document(
+        reservation=reservation, reason=reason
+    )
+    terminal_path = _source_terminal_marker_path(scratch, purpose)
+    created = True
+    try:
+        _write_immutable_journal_marker(
+            terminal_path, intended_terminal, scratch
+        )
+    except FileExistsError:
+        created = False
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    if terminal is None:
+        raise SourceHandoffError(
+            'source_journal_write_failed',
+            f'{terminal_path}: terminal marker was not persisted',
+        )
+    if terminal['status'] != 'aborted':
+        _verify_committed_source(source_root, reservation, terminal)
+        raise SourceHandoffError(
+            'source_handoff_committed',
+            f'{purpose}: a commit won the terminal-state race',
+        )
+    if terminal['reason'] != reason:
+        raise SourceHandoffError(
+            'source_handoff_conflict',
+            f'{purpose}: concurrent abort used a different reason',
+        )
+    if os.path.lexists(source_path):
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_path}: source appeared after the abort terminal was sealed',
+        )
+    receipt = _source_receipt_base(
+        action='abort-source',
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        reservation=reservation,
+    )
+    receipt.update(
+        {
+            'status': 'aborted',
+            'reason': reason,
+            'source': None,
+            'idempotent': not created,
+        }
+    )
+    return receipt
+
+
+def _lookup_source(args: argparse.Namespace) -> dict[str, Any]:
+    purpose = _validated_source_purpose(args.purpose)
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=purpose,
+    )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    source_path = source_root / reservation['source_filename']
+    if terminal is None:
+        if os.path.lexists(source_path):
+            _read_reserved_source(source_root, reservation)
+            receipt = _source_receipt_base(
+                action='lookup-source',
+                scratch=scratch,
+                scratch_marker=scratch_marker,
+                transport_marker=transport_marker,
+                source_root=source_root,
+                reservation=reservation,
+            )
+            receipt.update(
+                {
+                    'status': 'reserved',
+                    'recovery_action': 'commit-only',
+                    'idempotent': True,
+                }
+            )
+            return receipt
+        receipt = _source_receipt_base(
+            action='lookup-source',
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            reservation=reservation,
+        )
+        receipt.update(
+            {
+                'status': 'reserved',
+                'source': None,
+                'recovery_action': 'halt',
+                'idempotent': True,
+            }
+        )
+        return receipt
+    if terminal['status'] == 'aborted':
+        if os.path.lexists(source_path):
+            raise SourceHandoffError(
+                'source_file_invalid',
+                f'{source_path}: aborted source unexpectedly exists',
+            )
+        receipt = _source_receipt_base(
+            action='lookup-source',
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            reservation=reservation,
+        )
+        receipt.update(
+            {
+                'status': 'aborted',
+                'reason': terminal['reason'],
+                'source': None,
+                'recovery_action': 'none',
+                'idempotent': True,
+            }
+        )
+        return receipt
+    _verify_committed_source(source_root, reservation, terminal)
+    receipt = _committed_source_receipt(
+        action='lookup-source',
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        reservation=reservation,
+        terminal=terminal,
+        idempotent=True,
+    )
+    receipt['recovery_action'] = 'consume'
+    return receipt
+
+
 def _parser() -> JsonArgumentParser:
     parser = JsonArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -2530,10 +3896,46 @@ def _parser() -> JsonArgumentParser:
     bind_transport.add_argument('--canary', required=True)
     bind_transport.add_argument('--account-name', required=True)
 
+    reserve_source = subparsers.add_parser(
+        'reserve-source',
+        help='reserve one immutable logical response-source handoff',
+    )
+    reserve_source.add_argument('--scratch', required=True)
+    reserve_source.add_argument('--purpose', required=True)
+
+    commit_source = subparsers.add_parser(
+        'commit-source',
+        help='seal the exact JSON file written for a source reservation',
+    )
+    commit_source.add_argument('--scratch', required=True)
+    commit_source.add_argument('--purpose', required=True)
+    commit_source.add_argument('--reservation-id', required=True)
+
+    abort_source = subparsers.add_parser(
+        'abort-source',
+        help='seal an absent response source as an explicit failed handoff',
+    )
+    abort_source.add_argument('--scratch', required=True)
+    abort_source.add_argument('--purpose', required=True)
+    abort_source.add_argument('--reservation-id', required=True)
+    abort_source.add_argument('--reason', choices=sorted(SOURCE_ABORT_REASONS), required=True)
+
+    lookup_source = subparsers.add_parser(
+        'lookup-source',
+        help='verify and recover one terminal source-handoff receipt',
+    )
+    lookup_source.add_argument('--scratch', required=True)
+    lookup_source.add_argument('--purpose', required=True)
+
     stage = subparsers.add_parser("stage", help="unwrap, validate, and stage snapshots")
     stage.add_argument("--kind", choices=SNAPSHOT_KINDS, required=True)
     stage.add_argument("--generation", choices=("A", "B"), required=True)
-    stage.add_argument("--source", action="append", required=True, metavar="FILE")
+    stage_source = stage.add_mutually_exclusive_group(required=True)
+    stage_source.add_argument("--source", action="append", metavar="FILE")
+    stage_source.add_argument(
+        "--source-purpose", action="append", metavar="PURPOSE",
+        help="repeat committed response-source purposes in request order",
+    )
     stage.add_argument("--output", action="append", required=True, metavar="FILE")
     stage.add_argument(
         "--request-cursor",
@@ -2552,6 +3954,8 @@ def _parser() -> JsonArgumentParser:
 def _error_result(action: str, exc: Exception) -> dict[str, Any]:
     if isinstance(exc, CliError):
         code = "usage_error"
+    elif isinstance(exc, SourceHandoffError):
+        code = exc.code
     elif isinstance(exc, ScratchCreateError):
         code = "scratch_create_failed"
     elif isinstance(exc, AccountScopeError):
@@ -2587,9 +3991,9 @@ def _reject_hyphenated_stage_action(arguments: Sequence[str]) -> None:
         f"invalid action {candidate!r}: {kind!r} is not a staged kind and "
         f"the kind is a separate argument. Staged kinds are "
         f"{', '.join(SNAPSHOT_KINDS)}. Historicals results, RSI inputs, and "
-        "quote maps are never staged through this helper: persist the raw "
-        "response through the bound file-change facility and pass that file "
-        "to evaluate_candidates.py"
+        "quote inputs are never staged through this helper: reserve, persist, "
+        "and commit the raw response through the bound source journal, then "
+        "pass its purpose to evaluate_candidates.py"
     )
 
 
@@ -2598,7 +4002,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     action = (
         arguments[0]
         if arguments and arguments[0] in {
-            'preflight', 'bind-transport', 'stage',
+            'preflight', 'bind-transport', 'reserve-source', 'commit-source',
+            'abort-source', 'lookup-source', 'stage',
         }
         else "unknown"
     )
@@ -2609,6 +4014,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = _preflight(args)
         elif args.action == 'bind-transport':
             result = _bind_transport(args)
+        elif args.action == 'reserve-source':
+            result = _reserve_source(args)
+        elif args.action == 'commit-source':
+            result = _commit_source(args)
+        elif args.action == 'abort-source':
+            result = _abort_source(args)
+        elif args.action == 'lookup-source':
+            result = _lookup_source(args)
         else:
             result = _stage(args)
         _print_json(result)

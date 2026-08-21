@@ -8,7 +8,8 @@ screen: price band, relative-volume floor, minimum absolute day move, then
 ranks by relative volume and keeps the top N.
 
 Usage:
-  python3 filter_scan.py --scratch <preflighted scratch> --scan-file <run_scan result file> \
+  python3 filter_scan.py --scratch <preflighted scratch> \
+      (--scan-file <run_scan result file> | --scan-purpose <purpose>) \
       --price-min 2.50 --price-max 5 --min-rel-volume 2 \
       --min-abs-pct-change 3 --top-n 15 [--json-out working_list.json]
 
@@ -37,7 +38,10 @@ import math
 import sys
 from decimal import Decimal
 
-from broker_snapshot import validate_bound_external_json_sources
+from broker_snapshot import (
+    validate_bound_external_json_purpose,
+    validate_bound_external_json_source,
+)
 
 
 def _reject_nonfinite_json(token):
@@ -86,8 +90,13 @@ def load_result(doc, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scratch", required=True,
-                    help="absolute preflighted scratch whose transport binding owns --scan-file")
-    ap.add_argument("--scan-file", required=True, help="raw run_scan JSON result file")
+                    help="absolute preflighted scratch whose transport binding owns the scan response")
+    scan_input = ap.add_mutually_exclusive_group(required=True)
+    scan_input.add_argument("--scan-file", help="raw run_scan JSON result file")
+    scan_input.add_argument(
+        "--scan-purpose",
+        help="committed response-source purpose containing the raw run_scan result",
+    )
     ap.add_argument("--price-min", type=finite_float_arg, required=True)
     ap.add_argument("--price-max", type=finite_float_arg, required=True)
     ap.add_argument("--min-rel-volume", type=finite_float_arg, required=True)
@@ -97,10 +106,19 @@ def main():
     ap.add_argument("--json-out", help="optional path for the machine-readable working list")
     args = ap.parse_args()
 
-    [(_scan_path, scan_document, _scan_bytes)] = validate_bound_external_json_sources(
-        args.scratch, [args.scan_file]
-    )
-    result = load_result(scan_document, args.scan_file)
+    if args.scan_purpose is not None:
+        _scan_path, scan_document, _scan_bytes = (
+            validate_bound_external_json_purpose(
+                args.scratch, args.scan_purpose
+            )
+        )
+        scan_label = args.scan_purpose
+    else:
+        _scan_path, scan_document, _scan_bytes = (
+            validate_bound_external_json_source(args.scratch, args.scan_file)
+        )
+        scan_label = args.scan_file
+    result = load_result(scan_document, scan_label)
     rows = result.get("results", [])
     total_items = result.get("total_items", len(rows))
     if isinstance(total_items, Decimal):

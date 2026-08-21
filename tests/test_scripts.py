@@ -48,12 +48,17 @@ BROKER_SNAPSHOT = os.path.join(ROOT, 'broker_snapshot.py')
 RUN_LIFECYCLE = os.path.join(ROOT, 'run_lifecycle.py')
 RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 
+_BOUND_SOURCE_SCRATCHES = {}
+
 sys.path.insert(0, ROOT)
 from evaluate_candidates import load_quote_documents, load_quotes, spread_gate
 import validate_constants as constants_validator
 import broker_snapshot as broker_snapshot_module
 from broker_snapshot import (
+    SourceHandoffError,
     SnapshotError,
+    validate_bound_external_json_purpose,
+    validate_bound_external_json_purposes,
     validate_bound_external_json_source,
     validate_bound_external_json_sources,
     validate_generation_inputs,
@@ -108,6 +113,62 @@ def run_cli(script, args):
     if proc.returncode != 0:
         raise AssertionError(f"{os.path.basename(script)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
+
+
+def _bound_source_scratch(directory):
+    return _BOUND_SOURCE_SCRATCHES.get(os.path.normcase(os.path.realpath(directory)))
+
+
+def write_test_source(directory, name, *, value=None, raw=None):
+    """Write a normal fixture, journaling it when ``directory`` is bound.
+
+    The production validators accept only committed source handoffs.  Keeping
+    this conversion in one test helper lets legacy path-mode coverage remain
+    meaningful without giving tests a bypass unavailable to the real runner.
+    """
+
+    scratch = _bound_source_scratch(directory)
+    if scratch is None:
+        path = os.path.join(directory, name)
+    else:
+        purpose = f"test-{uuid.uuid4().hex}"
+        receipt = json.loads(run_cli(BROKER_SNAPSHOT, [
+            "reserve-source", "--scratch", scratch, "--purpose", purpose,
+        ]))
+        path = receipt["source"]
+    if raw is None:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+    else:
+        mode = "wb" if isinstance(raw, bytes) else "w"
+        kwargs = {} if mode == "wb" else {"encoding": "utf-8", "newline": "\n"}
+        with open(path, mode, **kwargs) as handle:
+            handle.write(raw)
+    if scratch is not None:
+        run_cli(BROKER_SNAPSHOT, [
+            "commit-source", "--scratch", scratch, "--purpose", purpose,
+            "--reservation-id", receipt["reservation_id"],
+        ])
+    return path
+
+
+def commit_test_source_purpose(scratch, purpose, value):
+    """Reserve, write, and commit one named response-source handoff."""
+
+    reserved = json.loads(run_cli(BROKER_SNAPSHOT, [
+        "reserve-source", "--scratch", scratch, "--purpose", purpose,
+    ]))
+    with open(
+        reserved["source"], "w", encoding="utf-8", newline="\n"
+    ) as handle:
+        json.dump(value, handle, separators=(",", ":"), sort_keys=True)
+        handle.write("\n")
+    committed = json.loads(run_cli(BROKER_SNAPSHOT, [
+        "commit-source", "--scratch", scratch, "--purpose", purpose,
+        "--reservation-id", reserved["reservation_id"],
+    ]))
+    return reserved, committed
 
 
 def prepare_source_root_for_test(scratch, scratch_id=None):
@@ -166,8 +227,13 @@ def bound_source_root(scratch):
             "--source-root", source_root, "--canary", canary,
             "--account-name", "Agentic",
         ])
+        source_key = os.path.normcase(os.path.realpath(source_root))
+        _BOUND_SOURCE_SCRATCHES[source_key] = os.path.realpath(scratch)
         yield source_root
     finally:
+        _BOUND_SOURCE_SCRATCHES.pop(
+            os.path.normcase(os.path.realpath(source_root)), None
+        )
         shutil.rmtree(source_root, ignore_errors=True)
 
 
@@ -983,7 +1049,7 @@ class DailyLossTests(unittest.TestCase):
             return match.group(1)
 
         portfolio_command = matrix_command("Portfolio template")
-        quotes_command = matrix_command("Quotes template (one batch or aggregate)")
+        quotes_command = matrix_command("Quotes first-stage template")
         page_command = matrix_command("Positions/orders page template")
         aggregate_command = matrix_command("Positions/orders aggregate template")
         self.assertIn("--kind portfolio", portfolio_command)
@@ -1261,22 +1327,72 @@ class EvaluateCandidatesTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertFalse(os.path.exists(output))
 
+    def test_cli_accepts_purpose_inputs_and_rejects_mixed_selector_modes(self):
+        bars = {
+            "data": {
+                "results": [{"symbol": "FISN", "bars": FISN_BARS}]
+            }
+        }
+        quotes = {
+            "data": {
+                "results": [{
+                    "quote": {
+                        "symbol": "FISN",
+                        "last_trade_price": "9.843",
+                    }
+                }]
+            }
+        }
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ):
+            bars_reserved, _bars_committed = commit_test_source_purpose(
+                scratch, "candidate-bars-0", bars
+            )
+            commit_test_source_purpose(
+                scratch, "candidate-quotes-0", quotes
+            )
+            output = os.path.join(scratch, "purpose-evaluation.json")
+            common = [
+                "--scratch", scratch,
+                "--quotes-purpose", "candidate-quotes-0",
+                "--volume-lookback-days", "20",
+                "--high-lookback-days", "5",
+                "--min-median-dollar-volume", "175000",
+                "--dip-entry-pct", "5",
+            ]
+            proc = self.evaluate_proc([
+                *common,
+                "--bars-purpose", "candidate-bars-0",
+                "--json-out", output,
+            ])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(output, encoding="utf-8") as handle:
+                document = json.load(handle)
+            self.assertEqual(
+                [row["symbol"] for row in document["results"]], ["FISN"]
+            )
+
+            mixed_output = os.path.join(scratch, "mixed-evaluation.json")
+            proc = self.evaluate_proc([
+                *common,
+                "--bars", bars_reserved["source"],
+                "--bars-purpose", "candidate-bars-0",
+                "--json-out", mixed_output,
+            ])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not allowed with argument", proc.stderr)
+            self.assertFalse(os.path.exists(mixed_output))
+
     @staticmethod
     def write_json(directory, name, value):
-        path = os.path.join(directory, name)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(value, handle)
-        return path
+        return write_test_source(directory, name, value=value)
 
     def run_eval(self, hist_payload, quotes, extra=None, return_document=False):
         with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
-            hist = os.path.join(source_root, "hist.json")
-            qts = os.path.join(source_root, "quotes.json")
+            hist = self.write_json(source_root, "hist.json", hist_payload)
+            qts = self.write_json(source_root, "quotes.json", quotes)
             out = os.path.join(td, "out.json")
-            with open(hist, "w", encoding="utf-8") as f:
-                json.dump(hist_payload, f)
-            with open(qts, "w", encoding="utf-8") as f:
-                json.dump(quotes, f)
             cli_extra = list(extra or [])
             if "--rsi-file" in cli_extra:
                 first = cli_extra.index("--rsi-file") + 1
@@ -1284,8 +1400,22 @@ class EvaluateCandidatesTests(unittest.TestCase):
                 while last < len(cli_extra) and not cli_extra[last].startswith("--"):
                     last += 1
                 for index in range(first, last):
-                    bound_rsi = os.path.join(source_root, f"rsi-{index - first}.json")
-                    shutil.copyfile(cli_extra[index], bound_rsi)
+                    try:
+                        with open(cli_extra[index], encoding="utf-8") as handle:
+                            rsi_value = json.load(handle)
+                    except json.JSONDecodeError:
+                        with open(cli_extra[index], "rb") as handle:
+                            write_test_source(
+                                source_root,
+                                f"rsi-{index - first}.json",
+                                raw=handle.read(),
+                            )
+                        raise AssertionError(
+                            "malformed RSI fixture unexpectedly committed"
+                        )
+                    bound_rsi = self.write_json(
+                        source_root, f"rsi-{index - first}.json", rsi_value
+                    )
                     cli_extra[index] = bound_rsi
             run_cli(EVALUATE, ["--scratch", td, "--bars", hist, "--quotes", qts,
                                "--volume-lookback-days", "20", "--high-lookback-days", "5",
@@ -1946,9 +2076,56 @@ class FilterScanTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertFalse(os.path.exists(output))
 
+    def test_cli_accepts_scan_purpose_and_rejects_mixed_selector_modes(self):
+        scan_document = {
+            "data": {
+                "result": {
+                    "results": [scan_row("KEEP", 4.45, 0.1528, 557.75)],
+                    "total_items": 1,
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ):
+            reserved, _committed = commit_test_source_purpose(
+                scratch, "run-scan", scan_document
+            )
+            output = os.path.join(scratch, "purpose-filter.json")
+            common = [
+                "--scratch", scratch,
+                "--price-min", "2.50",
+                "--price-max", "5",
+                "--min-rel-volume", "2",
+                "--min-abs-pct-change", "3",
+                "--top-n", "15",
+            ]
+            proc = self.filter_proc([
+                *common,
+                "--scan-purpose", "run-scan",
+                "--json-out", output,
+            ])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(output, encoding="utf-8") as handle:
+                document = json.load(handle)
+            self.assertEqual(
+                [row["symbol"] for row in document["working_list"]],
+                ["KEEP"],
+            )
+
+            mixed_output = os.path.join(scratch, "mixed-filter.json")
+            proc = self.filter_proc([
+                *common,
+                "--scan-file", reserved["source"],
+                "--scan-purpose", "run-scan",
+                "--json-out", mixed_output,
+            ])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not allowed with argument", proc.stderr)
+            self.assertFalse(os.path.exists(mixed_output))
+
     def run_filter(self, rows, top_n=15, mcp_envelope=False, mcp_error=False):
         with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
-            scan = os.path.join(source_root, "scan.json")
             out = os.path.join(td, "out.json")
             document = {
                 "data": {"result": {"results": rows, "total_items": len(rows)}}
@@ -1960,8 +2137,7 @@ class FilterScanTests(unittest.TestCase):
                     "isError": mcp_error,
                 }
 
-            with open(scan, "w", encoding="utf-8") as f:
-                json.dump(document, f)
+            scan = write_test_source(source_root, "scan.json", value=document)
             run_cli(FILTER, ["--scratch", td, "--scan-file", scan,
                              "--price-min", "2.50", "--price-max", "5",
                              "--min-rel-volume", "2", "--min-abs-pct-change", "3",
@@ -2069,6 +2245,28 @@ class OrderIntentTests(unittest.TestCase):
     BASELINE_ORDER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
     def invoke(self, state_file, action, *args, expected_success=True, now=None):
+        args = list(args)
+        if action == "observe":
+            transport_scratch, source_root = self.ack_transport()
+            if "--transport-scratch" not in args:
+                args += ["--transport-scratch", transport_scratch]
+            for flag in ("--orders", "--positions"):
+                if flag not in args:
+                    continue
+                first = args.index(flag) + 1
+                last = first
+                while last < len(args) and not args[last].startswith("--"):
+                    last += 1
+                replacements = []
+                for index, path in enumerate(args[first:last]):
+                    with open(path, encoding="utf-8") as handle:
+                        value = json.load(handle)
+                    replacements.append(self.write_json(
+                        source_root,
+                        f"observe-{flag[2:]}-{uuid.uuid4().hex}-{index}.json",
+                        value,
+                    ))
+                args[first:last] = replacements
         command = [
             sys.executable,
             ORDER_INTENTS,
@@ -2081,7 +2279,7 @@ class OrderIntentTests(unittest.TestCase):
             command += ["--transport-scratch", transport_scratch]
         if now is not None:
             command += ["--now-utc", now]
-        command += list(args)
+        command += args
         proc = subprocess.run(
             command, capture_output=True, text=True, cwd=ROOT
         )
@@ -2104,10 +2302,7 @@ class OrderIntentTests(unittest.TestCase):
 
     @staticmethod
     def write_json(directory, name, value):
-        path = os.path.join(directory, name)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(value, handle)
-        return path
+        return write_test_source(directory, name, value=value)
 
     def ack_transport(self):
         if not hasattr(self, "_ack_transport_scratch"):
@@ -2475,6 +2670,86 @@ class OrderIntentTests(unittest.TestCase):
             self.assertEqual(stop_ack["outcome"], "active_stop")
             self.assertEqual(stop_ack["stop_coverage_quantity"], "67.000000")
 
+    def test_acknowledge_and_observe_accept_committed_source_purposes(self):
+        with tempfile.TemporaryDirectory() as td:
+            transport_scratch, _source_root = self.ack_transport()
+
+            ack_state = os.path.join(td, "ack-purpose.sqlite3")
+            prepared = self.prepare(td, ack_state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                ack_state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            commit_test_source_purpose(
+                transport_scratch,
+                "place-order-response-0",
+                {"data": {"order": self.broker_order()}},
+            )
+            acknowledged = self.invoke(
+                ack_state,
+                "acknowledge",
+                "--intent-id",
+                intent_id,
+                "--response-purpose",
+                "place-order-response-0",
+                "--transport-scratch",
+                transport_scratch,
+                now="2026-07-31T16:00:04Z",
+            )
+            self.assertEqual(acknowledged["status"], "resolved")
+            self.assertEqual(
+                acknowledged["broker_order_id"],
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+
+            observe_state = os.path.join(td, "observe-purpose.sqlite3")
+            prepared = self.prepare(
+                td, observe_state, name="observe-purpose-intent.json"
+            )
+            observed_intent_id = prepared["intent_id"]
+            self.invoke(
+                observe_state,
+                "begin",
+                "--intent-id",
+                observed_intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            commit_test_source_purpose(
+                transport_scratch,
+                "recovery-orders-0",
+                {"data": {"orders": [], "next": None}},
+            )
+            commit_test_source_purpose(
+                transport_scratch,
+                "recovery-positions-0",
+                {"data": {"positions": [], "next": None}},
+            )
+            observed = self.invoke(
+                observe_state,
+                "observe",
+                "--intent-id",
+                observed_intent_id,
+                "--orders-purpose",
+                "recovery-orders-0",
+                "--positions-purpose",
+                "recovery-positions-0",
+                "--transport-scratch",
+                transport_scratch,
+                "--as-of-utc",
+                "2026-07-31T16:01:00Z",
+                now="2026-07-31T16:01:00Z",
+            )
+            self.assertFalse(observed["matched"])
+            self.assertEqual(observed["status"], "unknown")
+
     def test_acknowledge_rejects_alternate_root_without_state_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             state = os.path.join(td, "intents.sqlite3")
@@ -2529,6 +2804,40 @@ class OrderIntentTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(row, ("submitting", 1, None))
+
+    def test_acknowledge_rejects_unknown_purpose_without_state_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            prepared = self.prepare(td, state)
+            intent_id = prepared["intent_id"]
+            self.invoke(
+                state,
+                "begin",
+                "--intent-id",
+                intent_id,
+                "--run-token",
+                self.RUN_TOKEN,
+                now="2026-07-31T16:00:02Z",
+            )
+            transport_scratch, _source_root = self.ack_transport()
+            before_sha256 = hashlib.sha256(Path(state).read_bytes()).hexdigest()
+            rejected = self.invoke(
+                state,
+                "acknowledge",
+                "--intent-id",
+                intent_id,
+                "--response-purpose",
+                "unknown-placement-response",
+                "--transport-scratch",
+                transport_scratch,
+                expected_success=False,
+                now="2026-07-31T16:00:03Z",
+            )
+            self.assertIn("no source handoff was reserved", rejected["detail"])
+            self.assertEqual(
+                hashlib.sha256(Path(state).read_bytes()).hexdigest(),
+                before_sha256,
+            )
 
     def test_crash_recovery_can_record_no_match_from_submitting(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3611,6 +3920,9 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def tearDown(self):
         for source_root in self._transport_roots.values():
+            _BOUND_SOURCE_SCRATCHES.pop(
+                os.path.normcase(os.path.realpath(source_root)), None
+            )
             shutil.rmtree(source_root, ignore_errors=True)
 
     def invoke(self, *args):
@@ -3627,15 +3939,17 @@ class BrokerSnapshotTests(unittest.TestCase):
                 f'broker_snapshot.py emitted non-JSON stdout: {proc.stdout!r}; '
                 f'stderr={proc.stderr!r}'
             )
+        if proc.returncode == 0 and args and args[0] == 'bind-transport':
+            scratch = args[args.index('--scratch') + 1]
+            source_root = args[args.index('--source-root') + 1]
+            _BOUND_SOURCE_SCRATCHES[
+                os.path.normcase(os.path.realpath(source_root))
+            ] = os.path.realpath(scratch)
         return proc, document
 
     @staticmethod
     def write_json(directory, name, document):
-        path = os.path.join(directory, name)
-        with open(path, 'w', encoding='utf-8', newline='\n') as handle:
-            json.dump(document, handle, separators=(',', ':'), sort_keys=True)
-            handle.write('\n')
-        return path
+        return write_test_source(directory, name, value=document)
 
     @staticmethod
     def write_text(directory, name, value):
@@ -3696,6 +4010,9 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertTrue(receipt['ok'])
             self.assertTrue(receipt['canary_removed'])
             self.assertFalse(os.path.exists(canary))
+            _BOUND_SOURCE_SCRATCHES[
+                os.path.normcase(os.path.realpath(source_root))
+            ] = os.path.realpath(scratch)
         return document
 
     def source_root(self, scratch):
@@ -3703,6 +4020,365 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def source_root_id(self, scratch):
         return self._transport_root_ids[os.path.abspath(scratch)]
+
+    def reserve_source(self, scratch, purpose):
+        proc, receipt = self.invoke(
+            'reserve-source', '--scratch', scratch, '--purpose', purpose
+        )
+        self.assertEqual(proc.returncode, 0, receipt)
+        return receipt
+
+    def commit_source(self, scratch, purpose, reservation_id):
+        proc, receipt = self.invoke(
+            'commit-source', '--scratch', scratch, '--purpose', purpose,
+            '--reservation-id', reservation_id,
+        )
+        self.assertEqual(proc.returncode, 0, receipt)
+        return receipt
+
+    def reserve_write_commit(self, scratch, purpose, document):
+        reserved = self.reserve_source(scratch, purpose)
+        with open(
+            reserved['source'], 'w', encoding='utf-8', newline='\n'
+        ) as handle:
+            json.dump(document, handle, separators=(',', ':'), sort_keys=True)
+            handle.write('\n')
+        committed = self.commit_source(
+            scratch, purpose, reserved['reservation_id']
+        )
+        return reserved, committed
+
+    def test_source_handoff_journal_reserve_lookup_commit_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            purpose = 'first-positions-0'
+            payload = {'data': {'positions': [], 'next': None}}
+
+            reserved = self.reserve_source(scratch, purpose)
+            self.assertEqual(reserved['action'], 'reserve-source')
+            self.assertEqual(reserved['status'], 'reserved')
+            self.assertEqual(reserved['purpose'], purpose)
+            self.assertFalse(reserved['idempotent'])
+            self.assertRegex(
+                reserved['reservation_id'],
+                r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
+                r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+            )
+            self.assertEqual(
+                os.path.dirname(reserved['source']), self.source_root(scratch)
+            )
+            self.assertFalse(os.path.exists(reserved['source']))
+
+            proc, pending = self.invoke(
+                'lookup-source', '--scratch', scratch, '--purpose', purpose
+            )
+            self.assertEqual(proc.returncode, 0, pending)
+            self.assertEqual(pending['status'], 'reserved')
+            self.assertEqual(pending['recovery_action'], 'halt')
+            self.assertIsNone(pending['source'])
+            self.assertEqual(
+                pending['reservation_id'], reserved['reservation_id']
+            )
+
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump(payload, handle, separators=(',', ':'), sort_keys=True)
+                handle.write('\n')
+            proc, recoverable = self.invoke(
+                'lookup-source', '--scratch', scratch, '--purpose', purpose
+            )
+            self.assertEqual(proc.returncode, 0, recoverable)
+            self.assertEqual(recoverable['status'], 'reserved')
+            self.assertEqual(recoverable['recovery_action'], 'commit-only')
+            self.assertEqual(recoverable['source'], reserved['source'])
+            self.assertEqual(
+                recoverable['reservation_id'], reserved['reservation_id']
+            )
+
+            committed = self.commit_source(
+                scratch, purpose, reserved['reservation_id']
+            )
+            self.assertEqual(committed['status'], 'committed')
+            self.assertFalse(committed['idempotent'])
+            self.assertEqual(
+                committed['source_sha256'],
+                hashlib.sha256(Path(reserved['source']).read_bytes()).hexdigest(),
+            )
+            repeated = self.commit_source(
+                scratch, purpose, reserved['reservation_id']
+            )
+            self.assertTrue(repeated['idempotent'])
+            self.assertEqual(
+                repeated['source_sha256'], committed['source_sha256']
+            )
+            proc, looked_up = self.invoke(
+                'lookup-source', '--scratch', scratch, '--purpose', purpose
+            )
+            self.assertEqual(proc.returncode, 0, looked_up)
+            self.assertEqual(looked_up['status'], 'committed')
+            self.assertEqual(looked_up['recovery_action'], 'consume')
+
+            by_purpose = validate_bound_external_json_purpose(scratch, purpose)
+            by_path = validate_bound_external_json_source(
+                scratch, reserved['source']
+            )
+            self.assertEqual(by_purpose[0], Path(reserved['source']))
+            self.assertEqual(by_purpose[1], by_path[1])
+            self.assertEqual(by_purpose[2], by_path[2])
+            plural = validate_bound_external_json_purposes(scratch, [purpose])
+            self.assertEqual(plural, [by_purpose])
+
+            proc, duplicate = self.invoke(
+                'reserve-source', '--scratch', scratch, '--purpose', purpose
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                duplicate['error']['code'], 'source_purpose_duplicate'
+            )
+
+    def test_source_handoff_abort_and_global_pending_fence(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            first = self.reserve_source(scratch, 'first-orders-0')
+
+            proc, fenced = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                fenced['error']['code'], 'source_handoff_pending'
+            )
+
+            abort_args = (
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-orders-0',
+                '--reservation-id', first['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            proc, aborted = self.invoke(*abort_args)
+            self.assertEqual(proc.returncode, 0, aborted)
+            self.assertEqual(aborted['status'], 'aborted')
+            self.assertEqual(aborted['reason'], 'connector-failed')
+            self.assertIsNone(aborted['source'])
+            self.assertFalse(aborted['idempotent'])
+            proc, repeated = self.invoke(*abort_args)
+            self.assertEqual(proc.returncode, 0, repeated)
+            self.assertTrue(repeated['idempotent'])
+            proc, looked_up = self.invoke(
+                'lookup-source', '--scratch', scratch,
+                '--purpose', 'first-orders-0',
+            )
+            self.assertEqual(proc.returncode, 0, looked_up)
+            self.assertEqual(looked_up['status'], 'aborted')
+            self.assertEqual(looked_up['recovery_action'], 'none')
+            self.assertIsNone(looked_up['source'])
+
+            proc, rejected_commit = self.invoke(
+                'commit-source', '--scratch', scratch,
+                '--purpose', 'first-orders-0',
+                '--reservation-id', first['reservation_id'],
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                rejected_commit['error']['code'], 'source_handoff_aborted'
+            )
+
+            second = self.reserve_source(scratch, 'first-positions-0')
+            with open(
+                second['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump({'data': {'positions': [], 'next': None}}, handle)
+                handle.write('\n')
+            proc, refused_abort = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+                '--reservation-id', second['reservation_id'],
+                '--reason', 'file-change-failed',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                refused_abort['error']['code'], 'source_commit_required'
+            )
+            self.commit_source(
+                scratch, 'first-positions-0', second['reservation_id']
+            )
+
+    def test_source_handoff_concurrent_reservations_have_one_winner(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+
+            def reserve(purpose):
+                return self.invoke(
+                    'reserve-source', '--scratch', scratch,
+                    '--purpose', purpose,
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(
+                    reserve, ('concurrent-orders', 'concurrent-positions')
+                ))
+            winners = [result for result in results if result[0].returncode == 0]
+            losers = [result for result in results if result[0].returncode != 0]
+            self.assertEqual(len(winners), 1, results)
+            self.assertEqual(len(losers), 1, results)
+            self.assertIn(
+                losers[0][1]['error']['code'],
+                {'source_journal_busy', 'source_handoff_pending'},
+            )
+
+            winner = winners[0][1]
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', winner['purpose'],
+                '--reservation-id', winner['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+    def test_pending_handoff_blocks_consuming_older_committed_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch, 'older-positions',
+                {'data': {'positions': [], 'next': None}},
+            )
+            pending = self.reserve_source(scratch, 'newer-orders')
+            with self.assertRaises(SourceHandoffError) as raised:
+                validate_bound_external_json_purpose(
+                    scratch, 'older-positions'
+                )
+            self.assertEqual(raised.exception.code, 'source_handoff_pending')
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'newer-orders',
+                '--reservation-id', pending['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+    def test_source_handoff_rejects_invalid_purpose_and_non_strict_json(self):
+        invalid_purposes = ('', 'Uppercase', 'bad_key', 'a' * 49)
+        for purpose in invalid_purposes:
+            with self.subTest(purpose=purpose), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                proc, result = self.invoke(
+                    'reserve-source', '--scratch', scratch, '--purpose', purpose
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(
+                    result['error']['code'], 'source_purpose_invalid'
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            reserved = self.reserve_source(scratch, 'malformed-response')
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                handle.write('{"data":1,"data":2}\n')
+            proc, result = self.invoke(
+                'commit-source', '--scratch', scratch,
+                '--purpose', 'malformed-response',
+                '--reservation-id', reserved['reservation_id'],
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(result['error']['code'], 'source_file_invalid')
+            self.assertFalse(any(
+                name.startswith(
+                    broker_snapshot_module.SOURCE_TERMINAL_MARKER_PREFIX
+                )
+                for name in os.listdir(scratch)
+            ))
+
+    def test_committed_source_tamper_is_rejected_by_lookup_and_validators(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            reserved, _committed = self.reserve_write_commit(
+                scratch,
+                'final-quotes-0',
+                {'data': {'results': []}},
+            )
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump({'data': {'results': [{'changed': True}]}}, handle)
+                handle.write('\n')
+
+            proc, result = self.invoke(
+                'lookup-source', '--scratch', scratch,
+                '--purpose', 'final-quotes-0',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(result['error']['code'], 'source_file_changed')
+            with self.assertRaises(SourceHandoffError) as raised:
+                validate_bound_external_json_purpose(
+                    scratch, 'final-quotes-0'
+                )
+            self.assertEqual(raised.exception.code, 'source_file_changed')
+            with self.assertRaises(SourceHandoffError) as raised:
+                validate_bound_external_json_source(
+                    scratch, reserved['source']
+                )
+            self.assertEqual(raised.exception.code, 'source_file_changed')
+
+    def test_stage_accepts_committed_source_purpose_and_hides_random_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            purpose = 'first-portfolio'
+            reserved, _committed = self.reserve_write_commit(
+                scratch,
+                purpose,
+                {
+                    'data': {
+                        'total_value': '1500.01',
+                        'cash': '100',
+                        'buying_power': '100',
+                    }
+                },
+            )
+
+            rejected_output = os.path.join(scratch, 'mixed.json')
+            proc, rejected = self.invoke(
+                'stage', '--kind', 'portfolio', '--generation', 'A',
+                '--source', reserved['source'],
+                '--source-purpose', purpose,
+                '--output', rejected_output,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(rejected['error']['code'], 'usage_error')
+            self.assertFalse(os.path.exists(rejected_output))
+
+            output = os.path.join(scratch, 'portfolio.json')
+            proc, result = self.invoke(
+                'stage', '--kind', 'portfolio', '--generation', 'A',
+                '--source-purpose', purpose,
+                '--output', output,
+            )
+            self.assertEqual(proc.returncode, 0, result)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['files'][0]['source_purpose'], purpose)
+            self.assertNotIn('source', result['files'][0])
+            self.assertNotIn(reserved['source'], json.dumps(result))
+            with open(output, encoding='utf-8') as handle:
+                self.assertEqual(json.load(handle)['data']['cash'], '100')
 
     def test_windows_file_change_temp_directory_prepares_narrow_acl(self):
         temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
@@ -5144,17 +5820,19 @@ class BrokerSnapshotTests(unittest.TestCase):
                 encoding='utf-8',
             ) as handle:
                 scratch_id = json.load(handle)['scratch_id']
-            self.write_json(
-                source_root,
-                '.rhmra-broker-response-source-root.json',
-                {
-                    'schema_version': 1,
-                    'marker': 'rhmra-broker-response-source-root',
-                    'scratch_id': scratch_id,
-                    'source_root_id': '00000000-0000-4000-8000-000000000001',
-                },
-            )
-            source = self.write_json(source_root, 'scan.json', {'data': {}})
+            with open(marker_path, 'w', encoding='utf-8') as handle:
+                json.dump(
+                    {
+                        'schema_version': 1,
+                        'marker': 'rhmra-broker-response-source-root',
+                        'scratch_id': scratch_id,
+                        'source_root_id': '00000000-0000-4000-8000-000000000001',
+                    },
+                    handle,
+                )
+            source = os.path.join(source_root, 'scan.json')
+            with open(source, 'w', encoding='utf-8') as handle:
+                json.dump({'data': {}}, handle)
             with self.assertRaises(SnapshotError):
                 validate_bound_external_json_source(scratch, source)
 
@@ -5593,9 +6271,14 @@ class BrokerSnapshotTests(unittest.TestCase):
                     proc, result = self.stage(kind, [source], [output])
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertFalse(result['ok'])
-                    self.assertEqual(
-                        result['error']['code'], 'invalid_snapshot'
+                    expected_code = (
+                        'source_unregistered'
+                        if os.path.basename(source) in {
+                            'duplicate.json', 'nonfinite.json', 'malformed.json'
+                        }
+                        else 'invalid_snapshot'
                     )
+                    self.assertEqual(result['error']['code'], expected_code)
                     self.assertFalse(os.path.exists(output))
 
     def test_preflight_marker_containment_readback_and_no_overwrite(self):
@@ -6176,6 +6859,8 @@ class RunLifecycleTests(unittest.TestCase):
             self.assertEqual(bound['action'], 'bind-context')
             self.assertEqual(bound['python'], os.path.abspath(sys.executable))
             self.assertEqual(bound['invocation_id'], invocation_id)
+            self.assertEqual(bound['classification'], 'running')
+            self.assertEqual(bound['phase'], 'preflight')
             for name in (
                 'run_start_pt', 'artifact_stamp', 'expected_report_file',
                 'expected_gate_file', 'expected_status_file',
@@ -8362,13 +9047,14 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('phase: "lifecycle-bound"', launcher)
         self.assertIn('phase: "configuration-bound"', launcher)
         self.assertIn(
-            'Only for these three startup receipts—the resolver receipt, '
-            'lifecycle-start receipt, and constants receipt',
+            'Only for these four startup receipts—the resolver receipt, '
+            'lifecycle-start receipt, constants receipt, and active-context '
+            'bind receipt',
             launcher,
         )
         self.assertIn(
             'This exemption does not apply to lifecycle event, status, or '
-            'bind-context receipts',
+            'any helper/tool receipt after bind-context',
             launcher,
         )
         self.assertIn(
@@ -8692,17 +9378,16 @@ class MarketClockTests(unittest.TestCase):
             transport_binding,
         )
         self.assertIn(
-            'Each Codex save reloads its exact `SOURCE_ROOT` and '
-            '`SOURCE_ROOT_ID`',
+            'Each save reserves a fresh purpose and uses only its '
+            'helper-issued source',
             transport_binding,
         )
         self.assertIn(
-            'a later cell must reload that exact keyed path',
+            'A checked-in consumer receives the logical purpose',
             transport_binding,
         )
         self.assertIn(
-            'invoke it inside this same orchestration call with the '
-            'just-saved variable and loaded `state.receipt.scratch`',
+            'never the random path',
             transport_binding,
         )
         post_bind_recipe = transport_binding.split(
@@ -8711,56 +9396,70 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('loading `rhmra.transport-state.v1`', post_bind_recipe)
         self.assertIn('requiring `phase: "transport-bound"`', post_bind_recipe)
         self.assertIn(
-            'Form `targetPath` only as loaded '
-            '`state.receipt.source_root`',
+            'executor state never allocates a filename, sequence, pending key, '
+            'or call/response phase',
+            post_bind_recipe,
+        )
+        self.assertIn('invoke `broker_snapshot.py reserve-source', post_bind_recipe)
+        self.assertIn(
+            'refuses every new reservation while any earlier purpose lacks an '
+            'immutable committed/aborted terminal marker',
             post_bind_recipe,
         )
         self.assertIn(
-            'store the same state with `phase: "source-call-started"`',
+            'every consumer likewise refuses to run while any purpose is pending',
             post_bind_recipe,
         )
         self.assertIn(
-            'store `phase: "source-response-received"`',
+            'four source-handoff actions are checked-in complete-receipt '
+            'authorities',
+            post_bind_recipe,
+        )
+        self.assertIn('Do not use `Object.keys`, count returned fields', post_bind_recipe)
+        self.assertIn(
+            'Helper-owned extra bookkeeping fields are not a failure',
             post_bind_recipe,
         )
         self.assertIn(
-            'restore `phase: "transport-bound"`, clear '
-            '`pending_handoff`, and add exactly '
-            '`handoffs[purposeKey] = targetPath`',
+            'Use only that receipt\'s returned `source` variable as the '
+            'file-change target',
+            post_bind_recipe,
+        )
+        self.assertIn('invoke `broker_snapshot.py commit-source', post_bind_recipe)
+        self.assertIn(
+            '`broker_snapshot.py lookup-source --scratch <loaded scratch> '
+            '--purpose <purpose>`',
             post_bind_recipe,
         )
         self.assertIn(
-            'REPORT status candidate follows the same rule but forms its '
-            'fixed path from loaded `state.receipt.scratch`',
+            'reserved with no file means halt without another broker call or '
+            'write',
             post_bind_recipe,
         )
         self.assertIn(
-            'final read/scan connector failure returned, or a final '
-            'read/scan exception caught, inside that same still-running '
-            'cell may restore `phase: "transport-bound"` and '
-            '`pending_handoff: null`',
+            'An interrupted/lost outer cell cannot prove the broker or write '
+            'boundary',
             post_bind_recipe,
         )
         self.assertIn(
-            'An uncaught exception or an interrupted/lost outer cell '
-            'cannot prove that boundary and remains fenced',
-            post_bind_recipe,
-        )
-        self.assertIn(
-            'monotonic sequence remains consumed after a proved connector '
-            'failure',
+            'invoke `abort-source` with fixed reason `connector-failed`',
             post_bind_recipe,
         )
         self.assertIn('**Mutation-response exception:**', post_bind_recipe)
         self.assertIn(
-            'do not enter `source-call-started` before '
+            'do not reserve a source before '
             '`place_equity_order` or `cancel_equity_order`',
             post_bind_recipe,
         )
         self.assertIn(
-            'must not leave transport in a phase that blocks those reads',
+            'no runner substitutes an executor-owned phase map',
             post_bind_recipe,
         )
+        for obsolete in (
+            'next_source_seq', 'pending_handoff', 'source-call-started',
+            'source-response-received', 'handoffs[purposeKey]',
+        ):
+            self.assertNotIn(obsolete, post_bind_recipe)
         self.assertIn(
             'rejects every caller-created, replaced, or alternate root',
             transport_binding,
@@ -8820,8 +9519,8 @@ class MarketClockTests(unittest.TestCase):
             'added cross-principal writer-only capability', coordination
         )
         self.assertIn(
-            'extend it with the exact parsed result as `context_receipt` '
-            'plus `phase: "context-bound"`',
+            'extend it with the complete unchanged parsed result as '
+            '`context_receipt` plus outer bootstrap `phase: "context-bound"`',
             coordination,
         )
         preflight_recipe = coordination.split(
@@ -9017,9 +9716,9 @@ class MarketClockTests(unittest.TestCase):
             'opaque structured value',
             'A non-Codex runner must perform the same full-object JSON '
             'serialization',
-            'A non-Codex runner uses its equivalent structured state for '
-            'every one of these destinations',
-            'In another harness, use the equivalent ordered phase fence',
+            'Codex and every non-Codex runner use the same checked-in '
+            'reserve/write/commit/lookup protocol',
+            'In another harness, use the same checked-in journal actions',
             'A non-Codex runner must use its equivalent opaque structured '
             'state',
         ):
@@ -9063,6 +9762,76 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("never place a payload reviewed for a different session", pre_buy)
         self.assertIn("Do not fall back to START CLOCK", pre_buy)
         self.assertIn("In DRY RUN", pre_buy)
+
+    def test_routine_distinguishes_bind_context_receipt_and_runner_phases(self):
+        with open(
+            os.path.join(ROOT, 'robinhood-momentum-routine-autonomous.md'),
+            encoding='utf-8',
+        ) as f:
+            routine = f.read()
+
+        startup = routine.split(
+            '### STARTUP SEQUENCE — complete exactly before normal account '
+            'or broker access', 1
+        )[1].split('### ACCOUNT SCOPE', 1)[0]
+        self.assertIn(
+            'receipt `phase: "preflight"`; `context-bound` is the runner\'s '
+            'stored-state phase, never the receipt phase',
+            startup,
+        )
+
+        coordination = routine.split(
+            '### RUN COORDINATION — fenced single-flight lease', 1
+        )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
+        bind_contract = coordination.split(
+            'Immediately after a successful acquisition and before scratch '
+            'creation', 1
+        )[1].split(
+            'After the active-context receipt succeeds and before '
+            '`rules_version`', 1
+        )[0]
+        self.assertIn(
+            'checked-in `bind-context` action is the sole '
+            'complete-schema/type/range authority',
+            bind_contract,
+        )
+        self.assertIn(
+            'do not count returned fields, compare `Object.keys(...)`, build '
+            'a copied key/type list',
+            bind_contract,
+        )
+        self.assertIn('`phase: "preflight"`', bind_contract)
+        self.assertIn(
+            '`receipt.phase === "preflight"` and the newly stored '
+            '`bootstrap.phase === "context-bound"` are both required and '
+            'describe different state machines',
+            bind_contract,
+        )
+        self.assertNotIn('exactly these thirteen fields', bind_contract)
+
+        bind_recipe = bind_contract.split(
+            '```javascript', 1
+        )[1].split('```', 1)[0]
+        receipt_check = bind_recipe.index('receipt.phase !== "preflight"')
+        state_store = bind_recipe.index(
+            'store(BOOTSTRAP_KEY, {...bootstrap, context_receipt: receipt,'
+        )
+        self.assertLess(receipt_check, state_store)
+        self.assertIn(
+            'bootstrap.phase !== "configuration-bound"', bind_recipe
+        )
+        self.assertIn('phase: "context-bound"', bind_recipe)
+        self.assertNotIn('receipt.phase !== "context-bound"', bind_recipe)
+        self.assertNotIn('Object.keys', bind_recipe)
+        self.assertNotIn('actualKeys', bind_recipe)
+        for artifact_field in (
+            'run_start_pt',
+            'artifact_stamp',
+            'expected_report_file',
+            'expected_gate_file',
+            'expected_status_file',
+        ):
+            self.assertNotIn(artifact_field, bind_recipe)
 
     def test_routine_timing_boundaries_are_retained_and_telemetry_is_nonfatal(self):
         with open(
@@ -9264,7 +10033,8 @@ class MarketClockTests(unittest.TestCase):
             'self-report fallback', 1
         )[1].split('## Tradeoffs / known limitations', 1)[0]
         for required in (
-            'Immediately after the routine-file read returns',
+            'Immediately after the complete bounded routine-file read '
+            'reaches EOF',
             'before any subsequent launcher/helper/broker call',
             'Who am I in this running task?',
             'runner product, exact model family/version, and current '
@@ -9501,8 +10271,8 @@ class MarketClockTests(unittest.TestCase):
             'or `TaskGet`, and never call any framework chapter, planning, '
             'task-list, todo, progress, or phase tool at any point. Do not '
             'use `ToolSearch` for any such tool. Begin directly with the '
-            'routine-file read below, and make no other model-authored tool '
-            'call before that read completes.'
+            'complete routine-file read below, and make no other '
+            'model-authored tool call before the read-through-EOF finishes.'
         )
         for label, prompt in (
             ('README Codex prompt', codex_prompt),
@@ -9793,7 +10563,7 @@ class MarketClockTests(unittest.TestCase):
             "Never pass the test-only lifecycle path overrides",
             "-RecoverActiveContext",
             "exact raw `RUN_LOCK_TOKEN` remains retained",
-            "exactly these thirteen fields",
+            "exactly these twelve fields",
             '`status: "recovered"`, classification `running`',
             "The receipt cannot recover a lost raw lease token",
             "make no further broker call or artifact write and stop "
@@ -9947,7 +10717,7 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn("InvalidArgument: un-specified asset class", routine)
         self.assertIn(
-            "`broker_snapshot.py` accepts exactly three actions", routine
+            "`broker_snapshot.py` accepts exactly seven actions", routine
         )
         self.assertIn("never hyphenate it onto the action", routine)
         self.assertIn(
@@ -10004,30 +10774,98 @@ class MarketClockTests(unittest.TestCase):
             telemetry,
         )
 
-    def test_routine_keeps_automation_memory_bounded_and_non_authoritative(self):
+    def test_routine_requires_complete_stateless_read_before_any_action(self):
         with open(
             os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
             encoding="utf-8",
         ) as f:
             routine = f.read()
 
-        memory_policy = routine.split(
-            "**AUTOMATION MEMORY IS DISABLED AND NEVER AUTHORITATIVE:**", 1
-        )[1].split("**Scratch hygiene:**", 1)[0]
+        input_heading = (
+            "### INPUT BOUNDARY — complete, stateless routine read before "
+            "all action"
+        )
+        input_start = routine.index(input_heading)
+        description_start = routine.index("**Description:**")
+        launch_start = routine.index(
+            "### LAUNCH BOUNDARY — no framework planning tools"
+        )
+        runtime_start = routine.index("## Runtime requirement — model")
+        self.assertLess(input_start, description_start)
+        self.assertLess(description_start, launch_start)
+        self.assertLess(launch_start, runtime_start)
+        self.assertEqual(routine.count(input_heading), 1)
+
+        memory_policy = routine[input_start:description_start]
         self.assertIn("every run is stateless", memory_policy)
         self.assertIn(
-            "Never read, create, edit, append to, or replace `memory.md`",
+            "scheduler-supplied automation-memory path or content",
             memory_policy,
         )
+        self.assertIn(
+            "Never read, open, create, edit, append to, or replace "
+            "`memory.md`",
+            memory_policy,
+        )
+        self.assertIn("even when the scheduler advertises or injects one", memory_policy)
         self.assertIn("never call a framework memory tool", memory_policy)
-        self.assertIn("Memory is not a recovery channel", memory_policy)
+        self.assertIn(
+            "Memory is not a recovery, progress, or telemetry channel",
+            memory_policy,
+        )
         self.assertIn("verified report/status artifacts", memory_policy)
+        for required in (
+            "LOAD THIS ENTIRE FILE BEFORE ACTING",
+            "sequentially from line 1",
+            "bounded chunks of at most 50 lines",
+            "exact next unread line through EOF",
+            "final read to prove that EOF was reached",
+            "re-read the missing interval in smaller sequential chunks",
+            "make no model-authored tool call except the next bounded read "
+            "of this same file",
+            "do not self-identify",
+            "resolve or launch Python",
+            "invoke a helper or broker connector",
+            "read another file",
+            "write any file or state",
+            "an early chunk never authorizes an early action",
+        ):
+            self.assertIn(required, memory_policy)
+
+        launch_policy = routine[launch_start:runtime_start]
+        for required in (
+            "Planning and progress stay internal",
+            "Never call, discover, or load `mark_chapter`, `TaskCreate`, "
+            "`TaskUpdate`, `TaskList`, or `TaskGet`",
+            "never call any framework chapter, planning, task-list, todo, "
+            "progress, or phase tool at any point",
+            "Do not use `ToolSearch` for any such tool",
+            "`run_lifecycle.py` helper is the only run-phase recorder",
+            "This rule is unconditional.",
+        ):
+            self.assertIn(required, launch_policy)
+
+        self.assertIn(
+            "Immediately after the complete bounded routine-file read "
+            "reaches EOF",
+            routine,
+        )
+        self.assertNotIn(
+            "Immediately after the routine-file read returns",
+            routine,
+        )
+        self.assertIn(
+            "**STATELESSNESS REMINDER — AUTOMATION MEMORY REMAINS "
+            "DISABLED:**",
+            routine,
+        )
 
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
             readme = f.read()
         self.assertIn("Treat every run as stateless", readme)
         self.assertEqual(readme.count("do not call a framework memory tool"), 2)
         self.assertNotIn("never append scan or account details", readme)
+
     def test_routine_uses_machine_readable_scan_handoff(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
@@ -10072,10 +10910,9 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("standard MCP envelope at `structuredContent.data.result`", scan_phase)
         self.assertIn("never call `run_scan` again", scan_phase)
         self.assertIn("startup-bound `SOURCE_ROOT`", scan_phase)
-        self.assertIn("machine-loaded `SOURCE_ROOT`", scan_phase)
-        self.assertIn("same bound file-change capability", scan_phase)
+        self.assertIn("`filter_scan.py --scan-purpose run-scan`", scan_phase)
+        self.assertIn("completed `fileChange` / file-edit / apply-patch capability", scan_phase)
         self.assertIn("same composed tool operation", scan_phase)
-        self.assertIn("tools.apply_patch", scan_phase)
         self.assertIn("POST-BIND COMPOSED JSON SAVE RECIPE", scan_phase)
         self.assertIn(
             "load `rhmra.transport-state.v1`",
@@ -10084,10 +10921,12 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("COMPLETE `fullToolResult`", scan_phase)
         self.assertIn("zero-prefix/zero-decoration", scan_phase)
         self.assertIn("any `text(...)`, `yield_control`", scan_phase)
-        self.assertIn('restore `transport-bound` with `handoffs["run-scan"]`', scan_phase)
         self.assertIn(
-            "invoke `filter_scan.py` with that just-saved variable plus "
-            "loaded `state.receipt.scratch`",
+            'call `commit-source` with the same purpose and reservation ID',
+            scan_phase,
+        )
+        self.assertIn(
+            "invoke `filter_scan.py --scan-purpose run-scan` with loaded scratch",
             scan_phase,
         )
         self.assertIn("never a saved path", scan_phase)
@@ -10096,12 +10935,11 @@ class MarketClockTests(unittest.TestCase):
         )[1]
         scan_order = (
             'load `rhmra.transport-state.v1`',
-            'store `phase: "source-call-started"`',
+            'call `reserve-source` for purpose `run-scan`',
             'only then await `run_scan`',
-            'store `phase: "source-response-received"`',
-            'invoke `tools.apply_patch`',
-            'restore `transport-bound` with `handoffs["run-scan"]`',
-            'invoke `filter_scan.py`',
+            'write it once to the reservation receipt\'s exact source variable',
+            'call `commit-source` with the same purpose and reservation ID',
+            'invoke `filter_scan.py --scan-purpose run-scan`',
         )
         scan_positions = [scan_save.index(marker) for marker in scan_order]
         self.assertEqual(scan_positions, sorted(scan_positions))
@@ -10111,7 +10949,8 @@ class MarketClockTests(unittest.TestCase):
             scan_phase,
         )
         self.assertIn(
-            "A save denial or path mismatch is terminal for the entire run as "
+            "A save denial, failed commit, or purpose mismatch is terminal "
+            "for the entire run as "
             "`snapshot-failure` / `snapshot-write-failed`",
             scan_phase,
         )
@@ -10147,13 +10986,14 @@ class MarketClockTests(unittest.TestCase):
             routine,
         )
         self.assertIn(
-            "Any unbound, alternate-root, nested, missing, changed, or "
+            "Any unknown, pending, aborted, unbound, alternate-root, nested, "
+            "missing, changed, or "
             "unreadable input is run-level `snapshot-failure` / "
             "`snapshot-write-failed`",
             routine,
         )
         self.assertIn(
-            "correctly bound and strictly read input that later fails "
+            "correctly committed and strictly read input that later fails "
             "deterministic schema, semantic, or evaluator-output validation "
             "is instead terminal only for that candidate or entry phase",
             routine,
@@ -10781,10 +11621,10 @@ class MarketClockTests(unittest.TestCase):
         valid_place_response = journal.split(
             "- **Valid place response:**", 1
         )[1].split("- **Connector/request rejection", 1)[0]
-        self.assertIn("fresh unique direct-child JSON file", valid_place_response)
-        self.assertIn("invocation-bound `SOURCE_ROOT`", valid_place_response)
-        self.assertIn("--transport-scratch <absolute scratch>", valid_place_response)
-        self.assertIn("bound response save", valid_place_response)
+        self.assertIn("reserve a unique `placement-response-*` purpose", valid_place_response)
+        self.assertIn("--response-purpose <that purpose>", valid_place_response)
+        self.assertIn("--transport-scratch <loaded scratch>", valid_place_response)
+        self.assertIn("No random response path enters the command", valid_place_response)
         self.assertIn("transport validation", valid_place_response)
         self.assertIn("strict parse", valid_place_response)
         self.assertIn("semantic acknowledgement", valid_place_response)
@@ -10792,7 +11632,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("`acknowledgement_failure`", valid_place_response)
         self.assertIn("ORDER-STATE HALT", valid_place_response)
         self.assertIn("never retry the save", valid_place_response)
-        self.assertIn("switch path or writer", valid_place_response)
+        self.assertIn("switch purpose/path/writer", valid_place_response)
         self.assertIn("second placement", valid_place_response)
         retryable_transient = journal.split(
             "- **Transient timeout/server/connector failure", 1
@@ -10856,14 +11696,14 @@ class MarketClockTests(unittest.TestCase):
             phase,
         )
         self.assertIn(
-            'save every COMPLETE successful batch response UNMODIFIED under '
-            'unique `candidate-quotes-0`, `candidate-quotes-1`, ... handoffs',
+            'save and commit every COMPLETE successful batch response UNMODIFIED under '
+            'unique `candidate-quotes-0`, `candidate-quotes-1`, ... purposes',
             phase,
         )
         self.assertIn(
-            'Pass all of those same saved response paths directly after the '
-            'single `evaluate_candidates.py --quotes` flag in both evaluator '
-            'passes',
+            'Pass all historical purposes after `evaluate_candidates.py '
+            '--bars-purpose` and all quote purposes after its single '
+            '`--quotes-purpose` flag in both evaluator passes',
             phase,
         )
         self.assertIn(
