@@ -1274,6 +1274,23 @@ telemetry paths. Only after the attempt does it clear all three executor-state s
 file-card line copies that returned bare name byte-for-byte and never reconstructs it from current
 time, narration, memory, a displayed pattern, or a prior run.
 
+**2026-08-24 08:03, Codex falsely rejected a valid START CLOCK receipt after inventing a schema
+field the producer did not emit.** `market_clock.py` executed before lease acquisition or broker
+access, but model-authored validation required `clock.schema_version === 1`. The clock's documented
+JSON contract had not yet included a `schema_version` property, so the wrapper converted a valid
+deterministic result into `coordination-halt / clock-unavailable`. Lifecycle finished safely after
+77 seconds with no run timestamp, lease, scratch, account resolution, Robinhood request, report,
+status snapshot, order intent, order, cancellation, or notification. The 08:34 invocation used the
+documented fields without the invented condition and completed normally, proving the helper and
+host clock path were available.
+
+**Rule produced:** every machine-readable clock result now carries integer `schema_version: 1`,
+and the routine names the complete producer-owned type contract for every START, DAILY-LOSS,
+PRE-BUY, and ORDER-INTENT clock invocation. Runner glue validates the named version, fields, types,
+and preflight constants hash; it never counts keys or invents an `action`, `ok`, `status`, or other
+required property. This keeps both Codex and Claude on one deterministic receipt contract while
+preserving the fail-closed response to a genuinely missing, malformed, or mismatched clock.
+
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 
 **2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The

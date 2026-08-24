@@ -58,6 +58,7 @@ from validate_constants import ConstantsValidationError, validate_constants_file
 
 EASTERN_STD_OFFSET = -5
 PACIFIC_STD_OFFSET = -8
+SCHEMA_VERSION = 1
 
 PREMARKET_OPEN = (4, 0)
 AFTERHOURS_CLOSE = (20, 0)
@@ -213,6 +214,7 @@ def main():
                    and since_open < blackout_minutes)
 
     out = {
+        "schema_version": SCHEMA_VERSION,
         "utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "et": f"{et:%Y-%m-%d %H:%M:%S} {et_name}",
         "pt": f"{pt:%Y-%m-%d %H:%M:%S} {pt_name}",

@@ -8546,6 +8546,8 @@ class MarketClockTests(unittest.TestCase):
     def test_summer_offsets_are_daylight(self):
         # 2026-07-21 15:07Z — the run that had to improvise a clock.
         c = self.clock("2026-07-21T15:07:00Z")
+        self.assertIs(type(c["schema_version"]), int)
+        self.assertEqual(c["schema_version"], 1)
         self.assertEqual(c["et"], "2026-07-21 11:07:00 EDT")
         self.assertEqual(c["pt"], "2026-07-21 08:07:00 PDT")
         self.assertEqual(c["pt_iso"], "2026-07-21T08:07:00-07:00")
@@ -8866,6 +8868,33 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('`circuit_breaker: "not-evaluated"`', pre_second)
         self.assertIn('`stop_fills_today: null`', pre_second)
         self.assertIn("finish lifecycle as normal `completed`", pre_second)
+
+    def test_routine_uses_the_versioned_clock_receipt_contract(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+        clock_contract = routine.split(
+            "### CURRENT TIME — capture run start; re-check only at named "
+            "safety boundaries",
+            1,
+        )[1].split("### RUN COORDINATION — fenced single-flight lease", 1)[0]
+
+        self.assertIn(
+            "`schema_version` exactly the JSON integer `1`", clock_contract
+        )
+        self.assertIn(
+            "The checked-in producer owns this complete clock schema",
+            clock_contract,
+        )
+        self.assertIn(
+            "any other property not named here", clock_contract
+        )
+        self.assertIn(
+            "a CONFIGURATION HALT, never a generic clock failure",
+            clock_contract,
+        )
 
     def test_routine_binds_one_verified_python_before_lifecycle(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
