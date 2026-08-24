@@ -2077,6 +2077,117 @@ class EvaluateCandidatesTests(unittest.TestCase):
         self.assertEqual(document["params"]["rsi_file"], ["rsi-0"])
         self.assertEqual(document["results"][0]["rsi_gate"], "pass")
 
+    def test_cli_accumulates_repeated_purpose_flags_and_blocks_missing_inputs(self):
+        bars = [
+            bar("2026-07-01", 4.5, 5.0, 900000),
+            bar("2026-07-02", 4.6, 4.9, 900000),
+            bar("2026-07-03", 4.6, 4.8, 900000),
+            bar("2026-07-06", 4.6, 4.9, 900000),
+            bar("2026-07-07", 4.6, 4.9, 900000),
+        ]
+        with tempfile.TemporaryDirectory() as scratch, bound_source_root(
+            scratch
+        ):
+            commit_test_source_purpose(
+                scratch,
+                "historicals-0",
+                {"data": {"results": [
+                    {"symbol": "SYNX", "bars": bars},
+                    {"symbol": "NOQUOTE", "bars": bars},
+                ]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "historicals-1",
+                {"data": {"results": [
+                    {"symbol": "OTHR", "bars": bars},
+                ]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "candidate-quotes-0",
+                {"data": {"results": [
+                    {"quote": {"symbol": "SYNX", "last_trade_price": "4.0"}},
+                    {"quote": {"symbol": "NOHIST", "last_trade_price": "4.0"}},
+                ]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "candidate-quotes-1",
+                {"data": {"results": [
+                    {"quote": {"symbol": "OTHR", "last_trade_price": "4.0"}},
+                ]}},
+            )
+            commit_test_source_purpose(
+                scratch,
+                "rsi-0",
+                self.raw_rsi_response("SYNX", [40, 36, 33, 30, 29, 34]),
+            )
+            commit_test_source_purpose(
+                scratch,
+                "rsi-1",
+                self.raw_rsi_response("OTHR", [42, 39, 36, 33, 31, 29]),
+            )
+            output = os.path.join(scratch, "repeated-purpose-output.json")
+            proc = self.evaluate_proc([
+                "--scratch", scratch,
+                "--bars-purpose", "historicals-0",
+                "--bars-purpose", "historicals-1",
+                "--quotes-purpose", "candidate-quotes-0",
+                "--quotes-purpose", "candidate-quotes-1",
+                "--expected-symbols", "SYNX",
+                "--expected-symbols", "OTHR", "NOHIST", "NOQUOTE", "NONE",
+                "--volume-lookback-days", "5",
+                "--high-lookback-days", "5",
+                "--min-median-dollar-volume", "0",
+                "--dip-entry-pct", "5",
+                "--rsi-purpose", "rsi-0",
+                "--rsi-purpose", "rsi-1",
+                "--rsi-oversold", "35",
+                "--rsi-lookback-bars", "5",
+                "--rsi-confirm-bars", "1",
+                "--rsi-max-entry", "60",
+                "--rsi-period", "14",
+                "--json-out", output,
+            ])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(output, encoding="utf-8") as handle:
+                document = json.load(handle)
+
+        self.assertEqual(
+            document["params"]["bars"], ["historicals-0", "historicals-1"]
+        )
+        self.assertEqual(
+            document["params"]["quotes"],
+            ["candidate-quotes-0", "candidate-quotes-1"],
+        )
+        self.assertEqual(document["params"]["rsi_file"], ["rsi-0", "rsi-1"])
+        self.assertEqual(
+            document["params"]["expected_symbols"],
+            ["SYNX", "OTHR", "NOHIST", "NOQUOTE", "NONE"],
+        )
+        by_symbol = {row["symbol"]: row for row in document["results"]}
+        self.assertEqual(set(by_symbol), {"SYNX", "OTHR", "NOHIST", "NOQUOTE", "NONE"})
+        self.assertTrue(by_symbol["SYNX"]["buy_candidate"])
+        self.assertEqual(by_symbol["SYNX"]["rsi_gate"], "pass")
+        self.assertFalse(by_symbol["OTHR"]["buy_candidate"])
+        self.assertEqual(by_symbol["OTHR"]["rsi_gate"], "block")
+        self.assertEqual(
+            by_symbol["NOHIST"]["skip_reason"],
+            "missing candidate input: historicals",
+        )
+        self.assertEqual(
+            by_symbol["NOQUOTE"]["skip_reason"],
+            "missing candidate input: quote",
+        )
+        self.assertEqual(
+            by_symbol["NONE"]["skip_reason"],
+            "missing candidate input: historicals and quote",
+        )
+        self.assertIsNone(by_symbol["NOQUOTE"]["current_price"])
+        self.assertFalse(by_symbol["NOQUOTE"]["insufficient_history"])
+        self.assertTrue(by_symbol["NOHIST"]["insufficient_history"])
+
     def test_rsi_rejects_malformed_raw_responses_and_tool_envelopes(self):
         valid = self.raw_rsi_response("SYNX", [40, 36, 33, 30, 29, 34])
         malformed = (
@@ -12428,6 +12539,26 @@ class MarketClockTests(unittest.TestCase):
             '--bars-purpose` and all quote purposes after its single '
             '`--quotes-purpose` flag in both evaluator passes',
             phase,
+        )
+        self.assertIn("Evaluator selector and candidate-set contract", phase)
+        self.assertIn(
+            "emit each selector exactly once followed by its complete ordered value list",
+            phase,
+        )
+        self.assertIn(
+            "--expected-symbols <remaining-symbol> [more symbols ...]", phase
+        )
+        self.assertIn(
+            "defensively accumulates a repeated selector occurrence but rejects a duplicated value",
+            phase,
+        )
+        self.assertIn("explicit `buy_candidate: false` row", phase)
+        self.assertIn("`String(value)` before `replaceAll`", phase)
+        self.assertNotIn(
+            "const psq = value => \"'\" + value.replaceAll", routine
+        )
+        self.assertNotIn(
+            "const shq = value => \"'\" + value.replaceAll", routine
         )
         self.assertIn(
             '`structuredContent.data.results[].quote.symbol`', phase

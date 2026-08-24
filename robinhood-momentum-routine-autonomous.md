@@ -204,8 +204,8 @@ if (!bootstrap || bootstrap.schema_version !== 1 ||
 }
 const pythonExe = bootstrap.resolver_receipt.python;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
@@ -301,8 +301,8 @@ if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context
 const pythonExe = bootstrap.resolver_receipt.python;
 const configuredAccountName = bootstrap.constants_receipt.values.AGENTIC_ACCOUNT_NAME;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
@@ -386,8 +386,8 @@ if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context
 const pythonExe = state.python_exe;
 const runLockToken = lease.run_lock_token;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
@@ -541,8 +541,8 @@ if (patchResult && patchResult.isError === true) throw new Error("accounts canar
 const savedState = {...requireState("account-response-received"), phase: "canary-saved"};
 store(STATE_KEY, savedState);
 const isWindows = /^[A-Za-z]:[\\/]/.test(savedState.python_exe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const bindCommand = (isWindows ? "& " : "") + quote(savedState.python_exe) +
   " broker_snapshot.py bind-transport --scratch " + quote(receipt.scratch) +
@@ -646,8 +646,8 @@ if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.context_receipt |
 const pythonExe = state.python_exe;
 const projectRoot = state.project_root;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const runLockToken = lease.run_lock_token;
 const quotedRunLockToken = quote(lease.run_lock_token);
@@ -687,8 +687,8 @@ const pythonExe = state && typeof state.python_exe === "string"
 const projectRoot = state && typeof state.project_root === "string"
   ? state.project_root : undefined;
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const runLockToken = lease.run_lock_token;
 const quotedRunLockToken = quote(lease.run_lock_token);
@@ -969,10 +969,44 @@ When ANY pre-SECOND gate skips entry, do NOT run SECOND, do NOT capture/stage a 
        2. Write the complete result EXACTLY as received, including the outer `content`/`structuredContent` MCP envelope when present. A save denial or unreadable bound file is terminal for the entire run as `snapshot-failure` / `snapshot-write-failed`; never retry, switch methods, relocate the payload, or continue with another candidate.
      Persist historicals and complete quote/RSI responses through the startup-bound file-change facility and `SOURCE_ROOT`; never search for, repair, or rewrite a result through another path or writer.
 
-   **Bound-source validation and read-once are deterministic:** `evaluate_candidates.py --scratch` resolves every `--bars-purpose`, `--quotes-purpose`, and `--rsi-purpose` through this invocation's committed journal, verifies its bound source-root markers plus sealed bytes/file identity, strictly parses every input once, and computes from those parsed documents without reopening them. Only script-owned evaluator outputs belong in `<scratch>` or `run-reports/`. Do not pre-read, probe, rewrite, retry, relocate, or switch writers. Any unknown, pending, aborted, unbound, alternate-root, nested, missing, changed, or unreadable input is run-level `snapshot-failure` / `snapshot-write-failed`. A correctly committed and strictly read input that later fails deterministic schema, semantic, or evaluator-output validation is instead terminal only for that candidate or entry phase. Then run the PRE-RSI pass:
-     Windows/PowerShell: `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>' --bars-purpose <historicals-purpose> [more purposes ...] --quotes-purpose <candidate-quotes-purpose> [more purposes ...] --volume-lookback-days <VOLUME_LOOKBACK_DAYS> --high-lookback-days <HIGH_LOOKBACK_DAYS> --min-median-dollar-volume <MIN_MEDIAN_DOLLAR_VOLUME> --dip-entry-pct <DIP_ENTRY_PCT> --max-spread-buy-pct <MAX_SPREAD_BUY_PCT> --rsi-period <RSI_PERIOD> --json-out <scratch>/pre-rsi-gates.json`; Linux/macOS: use the same retained `PYTHON_EXE` without `&` with the same arguments — all six constant values from `constants.md`.
+   **Evaluator selector and candidate-set contract:** in both evaluator passes,
+   emit each selector exactly once followed by its complete ordered value list:
+   one `--bars-purpose` for every committed `historicals-*` purpose, one
+   `--quotes-purpose` for every committed `candidate-quotes-*` purpose, and in
+   Step 10 one `--rsi-purpose` for every committed `rsi-*` purpose. Never build
+   argv by mapping one selector onto each value. Pass the exact ordered REMAINING
+   post-prefilter symbols exactly once after one `--expected-symbols` selector in
+   both passes. The deterministic CLI defensively accumulates a repeated selector occurrence but rejects a duplicated value,
+   so noncanonical command construction cannot silently discard an earlier batch.
+   A requested symbol omitted from historicals, quotes, or both must appear in
+   evaluator JSON as an explicit `buy_candidate: false` row whose `skip_reason`
+   names the missing input; that candidate is blocked, while other complete
+   candidates remain evaluable. Any symbol returned by those broker inputs
+   outside the expected set is still a fail-closed evaluator error. Reuse the
+   exact quoting helpers above: they convert already-validated typed scalar
+   state/constants with `String(value)` before `replaceAll`; never call
+   `replaceAll` directly on a numeric or Boolean constant.
 
-   **PRE-RSI machine-readable handoff (REQUIRED):** after a successful exit, read `<scratch>/pre-rsi-gates.json` as JSON. The root must be an object with `schema_version` exactly `1`, `rsi_gate_enabled` exactly the JSON boolean `false`, a `params` object matching this invocation's constant values, and a `results` array containing exactly one unique-symbol row for every pre-filtered input symbol and no others. Every row must have a non-empty string `symbol`, JSON-boolean `buy_candidate` and `insufficient_history`, a string-or-null `skip_reason`, and finite JSON-number-or-null `current_price`, `median_dollar_volume`, `recent_high`, `pct_below_high`, and `spread_pct`. The PRE-RSI LIST is only the rows whose `buy_candidate` is exactly `true`; every short-history row must instead have `insufficient_history: true` and `buy_candidate: false`. Preserve the script's unrounded numbers and reason strings. This JSON is the SOLE authority for the pre-RSI verdicts; formatted stdout is diagnostic-only and must never be parsed or copied.
+   **Bound-source validation and read-once are deterministic:** `evaluate_candidates.py --scratch` resolves every `--bars-purpose`, `--quotes-purpose`, and `--rsi-purpose` through this invocation's committed journal, verifies its bound source-root markers plus sealed bytes/file identity, strictly parses every input once, and computes from those parsed documents without reopening them. Only script-owned evaluator outputs belong in `<scratch>` or `run-reports/`. Do not pre-read, probe, rewrite, retry, relocate, or switch writers. Any unknown, pending, aborted, unbound, alternate-root, nested, missing, changed, or unreadable input is run-level `snapshot-failure` / `snapshot-write-failed`. A correctly committed and strictly read input that later fails deterministic schema, semantic, or evaluator-output validation is instead terminal only for that candidate or entry phase. Then run the PRE-RSI pass:
+     Windows/PowerShell: `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>' --bars-purpose <historicals-purpose> [more purposes ...] --quotes-purpose <candidate-quotes-purpose> [more purposes ...] --expected-symbols <remaining-symbol> [more symbols ...] --volume-lookback-days <VOLUME_LOOKBACK_DAYS> --high-lookback-days <HIGH_LOOKBACK_DAYS> --min-median-dollar-volume <MIN_MEDIAN_DOLLAR_VOLUME> --dip-entry-pct <DIP_ENTRY_PCT> --max-spread-buy-pct <MAX_SPREAD_BUY_PCT> --rsi-period <RSI_PERIOD> --json-out <scratch>/pre-rsi-gates.json`; Linux/macOS: use the same retained `PYTHON_EXE` without `&` with the same arguments — all six constant values from `constants.md`.
+
+   **PRE-RSI machine-readable handoff (REQUIRED):** after a successful exit,
+   read `<scratch>/pre-rsi-gates.json` as JSON. The root must be an object with
+   `schema_version` exactly `1`, `rsi_gate_enabled` exactly the JSON boolean `false`,
+   a `params` object matching this invocation's constant values plus the
+   exact ordered bars-purpose, quotes-purpose, and expected-symbol lists supplied,
+   and a `results` array containing exactly one unique-symbol row for every
+   pre-filtered input symbol and no others. Every row must have a non-empty string
+   `symbol`, JSON-boolean `buy_candidate` and `insufficient_history`, a
+   string-or-null `skip_reason`, and finite JSON-number-or-null `current_price`,
+   `median_dollar_volume`, `recent_high`, `pct_below_high`, and `spread_pct`. A row
+   naming a missing historicals or quote input is valid only when `buy_candidate`
+   is exactly `false`; it is a per-candidate data block, not permission to omit
+   the row or halt the complete candidates. The PRE-RSI LIST is only the rows
+   whose `buy_candidate` is exactly `true`; every short-history row must instead
+   have `insufficient_history: true` and `buy_candidate: false`. Preserve the
+   script's unrounded numbers and reason strings. This JSON is the SOLE authority for the pre-RSI verdicts;
+   formatted stdout is diagnostic-only and must never be parsed or copied.
 
    If the pre-RSI script exits nonzero, the output is missing/unreadable/non-JSON, any expected symbol is absent, or any schema/value/parameter check fails, set `entry_phase: "halted"`, skip the remaining entry phase (Steps 9–12), and report `candidate evaluation handoff failure`. Do NOT use formatted stdout, a stale gate file, or ad-hoc calculations.
 
@@ -982,7 +1016,7 @@ When ANY pre-SECOND gate skips entry, do NOT run SECOND, do NOT capture/stage a 
 
    If an indicator read explicitly exhausts the one-retry policy, abort its reservation and omit that name; the deterministic missing-RSI gate BLOCKS it. Do not fetch historicals, derive closes/RSI, or repair a malformed committed success. If the PRE-RSI LIST is empty—or no RSI purpose committed—commit fixed purpose `rsi-empty` containing exactly `{}` so the final RSI-enabled pass still runs.
 
-   Then RE-RUN with `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>'` and the SAME `--bars-purpose`, `--quotes-purpose`, and constant flags as the PRE-RSI pass plus `--rsi-purpose <every committed rsi-* purpose exactly once> --rsi-oversold <RSI_OVERSOLD> --rsi-lookback-bars <RSI_LOOKBACK_BARS> --rsi-confirm-bars <RSI_CONFIRM_BARS> --rsi-max-entry <RSI_MAX_ENTRY> --json-out run-reports/<EXPECTED_GATE_FILE>`; use only the retained `PYTHON_EXE`, never pass an aborted purpose, and use the lifecycle-bound exact bare `EXPECTED_GATE_FILE`; never rebuild it from current time, another clock, or a context summary.
+   Then RE-RUN with `& '<PYTHON_EXE>' evaluate_candidates.py --scratch '<absolute scratch>'` and the SAME `--bars-purpose`, `--quotes-purpose`, `--expected-symbols`, and constant flags as the PRE-RSI pass plus one `--rsi-purpose <every committed rsi-* purpose exactly once> --rsi-oversold <RSI_OVERSOLD> --rsi-lookback-bars <RSI_LOOKBACK_BARS> --rsi-confirm-bars <RSI_CONFIRM_BARS> --rsi-max-entry <RSI_MAX_ENTRY> --json-out run-reports/<EXPECTED_GATE_FILE>`; use only the retained `PYTHON_EXE`, never pass an aborted purpose, and use the lifecycle-bound exact bare `EXPECTED_GATE_FILE`; never rebuild it from current time, another clock, or a context summary.
 
    **FINAL machine-readable handoff and gate record (REQUIRED):** only after that final command exits successfully, read its JSON output. Apply the same root, parameter, symbol, type, finiteness, and completeness checks as the PRE-RSI handoff, except `rsi_gate_enabled` must be exactly the JSON boolean `true` and `params` must match every RSI constant plus the exact ordered RSI purpose list supplied. A row may reach Step 11 only when its final `buy_candidate` is exactly `true`, `rsi_gate` is exactly `"pass"`, and `insufficient_history` is exactly `false`. The final JSON's unrounded measurements, verdicts, and reason strings are the SOLE authority for Step 11 and the report; stdout remains diagnostic-only.
 
@@ -1126,8 +1160,8 @@ const pythonExe = bootstrap.resolver_receipt.python;
 const runStartPt = bootstrap.context_receipt.run_start_pt;
 const session = "<unchanged START CLOCK session>";
 const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
-const psq = value => "'" + value.replaceAll("'", "''") + "'";
-const shq = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;

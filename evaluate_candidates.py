@@ -28,6 +28,7 @@ Usage:
   python evaluate_candidates.py --scratch <preflighted scratch> \
       (--bars hist1.json [hist2.json ...] | --bars-purpose KEY [KEY ...]) \
       (--quotes quotes1.json [quotes2.json ...] | --quotes-purpose KEY [KEY ...]) \
+      [--expected-symbols SYMBOL [SYMBOL ...]] \
       --volume-lookback-days 20 --high-lookback-days 5 \
       --min-median-dollar-volume 175000 --dip-entry-pct 5 \
       [--max-spread-buy-pct 2.0] [--json-out results.json]
@@ -40,6 +41,9 @@ Usage:
 --rsi-file/--rsi-purpose: one or more sources, each a RAW get_equity_technical_indicators
   response saved verbatim (the symbol is read from data.symbol, so responses
   are never re-keyed or retyped). A symbol-keyed map is still accepted.
+--expected-symbols: the exact post-prefilter candidate set. When supplied, a
+  requested symbol omitted from historicals or quotes is emitted as an
+  explicit blocked row instead of disappearing from the result intersection.
 --quotes files: one or more saved get_equity_quotes results. Accepted raw shapes:
   standard MCP envelope containing structuredContent.data.results
   {"data": {"results": [{"quote": {...}, "close": {...}}]}}
@@ -488,6 +492,7 @@ def main():
     bars_input.add_argument(
         "--bars-purpose",
         nargs="+",
+        action="extend",
         help="committed response-source purpose(s) containing historicals",
     )
     quotes_input = ap.add_mutually_exclusive_group(required=True)
@@ -499,7 +504,17 @@ def main():
     quotes_input.add_argument(
         "--quotes-purpose",
         nargs="+",
+        action="extend",
         help="committed response-source purpose(s) containing quotes",
+    )
+    ap.add_argument(
+        "--expected-symbols",
+        nargs="+",
+        action="extend",
+        help=(
+            "exact post-prefilter symbols; missing historical/quote inputs "
+            "become explicit blocked rows"
+        ),
     )
     ap.add_argument("--volume-lookback-days", type=int, required=True)
     ap.add_argument("--high-lookback-days", type=int, required=True)
@@ -512,6 +527,7 @@ def main():
     rsi_input.add_argument(
         "--rsi-purpose",
         nargs="+",
+        action="extend",
         help="committed response-source purpose(s) containing RSI responses; enables the RSI curl-up entry gate",
     )
     ap.add_argument("--rsi-oversold", type=finite_float_arg, help="RSI_OVERSOLD (required with an RSI input)")
@@ -521,6 +537,20 @@ def main():
     ap.add_argument("--rsi-period", type=int,
                     help="RSI_PERIOD, required with an RSI input so the closes fallback uses the configured period")
     args = ap.parse_args()
+
+    def reject_duplicates(values, option):
+        if values is not None and len(values) != len(set(values)):
+            ap.error(f"{option} must list every value exactly once")
+
+    reject_duplicates(args.bars_purpose, "--bars-purpose")
+    reject_duplicates(args.quotes_purpose, "--quotes-purpose")
+    reject_duplicates(args.rsi_purpose, "--rsi-purpose")
+    if args.expected_symbols is not None:
+        args.expected_symbols = [
+            _rsi_symbol(value, "--expected-symbols")
+            for value in args.expected_symbols
+        ]
+        reject_duplicates(args.expected_symbols, "--expected-symbols")
 
     def resolve_inputs(paths, purposes):
         if purposes is not None:
@@ -564,15 +594,53 @@ def main():
             bars_by_symbol[sym] = sorted(result["bars"], key=lambda b: b["begins_at"])
 
     for sym in sorted(set(quotes) - set(bars_by_symbol)):
-        print(f"WARNING: {sym} has a quote but no bars data - not evaluated", file=sys.stderr)
+        print(f"WARNING: {sym} has a quote but no bars data", file=sys.stderr)
     for sym in sorted(set(bars_by_symbol) - set(quotes)):
-        print(f"WARNING: {sym} has bars but no quote in --quotes - not evaluated", file=sys.stderr)
+        print(f"WARNING: {sym} has bars but no quote in --quotes", file=sys.stderr)
+
+    if args.expected_symbols is not None:
+        expected = set(args.expected_symbols)
+        unexpected_bars = sorted(set(bars_by_symbol) - expected)
+        unexpected_quotes = sorted(set(quotes) - expected)
+        if unexpected_bars:
+            raise ValueError(
+                "historicals returned symbol(s) outside --expected-symbols: "
+                + ", ".join(unexpected_bars)
+            )
+        if unexpected_quotes:
+            raise ValueError(
+                "quotes returned symbol(s) outside --expected-symbols: "
+                + ", ".join(unexpected_quotes)
+            )
+        evaluation_symbols = sorted(expected)
+    else:
+        evaluation_symbols = sorted(set(bars_by_symbol) & set(quotes))
 
     rows = []
-    for sym in sorted(set(bars_by_symbol) & set(quotes)):
-        bars = bars_by_symbol[sym]
-        current, bid, ask = quotes[sym]
-        required_history = max(args.volume_lookback_days, args.high_lookback_days)
+    required_history = max(args.volume_lookback_days, args.high_lookback_days)
+    for sym in evaluation_symbols:
+        bars = bars_by_symbol.get(sym)
+        quote = quotes.get(sym)
+        if bars is None or quote is None:
+            missing = []
+            if bars is None:
+                missing.append("historicals")
+            if quote is None:
+                missing.append("quote")
+            rows.append({
+                "symbol": sym,
+                "current_price": quote[0] if quote is not None else None,
+                "buy_candidate": False,
+                "median_dollar_volume": None,
+                "recent_high": None,
+                "pct_below_high": None,
+                "skip_reason": "missing candidate input: " + " and ".join(missing),
+                "spread_pct": None,
+                "insufficient_history": bars is None or len(bars) < required_history,
+            })
+            continue
+
+        current, bid, ask = quote
         row = {"symbol": sym, "current_price": current, "buy_candidate": False,
                "median_dollar_volume": None, "recent_high": None,
                "pct_below_high": None, "skip_reason": None, "spread_pct": None,
@@ -666,7 +734,7 @@ def main():
             r["symbol"],
             "-" if r["median_dollar_volume"] is None else f"${r['median_dollar_volume']:,.0f}",
             "-" if r["recent_high"] is None else f"${r['recent_high']:.3f}",
-            f"${r['current_price']:.3f}",
+            "-" if r["current_price"] is None else f"${r['current_price']:.3f}",
             "-" if r["pct_below_high"] is None else f"{r['pct_below_high']:+.2f}%",
             "-" if r["spread_pct"] is None else f"{r['spread_pct']:.2f}%",
             ("BUY CANDIDATE" if r["buy_candidate"] else f"SKIP ({r['skip_reason']})")

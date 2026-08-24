@@ -1291,6 +1291,31 @@ and preflight constants hash; it never counts keys or invents an `action`, `ok`,
 required property. This keeps both Codex and Claude on one deterministic receipt contract while
 preserving the fail-closed response to a genuinely missing, malformed, or mismatched clock.
 
+**2026-08-24 10:33, repeated evaluator selectors silently discarded the first committed
+historicals batch.** The scan produced 13 working-list names. The runner correctly reserved,
+saved, and committed `historicals-0`, `historicals-1`, and `candidate-quotes-0`, but built the
+command as `--bars-purpose historicals-0 --bars-purpose historicals-1`. The evaluator's
+`nargs="+"` option still used argparse's default last-value storage, so the second occurrence
+replaced the first. Its pre-RSI JSON consequently recorded only `historicals-1` and returned only
+COPR; the completeness check rejected one row where 13 were required and safely halted entry.
+Forensics also showed that Robinhood omitted CHNR and AMOD from both requested historical/quote
+results, so consuming both batches would otherwise have produced only 11 rows and triggered the
+same all-candidate halt. Earlier in the run, a shell quote helper called `replaceAll` directly on
+numeric constants; the runner recovered by converting the validated values to strings and reused
+the already committed scan without making a second broker scan. No RSI request, review, intent,
+order, cancellation, notification, or other broker mutation followed, and the account remained
+flat.
+
+**Rules produced:** every evaluator purpose selector now accumulates both canonical grouped values
+and repeated occurrences in order, while duplicate purpose values are rejected. The routine's
+canonical form still emits each selector exactly once with its complete ordered list. Both passes
+also receive the exact post-prefilter symbols through `--expected-symbols`; a requested name
+missing historicals, quotes, or both receives an explicit deterministic non-buy row instead of
+vanishing from the intersection and halting otherwise complete names. An unexpected returned name,
+invalid expected set, malformed source, or incomplete evaluator output still fails closed. Exact
+command recipes stringify already validated scalar constants before applying native-shell quoting,
+so numeric and Boolean settings cannot fail inside `replaceAll`.
+
 ## STATUS SNAPSHOT — deterministic publication and dashboard fallback
 
 **2026-08-12, Claude authored three malformed final snapshots in eight completed runs.** The
