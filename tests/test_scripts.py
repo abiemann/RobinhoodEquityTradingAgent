@@ -783,7 +783,7 @@ class DailyLossTests(unittest.TestCase):
                     ]),
                     f,
                 )
-            run_cli(
+            stdout = run_cli(
                 DAILY_LOSS,
                 [
                     "--positions", positions_path,
@@ -792,6 +792,20 @@ class DailyLossTests(unittest.TestCase):
                     "--as-of-utc", self.AS_OF_UTC,
                     "--symbols-out", symbols_path,
                 ],
+            )
+            self.assertEqual(stdout.count("\n"), 1)
+            receipt = json.loads(stdout)
+            self.assertEqual(
+                receipt,
+                {
+                    "schema_version": 1,
+                    "action": "discover-symbols",
+                    "ok": True,
+                    "trading_date_et": self.TRADING_DATE,
+                    "as_of_utc": self.AS_OF_UTC,
+                    "symbol_count": 2,
+                    "symbols": ["CLOSED", "HELD"],
+                },
             )
             with open(symbols_path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), ["CLOSED", "HELD"])
@@ -1022,6 +1036,19 @@ class DailyLossTests(unittest.TestCase):
             encoding="utf-8",
         ) as f:
             routine = f.read()
+        drain_contracts = re.findall(
+            r"const drainCommand = async result => \{(.*?)\n\};",
+            routine,
+            re.DOTALL,
+        )
+        self.assertEqual(len(drain_contracts), 6)
+        for drain_contract in drain_contracts:
+            self.assertIn('let output = String(current.output ?? "");', drain_contract)
+            self.assertIn('output += String(next.output ?? "");', drain_contract)
+            self.assertIn(
+                "return Object.freeze({...current, output});",
+                drain_contract,
+            )
         lifecycle = routine.split(
             "### INVOCATION LIFECYCLE", 1
         )[1].split("**Mandatory configuration preflight", 1)[0]
@@ -1052,6 +1079,9 @@ class DailyLossTests(unittest.TestCase):
         block = routine.split("### DAILY-LOSS CIRCUIT BREAKER", 1)[1].split(
             "### RUN THESE STEPS IN ORDER", 1
         )[0]
+        self.assertNotIn("const runHelper", block)
+        self.assertNotIn("const runJson", block)
+        self.assertNotIn(".r.exit_code", block)
         self.assertIn("SOLE authority is therefore `daily_loss.py`", block)
         self.assertIn("use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter", block)
         self.assertIn("Follow `data.next` until it is absent/empty", block)
@@ -1127,8 +1157,40 @@ class DailyLossTests(unittest.TestCase):
             block,
         )
         purpose_binding = block.split(
-            "**SNAPSHOT SOURCE PURPOSE AND PRE-CALL RESERVATION", 1
+            "**SNAPSHOT LOCAL-COMMAND RESULT AND SOURCE RESERVATION", 1
         )[1].split("For every successful broker call", 1)[0]
+        self.assertEqual(block.count("const runSnapshotJsonCommand = async command =>"), 1)
+        self.assertIn("in Codex, every local helper command", purpose_binding)
+        self.assertIn("A non-Codex runner uses its one native fully drained", purpose_binding)
+        self.assertIn(
+            "The exact JavaScript property names apply to Codex only",
+            purpose_binding,
+        )
+        self.assertIn('let stdout = String(process.output ?? "");', purpose_binding)
+        self.assertIn("while (process.session_id !== undefined)", purpose_binding)
+        self.assertIn('stdout += String(next.output ?? "");', purpose_binding)
+        self.assertIn(
+            "const finalProcess = Object.freeze({...process, output: stdout});",
+            purpose_binding,
+        )
+        self.assertIn("try { receipt = JSON.parse(stdout); }", purpose_binding)
+        self.assertIn(
+            "return Object.freeze({process: finalProcess, receipt});",
+            purpose_binding,
+        )
+        self.assertIn(
+            "const commandResult = await runSnapshotJsonCommand(command);",
+            purpose_binding,
+        )
+        self.assertIn("const receipt = commandResult.receipt;", purpose_binding)
+        self.assertIn("commandResult.process.exit_code !== 0", purpose_binding)
+        command_contract_source = purpose_binding.split("```javascript", 1)[1].split(
+            "```", 1
+        )[0]
+        self.assertEqual(command_contract_source.count("tools.exec_command"), 1)
+        self.assertNotIn("runHelper", command_contract_source)
+        self.assertNotIn("runJson", command_contract_source)
+        self.assertNotIn(".r.exit_code", command_contract_source)
         self.assertIn(
             'const generationPurposeSlug = generation === "A" ? "a" : '
             'generation === "B" ? "b" : null;',
@@ -1196,6 +1258,14 @@ class DailyLossTests(unittest.TestCase):
             receipt_binding,
         )
         self.assertIn(
+            "const stageCommandResult = await runSnapshotJsonCommand(stageCommand);",
+            receipt_binding,
+        )
+        self.assertIn(
+            "commandResult.process.exit_code !== 0",
+            receipt_binding,
+        )
+        self.assertIn(
             "Use only `stagedOutputPaths` after that binding",
             receipt_binding,
         )
@@ -1211,6 +1281,40 @@ class DailyLossTests(unittest.TestCase):
         self.assertNotIn("stageReceipt.files[0]", validator_source)
         self.assertNotIn("String(descriptor)", validator_source)
         self.assertNotIn("descriptor.toLowerCase", validator_source)
+        self.assertNotIn(".r.exit_code", validator_source)
+        self.assertIn(
+            "The atomically written symbols file is an audit artifact only",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "a non-Codex runner uses the single-shape fully drained native equivalent",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "const symbolCommandResult = await "
+            "runSnapshotJsonCommand(symbolCommand);",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            'receipt.action !== "discover-symbols"',
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "receipt.symbols.length !== receipt.symbol_count",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "const requiredQuoteSymbols = symbolBinding.symbols;",
+            quote_discovery_step,
+        )
+        quote_contract_source = quote_discovery_step.split(
+            "```javascript", 1
+        )[1].split("```", 1)[0]
+        self.assertNotIn("Get-Content", quote_contract_source)
+        self.assertNotIn("runHelper", quote_contract_source)
+        self.assertNotIn("runJson", quote_contract_source)
+        self.assertNotIn(".r.exit_code", quote_contract_source)
+        self.assertNotIn("Object.keys(receipt)", quote_contract_source)
         matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
             "For positions and orders, stage each returned page", 1
         )[0]
@@ -1303,7 +1407,11 @@ class DailyLossTests(unittest.TestCase):
         snapshot = routine.split("**Publish the STATUS SNAPSHOT", 1)[1].split(
             "The filename is exactly:", 1
         )[0]
-        self.assertIn("or null only when that telemetry call failed twice", snapshot)
+        self.assertIn(
+            "or null only when both identical-payload attempts failed or had "
+            "invalid aggregates",
+            snapshot,
+        )
         self.assertIn("<clear|tripped|indeterminate|not-evaluated>", snapshot)
         self.assertIn("<integer|null>", snapshot)
 
@@ -1359,6 +1467,14 @@ class DailyLossTests(unittest.TestCase):
             self.assertIn(mutation, refresh)
         self.assertIn('`confirmed`/`queued` protective stops', refresh)
         self.assertIn('mandatory and read-only in LIVE and DRY RUN', refresh)
+        self.assertIn(
+            'CODEX LATER TOKEN PRECONDITION pasted exactly and unmodified',
+            refresh,
+        )
+        self.assertIn(
+            'never author a second invocation/token validator or UUID regular expression',
+            refresh,
+        )
         self.assertIn('every page of `get_equity_positions` as the BEFORE census', refresh)
         self.assertIn('`get_portfolio`', refresh)
         self.assertIn('`get_realized_pnl`', refresh)
@@ -1400,6 +1516,21 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn('lease remains valid', refresh)
         self.assertIn('release normally', refresh)
         self.assertIn('previous truthful snapshot', refresh)
+
+        realized_contract = routine.split(
+            '**Cost-basis realized P&L is telemetry only:**', 1
+        )[1].split('### RUN THESE STEPS IN ORDER', 1)[0]
+        self.assertIn('sole aggregate dollar figure is `data.total_returns`', realized_contract)
+        self.assertIn('finite base-10 decimal string', realized_contract)
+        self.assertIn('`data.total_returns: "0"` is a valid $0 result', realized_contract)
+        self.assertIn("`number_of_trades` is zero", realized_contract)
+        self.assertIn("`realized_gain` is null", realized_contract)
+        self.assertIn('both attempts fail or are invalid', realized_contract)
+        self.assertIn(
+            'a structurally successful but invalid aggregate spends the same one retry',
+            refresh,
+        )
+        self.assertIn('then only that telemetry is unavailable and null', refresh)
 
         snapshot = routine[publish_start : routine.index('The filename is exactly:', publish_start)]
         self.assertIn(
@@ -6945,6 +7076,18 @@ class BrokerSnapshotTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout),
+                {
+                    'schema_version': 1,
+                    'action': 'discover-symbols',
+                    'ok': True,
+                    'trading_date_et': '2026-08-04',
+                    'as_of_utc': '2026-08-04T19:00:00Z',
+                    'symbol_count': 0,
+                    'symbols': [],
+                },
+            )
             with open(symbols_output, encoding='utf-8') as handle:
                 self.assertEqual(json.load(handle), [])
 

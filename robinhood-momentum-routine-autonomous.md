@@ -211,10 +211,13 @@ const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 const commandArgs = command => {
   const args = {cmd: command, yield_time_ms: 30000, max_output_tokens: 2000};
@@ -308,10 +311,13 @@ const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 const cwdArgs = isWindows
   ? {cmd: "[Console]::Out.Write((Get-Location).Path)", shell: "powershell.exe", yield_time_ms: 30000, max_output_tokens: 1000}
@@ -393,10 +399,13 @@ const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 const runJournal = async suffix => {
   const command = (isWindows ? "& " : "") + quote(pythonExe) +
@@ -467,10 +476,13 @@ const LEASE_KEY = "rhmra.lease-state.v1";
 const STATE_KEY = "rhmra.transport-state.v1";
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 let expectedScratchId = null;
 let expectedSourceRootId = null;
@@ -715,10 +727,13 @@ const runLockToken = lease.run_lock_token;
 const quotedRunLockToken = quote(lease.run_lock_token);
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 2000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 const releaseCommand = (isWindows ? "& " : "") + quote(pythonExe) +
   " run_lock.py release --token " + quotedRunLockToken;
@@ -868,9 +883,37 @@ After FIRST has finished all position management, collect one fresh breaker snap
 
 **Deterministic response staging is mandatory.** The startup SAVE TRANSPORT BINDING is the sole authority for where and how every complete broker result crosses into a file. Never use a harness visualization/output path, an arbitrary tool-result path, another temporary directory, or a later path probe—even if the completed broker call advertises one. Never invent or search for a result filename. There is exactly one bound `SOURCE_ROOT`, one proven file-change facility, and zero per-generation transport probes.
 
-**SNAPSHOT SOURCE PURPOSE AND PRE-CALL RESERVATION — EXACT:** uppercase `A` and `B` are generation values ONLY for `broker_snapshot.py --generation`, `daily_loss.py --snapshot-generation`, stage-receipt validation, and generation metadata. They are NEVER source-purpose fragments. Every DAILY-LOSS purpose uses the exact lowercase mapping `A → a`, `B → b` and the exact builder below. Its phase/kind pairs are closed: discovery positions/orders, mark quotes, and final portfolio/positions/orders. Every call/page uses its zero-based index, including `0` for a singleton or non-paginated call.
+**SNAPSHOT LOCAL-COMMAND RESULT AND SOURCE RESERVATION — EXACT:** in Codex, every local helper command from DAILY-LOSS item 1 through item 6 MUST use the one `runSnapshotJsonCommand` function below and its one frozen `{process, receipt}` return shape. Define it once for the whole snapshot and do not define, call, pass, or alias another `runHelper`, `runJson`, `runCommand`, or other command-result wrapper anywhere in that snapshot. The sole raw `tools.exec_command` call is the one inside this function; no DAILY-LOSS caller may invoke it directly. Every command check reads `commandResult.process.exit_code`; every parsed JSON value reads `commandResult.receipt`. The properties `.r`, `.j`, `.exit_code` directly on `commandResult`, and `.output` directly on `commandResult` do not exist and are forbidden. The wrapper drains a nested command session, accumulates every output chunk in arrival order, and only then parses exactly one complete JSON value; a nonzero exit or invalid receipt follows the existing fail-closed rule for that specific helper and never authorizes wrapper reinvention. A non-Codex runner uses its one native fully drained command mechanism for the entire snapshot, with one stable process/result shape and one parsed stdout receipt shape; it must not mix raw and wrapped aliases, add a second command wrapper, or replace a direct stdout handoff with an audit-file read. The exact JavaScript property names apply to Codex only; the one-shape and direct-stdout invariants apply to every runner.
+
+Uppercase `A` and `B` are generation values ONLY for `broker_snapshot.py --generation`, `daily_loss.py --snapshot-generation`, stage-receipt validation, and generation metadata. They are NEVER source-purpose fragments. Every DAILY-LOSS purpose uses the exact lowercase mapping `A → a`, `B → b` and the exact builder below. Its phase/kind pairs are closed: discovery positions/orders, mark quotes, and final portfolio/positions/orders. Every call/page uses its zero-based index, including `0` for a singleton or non-paginated call. `projectRoot`, `isWindows`, `pythonExe`, `scratch`, and `quote` below are the unchanged machine-bound values already held by the running snapshot operation.
 
 ```javascript
+const runSnapshotJsonCommand = async command => {
+  const args = {
+    cmd: command,
+    workdir: projectRoot,
+    yield_time_ms: 30000,
+    max_output_tokens: 12000
+  };
+  if (isWindows) args.shell = "powershell.exe";
+  let process = await tools.exec_command(args);
+  let stdout = String(process.output ?? "");
+  while (process.session_id !== undefined) {
+    const next = await tools.write_stdin({
+      session_id: process.session_id,
+      chars: "",
+      yield_time_ms: 30000,
+      max_output_tokens: 12000
+    });
+    stdout += String(next.output ?? "");
+    process = next;
+  }
+  const finalProcess = Object.freeze({...process, output: stdout});
+  let receipt = null;
+  try { receipt = JSON.parse(stdout); } catch {}
+  return Object.freeze({process: finalProcess, receipt});
+};
+
 const buildSnapshotSourcePurpose = (generation, phase, kind, index) => {
   const generationPurposeSlug = generation === "A" ? "a" : generation === "B" ? "b" : null;
   const allowedPhaseKinds = [
@@ -887,9 +930,7 @@ const buildSnapshotSourcePurpose = (generation, phase, kind, index) => {
   return /^[a-z0-9][a-z0-9-]{0,47}$/.test(purpose) ? purpose : null;
 };
 
-const reserveSnapshotSourceBeforeRead = async (
-  generation, phase, kind, index, pythonExe, scratch, isWindows, quote, runHelper
-) => {
+const reserveSnapshotSourceBeforeRead = async (generation, phase, kind, index) => {
   const failure = () => Object.freeze({
     schema_version: 1,
     action: "reserve-snapshot-source",
@@ -901,11 +942,10 @@ const reserveSnapshotSourceBeforeRead = async (
   const command = (isWindows ? "& " : "") + quote(pythonExe) +
     " broker_snapshot.py reserve-source --scratch " + quote(scratch) +
     " --purpose " + quote(purpose);
-  const process = await runHelper(command);
-  let receipt = null;
-  try { receipt = JSON.parse(String(process.output ?? "")); } catch {}
+  const commandResult = await runSnapshotJsonCommand(command);
+  const receipt = commandResult.receipt;
   const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-  if (process.exit_code !== 0 || !receipt || typeof receipt !== "object" ||
+  if (commandResult.process.exit_code !== 0 || !receipt || typeof receipt !== "object" ||
       Array.isArray(receipt) || receipt.schema_version !== 1 ||
       receipt.action !== "reserve-source" || receipt.ok !== true ||
       receipt.status !== "reserved" || receipt.idempotent !== false ||
@@ -925,8 +965,7 @@ const reserveSnapshotSourceBeforeRead = async (
 };
 
 const sourceReservation = await reserveSnapshotSourceBeforeRead(
-  stageGeneration, snapshotPhase, stageKind, pageIndex,
-  pythonExe, scratch, isWindows, quote, runHelper
+  stageGeneration, snapshotPhase, stageKind, pageIndex
 );
 if (!sourceReservation.ok) {
   text(JSON.stringify(sourceReservation));
@@ -936,7 +975,7 @@ if (!sourceReservation.ok) {
 const fullToolResult = await resolvedSnapshotRead(brokerArguments);
 ```
 
-This exact order applies to every DAILY-LOSS broker response in A and B: build the canonical lowercase purpose; successfully reserve it; only then invoke that page's broker tool; write the complete returned object once to `sourceReservation.source`; commit with `sourceReservation.purpose` and `sourceReservation.reservation_id`; stage using that same committed `sourceReservation.purpose`; bind the stage receipt; then begin another page/call. Never define or use a `saveSource(purpose, fullToolResult)`-style helper that reserves after accepting an already-returned response. Never call a broker tool and then reserve its purpose. If reservation fails, no broker call has occurred; emit the compact failure and stop. If the broker read fails after reservation, use only the POST-BIND recipe's fixed `connector-failed` abort path. Do not reuse the purpose variable passed into a helper when a validated receipt exists; commit and stage only with `sourceReservation.purpose`.
+This exact order applies to every DAILY-LOSS broker response in A and B: build the canonical lowercase purpose; successfully reserve it through `runSnapshotJsonCommand`; only then invoke that page's broker tool; write the complete returned object once to `sourceReservation.source`; commit with `sourceReservation.purpose` and `sourceReservation.reservation_id`; stage using that same committed `sourceReservation.purpose`; bind the stage receipt; then begin another page/call. Never define or use a `saveSource(purpose, fullToolResult)`-style helper that reserves after accepting an already-returned response. Never call a broker tool and then reserve its purpose. If reservation fails, no broker call has occurred; emit the compact failure and stop. If the broker read fails after reservation, use only the POST-BIND recipe's fixed `connector-failed` abort path. Do not reuse the purpose variable passed into a helper when a validated receipt exists; commit and stage only with `sourceReservation.purpose`.
 
 For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into a fresh, generation-specific file in the marked machine-loaded `<scratch>` directory using the exact kind-specific command below. Use uppercase `A` throughout generation A and uppercase `B` throughout generation B only in the generation-valued arguments/receipts named above; source purposes always use the exact lowercase builder. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, the exact `kind` and `generation`, a canonical `set_id`, JSON-boolean `complete`, positive integer `file_count` equal to both the length of `files` and the length of `output_paths`, an ordered string `output_paths` entry for every requested output, and a validated hash/provenance descriptor object in `files` for every requested output. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. Every `files[i]` is a descriptor object, never a path. Its nested `files[i].output` must equal `output_paths[i]`, while only the separately bound `output_paths[i]` string may be passed to a command or retained as a staged-file path. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
 
@@ -944,7 +983,7 @@ For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE
 
 ```javascript
 const bindStageOutputPaths = (
-  stageReceipt, expectedKind, expectedGeneration, expectedComplete, requestedOutputs
+  commandResult, expectedKind, expectedGeneration, expectedComplete, requestedOutputs
 ) => {
   const failure = () => Object.freeze({
     schema_version: 1,
@@ -952,6 +991,11 @@ const bindStageOutputPaths = (
     ok: false,
     failure: "stage-receipt-invalid"
   });
+  if (!commandResult || typeof commandResult !== "object" ||
+      !commandResult.process || commandResult.process.exit_code !== 0) {
+    return failure();
+  }
+  const stageReceipt = commandResult.receipt;
   const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const allowedKinds = new Set(["portfolio", "positions", "orders", "quotes"]);
   if (!stageReceipt || typeof stageReceipt !== "object" || Array.isArray(stageReceipt) ||
@@ -991,8 +1035,9 @@ const bindStageOutputPaths = (
     output_paths: Object.freeze(outputPaths)
   });
 };
+const stageCommandResult = await runSnapshotJsonCommand(stageCommand);
 const stageBinding = bindStageOutputPaths(
-  stageReceipt, stageKind, stageGeneration, expectedComplete, requestedOutputs
+  stageCommandResult, stageKind, stageGeneration, expectedComplete, requestedOutputs
 );
 if (!stageBinding.ok) {
   text(JSON.stringify(stageBinding));
@@ -1024,7 +1069,58 @@ Run the following steps for generation A:
 
 1. Re-fetch every page of `get_equity_positions` and every page of `get_equity_orders`; immediately stage each response under this generation's unique DISCOVERY prefix, then use a proved terminal singleton directly or aggregate-seal only a multi-page set as specified above. Do not fetch or stage a DISCOVERY portfolio: symbol discovery derives its exact quote set only from positions and executions, and `daily_loss.py --symbols-out` rejects the calculation-only `--portfolio`, `--quotes`, and `--halt-pct` options. The authoritative portfolio is still fetched fresh in the separate FINAL set at item 5. For orders, use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter — pass only the account number on the first request and the returned cursor on later pages. An old GTC order created days ago can fill today, a cancelled-rest order can contain a partial execution, and manual/app activity changes the same account-wide loss. Follow `data.next` until it is absent/empty. Missing, failed, malformed, skipped, unstaged, or incomplete pagination fails this entire generation.
 2. Immediately after those discovery sets are staged and sealed, run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` for the DAILY-LOSS DISCOVERY reading. Require valid `utc` and `date_et`, and require this `date_et` to equal START CLOCK's `date_et`; otherwise the breaker is INDETERMINATE. A constants hash/validation failure remains a FULL-RUN CONFIGURATION HALT.
-3. Ask the helper for the exact quote set — Windows/PowerShell: `py -3 daily_loss.py --positions <sealed discovery position-page files> --orders <sealed discovery order-page files> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS DISCOVERY utc> --symbols-out <scratch>/daily-loss-<generation>-symbols.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. The file must parse as one JSON array of unique ticker strings. Fetch `get_equity_quotes` for exactly those symbols in batches of at most 20 (the connector omits official closes above 20), immediately stage every response with that generation, use one proved terminal batch directly, and aggregate-seal only when there are multiple quote batches. An empty symbol array requires no quote call.
+3. Ask the helper for the exact quote set — Windows/PowerShell: `py -3 daily_loss.py --positions <sealed discovery position-page files> --orders <sealed discovery order-page files> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS DISCOVERY utc> --symbols-out <scratch>/daily-loss-<generation>-symbols.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. Codex runs this command through `runSnapshotJsonCommand` and binds stdout with the exact recipe below; a non-Codex runner uses the single-shape fully drained native equivalent defined above and enforces the same receipt fields. The atomically written symbols file is an audit artifact only: NEVER read it with a file tool, shell command, `Get-Content`, or second Python command. Use only the bound receipt's frozen `symbols` array (or the non-Codex runner's immutable equivalent). Fetch `get_equity_quotes` for exactly those symbols in batches of at most 20 (the connector omits official closes above 20), immediately stage every response with that generation, use one proved terminal batch directly, and aggregate-seal only when there are multiple quote batches. An empty bound symbol array requires no quote call.
+
+```javascript
+const bindDiscoveredSymbols = (
+  commandResult, expectedTradingDateEt, expectedAsOfUtc
+) => {
+  const failure = () => Object.freeze({
+    schema_version: 1,
+    action: "bind-discovered-symbols",
+    ok: false,
+    failure: "symbol-discovery-receipt-invalid"
+  });
+  if (!commandResult || typeof commandResult !== "object" ||
+      !commandResult.process || commandResult.process.exit_code !== 0) {
+    return failure();
+  }
+  const receipt = commandResult.receipt;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt) ||
+      receipt.schema_version !== 1 || receipt.action !== "discover-symbols" ||
+      receipt.ok !== true || receipt.trading_date_et !== expectedTradingDateEt ||
+      receipt.as_of_utc !== expectedAsOfUtc ||
+      !Number.isSafeInteger(receipt.symbol_count) || receipt.symbol_count < 0 ||
+      !Array.isArray(receipt.symbols) || receipt.symbols.length !== receipt.symbol_count) {
+    return failure();
+  }
+  const symbols = [];
+  const seen = new Set();
+  for (const symbol of receipt.symbols) {
+    if (typeof symbol !== "string" || symbol.length < 1 || symbol !== symbol.trim() ||
+        symbol !== symbol.toUpperCase() || seen.has(symbol)) {
+      return failure();
+    }
+    seen.add(symbol);
+    symbols.push(symbol);
+  }
+  return Object.freeze({
+    schema_version: 1,
+    action: "bind-discovered-symbols",
+    ok: true,
+    symbols: Object.freeze(symbols)
+  });
+};
+const symbolCommandResult = await runSnapshotJsonCommand(symbolCommand);
+const symbolBinding = bindDiscoveredSymbols(
+  symbolCommandResult, startClock.date_et, dailyLossDiscoveryClock.utc
+);
+if (!symbolBinding.ok) {
+  text(JSON.stringify(symbolBinding));
+  exit();
+}
+const requiredQuoteSymbols = symbolBinding.symbols;
+```
 4. Immediately after every quote response is staged and the quote set is sealed (or immediately after discovery when the symbol array is empty), run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` again for the DAILY-LOSS FINAL reading. Validate it exactly like the discovery reading and require its `date_et` to equal START CLOCK's `date_et`. This reading must occur after the quotes so the helper can reject a quote timestamp from the future. A constants hash/validation failure remains a FULL-RUN CONFIGURATION HALT.
 5. Now re-fetch `get_portfolio`, every page of `get_equity_positions`, and every unfiltered page of `get_equity_orders` into a separate generation-specific FINAL set, immediately staging every response and aggregate-sealing position/order pages exactly as in item 1. The FINAL clock is deliberately just before this verification snapshot: an execution that happens during these calls has a timestamp later than the cutoff and makes the helper fail closed; an execution that happened during quote collection is included. Never evaluate with the earlier discovery files. If the account changed enough that the final required quote set differs, the helper's missing/unexpected-symbol check fails this generation instead of mixing snapshots.
 6. Run the authoritative evaluation using ONLY this generation's sealed inputs — Windows/PowerShell: `py -3 daily_loss.py --portfolio <sealed FINAL portfolio file> --positions <all sealed FINAL position-page files> --orders <all sealed FINAL order-page files> --quotes <all sealed quote-batch files, omit this option when the discovery symbol array is empty> --snapshot-generation <A|B> --trading-date <START date_et> --as-of-utc <DAILY-LOSS FINAL utc> --halt-pct <DAILY_LOSS_HALT_PCT> --json-out <scratch>/daily-loss-<generation>.json`; Linux/macOS: the same command with `python3`. Pass the generation being executed exactly. On success, stdout is exactly one compact JSON object containing the complete authoritative result, semantically identical to the atomically written `--json-out` document. Bind and validate that stdout object directly. The file is retained only as a scratch audit artifact: do not read it with a file tool, shell command, or second Python command, and never embed its Windows path in `-c` source. Missing, extra, malformed, or non-JSON stdout fails this generation even if a file exists. The evaluator rejects unstaged, unsealed, wrong-kind, hash-changed, cross-scratch, or cross-generation inputs. Do not re-key, summarize, hand-transcribe, repair, or substitute any broker response.
@@ -1041,7 +1137,7 @@ If the validated result says `"tripped"` / `halt_new_buys: true`, fire the HALT 
 
 **REALIZED P&L PAYLOAD — every `get_realized_pnl` call in this routine, first attempt and retry alike, sends exactly these four arguments and nothing else:** `{ "account_number": "<resolved at runtime>", "span": "day", "asset_classes": ["equity"], "timezone": "America/New_York" }`. `asset_classes` is documented as optional but the backend REQUIRES it — omitting it fails the call with `InvalidArgument: un-specified asset class`. `start_date` and `end_date` are NOT arguments of this call: never substitute a date-range form, never drop `span` or `timezone`, and never vary arguments between attempts.
 
-**Cost-basis realized P&L is telemetry only:** retain that dashboard/report call, but NEVER feed its result into `daily_loss.py` or override the helper verdict with it. If this telemetry call fails twice, report it as unavailable and publish `realized_pnl_today: null` in the status snapshot — never substitute $0. A telemetry-only failure does not invalidate an otherwise validated broker-day calculation.
+**Cost-basis realized P&L is telemetry only:** retain that dashboard/report call, but NEVER feed its result into `daily_loss.py` or override the helper verdict with it. For a successful non-error response, the sole aggregate dollar figure is `data.total_returns`: require it to be a finite base-10 decimal string and publish its numeric value. Never derive the headline from a `data_points[].realized_gain` bucket. In particular, `data.total_returns: "0"` is a valid $0 result when `number_of_trades` is zero even if a returned bucket's `realized_gain` is null. A missing, malformed, or non-finite aggregate makes that attempt invalid and uses the one identical-payload retry. Only when both attempts fail or are invalid may the report call the telemetry unavailable and the status publish `realized_pnl_today: null`; never substitute an estimated zero. A telemetry-only failure does not invalidate an otherwise validated broker-day calculation.
 
 ### RUN THESE STEPS IN ORDER
 
@@ -1192,11 +1288,11 @@ After `review_equity_order` returns clean and immediately before intent preparat
 
 **REPORT phase-entry fence:** before any REPORT broker call or artifact work, perform and validate the required REPORT lease renewal with the retained `PYTHON_EXE` and exact `RUN_LOCK_TOKEN`. Then call exactly once `run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase report` with the retained launcher. Require an exact success envelope for that invocation and phase; on any marker failure, do not retry and leave only the strategy split unavailable before continuing under the valid lease. Lifecycle `finish` is never a strategy boundary.
 
-**FINAL STATUS REFRESH — ONE COHERENT POST-MUTATION GENERATION:** Immediately after successfully renewing the REPORT lease, and only after every profit-take, dust sweep, stop fill/repair, entry buy, partial fill, cancellation, and replacement order workflow has been fully reconciled to its prescribed final state, perform this refresh before writing the report or status snapshot. Valid final states explicitly include `confirmed`/`queued` protective stops and terminal or explicitly indeterminate mutation orders, as applicable. It is mandatory and read-only in LIVE and DRY RUN. It has no authority to change a gate decision or place/cancel an order, and no broker mutation may occur after it begins.
+**FINAL STATUS REFRESH — ONE COHERENT POST-MUTATION GENERATION:** Immediately after successfully renewing the REPORT lease, and only after every profit-take, dust sweep, stop fill/repair, entry buy, partial fill, cancellation, and replacement order workflow has been fully reconciled to its prescribed final state, perform this refresh before writing the report or status snapshot. Valid final states explicitly include `confirmed`/`queued` protective stops and terminal or explicitly indeterminate mutation orders, as applicable. It is mandatory and read-only in LIVE and DRY RUN. It has no authority to change a gate decision or place/cancel an order, and no broker mutation may occur after it begins. Its broker-call orchestration begins with the CODEX LATER TOKEN PRECONDITION pasted exactly and unmodified; never author a second invocation/token validator or UUID regular expression for this refresh.
 
 1. One final generation consists of these fresh reads in this strict sequence: every page of `get_equity_positions` as the BEFORE census; `get_portfolio`; `get_realized_pnl` with exactly the REALIZED P&L PAYLOAD `{ "account_number": "<resolved at runtime>", "span": "day", "asset_classes": ["equity"], "timezone": "America/New_York" }`; quotes for every positive held symbol in batches of at most 20; every page of `get_equity_orders` for each held symbol with NO state filter; then every page of `get_equity_positions` again as the AFTER census. Complete, validate, and dedupe each call/page before starting the next; these reads are strictly sequential and must never be issued in parallel. Derive stop coverage only with the canonical active-stop predicate from Step 2.
 2. Validate that `total_value`, `cash`, and `equity_value` are present, numeric, and finite; resolve and validate the normalized authoritative buying-power scalar using the rule above; and validate every positive held position. Compute a validation-only held-position fingerprint from sorted `(symbol, exact quantity, average_buy_price)` tuples and require the BEFORE and AFTER fingerprints to match exactly. Also compute validation-only `quoted_equity = sum(quantity * current_price)` from the matching final quotes and require `abs(equity_value - quoted_equity) <= max(0.05, 0.01 * max(abs(equity_value), abs(quoted_equity)))`. Require `equity_value == 0` exactly when the final held-position set is empty. A fingerprint change, a portfolio/quoted-equity mismatch outside that tolerance, a nonzero `equity_value` paired with no held position, or zero `equity_value` paired with a held position is incoherent.
-3. A connector read failure follows the generic immediate one-retry rule. The `get_realized_pnl` retry MUST repeat the identical REALIZED P&L PAYLOAD above, including `span: "day"`, `asset_classes: ["equity"]`, and `timezone: "America/New_York"`; never omit the asset class, substitute a start/end date form, or change arguments between attempts. If a retry also fails, the required final facts are unavailable and a new generation must NOT resurrect the twice-failed read. The sole exception is the existing `get_equity_positions` zero-equity tiebreak: a twice-failed census may count as empty only when the successful portfolio reports `equity_value` exactly zero and the other census either succeeded empty or independently qualifies for the same fallback. `get_realized_pnl` is optional telemetry here: retry it once, then use null if it still fails without invalidating the rest of the generation.
+3. A connector read failure follows the generic immediate one-retry rule. The `get_realized_pnl` retry MUST repeat the identical REALIZED P&L PAYLOAD above, including `span: "day"`, `asset_classes: ["equity"]`, and `timezone: "America/New_York"`; never omit the asset class, substitute a start/end date form, or change arguments between attempts. Its response must also pass the aggregate `data.total_returns` rule above; a structurally successful but invalid aggregate spends the same one retry instead of becoming null immediately. If a required read's retry also fails, the required final facts are unavailable; a new generation must NOT resurrect the twice-failed read. The sole exception is the existing `get_equity_positions` zero-equity tiebreak: a twice-failed census may count as empty only when the successful portfolio reports `equity_value` exactly zero and the other census either succeeded empty or independently qualifies for the same fallback. `get_realized_pnl` is optional telemetry here: retry it once, then only that telemetry is unavailable and null if both attempts fail or are invalid; this does not invalidate the rest of the generation.
 4. Only when every required read succeeded but semantic validation or a coherence check failed, discard the ENTIRE generation and perform exactly one new generation from its first read. This consistency retry is distinct from retrying a failed connector call. There is no third generation, never combine values across generations, and any required read that fails twice during the second generation makes the final facts unavailable.
 5. The successful generation's portfolio is the SOLE source of all four `account` fields in the status JSON, with `account.buying_power` set to the normalized authoritative scalar rather than the raw object. Its AFTER census and matching quotes and stop-order pages are the SOLE source of the `positions` array. Its final `get_realized_pnl` result is the SOLE non-null source of `realized_pnl_today`. Never splice fields or reuse FIRST, SECOND/DAILY-LOSS, pre-buy, or Step 12 symbol-only values for those sections. Earlier guard verdicts may supply only their own event/gate fields.
 
@@ -1237,7 +1333,7 @@ The Windows preflight prepared this directory for that exact cross-facility dire
   "session": "<market_clock session value>",
   "account": { "total_value": <number>, "cash": <number>,
                "buying_power": <number>, "equity_value": <number> },
-  "realized_pnl_today": <number — the get_realized_pnl figure from the FINAL STATUS REFRESH, or null only when that telemetry call failed twice>,
+  "realized_pnl_today": <number — the get_realized_pnl data.total_returns figure from the FINAL STATUS REFRESH, or null only when both identical-payload attempts failed or had invalid aggregates>,
   "positions": [
     { "symbol": "<TICKER>", "quantity": <number>, "avg_buy_price": <number>,
       "current_price": <number — this run's quote>,
@@ -1319,10 +1415,13 @@ const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 const quote = isWindows ? psq : shq;
 const drainCommand = async result => {
   let current = result;
+  let output = String(current.output ?? "");
   while (current.session_id !== undefined) {
-    current = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 4000});
+    const next = await tools.write_stdin({session_id: current.session_id, chars: "", yield_time_ms: 30000, max_output_tokens: 4000});
+    output += String(next.output ?? "");
+    current = next;
   }
-  return current;
+  return Object.freeze({...current, output});
 };
 const command = (isWindows ? "& " : "") + quote(pythonExe) +
   " run_performance.py record-internal --invocation-id " + quote(invocationId) +

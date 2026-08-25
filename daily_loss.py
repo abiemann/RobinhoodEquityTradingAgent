@@ -37,6 +37,9 @@ All monetary and quantity arithmetic uses :class:`decimal.Decimal`.  JSON
 numbers are loaded directly as Decimal values, non-finite JSON constants are
 rejected, pagination is checked, duplicate broker IDs must be identical, and
 malformed or unreconciled input fails without publishing a usable result.
+Both modes emit exactly one compact machine-readable JSON object on stdout
+after their atomic output write; the discovery receipt contains the exact
+ordered quote-symbol array as well as its count and time binding.
 
 The importable entry points are :func:`discover_required_symbols` and
 :func:`calculate_daily_loss`.  They accept already-decoded raw connector
@@ -1317,8 +1320,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _write_json_atomic(args.symbols_out, symbols)
             print(
-                f"{len(symbols)} required quote symbol(s) written to "
-                f"{args.symbols_out}"
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "action": "discover-symbols",
+                        "ok": True,
+                        "trading_date_et": args.trading_date,
+                        "as_of_utc": args.as_of_utc,
+                        "symbol_count": len(symbols),
+                        "symbols": symbols,
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
             )
             return 0
 
