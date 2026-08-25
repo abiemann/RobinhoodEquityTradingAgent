@@ -1117,7 +1117,8 @@ class DailyLossTests(unittest.TestCase):
         )
         self.assertIn("The field is literally `file_count`, never `count`", block)
         self.assertIn(
-            "nonnegative integer `file_count` equal to the length of `files`",
+            "positive integer `file_count` equal to both the length of `files` "
+            "and the length of `output_paths`",
             block,
         )
         self.assertIn(
@@ -1125,6 +1126,91 @@ class DailyLossTests(unittest.TestCase):
             "counting object keys",
             block,
         )
+        purpose_binding = block.split(
+            "**SNAPSHOT SOURCE PURPOSE AND PRE-CALL RESERVATION", 1
+        )[1].split("For every successful broker call", 1)[0]
+        self.assertIn(
+            'const generationPurposeSlug = generation === "A" ? "a" : '
+            'generation === "B" ? "b" : null;',
+            purpose_binding,
+        )
+        for phase_kind in (
+            "discovery:positions",
+            "discovery:orders",
+            "marks:quotes",
+            "final:portfolio",
+            "final:positions",
+            "final:orders",
+        ):
+            self.assertIn(f'"{phase_kind}"', purpose_binding)
+        self.assertIn(
+            'return /^[a-z0-9][a-z0-9-]{0,47}$/.test(purpose)',
+            purpose_binding,
+        )
+        self.assertIn(
+            'receipt.purpose !== purpose', purpose_binding
+        )
+        self.assertIn(
+            'purpose: receipt.purpose', purpose_binding
+        )
+        reserve_position = purpose_binding.index(
+            "const sourceReservation = await reserveSnapshotSourceBeforeRead("
+        )
+        broker_position = purpose_binding.index(
+            "const fullToolResult = await resolvedSnapshotRead(brokerArguments);"
+        )
+        self.assertLess(reserve_position, broker_position)
+        self.assertIn(
+            "ONLY NOW may this page's already-resolved read-only broker tool "
+            "be invoked",
+            purpose_binding,
+        )
+        self.assertIn(
+            "Never define or use a `saveSource(purpose, fullToolResult)`-style "
+            "helper",
+            purpose_binding,
+        )
+        self.assertIn(
+            "Never call a broker tool and then reserve its purpose",
+            purpose_binding,
+        )
+        self.assertNotIn("daily-loss-A-", purpose_binding)
+        self.assertNotIn("daily-loss-B-", purpose_binding)
+        receipt_binding = block.split(
+            "**STAGE RECEIPT PATH BINDING", 1
+        )[1].split("**STAGING COMMAND MATRIX", 1)[0]
+        for kind in ("portfolio", "positions", "orders", "quotes"):
+            self.assertIn(f'"{kind}"', receipt_binding)
+        self.assertIn(
+            "stageReceipt.file_count !== stageReceipt.files.length",
+            receipt_binding,
+        )
+        self.assertIn(
+            "stageReceipt.file_count !== stageReceipt.output_paths.length",
+            receipt_binding,
+        )
+        self.assertIn("descriptor.output !== outputPath", receipt_binding)
+        self.assertIn("outputPath !== requestedOutputs[i]", receipt_binding)
+        self.assertIn(
+            "const stagedOutputPaths = stageBinding.output_paths;",
+            receipt_binding,
+        )
+        self.assertIn(
+            "Use only `stagedOutputPaths` after that binding",
+            receipt_binding,
+        )
+        self.assertIn(
+            "Access to `stageReceipt.files` outside the exact validator is "
+            "forbidden",
+            receipt_binding,
+        )
+        self.assertIn("MUST NOT consume generation B", receipt_binding)
+        validator_source = receipt_binding.split("```javascript", 1)[1].split(
+            "```", 1
+        )[0]
+        self.assertNotIn("stageReceipt.files[0]", validator_source)
+        self.assertNotIn("String(descriptor)", validator_source)
+        self.assertNotIn("descriptor.toLowerCase", validator_source)
         matrix = block.split("**STAGING COMMAND MATRIX", 1)[1].split(
             "For positions and orders, stage each returned page", 1
         )[0]
@@ -1176,8 +1262,8 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("aggregate-seal", block)
         self.assertIn("`complete: true` and `file_count: 1`", block)
         self.assertIn(
-            "use it directly and do not stage it again under a retry or "
-            "aggregate filename",
+            "use that bound string directly and do not stage it again under a "
+            "retry or aggregate filename",
             block,
         )
         self.assertIn("abandon ALL of A", block)
@@ -4590,7 +4676,13 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, aborted)
 
     def test_source_handoff_rejects_invalid_purpose_and_non_strict_json(self):
-        invalid_purposes = ('', 'Uppercase', 'bad_key', 'a' * 49)
+        invalid_purposes = (
+            '',
+            'Uppercase',
+            'daily-loss-A-discovery-positions-0',
+            'bad_key',
+            'a' * 49,
+        )
         for purpose in invalid_purposes:
             with self.subTest(purpose=purpose), tempfile.TemporaryDirectory() as td:
                 scratch = os.path.join(td, 'scratch')
@@ -6746,6 +6838,14 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, sealed)
             self.assertTrue(sealed['complete'])
             self.assertEqual(sealed['file_count'], 2)
+            self.assertEqual(
+                sealed['output_paths'],
+                [os.path.abspath(sealed_one), os.path.abspath(sealed_two)],
+            )
+            self.assertEqual(
+                [item['output'] for item in sealed['files']],
+                sealed['output_paths'],
+            )
             validate_generation_inputs(
                 {'positions': [sealed_one, sealed_two]}, 'A'
             )
@@ -6804,10 +6904,23 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(positions_proc.returncode, 0, positions_receipt)
             self.assertEqual(orders_proc.returncode, 0, orders_receipt)
-            for receipt in (positions_receipt, orders_receipt):
+            for receipt, expected_output in (
+                (positions_receipt, positions_output),
+                (orders_receipt, orders_output),
+            ):
                 self.assertTrue(receipt['complete'])
                 self.assertEqual(receipt['file_count'], 1)
                 self.assertEqual(len(receipt['files']), 1)
+                self.assertIsInstance(receipt['files'][0], dict)
+                self.assertEqual(
+                    receipt['output_paths'], [os.path.abspath(expected_output)]
+                )
+                self.assertEqual(
+                    receipt['files'][0]['output'], receipt['output_paths'][0]
+                )
+                self.assertNotEqual(
+                    receipt['files'][0], receipt['output_paths'][0]
+                )
 
             validate_generation_inputs(
                 {
@@ -9617,12 +9730,22 @@ class MarketClockTests(unittest.TestCase):
             startup_recipe.index(
                 'const state = requireState("preflight-bound");'
             ),
+            startup_recipe.index(
+                'const GET_ACCOUNTS_TOOL = '
+                '"mcp__robinhood_mcp__get_accounts";'
+            ),
+        )
+        self.assertLess(
+            startup_recipe.index(
+                'const GET_ACCOUNTS_TOOL = '
+                '"mcp__robinhood_mcp__get_accounts";'
+            ),
             startup_recipe.index(target_declaration),
         )
         self.assertLess(
             startup_recipe.index(target_declaration),
             startup_recipe.index(
-                'await tools.<resolved_get_accounts_tool>({})'
+                'await resolvedGetAccountsTool({})'
             ),
         )
         self.assertLess(
@@ -9630,7 +9753,7 @@ class MarketClockTests(unittest.TestCase):
                 'phase: "account-call-started", canary_path: targetPath'
             ),
             startup_recipe.index(
-                'await tools.<resolved_get_accounts_tool>({})'
+                'await resolvedGetAccountsTool({})'
             ),
         )
         self.assertIn('const parsed = JSON.parse(payload);', startup_recipe)
@@ -9672,7 +9795,8 @@ class MarketClockTests(unittest.TestCase):
             'phase: "account-retry-started"'
         )
         retry_call_position = startup_recipe.index(
-            'await tools.<same_resolved_get_accounts_tool>({})'
+            'await resolvedGetAccountsTool({})',
+            startup_recipe.index('phase: "account-retry-started"'),
         )
         exhausted_position = startup_recipe.index(
             'canary_path: null, failure_code: "account-scope-failed"'
@@ -9698,6 +9822,11 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             'error: {code: "account-scope-failed"}', startup_recipe
         )
+        self.assertEqual(
+            startup_recipe.count('await resolvedGetAccountsTool({})'), 2
+        )
+        self.assertNotIn('<resolved_get_accounts_tool>', startup_recipe)
+        self.assertNotIn('<same_resolved_get_accounts_tool>', startup_recipe)
         self.assertNotIn('text(fullToolResult', startup_recipe)
         self.assertNotIn('text(first', startup_recipe)
         for loaded_argument in (
@@ -10388,7 +10517,9 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertLess(
             accounts_code.index("requireLease(expectedInvocationId);"),
-            accounts_code.index("fullToolResult = await tools."),
+            accounts_code.index(
+                "fullToolResult = await resolvedGetAccountsTool({});"
+            ),
         )
 
         later_contract = coordination.split(
@@ -11856,6 +11987,15 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             'startup sequence reaches item 13 after items 1–12 have succeeded',
             'not exposed or callable',
+            'filtered `ALL_TOOLS` for the one canonical name',
+            '`mcp__robinhood_mcp__get_accounts`',
+            'Never infer absence from the initially displayed namespace',
+            'Exactly one metadata match whose property is callable MUST proceed',
+            'zero matches, duplicate matches, or one non-callable match',
+            'Never choose among duplicates',
+            '`get-accounts-zero-matches`',
+            '`get-accounts-noncallable-match`',
+            '`get-accounts-duplicate-matches`',
             'No Robinhood request was attempted',
             '`coordination-halt` / `account-scope-failed`',
             'release the lease',
@@ -11886,6 +12026,72 @@ class MarketClockTests(unittest.TestCase):
             'never use the CLI to create a duplicate',
         ):
             self.assertIn(required, connector)
+
+        transport_binding = routine.split(
+            '**SAVE TRANSPORT BINDING', 1
+        )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
+        startup_recipe = transport_binding.split(
+            '**EXACT CODEX STARTUP SAVE-AND-BIND RECIPE', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
+        exact_name = (
+            'const GET_ACCOUNTS_TOOL = '
+            '"mcp__robinhood_mcp__get_accounts";'
+        )
+        discovery = startup_recipe.index('ALL_TOOLS.filter(entry =>')
+        terminal_guard = startup_recipe.index(
+            'if (toolResolutionFailure !== null)'
+        )
+        terminal_exit = startup_recipe.index('exit();', terminal_guard)
+        call_started = startup_recipe.index(
+            'phase: "account-call-started", canary_path: targetPath'
+        )
+        first_call = startup_recipe.index(
+            'await resolvedGetAccountsTool({})'
+        )
+        self.assertIn(exact_name, startup_recipe)
+        self.assertIn('entry.name === GET_ACCOUNTS_TOOL', startup_recipe)
+        self.assertIn('getAccountsMatches.length === 0', startup_recipe)
+        self.assertIn('getAccountsMatches.length > 1', startup_recipe)
+        self.assertIn(
+            'typeof getAccountsCandidate !== "function"', startup_recipe
+        )
+        self.assertIn(
+            'const resolvedGetAccountsTool = '
+            'getAccountsCandidate.bind(tools);',
+            startup_recipe,
+        )
+        capture = startup_recipe.index(
+            'const resolvedGetAccountsTool = '
+            'getAccountsCandidate.bind(tools);'
+        )
+        self.assertLess(discovery, terminal_guard)
+        self.assertLess(terminal_guard, terminal_exit)
+        self.assertLess(terminal_exit, call_started)
+        self.assertLess(capture, call_started)
+        self.assertLess(call_started, first_call)
+        self.assertEqual(
+            startup_recipe.count('ALL_TOOLS.filter(entry =>'), 1
+        )
+        self.assertEqual(
+            startup_recipe.count('tools[getAccountsMatches[0].name]'), 1
+        )
+        self.assertEqual(
+            startup_recipe.count('getAccountsCandidate.bind(tools)'), 1
+        )
+        self.assertEqual(
+            startup_recipe.count('await resolvedGetAccountsTool({})'), 2
+        )
+        self.assertNotIn('entry.description', startup_recipe)
+        terminal_branch = startup_recipe[terminal_guard:terminal_exit]
+        for required in (
+            'phase: "terminal"',
+            'canary_path: null',
+            'failure_code: "account-scope-failed"',
+            'tool_resolution: toolResolutionFailure',
+            'action: "account-tool-resolution-failed"',
+            'resolution: toolResolutionFailure',
+        ):
+            self.assertIn(required, terminal_branch)
 
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             readme = f.read()

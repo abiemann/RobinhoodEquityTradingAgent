@@ -57,6 +57,10 @@ Accepted source shapes are deliberately narrow:
 
 Every operational invocation writes exactly one JSON object to stdout.  The
 script is stdlib-only and preserves JSON number precision with ``Decimal``.
+A successful ``stage`` receipt keeps detailed provenance records in ``files``
+and exposes their exact ordered path strings separately in ``output_paths``.
+Consumers must use ``output_paths`` for argv/path handoffs; a ``files`` entry is
+a descriptor object, never a pathname.
 """
 
 from __future__ import annotations
@@ -2369,6 +2373,7 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
         "set_id": set_id,
         "complete": not allow_more,
         "file_count": len(files),
+        "output_paths": [entry["output"] for entry in files],
         "files": files,
     }
 

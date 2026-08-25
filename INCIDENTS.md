@@ -628,6 +628,25 @@ halt, not a retryable connector call or an empty-account result. The visible hal
 reauthorizing or re-creating the Robinhood MCP connection, restarting Codex, and verifying that a
 fresh task exposes `get_accounts` before scheduled trading resumes.
 
+**2026-08-25 06:33 and 07:33, Codex mistook deferred Robinhood tools for an absent connector.**
+Both invocations completed deterministic startup, but Codex declared `get_accounts` unavailable
+without consulting its `ALL_TOOLS` registry and closed as `coordination-halt` /
+`account-scope-failed`. The same single active automation's adjacent 07:03 and 08:03 invocations
+did consult that registry, found `mcp__robinhood_mcp__get_accounts`, and continued; the 08:03 run
+completed its scan. The false halts made no Robinhood request or broker mutation and released their
+leases, so fail-closed containment worked, but their authorization recovery message diagnosed a
+connector failure that had not been established.
+
+**Rule produced:** in Codex, a tool missing from the initially displayed namespace is not proof
+that it is unavailable. Immediately before startup item 13, the exact composed operation filters
+`ALL_TOOLS` for the canonical Robinhood `get_accounts` registration. One exact callable match ends
+discovery and must be invoked; zero matches or one non-callable match enters the unavailable-tool
+path, while duplicate exact matches fail closed without choosing. The retry reuses the same
+captured callable and never repeats discovery. Skipped discovery alone never authorizes
+reauthentication, connector removal, or an expired-authorization diagnosis. This supersedes none
+of the 2026-08-11 real `invalid_grant` recovery rule; it adds the proof required before that rule
+applies.
+
 ## REPORT — halted-run discipline
 
 **2026-07-13.** Identical halted runs ranged 13.5K–50K tokens (~3×) purely from improvised
@@ -1197,6 +1216,58 @@ helper-owned object keys. A terminal singleton positions/order page or quote bat
 complete sealed set, so it is consumed directly when the helper proves `complete: true` and
 `file_count: 1`; only real multi-page or multi-batch sets are aggregate-staged. Hash, provenance,
 cursor, scratch, generation, and FINAL-snapshot validation remain unchanged.
+
+**2026-08-25 08:03 and 08:33, the runner treated a stage descriptor object as a pathname.** At
+08:33 the first positions response was successfully reserved, saved, committed, semantically
+validated, atomically staged, and sealed as one terminal page. Model-authored glue then compared
+`stage.files[0]` directly with the requested output string. The comparison could never succeed:
+`files[0]` is the helper's provenance descriptor object and its pathname is nested at
+`files[0].output`. The run falsely closed as `snapshot-failure` / `snapshot-write-failed` even
+though neither the broker read nor the write/stage operation failed. It made only the account and
+positions reads; no scan, review, order, cancellation, notification, or broker mutation occurred.
+
+The successful 08:03 run had already exercised the same bug without exposing it on the dashboard.
+It passed `stage.files[0]` as a `daily_loss.py` argument, consumed fresh A and B files while trying
+to repair the resulting path rejection, and then called `.toLowerCase()` on the object before
+eventually inspecting the receipt and recovering with `.files[0].output`. Generation B was thereby
+spent on runner glue rather than a semantic/coherence failure. The earlier `count` rule named the
+relationship in prose but did not make the usable path type mechanically unambiguous.
+
+**Rule produced:** `broker_snapshot.py stage` now preserves its existing detailed `files[]`
+descriptors and additionally derives one ordered `output_paths[]` string list from their nested
+outputs. One exact receipt binder validates action, kind, generation, completion, set identity,
+counts, descriptor shape, and index-for-index equality with the submitted `--output` strings for
+every staged kind, page, singleton, and aggregate. Downstream code receives only the frozen
+`output_paths` strings. It may never compare, stringify, lowercase, or pass a `files[i]` descriptor
+as a path. A runner receipt-binding failure stops immediately and cannot spend generation B; the
+one A→B retry remains reserved for a fully persisted generation's semantic/coherence failure.
+
+**2026-08-25 09:35, the runner reserved after the broker read and put uppercase generation identity
+inside a lowercase journal purpose.** The run had loaded the new `output_paths` receipt contract
+and successfully used it during earlier staging, so this was not the 08:33 descriptor bug or stale
+routine text. At DAILY-LOSS discovery it called `get_equity_positions` successfully and only then
+tried to reserve `daily-loss-A-discovery-positions-0`. `reserve-source` correctly rejected uppercase
+`A` because immutable source purposes accept only lowercase letters, digits, and hyphens. Since the
+read had already happened without a reservation, its complete response could not be persisted,
+reconstructed, or fetched again; the run closed `snapshot-failure` / `snapshot-write-failed` before
+orders discovery or scanning. Exactly five Robinhood calls occurred, all successful read-only
+account/positions/portfolio/SPY/positions calls. The account was flat and no review, order,
+cancellation, notification, or broker mutation occurred. Lease release, report read-back, and
+lifecycle finalization all succeeded.
+
+The routine did state that source purposes are lowercase, but the adjacent instruction to use `A`
+throughout generation A was broad enough for the runner to interpolate it into the purpose. The
+generic save helper also accepted an already-returned response and therefore made reservation
+happen too late, contradicting the pre-call fence in the source-journal section.
+
+**Rule produced:** uppercase `A`/`B` is now scoped only to helper generation arguments, receipt
+validation, and generation metadata. A closed exact builder maps those values to lowercase purpose
+slugs `a`/`b`, allows only the DAILY-LOSS discovery/marks/final kind pairs and a bounded page index,
+and validates the canonical grammar before any command. An exact reservation operation must then
+succeed before the corresponding broker callable is awaited. The successful reservation receipt's
+canonical purpose and ID are the only values permitted for the write, commit, and stage; a helper
+that accepts an already-returned response and reserves afterward is forbidden. The Python journal
+validator remains strict—there is no case-normalizing alias or collision ambiguity.
 
 **The same review found that Step 10 still made the model extract successful RSI responses into a
 new symbol→numbers map.** That rule was correct in July when the runner had no mechanical

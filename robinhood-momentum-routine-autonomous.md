@@ -101,7 +101,7 @@ This is the one canonical startup order. Complete and validate each numbered ite
 10. Run `order_intents.py check`.
 11. Run `order_intents.py pending --run-token <RUN_LOCK_TOKEN>` using the exact token from item 7.
 12. Resolve `rules_version`.
-13. Load the exact machine-carried preflight state from item 9; never type or paste a path from its visible output. Call `get_accounts` as the first broker operation. An errored connector call may use the routine's one generic read retry inside the same orchestration recipe, but after the first successful response never call it again. Perform the one mandatory SAVE TRANSPORT BINDING below: mechanically derive the canary path from the loaded `SOURCE_ROOT`, save that COMPLETE unchanged successful response exactly once, and invoke `bind-transport` in that same operation with `scratch`, `source_root`, and `canary` taken only from loaded state. Bind transport and account scope only from the helper's validated receipt. Every later Codex source/status path is likewise formed from that loaded state; another runner uses its equivalent opaque structured value. Then handle every pending journal row before FIRST or any broker mutation.
+13. Load the exact machine-carried preflight state from item 9; never type or paste a path from its visible output. In Codex, resolve the exact canonical deferred `get_accounts` tool through `ALL_TOOLS` inside the pinned startup operation below; absence from the initially displayed tool namespace is never evidence that the tool is unavailable. Call `get_accounts` as the first broker operation through that uniquely resolved callable. An errored connector call may use the routine's one generic read retry inside the same orchestration recipe, but after the first successful response never call it again. Perform the one mandatory SAVE TRANSPORT BINDING below: mechanically derive the canary path from the loaded `SOURCE_ROOT`, save that COMPLETE unchanged successful response exactly once, and invoke `bind-transport` in that same operation with `scratch`, `source_root`, and `canary` taken only from loaded state. Bind transport and account scope only from the helper's validated receipt. Every later Codex source/status path is likewise formed from that loaded state; another runner uses its equivalent opaque structured value. Then handle every pending journal row before FIRST or any broker mutation.
 
 Do not create or preflight scratch, touch the order-intent journal, resolve `rules_version`, or call any broker tool before successful lease acquisition and active-context binding. Never invent a placeholder token or substitute `INVOCATION_ID`, another UUID, or a remembered token for `RUN_LOCK_TOKEN`; only the successful `run_lock.py acquire` result can supply it. Items 1–12 normally succeed before the one `get_accounts` transport canary. If item 10 or 11 fails, follow ORDER-INTENT JOURNAL's explicit ORDER-STATE HALT path: resolving the account and making only its named read-only positions/orders calls for a compact diagnostic report is the sole exception, and no broker mutation is permitted. After normal account resolution, allow only the broker reads required for pending-intent recovery until every returned journal row is handled; FIRST and all unrelated broker work wait. A startup step that fails follows its own section's terminal path; never skip forward and repair the sequence after broker access.
 
@@ -116,7 +116,9 @@ The single successful `get_accounts` response used for SAVE TRANSPORT BINDING is
 ### CONNECTOR FAILURES — retry reads once; mutations use their own recovery protocol
 
 **Claude Code recovery-path override:** when the current framework is Claude Code, keep the ACTION REQUIRED, no-request, authorization, fresh-task, and do-not-rerun statements below, but replace the Codex-only settings sentence with: **“In Claude Desktop, first open Customize → Connectors (or Settings → Connectors) and confirm that the existing Robinhood account connector is present and authorized; never create a duplicate. Then open `/mcp` in a Code-tab session with Environment: Local on the native Windows main checkout with worktree isolation off, select the Robinhood server, and choose Re-authenticate. If reauthentication still fails, return to Customize → Connectors (or Settings → Connectors), remove only that single existing Robinhood connector, add it back once there, complete OAuth, and restart Claude; never leave or create a duplicate. Open a fresh session on that same main checkout with worktree isolation off and verify `get_accounts`. For a Local scheduled routine, click Run now and require `get_accounts` there too; that is the proof that the scheduled context can see the connector. Only if no account connector exists and the standalone `claude` CLI is installed may you optionally add this server once with `claude mcp add --transport http robinhood-trading https://agent.robinhood.com/mcp/trading`, complete OAuth through `/mcp`, and optionally confirm it with `claude mcp list`; never use the CLI to create a duplicate. Do not rerun this automation until the fresh-session check and, when applicable, the Run now check succeed.”** Give only the recovery path for the framework actually running.
-When the canonical startup sequence reaches item 13 after items 1–12 have succeeded, if `get_accounts` is not exposed or callable, this is not an errored broker call and cannot use the generic retry below. Make no Robinhood request or order, follow the pre-broker account-scope halt path, release the lease, and finish lifecycle as `coordination-halt` / `account-scope-failed`. The final user-facing COORDINATION HALT must state: **“ACTION REQUIRED — Robinhood MCP connection unavailable. No Robinhood request was attempted. Robinhood authorization may have expired, been revoked, or become invalid. In Codex, open Settings → Plugins → MCPs, select `robinhood-trading` (or the Robinhood server name shown there), choose Authenticate, restart Codex, then open a fresh task and verify `get_accounts` is callable. If it is still absent in that fresh task, remove and re-create the MCP connection, restart Codex, and test `get_accounts` again. Do not rerun this automation until that fresh-task check succeeds.”** Do not claim that the computer was offline or that Robinhood rejected a request without independent evidence.
+When the canonical startup sequence reaches item 13 after items 1–12 have succeeded, if `get_accounts` is not exposed or callable, this is not an errored broker call and cannot use the generic retry below. In Codex, that condition is not established until the exact startup recipe has filtered `ALL_TOOLS` for the one canonical name `mcp__robinhood_mcp__get_accounts`, counted every exact metadata match without deduplicating, and checked the matching `tools[...]` property. Never infer absence from the initially displayed namespace, a fuzzy name/description search, narration, or a skipped lookup. Exactly one metadata match whose property is callable MUST proceed to the broker call; zero matches, duplicate matches, or one non-callable match MUST store the recipe's named terminal resolution failure, make no Robinhood request or retry, release the lease, and finish lifecycle as `coordination-halt` / `account-scope-failed`. Never choose among duplicates or substitute a similarly named tool.
+
+For `get-accounts-zero-matches` or `get-accounts-noncallable-match`, the final user-facing COORDINATION HALT must state: **“ACTION REQUIRED — Robinhood MCP connection unavailable. No Robinhood request was attempted. Robinhood authorization may have expired, been revoked, or become invalid. In Codex, open Settings → Plugins → MCPs, select `robinhood-trading` (or the Robinhood server name shown there), choose Authenticate, restart Codex, then open a fresh task and verify `get_accounts` is callable. If it is still absent in that fresh task, remove and re-create the MCP connection, restart Codex, and test `get_accounts` again. Do not rerun this automation until that fresh-task check succeeds.”** For `get-accounts-duplicate-matches`, instead state: **“ACTION REQUIRED — Codex exposed duplicate exact Robinhood `get_accounts` registrations. No Robinhood request was attempted. Restart Codex, open a fresh task, and verify exactly one canonical `get_accounts` registration is callable. Do not choose one, change authorization, remove a connector, or rerun this automation until the duplicate is gone.”** Do not claim that the computer was offline, authorization failed, or Robinhood rejected a request without independent evidence.
 
 An errored broker call ("The connector's server isn't responding", timeout, etc.) is a FAILED call, never an empty result: "no positions / no orders / no fills" may only be reported from a call that SUCCEEDED. For reads and `review_equity_order`, retry the failed call exactly once, immediately — no third attempt — and draw no conclusion until the retry returns. **Never apply this generic retry paragraph to `place_equity_order` or `cancel_equity_order`.** Placement must use the durable same-`ref_id` protocol in ORDER-INTENT JOURNAL; cancellation must inspect the known order before deciding whether a retry is safe. If a read/review retry also fails:
 - **`get_equity_positions`:** tiebreak with this run's successful `get_portfolio` — `equity_value` of exactly $0 proves the account is flat; proceed with positions = none. If `equity_value` is nonzero, or `get_portfolio` failed too, holdings exist that cannot be audited for stop coverage: place NO orders this run, fire the 🔔 HALT notification, and go to the report.
@@ -499,6 +501,23 @@ expectedScratchId = state.receipt.scratch_id;
 expectedSourceRootId = state.receipt.source_root_id;
 expectedInvocationId = state.context_receipt.invocation_id;
 requireLease(expectedInvocationId);
+const GET_ACCOUNTS_TOOL = "mcp__robinhood_mcp__get_accounts";
+const getAccountsMatches = ALL_TOOLS.filter(entry =>
+  entry && entry.name === GET_ACCOUNTS_TOOL);
+const getAccountsCandidate = getAccountsMatches.length === 1
+  ? tools[getAccountsMatches[0].name] : null;
+const toolResolutionFailure =
+  getAccountsMatches.length === 0 ? "get-accounts-zero-matches" :
+  getAccountsMatches.length > 1 ? "get-accounts-duplicate-matches" :
+  typeof getAccountsCandidate !== "function" ? "get-accounts-noncallable-match" : null;
+if (toolResolutionFailure !== null) {
+  store(STATE_KEY, {...state, phase: "terminal", canary_path: null,
+    failure_code: "account-scope-failed", tool_resolution: toolResolutionFailure});
+  text(JSON.stringify({schema_version: 1, action: "account-tool-resolution-failed",
+    ok: false, resolution: toolResolutionFailure}));
+  exit();
+}
+const resolvedGetAccountsTool = getAccountsCandidate.bind(tools);
 const receipt = state.receipt;
 const separator = receipt.source_root.includes("\\") ? "\\" : "/";
 const targetPath = receipt.source_root + separator + "get-accounts-" + receipt.source_root_id + ".json";
@@ -506,7 +525,7 @@ store(STATE_KEY, {...state, phase: "account-call-started", canary_path: targetPa
 let fullToolResult;
 let firstFailed = false;
 try {
-  fullToolResult = await tools.<resolved_get_accounts_tool>({});
+  fullToolResult = await resolvedGetAccountsTool({});
   firstFailed = !!(fullToolResult && fullToolResult.isError === true);
 } catch (ignored) {
   firstFailed = true;
@@ -515,7 +534,7 @@ if (firstFailed) {
   store(STATE_KEY, {...requireState("account-call-started"), phase: "account-retry-started"});
   let retryFailed = false;
   try {
-    fullToolResult = await tools.<same_resolved_get_accounts_tool>({});
+    fullToolResult = await resolvedGetAccountsTool({});
     retryFailed = !!(fullToolResult && fullToolResult.isError === true);
   } catch (ignored) {
     retryFailed = true;
@@ -588,6 +607,8 @@ store(STATE_KEY, {...savedState, phase: "transport-bound", canary_path: null,
 text(JSON.stringify({schema_version: 1, action: "transport-state-bound", ok: true}));
 }
 ```
+
+The `ALL_TOOLS` filter above is the one mandatory Codex discovery operation for startup account binding. It uses exact-name equality only, counts every match, performs no fuzzy search or description matching, and never emits the registry. A zero-match, duplicate-match, or non-callable-match result stores terminal `account-scope-failed`, emits only the exact compact `account-tool-resolution-failed` object with its fixed resolution string, and exits before `account-call-started`, path derivation, or any broker request. A unique callable is captured once as `resolvedGetAccountsTool`; both allowed attempts use that same captured callable without another registry search or `tools[...]` lookup.
 
 The `account-call-started`, `account-retry-started`, `account-response-received`, and `canary-saved` phases are non-retriable fences. If the cell stops after a possible successful broker call, serialization, file change, or bind attempt, a later cell must fail closed from that phase; it may not call `get_accounts`, save, or bind again. The only permitted read retry is the one inside this cell before a successful response. If that final attempt returns an error or throws inside the still-running cell, the exact recipe records terminal `account-scope-failed`, emits only its compact path-free envelope, and the run finishes `coordination-halt` / `account-scope-failed`; no successful response or save existed, so this is not `snapshot-write-failed`. There must be no `text(...)`, `yield_control()`, assistant narration, raw payload output, or saved-path receipt between a successful broker call and validated bind result. A missing, malformed, or wrong-phase store is `snapshot-failure` / `snapshot-write-failed`, with no reconstruction or retry.
 
@@ -847,7 +868,140 @@ After FIRST has finished all position management, collect one fresh breaker snap
 
 **Deterministic response staging is mandatory.** The startup SAVE TRANSPORT BINDING is the sole authority for where and how every complete broker result crosses into a file. Never use a harness visualization/output path, an arbitrary tool-result path, another temporary directory, or a later path probe—even if the completed broker call advertises one. Never invent or search for a result filename. There is exactly one bound `SOURCE_ROOT`, one proven file-change facility, and zero per-generation transport probes.
 
-For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into a fresh, generation-specific file in the marked machine-loaded `<scratch>` directory using the exact kind-specific command below. Use `A` throughout generation A and `B` throughout generation B. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, the exact `kind` and `generation`, a canonical `set_id`, JSON-boolean `complete`, nonnegative integer `file_count` equal to the length of `files`, and a validated hash/provenance object for every requested output. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
+**SNAPSHOT SOURCE PURPOSE AND PRE-CALL RESERVATION — EXACT:** uppercase `A` and `B` are generation values ONLY for `broker_snapshot.py --generation`, `daily_loss.py --snapshot-generation`, stage-receipt validation, and generation metadata. They are NEVER source-purpose fragments. Every DAILY-LOSS purpose uses the exact lowercase mapping `A → a`, `B → b` and the exact builder below. Its phase/kind pairs are closed: discovery positions/orders, mark quotes, and final portfolio/positions/orders. Every call/page uses its zero-based index, including `0` for a singleton or non-paginated call.
+
+```javascript
+const buildSnapshotSourcePurpose = (generation, phase, kind, index) => {
+  const generationPurposeSlug = generation === "A" ? "a" : generation === "B" ? "b" : null;
+  const allowedPhaseKinds = [
+    "discovery:positions", "discovery:orders", "marks:quotes",
+    "final:portfolio", "final:positions", "final:orders"
+  ];
+  if (generationPurposeSlug === null ||
+      !allowedPhaseKinds.includes(phase + ":" + kind) ||
+      !Number.isSafeInteger(index) || index < 0 || index > 999) {
+    return null;
+  }
+  const purpose = "daily-loss-" + generationPurposeSlug + "-" +
+    phase + "-" + kind + "-" + index;
+  return /^[a-z0-9][a-z0-9-]{0,47}$/.test(purpose) ? purpose : null;
+};
+
+const reserveSnapshotSourceBeforeRead = async (
+  generation, phase, kind, index, pythonExe, scratch, isWindows, quote, runHelper
+) => {
+  const failure = () => Object.freeze({
+    schema_version: 1,
+    action: "reserve-snapshot-source",
+    ok: false,
+    failure: "snapshot-source-reservation-invalid"
+  });
+  const purpose = buildSnapshotSourcePurpose(generation, phase, kind, index);
+  if (purpose === null) return failure();
+  const command = (isWindows ? "& " : "") + quote(pythonExe) +
+    " broker_snapshot.py reserve-source --scratch " + quote(scratch) +
+    " --purpose " + quote(purpose);
+  const process = await runHelper(command);
+  let receipt = null;
+  try { receipt = JSON.parse(String(process.output ?? "")); } catch {}
+  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (process.exit_code !== 0 || !receipt || typeof receipt !== "object" ||
+      Array.isArray(receipt) || receipt.schema_version !== 1 ||
+      receipt.action !== "reserve-source" || receipt.ok !== true ||
+      receipt.status !== "reserved" || receipt.idempotent !== false ||
+      receipt.scratch !== scratch || receipt.purpose !== purpose ||
+      typeof receipt.reservation_id !== "string" || !uuid4.test(receipt.reservation_id) ||
+      typeof receipt.source !== "string" || receipt.source.length < 1) {
+    return failure();
+  }
+  return Object.freeze({
+    schema_version: 1,
+    action: "reserve-snapshot-source",
+    ok: true,
+    purpose: receipt.purpose,
+    reservation_id: receipt.reservation_id,
+    source: receipt.source
+  });
+};
+
+const sourceReservation = await reserveSnapshotSourceBeforeRead(
+  stageGeneration, snapshotPhase, stageKind, pageIndex,
+  pythonExe, scratch, isWindows, quote, runHelper
+);
+if (!sourceReservation.ok) {
+  text(JSON.stringify(sourceReservation));
+  exit();
+}
+// ONLY NOW may this page's already-resolved read-only broker tool be invoked.
+const fullToolResult = await resolvedSnapshotRead(brokerArguments);
+```
+
+This exact order applies to every DAILY-LOSS broker response in A and B: build the canonical lowercase purpose; successfully reserve it; only then invoke that page's broker tool; write the complete returned object once to `sourceReservation.source`; commit with `sourceReservation.purpose` and `sourceReservation.reservation_id`; stage using that same committed `sourceReservation.purpose`; bind the stage receipt; then begin another page/call. Never define or use a `saveSource(purpose, fullToolResult)`-style helper that reserves after accepting an already-returned response. Never call a broker tool and then reserve its purpose. If reservation fails, no broker call has occurred; emit the compact failure and stop. If the broker read fails after reservation, use only the POST-BIND recipe's fixed `connector-failed` abort path. Do not reuse the purpose variable passed into a helper when a validated receipt exists; commit and stage only with `sourceReservation.purpose`.
+
+For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into a fresh, generation-specific file in the marked machine-loaded `<scratch>` directory using the exact kind-specific command below. Use uppercase `A` throughout generation A and uppercase `B` throughout generation B only in the generation-valued arguments/receipts named above; source purposes always use the exact lowercase builder. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, the exact `kind` and `generation`, a canonical `set_id`, JSON-boolean `complete`, positive integer `file_count` equal to both the length of `files` and the length of `output_paths`, an ordered string `output_paths` entry for every requested output, and a validated hash/provenance descriptor object in `files` for every requested output. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. Every `files[i]` is a descriptor object, never a path. Its nested `files[i].output` must equal `output_paths[i]`, while only the separately bound `output_paths[i]` string may be passed to a command or retained as a staged-file path. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
+
+**STAGE RECEIPT PATH BINDING — EXACT, FOR EVERY STAGED KIND AND EVERY PAGE/SINGLETON/AGGREGATE:** before invoking `broker_snapshot.py stage`, retain the exact ordered absolute strings supplied by machine-owned orchestration as its repeated `--output` arguments in `requestedOutputs`; do not recover them from command text or visible output. After exit zero and parsing the one receipt, Codex MUST invoke this exact validator in the same composed operation before any model-visible output or dependent helper. This is a receipt validator only, not a generic staging argv builder; the kind-specific command matrix below remains mandatory.
+
+```javascript
+const bindStageOutputPaths = (
+  stageReceipt, expectedKind, expectedGeneration, expectedComplete, requestedOutputs
+) => {
+  const failure = () => Object.freeze({
+    schema_version: 1,
+    action: "bind-stage-receipt",
+    ok: false,
+    failure: "stage-receipt-invalid"
+  });
+  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const allowedKinds = new Set(["portfolio", "positions", "orders", "quotes"]);
+  if (!stageReceipt || typeof stageReceipt !== "object" || Array.isArray(stageReceipt) ||
+      stageReceipt.schema_version !== 1 || stageReceipt.action !== "stage" ||
+      stageReceipt.ok !== true || !allowedKinds.has(expectedKind) ||
+      stageReceipt.kind !== expectedKind ||
+      (expectedGeneration !== "A" && expectedGeneration !== "B") ||
+      stageReceipt.generation !== expectedGeneration ||
+      typeof expectedComplete !== "boolean" ||
+      stageReceipt.complete !== expectedComplete ||
+      typeof stageReceipt.set_id !== "string" || !uuid4.test(stageReceipt.set_id) ||
+      !Number.isSafeInteger(stageReceipt.file_count) || stageReceipt.file_count < 1 ||
+      !Array.isArray(stageReceipt.files) || !Array.isArray(stageReceipt.output_paths) ||
+      !Array.isArray(requestedOutputs) || requestedOutputs.length < 1 ||
+      stageReceipt.file_count !== stageReceipt.files.length ||
+      stageReceipt.file_count !== stageReceipt.output_paths.length ||
+      stageReceipt.file_count !== requestedOutputs.length) {
+    return failure();
+  }
+  const outputPaths = [];
+  for (let i = 0; i < stageReceipt.file_count; i += 1) {
+    const descriptor = stageReceipt.files[i];
+    const outputPath = stageReceipt.output_paths[i];
+    if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor) ||
+        descriptor.index !== i + 1 || typeof descriptor.output !== "string" ||
+        typeof outputPath !== "string" || outputPath.length < 1 ||
+        typeof requestedOutputs[i] !== "string" || requestedOutputs[i].length < 1 ||
+        descriptor.output !== outputPath || outputPath !== requestedOutputs[i]) {
+      return failure();
+    }
+    outputPaths.push(outputPath);
+  }
+  return Object.freeze({
+    schema_version: 1,
+    action: "bind-stage-receipt",
+    ok: true,
+    output_paths: Object.freeze(outputPaths)
+  });
+};
+const stageBinding = bindStageOutputPaths(
+  stageReceipt, stageKind, stageGeneration, expectedComplete, requestedOutputs
+);
+if (!stageBinding.ok) {
+  text(JSON.stringify(stageBinding));
+  exit();
+}
+const stagedOutputPaths = stageBinding.output_paths;
+```
+
+Use only `stagedOutputPaths` after that binding: singleton consumers use `stagedOutputPaths[0]`; multi-file consumers iterate it in order. Access to `stageReceipt.files` outside the exact validator is forbidden. Never compare a descriptor object with an output string, pass a descriptor to a helper, coerce it with `String(...)`/template syntax, call a string method such as `.toLowerCase()` on it, or invent a replacement path. A failed exact binding emits only the compact structured failure above, stops this snapshot without another broker call/save/stage attempt, and MUST NOT consume generation B; B is a semantic/coherence retry, not a retry for runner receipt misuse.
 
 The exact recipe always runs through the startup-bound file-change facility; no other serializer or writer is valid after binding.
 
@@ -864,7 +1018,7 @@ Portfolio and quotes are NON-PAGINATED staging kinds: use their literal cursor-f
 
 `broker_snapshot.py` accepts exactly seven actions — `preflight`, `bind-transport`, `reserve-source`, `commit-source`, `abort-source`, `lookup-source`, and `stage` — and the ONLY staged kinds are `portfolio`, `positions`, `orders`, and `quotes`. The kind is always a separate `--kind` value: never hyphenate it onto the action, because `stage-quotes`, `stage-historicals` and every similar form are not commands and the helper rejects them. Staging belongs to the snapshot generations in this section only. The four source-handoff actions journal every later external response; they never stage or transform it. Step 8 historicals and complete quote responses plus Step 10 RSI inputs are committed purposes consumed directly by `evaluate_candidates.py`, not staged snapshot kinds.
 
-For positions and orders, stage each returned page immediately. Pass the exact request cursor used for that page; use `FIRST` for page 1 and `--allow-more` only while that page proves a continuation. If that first page is terminal and its stage receipt has exactly `complete: true` and `file_count: 1`, its single staged file already is the complete sealed set; use it directly and do not stage it again under a retry or aggregate filename. If pagination produced more than one page, run the positions/orders aggregate template with the same `--generation` over all just-staged page files into an entirely fresh set of sealed output filenames, passing the full cursor chain beginning with `FIRST` and omitting `--allow-more`. For quotes, a single terminal at-most-20-symbol batch with that same exact singleton receipt is likewise already sealed and is used directly; only multiple batches are aggregate-staged together into fresh sealed outputs. A successful singleton or aggregate command's shared set ID proves one complete coherent set; `daily_loss.py` revalidates that set, its cursor chain, kind, hashes, scratch ID, and A/B generation. Never hand-edit a file, marker, provenance sidecar, cursor, envelope, or helper result.
+For positions and orders, stage each returned page immediately. Pass the exact request cursor used for that page; use `FIRST` for page 1 and `--allow-more` only while that page proves a continuation. If that first page is terminal and its stage receipt has exactly `complete: true` and `file_count: 1`, the exact validator's `stagedOutputPaths[0]` string already names the complete sealed set; use that bound string directly and do not stage it again under a retry or aggregate filename. If pagination produced more than one page, pass only each page receipt's ordered `stagedOutputPaths` strings to the positions/orders aggregate template, then bind that aggregate receipt through the same exact validator into an entirely fresh ordered `stagedOutputPaths` set, passing the full cursor chain beginning with `FIRST` and omitting `--allow-more`. For quotes, a single terminal at-most-20-symbol batch with that same exact singleton receipt is likewise already sealed and is used directly through `stagedOutputPaths[0]`; only multiple batches are aggregate-staged together into fresh sealed outputs, whose receipt uses the same binding. A successful singleton or aggregate command's shared set ID proves one complete coherent set; `daily_loss.py` receives only the bound `stagedOutputPaths` strings and revalidates that set, its cursor chain, kind, hashes, scratch ID, and A/B generation. Never hand-edit a file, marker, provenance sidecar, cursor, envelope, or helper result.
 
 Run the following steps for generation A:
 
