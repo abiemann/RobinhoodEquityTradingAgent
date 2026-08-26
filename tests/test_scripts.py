@@ -11188,8 +11188,20 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             'Code sidebar', bootstrap_contract
         )
-        self.assertIn('Environment: Local', bootstrap_contract)
         self.assertIn('Cowork/local-agent', bootstrap_contract)
+        self.assertIn(
+            'pause or disable that legacy Claude task and leave it disabled',
+            bootstrap_contract,
+        )
+        self.assertIn(
+            'do not create or enable a replacement Claude schedule',
+            bootstrap_contract,
+        )
+        self.assertIn(
+            'recommended Codex runner on the exact native Windows main '
+            'checkout',
+            bootstrap_contract,
+        )
         self.assertIn(
             'before opening the production journal', bootstrap_contract
         )
@@ -12965,7 +12977,7 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, final_summary)
 
-    def test_claude_local_temp_permissions_keep_helper_markers_denied(self):
+    def test_supported_docs_keep_helper_owned_temp_bridge_safety(self):
         source_allow = (
             'Edit(//c/Users/<Windows-user>/AppData/Local/Temp/'
             'rhmra-source-*/*.json)'
@@ -12982,20 +12994,27 @@ class MarketClockTests(unittest.TestCase):
             with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
                 document = f.read()
             with self.subTest(document=filename):
-                self.assertEqual(document.count(source_allow), 1)
-                self.assertEqual(document.count(status_allow), 1)
-                self.assertEqual(document.count(source_marker_deny), 1)
-                self.assertIn('exact protective deny', document)
-                self.assertIn('helper-owned dot marker', document)
-                self.assertIn('grant all-temp', document.lower())
-                self.assertIn('OS bridge', document)
-                self.assertIn('separate', document)
+                # Unsupported Claude permission recipes must not reappear.
+                self.assertNotIn(source_allow, document)
+                self.assertNotIn(status_allow, document)
+                self.assertNotIn(source_marker_deny, document)
+                self.assertIn('least-privilege per-directory', document)
+                self.assertIn('separate file-change facility', document)
+                self.assertIn('helper', document)
+                self.assertIn('markers', document)
+                self.assertIn('changes permissions', document)
                 if filename == 'README.md':
                     self.assertIn(
-                        'runner/model must never author ACL commands', document
+                        'never calls `New-Item`, `mkdir`, `mktemp`/`mkdtemp`, '
+                        '`icacls`, or an ACL API',
+                        document,
                     )
                 else:
-                    self.assertIn('never ask a model', document.lower())
+                    self.assertIn(
+                        'without making the added cross-principal '
+                        'writer-only capability inherit to helper markers',
+                        document,
+                    )
 
     def test_timing_identity_and_metric_names_do_not_guess(self):
         documents = {}
@@ -13183,7 +13202,12 @@ class MarketClockTests(unittest.TestCase):
 
         for filename in ('README.md', 'QUICKSTART.md'):
             self.assertEqual(documents[filename].count(codex_observe), 1)
-            self.assertEqual(documents[filename].count(claude_observe), 1)
+        self.assertEqual(documents['README.md'].count(claude_observe), 1)
+        self.assertEqual(documents['QUICKSTART.md'].count(claude_observe), 0)
+        self.assertIn(
+            'Historical Claude transcript backfill only',
+            documents['README.md'],
+        )
         for filename in documents:
             for required in (
                 'Comparable run duration',
@@ -13215,8 +13239,13 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             readme = f.read()
         self.assertIn(
-            'current preferred models are **Claude Sonnet 5 '
-            '(effort high)** and **Codex Luna 5.6 (reasoning high)**',
+            'currently recommended deployment candidate is '
+            '**Codex Luna 5.6 (reasoning high)**',
+            readme,
+        )
+        self.assertIn(
+            '**Claude is not recommended as the execution runner for this '
+            'project.**',
             readme,
         )
         self.assertIn(
@@ -13225,8 +13254,8 @@ class MarketClockTests(unittest.TestCase):
             readme,
         )
         self.assertIn(
-            'New Sonnet 5 runs use a separate `claude-sonnet-5` '
-            'comparison cohort; never relabel old 4.6 timings as Sonnet 5',
+            'The later Sonnet 5, Haiku 4.5, and Opus 4.6 refusals are '
+            'separate evidence',
             readme,
         )
         scheduling = readme.split('### Scheduling', 1)[1].split(
@@ -13235,28 +13264,16 @@ class MarketClockTests(unittest.TestCase):
         codex_prompt = scheduling.split(
             'Use this scheduler prompt in Codex:', 1
         )[1].split(
-            'Use this in the Claude Desktop Code Local scheduler '
-            '**Instructions**:', 1
-        )[0]
-        claude_prompt = scheduling.split(
-            'Use this in the Claude Desktop Code Local scheduler '
-            '**Instructions**:', 1
-        )[1].split(
-            'Keep exactly one `TIMING_IDENTITY` line in each '
+            'Keep exactly one `TIMING_IDENTITY` line in the Codex '
             'scheduler\'s **Instructions**.', 1
         )[0]
         codex_declaration = (
             'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna '
             'config=reasoning=high'
         )
-        claude_declaration = (
-            'TIMING_IDENTITY: runner=claude model=claude-sonnet-5 '
-            'config=effort=high'
-        )
         self.assertEqual(codex_prompt.count('TIMING_IDENTITY:'), 1)
-        self.assertEqual(claude_prompt.count('TIMING_IDENTITY:'), 1)
         self.assertIn(codex_declaration, codex_prompt)
-        self.assertIn(claude_declaration, claude_prompt)
+        self.assertNotIn('TIMING_IDENTITY: runner=claude', scheduling)
         self.assertIn(
             'Do not put it in the ordinary Description field, memory, or '
             'a separate scheduling guide',
@@ -13273,7 +13290,6 @@ class MarketClockTests(unittest.TestCase):
         )
         for label, prompt in (
             ('README Codex prompt', codex_prompt),
-            ('README Claude prompt', claude_prompt),
         ):
             with self.subTest(prompt=label):
                 self.assertEqual(prompt.count(launch_boundary), 1)
@@ -13339,73 +13355,39 @@ class MarketClockTests(unittest.TestCase):
             'UI layout, task name/date, project/path, schedule, '
             'notifications, and other settings may vary', codex_prompt
         )
-        claude_setup_image = os.path.join(
-            ROOT, 'images', 'claude-automation-part-a-setup.png'
+        self.assertNotIn(
+            'claude-automation-part-a-setup.png', scheduling
         )
-        self.assertTrue(os.path.isfile(claude_setup_image))
-        self.assertGreater(os.path.getsize(claude_setup_image), 0)
-        self.assertIn(
-            '![Claude Desktop Local Part A scheduler showing matching '
-            'TIMING_IDENTITY, Sonnet 5, Current branch, Worktree off, '
-            'Auto, and the hourly weekday cron]'
-            '(images/claude-automation-part-a-setup.png)',
-            claude_prompt,
-        )
-        self.assertIn(
-            '**Sonnet 5** maps to `model=claude-sonnet-5`',
-            claude_prompt,
-        )
-        self.assertIn(
-            '**effort high** maps to `config=effort=high`',
-            claude_prompt,
+        self.assertNotIn(
+            'Use this in the Claude Desktop Code Local scheduler',
+            scheduling,
         )
         for required in (
-            '**post-validation Part A settings reference**',
-            'Use the complete maintained prompt above rather than '
-            'transcribing the screenshot',
-            'Do not activate this Custom cron until both tasks pass the '
-            'supervised Manual `DRY_RUN = true` checks',
-            '**Auto** is only the form label',
-            'Confirm Allowed permissions and the Pacific-time schedule '
-            'preview',
+            'Do not create or enable a Claude scheduled task',
+            'Sonnet 5, Haiku 4.5, and Opus 4.6 refusals',
+            'cannot be repaired by changing this scheduler prompt',
         ):
-            self.assertIn(required, claude_prompt)
+            self.assertIn(required, scheduling)
         self.assertIn(
             'synchronized with the runner, model, and configuration '
             'actually selected', scheduling
         )
         self.assertIn('does not switch the model', scheduling)
         self.assertIn(
-            'identity formats are runner-specific and are not '
-            'interchangeable', scheduling
-        )
-        self.assertIn(
-            'Codex automation in the ChatGPT/Codex app uses the exact '
-            'OpenAI model ID `gpt-5.6-luna` and '
+            'Codex automation uses the exact OpenAI model ID '
+            '`gpt-5.6-luna` and '
             '`config=reasoning=high`', scheduling
-        )
-        self.assertIn(
-            'current Claude Desktop Code setup uses '
-            '`claude-sonnet-5` and `config=effort=high`', scheduling
         )
         self.assertIn(
             'one exact, all-or-nothing tuple', scheduling
         )
-        self.assertIn(
-            'do not use Claude\'s `effort=high` configuration with '
-            'Codex', scheduling
-        )
         for required in (
             'one pre-helper self-report',
             'only framework-explicit identity',
-            'Direct metadata remains strongest',
-            'reads only `CLAUDECODE` and `CLAUDE_EFFORT`',
-            'without enumerating the environment',
-            'runtime evidence plus self-report can produce a `composite` '
-            'identity',
+            'direct current-task metadata remains strongest',
+            'historical Claude runtime aliases',
             'Any unknown field, self-reported field, or conflict excludes '
             'the sample from primary fair comparisons',
-            'strongest symmetric source across Claude and Codex',
             'no trading authority',
         ):
             self.assertIn(required, scheduling)
@@ -13430,15 +13412,11 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             'one structured self-report',
             'Complete direct task metadata',
-            'registry-recognized self-report',
-            'reads only the allowlisted `CLAUDECODE` runtime marker and '
-            '`CLAUDE_EFFORT` setting',
-            'never enumerates or persists the environment',
-            'inherited/spoofable corroboration rather than authentication',
-            'field-level `composite`',
+            'Historical Claude runtime aliases remain available only so '
+            'old performance records retain their provenance',
             'Any unknown field, self-reported field, or conflict excludes '
             'the record from primary fair-comparison cohorts',
-            'strongest symmetric comparison source for Claude and Codex',
+            'Do not create or enable a Claude schedule',
         ):
             self.assertIn(required, quickstart)
 
@@ -13886,13 +13864,17 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
             readme = f.read()
         self.assertIn("Treat every run as stateless", readme)
-        self.assertEqual(readme.count("do not call a framework memory tool"), 2)
+        self.assertIn('Use this scheduler prompt in Codex', readme)
+        self.assertNotIn(
+            'Use this in the Claude Desktop Code Local scheduler', readme
+        )
+        self.assertEqual(readme.count("do not call a framework memory tool"), 1)
         self.assertEqual(
             readme.count(
                 "scheduler-injected `Automation memory:` line and path are "
                 "metadata, not a request"
             ),
-            2,
+            1,
         )
         self.assertNotIn("never append scan or account details", readme)
 
@@ -14341,23 +14323,13 @@ class MarketClockTests(unittest.TestCase):
             '`get_accounts`',
             'fresh task',
             'Do not rerun this automation until that fresh-task check succeeds',
-            'Claude Code recovery-path override',
-            'Customize → Connectors',
-            'Settings → Connectors',
-            '`/mcp`',
-            'choose Re-authenticate',
-            'If reauthentication still fails',
-            'remove only that single existing Robinhood connector',
-            'add it back once there',
-            'complete OAuth, and restart Claude',
-            'never leave or create a duplicate',
-            'same main checkout with worktree isolation off',
-            'click Run now',
-            'proof that the scheduled context can see the connector',
-            'Only if no account connector exists and the standalone `claude` CLI is installed',
-            'claude mcp add --transport http robinhood-trading',
-            'optionally confirm it with `claude mcp list`',
-            'never use the CLI to create a duplicate',
+            'Unsupported Claude runner override',
+            'Claude is not a supported execution runner for this project',
+            'current tested Claude models refuse the required '
+            'financial-trade mutations',
+            'Pause or disable this Claude schedule and leave it disabled',
+            'Migrate the task to the recommended Codex runner',
+            'Do not repair or rerun this Claude automation',
         ):
             self.assertIn(required, connector)
 
@@ -14441,7 +14413,7 @@ class MarketClockTests(unittest.TestCase):
             '| Runner | Model / configuration | After-hours timing record | Market-hours timing record | Status |',
             '4m40 Reference run duration (Claude transcript); '
             '4m05 Routine total (lifecycle)',
-            'Pending — measure during a market-hours run',
+            'Pending — no Sonnet 5 after-hours sample recorded',
             '6m03 Reference run duration (Codex app UI); '
             '4m16 Routine total (lifecycle)',
             '17m41 Reference run duration (Codex runner metadata); '
@@ -14455,40 +14427,33 @@ class MarketClockTests(unittest.TestCase):
             '2026-08-10 full market-hours Routine total',
             '15-candidate scan was 14m24',
             'market-hours timing has not yet been measured',
-            'Future Claude-versus-Codex and model-version comparisons use '
+            'Historical Claude-versus-Codex and model-version comparisons use '
             '**Comparable run duration**',
             'boundaries are identical on both runners',
             'same session class, workload path, and configuration cohort',
-            'Repeated samples are preferable to a single run',
+            'Do not create new production Claude cohorts unless a current '
+            'release passes both the complete supervised mutation-path '
+            'acceptance and the scheduled-run acceptance',
         ):
             self.assertIn(required, readme)
-        self.assertNotIn('## Models and runner support', readme)
+        self.assertIn('### Runner compatibility warning', readme)
         for required in (
-            'Part A native bootstrap/MCP reads/lifecycle+lease',
-            'prescribed per-task `DRY_RUN` acceptance still required',
-            '**Part A only**',
-            'used `DRY_RUN = false`',
-            'Part B was never tested with **Run now**',
-            'after hours with a flat account',
-            'no order-mutation tool call',
-            '**Schedule: Manual** first',
-            'saved Custom cron becomes active immediately',
-            'immediately Pause it in task detail',
-            'Only after both proofs pass',
-            'Scheduled tasks must run at most once per hour.',
-            '`0 6-13 * * 1-5`',
-            '`30 6-13 * * 1-5`',
-            'local machine/app timezone',
-            'intended Pacific bounds',
-            'randomized start delays',
-            'permission control is currently labeled **Auto**',
-            'Allowed permissions',
-            '`place_equity_order`',
-            '`cancel_equity_order`',
-            'do not enable live Claude trading',
-            'original **Cowork/Scheduled** interface',
-            'Code **Routines** list does not control it',
-            'bind its exact returned `PYTHON_EXE`',
+            '**Claude is not recommended as the execution runner for this '
+            'project.**',
+            '2026-07-06 — Claude Sonnet 4.6',
+            'Historical live run bought TDIC',
+            '2026-08-19 11:17 PT — Claude Sonnet 5',
+            'EPM cleared every deterministic gate',
+            '`submit_attempts=0` and `outcome=never_submitted`',
+            'misleadingly finalized as `completed`',
+            '2026-08-19 11:35 PT — Claude Haiku 4.5',
+            '2026-08-20 16:08 PT — Claude Opus 4.6',
+            'Do not create or enable a Claude schedule',
+            'Existing Claude schedules should remain paused or be disabled',
+            'Use this scheduler prompt in Codex',
+            'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna',
+            'both `place_equity_order` and `cancel_equity_order` '
+            'approval-gated',
         ):
             self.assertIn(required, readme)
         self.assertNotIn(
@@ -14498,28 +14463,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn(
             'host-native `py -3 run_lifecycle.py export`', readme
         )
-        self.assertIn('Routines → New routine → Local', readme)
-        self.assertIn('isolated-worktree option **off**', readme)
-        self.assertIn('Customize → Connectors', readme)
-        self.assertIn('Settings → Connectors', readme)
-        self.assertIn('Do not add a duplicate', readme)
-        self.assertIn('choose **Re-authenticate**', readme)
-        self.assertIn('If reauthentication still fails', readme)
-        self.assertIn(
-            'remove only that single existing Robinhood connector', readme
-        )
-        self.assertIn('add it back once there', readme)
-        self.assertIn('complete OAuth, and restart Claude', readme)
-        self.assertIn('never leave or create a duplicate', readme)
-        self.assertIn('same native Windows main checkout', readme)
-        self.assertIn('Desktop local scheduled task', readme)
-        self.assertIn('success proves the scheduled context can see the connector', readme)
-        self.assertIn(
-            'Only if no account connector exists and the standalone `claude` CLI is installed',
-            readme,
-        )
-        self.assertIn('optionally confirm it with `claude mcp list`', readme)
-        self.assertIn('never use the CLI to create a duplicate', readme)
+        self.assertNotIn('Use this in the Claude Desktop Code Local scheduler', readme)
+        self.assertNotIn('claude mcp add --transport http', readme)
         self.assertIn(
             'Read `./robinhood-momentum-routine-autonomous.md`', readme
         )
@@ -14531,11 +14476,14 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, 'QUICKSTART.md'), encoding='utf-8') as f:
             quickstart = f.read()
         self.assertIn(
-            'brand-new Claude Desktop **Code** session whose '
-            '**Environment** selector above the prompt is **Local**',
-            quickstart,
+            '**Claude is not a supported setup target.**', quickstart
         )
-        self.assertIn('Do not use Claude Cowork/local-agent', quickstart)
+        self.assertIn(
+            'Use Codex for setup, testing, and execution', quickstart
+        )
+        self.assertIn(
+            'do not create or enable a Claude schedule', quickstart
+        )
         self.assertIn('do not fall back to `/usr/bin/python3`', quickstart)
         self.assertIn('genuinely native Linux/macOS checkout', quickstart)
         self.assertIn('[README scheduling](README.md#scheduling)', quickstart)
@@ -14596,16 +14544,11 @@ class MarketClockTests(unittest.TestCase):
             'Authenticate** or **Re-authenticate',
             'Add one only if no Robinhood connector exists',
             'If no Robinhood connector exists and you add one',
-            'first inspect the account connector in Claude Desktop',
-            'add exactly one custom connector and complete OAuth',
-            'ask which known connector to keep',
-            'remove the duplicates explicitly',
-            'never silently delete an unknown connector',
-            'Restart Claude, then open a brand-new **Code** session',
-            '**Environment** selector above the prompt to **Local**',
-            'select this exact repository\'s main checkout',
-            'keep worktree isolation **off**',
-            'Code sidebar is only a list filter',
+            '**Claude is not a supported setup target.**',
+            'Current tested Claude models refuse the live '
+            'financial-trade operations',
+            'Use Codex for setup, testing, and execution',
+            'do not create or enable a Claude schedule',
             'remove only that single connector',
             'add it back once',
             'verify `get_accounts` in another fresh task/session',
@@ -14614,20 +14557,7 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, connector)
 
-        claude = connector.split('- **Claude Code:**', 1)[1].split(
-            '\n\n', 1
-        )[0]
-        claude_order = (
-            'account connector',
-            'complete OAuth',
-            'Restart Claude',
-            'brand-new **Code** session',
-            '**Environment** selector above the prompt',
-            'exact repository\'s main checkout',
-            '`/mcp`',
-        )
-        for earlier, later in zip(claude_order, claude_order[1:]):
-            self.assertLess(claude.index(earlier), claude.index(later))
+        self.assertNotIn('- **Claude Code:**', connector)
 
         for required in (
             'Never ask me to paste passwords, MFA codes, account numbers',
@@ -14638,8 +14568,6 @@ class MarketClockTests(unittest.TestCase):
             'Neither `place_equity_order` nor `cancel_equity_order` '
             'may be preapproved',
             'In Codex, keep both set to `Needs approval`',
-            'control may be labeled `Auto`',
-            '`Allowed permissions`',
             'stop before running the routine',
             'Dry run prevents new entries, but it may still sell or '
             'protect existing positions',
@@ -14651,7 +14579,6 @@ class MarketClockTests(unittest.TestCase):
             'open that cloned repository in a brand-new native '
             'project session',
             'Do not continue from the parent-folder session',
-            'sidebar Local filter is insufficient',
             'powershell.exe -NoProfile -NonInteractive '
             '-ExecutionPolicy Bypass -File ./resolve_python.ps1',
             'bind the exact returned absolute Python 3 path as '
@@ -14662,10 +14589,7 @@ class MarketClockTests(unittest.TestCase):
             'generic “Windows equivalent.”',
             '`powershell.exe` is unavailable',
             'close the wrong context',
-            'sidebar Local filter alone is insufficient',
             'genuinely native Linux/macOS checkout',
-            'does not validate the Claude Windows Desktop scheduler '
-            'path',
             'zero agentic-enabled accounts, stop',
             'if several exist, show only their display names',
             'must then resolve to exactly one account',
@@ -14747,206 +14671,171 @@ class MarketClockTests(unittest.TestCase):
             readme = f.read()
         pre_live = readme.split(
             '## Testing before going live', 1
-        )[1].split('## Architecture', 1)[0]
+        )[1].split('## Deterministic layer', 1)[0]
         for required in (
             'both `place_equity_order` and `cancel_equity_order`',
-            '**"Needs approval"** (or the platform\'s equivalent)',
+            'In Codex, keep both `place_equity_order` and '
+            '`cancel_equity_order` on **"Needs approval"**',
             'Neither mutation tool may be preapproved',
-            'control may be labeled **Auto**',
-            'inspect **Allowed permissions**',
-            'both tools to remain approval-gated',
+            'if both approval gates cannot be guaranteed',
             'stop before running the routine or enabling live trading',
         ):
             self.assertIn(required, pre_live)
+        self.assertNotIn('control may be labeled **Auto**', pre_live)
+        self.assertNotIn('inspect **Allowed permissions**', pre_live)
 
-    def test_claude_schedule_migration_requires_a_new_code_local_routine(self):
-        documents = (
-            'robinhood-momentum-routine-autonomous.md',
+    def test_claude_runner_is_explicitly_unsupported(self):
+        documents = {}
+        for filename in (
             'README.md',
+            'QUICKSTART.md',
+            'robinhood-momentum-routine-autonomous.md',
+            'INCIDENTS.md',
+        ):
+            with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
+                documents[filename] = f.read()
+
+        readme = documents['README.md']
+        compatibility = readme.split(
+            '### Runner compatibility warning', 1
+        )[1].split('## Strategy in one line', 1)[0]
+        for required in (
+            '**Claude is not recommended as the execution runner for this '
+            'project.**',
+            'currently tested Claude models refuse live financial-trade '
+            'execution at a higher-priority model-policy boundary',
+            '2026-07-06 — Claude Sonnet 4.6',
+            'Historical live run bought TDIC, received a fill, and placed '
+            'its protective stop',
+            '2026-08-19 11:17 PT — Claude Sonnet 5',
+            'EPM cleared every deterministic gate for a $301.79 buy',
+            '`review_equity_order` returned no alerts',
+            'No `place_equity_order` call',
+            '`submit_attempts=0` and `outcome=never_submitted`',
+            'misleadingly finalized as `completed`',
+            '2026-08-19 11:35 PT — Claude Haiku 4.5',
+            'no lifecycle start, broker execution, or run report',
+            '2026-08-20 16:08 PT — Claude Opus 4.6',
+            'no lifecycle start or Robinhood call',
+            'The evidence audit covered 467 run reports, 35 current Claude '
+            'project transcripts, and 586 older Claude local-agent '
+            'transcripts',
+            'ordinary strategy gates and infrastructure failures were '
+            'excluded from this compatibility conclusion',
+            'raw Claude transcripts remain local outside the repository',
+            'run reports and order-intent database are local and gitignored',
+            '[INCIDENTS.md](INCIDENTS.md#claude-runner-compatibility--'
+            'newer-models-refused-live-order-execution)',
+            'Treat Claude as unsupported for this project',
+            'buy, sell, cancellation, protective-stop placement, and stop '
+            'verification',
+            'repeat the required behavior from a scheduled run',
+        ):
+            self.assertIn(required, compatibility)
+        self.assertIn(
+            'The currently recommended deployment candidate is '
+            '**Codex Luna 5.6 (reasoning high)**',
+            readme,
         )
+        for required in (
+            'Claude connector and scheduler setup is intentionally not '
+            'provided',
+            'Do not create or enable a Claude schedule for this project',
+            'Existing Claude schedules should remain paused or be disabled',
+            'use the recommended Codex setup above instead',
+            'Do not create or enable a Claude scheduled task',
+            'cannot be repaired by changing this scheduler prompt',
+        ):
+            self.assertIn(required, readme)
 
-        for filename in documents:
-            with self.subTest(document=filename):
-                with open(os.path.join(ROOT, filename), encoding='utf-8') as f:
-                    text = re.sub(r'\s+', ' ', f.read().lower())
+        quickstart = documents['QUICKSTART.md']
+        for required in (
+            '**Claude is not a supported setup target.**',
+            'Current tested Claude models refuse the live '
+            'financial-trade operations',
+            'Use Codex for setup, testing, and execution',
+            'do not create or enable a Claude schedule',
+            'Open this project in **ChatGPT Desktop in Codex mode or '
+            'Codex**',
+            'When you later create a Codex scheduled task',
+        ):
+            self.assertIn(required, quickstart)
 
-                # Anchor these checks to the migration guidance. Generic
-                # mentions elsewhere in these long documents must not pass it.
-                sidebar = text.rfind('sidebar')
-                self.assertNotEqual(
-                    sidebar, -1,
-                    f'{filename} must explain the Claude sidebar Local trap',
-                )
-                guide = text[max(0, sidebar - 1500):sidebar + 6000]
+        routine = documents['robinhood-momentum-routine-autonomous.md']
+        model_note = 'Use **Codex Luna 5.6 (high)**' + routine.split(
+            'Use **Codex Luna 5.6 (high)**', 1
+        )[1].split('\n', 1)[0]
+        for required in (
+            'Use **Codex Luna 5.6 (high)** for this routine',
+            'Claude is not a recommended or supported deployment runner',
+            'Sonnet 4.6 historically completed live buys and protective '
+            'stops',
+            'Sonnet 5, Haiku 4.5, and Opus 4.6',
+            'higher-priority model-policy boundary despite explicit '
+            'authorization',
+            'Repository instructions cannot override that boundary',
+        ):
+            self.assertIn(required, model_note)
+        for required in (
+            'pause or disable that legacy Claude task and leave it disabled',
+            'do not create or enable a replacement Claude schedule',
+            'Migrate the schedule to the recommended Codex runner',
+            '**Unsupported Claude runner override:**',
+            'Claude is not a supported execution runner for this project',
+            'Pause or disable this Claude schedule and leave it disabled',
+            'Migrate the task to the recommended Codex runner',
+            'Do not repair or rerun this Claude automation',
+        ):
+            self.assertIn(required, routine)
 
-                legacy_cowork = (
-                    re.search(
-                        r'(?:legacy|old|existing).{0,160}'
-                        r'(?:cowork|local-agent).{0,160}'
-                        r'(?:routine|scheduled task|schedule)', guide,
-                    )
-                    or re.search(
-                        r'(?:cowork|local-agent).{0,160}'
-                        r'(?:routine|scheduled task|schedule).{0,160}'
-                        r'(?:legacy|old|existing)', guide,
-                    )
-                )
-                self.assertIsNotNone(
-                    legacy_cowork,
-                    f'{filename} must identify the old Cowork schedule as legacy',
-                )
+        incidents = documents['INCIDENTS.md']
+        incident = incidents.split(
+            '## CLAUDE RUNNER COMPATIBILITY — newer models refused live '
+            'order execution', 1
+        )[1].split('## The pattern across all of these', 1)[0]
+        incident = re.sub(r'\s+', ' ', incident)
+        for required in (
+            '2026-08-19 11:17 Pacific, Claude Sonnet 5 refused a valid '
+            'live EPM buy',
+            '`DRY_RUN = false`',
+            'EPM passed the liquidity, dip, spread, and RSI gates for a '
+            '$301.79 buy',
+            '`review_equity_order` returned no alerts',
+            'never called `place_equity_order`',
+            '`submit_attempts = 0`',
+            '`outcome = never_submitted`',
+            'assistant policy as the sole reason',
+            'finalized lifecycle as `completed`',
+            'Claude Haiku 4.5',
+            'Claude Opus 4.6',
+            'Neither session reached Robinhood or created a run artifact',
+            '2026-07-06 Claude Sonnet 4.6 run bought TDIC',
+            'not a strategy gate, account problem, connector failure, or '
+            'general moral judgment about this particular trade',
+            '467 run reports, 35 current Claude project transcripts, and '
+            '586 older Claude local-agent transcripts',
+            'Strategy gates such as SPY red/blackout and infrastructure '
+            'failures such as snapshot or coordination errors were excluded',
+            'Claude is no longer recommended or supported',
+            'keep existing Claude schedules disabled',
+            'live buy, sell, cancellation, filled-buy stop placement, and '
+            'stop verification',
+            'Claude transcripts remain local outside the repository',
+            'reports and order-intent records remain local and gitignored',
+        ):
+            self.assertIn(required, incident)
 
-                sidebar_trap = text[max(0, sidebar - 100):sidebar + 500]
-                self.assertIn('local', sidebar_trap)
-                self.assertTrue(
-                    any(term in sidebar_trap for term in (
-                        'does not', 'doesn\'t', 'cannot', 'will not', 'do not',
-                        'do not assume',
-                    )),
-                    f'{filename} must negate migration by sidebar selection',
-                )
-                self.assertTrue(
-                    any(term in sidebar_trap for term in (
-                        'migrate', 'convert', 'move', 'recreate', 'change',
-                    )),
-                    f'{filename} must explain what sidebar Local cannot do',
-                )
-                self.assertTrue(
-                    any(term in sidebar_trap for term in (
-                        'existing', 'old', 'legacy',
-                    )),
-                    f'{filename} must identify the task that is not migrated',
-                )
-                self.assertRegex(
-                    sidebar_trap,
-                    r'(?:local.{0,100}selector.{0,100}new session|'
-                    r'new[- ]session.{0,100}(?:local|selector)|'
-                    r'(?:choosing|selecting).{0,80}local.{0,80}'
-                    r'(?:new chat|new session))',
-                    f'{filename} must cover the Local new-session selector',
-                )
-
-                self.assertRegex(
-                    guide,
-                    r'(?:new|newly created|replacement).{0,240}'
-                    r'(?:routine|scheduled task)',
-                )
-                self.assertRegex(
-                    guide,
-                    r'(?:(?:new|replacement).{0,120}'
-                    r'(?:uniquely named|distinct name|new name).{0,120}'
-                    r'(?:task|routine)|(?:task|routine).{0,120}'
-                    r'(?:uniquely named|distinct name|new name))',
-                )
-                self.assertIn('code', guide)
-                self.assertRegex(
-                    guide,
-                    r'code.{0,100}routines?.{0,100}new routine.{0,100}local',
-                )
-                self.assertTrue(
-                    any(path in guide for path in (
-                        r'd:\projects\robinhoodequitytradingagent',
-                        'd:/projects/robinhoodequitytradingagent',
-                    ))
-                    or re.search(
-                        r'(?:this )?exact.{0,100}native windows.{0,100}'
-                        r'(?:checkout|project folder|repository)', guide,
-                    ),
-                    f'{filename} must require the exact native repository',
-                )
-                self.assertRegex(
-                    guide,
-                    r'(?:(?:worktree|worktree isolation).{0,80}'
-                    r'(?:off|disabled)|(?:off|disable).{0,80}worktree)',
-                )
-                self.assertIn('run now', guide)
-                self.assertRegex(guide, r'dry_run\s*=\s*`?true')
-                self.assertIn('powershell', guide)
-                self.assertIn('resolver', guide)
-                self.assertIn('get_accounts', guide)
-                self.assertRegex(guide, r'(?:proof|prove|require.{0,80}success)')
-
-                pause = re.search(
-                    r'(?:pause|disable).{0,160}(?:old|legacy|existing)|'
-                    r'(?:old|legacy|existing).{0,160}(?:pause|disable)',
-                    guide,
-                )
-                self.assertIsNotNone(pause)
-                run_now_after_pause = guide.find('run now', pause.start())
-                self.assertNotEqual(
-                    run_now_after_pause,
-                    -1,
-                    f'{filename} must test the replacement after pausing '
-                    'the old task',
-                )
-                self.assertLess(
-                    pause.start(), run_now_after_pause,
-                    f'{filename} must pause the old task before testing',
-                )
-
-                delete_only_after_success = (
-                    re.search(
-                        r'(?:delet(?:e|ing)|remove).{0,120}'
-                        r'(?:old|legacy|existing)'
-                        r'.{0,240}(?:only after|after).{0,160}'
-                        r'(?:success|succeeds|passes)', guide,
-                    )
-                    or re.search(
-                        r'(?:only after|after).{0,160}'
-                        r'(?:success|succeeds|passes|proof).{0,240}'
-                        r'(?:delet(?:e|ing)|remove).{0,120}'
-                        r'(?:old|legacy|existing)',
-                        guide,
-                    )
-                    or re.search(
-                        r'(?:do not|never).{0,100}'
-                        r'(?:delet(?:e|ing)|remove)'
-                        r'.{0,160}(?:old|legacy|existing).{0,240}'
-                        r'(?:until|unless).{0,160}'
-                        r'(?:success|succeeds|passes)', guide,
-                    )
-                    or re.search(
-                        r'(?:success|successful|proof|require).{0,300}'
-                        r'before.{0,100}(?:delet(?:e|ing)|remove)', guide,
-                    )
-                )
-                self.assertIsNotNone(
-                    delete_only_after_success,
-                    f'{filename} must retain the old task until the new '
-                    'routine succeeds',
-                )
-
-                enable_only_after_success = (
-                    re.search(
-                        r'(?:success|successful|proof|require).{0,320}'
-                        r'before.{0,120}'
-                        r'(?:enabl(?:e|ing)|activat(?:e|ing))', guide,
-                    )
-                    or re.search(
-                        r'before.{0,120}'
-                        r'(?:enabl(?:e|ing)|activat(?:e|ing)).{0,320}'
-                        r'(?:success|successful|proof|require)', guide,
-                    )
-                    or re.search(
-                        r'before.{0,120}(?:activating|enabling).{0,320}'
-                        r'(?:success|successful|proof|require)', guide,
-                    )
-                    or re.search(
-                        r'(?:enabl(?:e|ed|ing)|activat(?:e|ed|ing)).{0,160}'
-                        r'only after.{0,160}'
-                        r'(?:success|succeed|successful|proof)', guide,
-                    )
-                    or re.search(
-                        r'(?:only after|after).{0,160}'
-                        r'(?:success|succeed|successful|proof).{0,160}'
-                        r'(?:enabl(?:e|ed|ing)|activat(?:e|ed|ing))', guide,
-                    )
-                )
-                self.assertIsNotNone(
-                    enable_only_after_success,
-                    f'{filename} must not enable the replacement schedule '
-                    'until the supervised proof succeeds',
-                )
+        for filename in ('README.md', 'QUICKSTART.md'):
+            with self.subTest(no_claude_setup=filename):
+                text = documents[filename]
+                for forbidden in (
+                    'Use this in the Claude Desktop Code Local scheduler',
+                    'TIMING_IDENTITY: runner=claude',
+                    'claude mcp add --transport http',
+                    'Routines → New routine → Local',
+                ):
+                    self.assertNotIn(forbidden, text)
+        self.assertNotIn('- **Claude Code:**', quickstart)
 
     def test_routine_requires_durable_order_intent_reconciliation(self):
         with open(

@@ -218,6 +218,11 @@ After the runner was stopped, host-native `py -3 run_lifecycle.py export` let SQ
 own rollback, republished the projection, preserved all 326 committed events, and restored the
 dashboard without changing the last truthful account snapshot.
 
+> **Superseded Claude deployment guidance:** the substrate diagnosis and deterministic filesystem
+> guard below remain valid, but the August 2026 runner-compatibility decision supersedes every
+> instruction here to create, repair, test, or enable a Claude schedule. Keep legacy Claude tasks
+> disabled and migrate this project to Codex.
+
 **Rule produced:** a Windows-hosted checkout exposed through POSIX/FUSE is never treated as native
 Linux. If the host Windows resolver cannot run, the routine halts before lifecycle rather than
 falling back to sandbox Python; Claude uses the Desktop Code tab with Environment: Local on native
@@ -244,7 +249,7 @@ PowerShell. This definitively identified the 14:59 firing as the legacy Cowork/l
 Telling the operator only to “select Local” therefore repeated an action already taken and did not
 migrate the schedule.
 
-**Follow-up rule produced:** pause the legacy task and create a new, uniquely named task through
+**Historical follow-up rule (superseded for deployment):** pause the legacy task and create a new, uniquely named task through
 Code → Routines → New routine → Local, bound to the exact native Windows main checkout with
 worktree isolation off. Run it once under supervision with `DRY_RUN = true`; require both the
 PowerShell resolver and `get_accounts`, then the complete lifecycle/report/status/dashboard smoke
@@ -264,6 +269,10 @@ entry path before the scan, daily-loss snapshot, or any order work. No order-mut
 called. That made the live-mode run safe, but it proves only the native execution substrate,
 connector/account-read path, coordination state, artifacts, and dashboard—not the required
 `DRY_RUN = true` acceptance, Part B, an entry-eligible scan, or an order path.
+
+> **Historical only:** the Claude task-creation procedure below is preserved as incident evidence,
+> not current setup guidance. Do not follow it; the August 2026 compatibility decision requires
+> Claude schedules to remain disabled.
 
 The installed Claude Local form rejected the twice-hourly expression `0,30 6-13 * * 1-5`
 with “Scheduled tasks must run at most once per hour.” The documented workaround uses two complementary
@@ -936,6 +945,9 @@ directory because it was not a direct child of the runtime temp directory. The l
 `snapshot-failure` / `snapshot-write-failed`, the lease released cleanly, and the previous truthful
 status remained untouched. No position was examined, no scan or entry guard ran, and no order was
 reviewed, placed, or cancelled.
+
+> **Superseded Claude deployment clause:** the transport rule remains current, but the historical
+> Claude permission instruction below must not be used to create or repair a Claude schedule.
 
 **Rule produced:** source-root identity now follows the same reserved-state rule as scratch identity.
 The retained `broker_snapshot.py preflight --create-scratch` operation creates both helper-owned
@@ -1774,6 +1786,50 @@ Neither label claims scheduler-start or task-completion boundaries.
 **2026-08-13 15:35, RSI handoff was authored in scratch instead of the bound response-source root.** The run had a successful transport binding, valid scan, and valid pre-RSI evaluation with no buy candidates. The final evaluator correctly rejected the RSI-number map because the runner wrote it under the invocation scratch directory, while `evaluate_candidates.py` treats `--rsi-file` as an externally authored input that must be a direct child of the bound `SOURCE_ROOT`. No broker mutation occurred; the account remained flat and the final status snapshot was valid. The lifecycle closed as `snapshot-failure` / `snapshot-write-failed`, the correct fail-closed outcome for an unbound external handoff.
 
 **Rule produced:** the routine now states the destination at both authoring and consumption: write the RSI map through the startup-bound file-change facility as a fresh direct child of `SOURCE_ROOT`; only evaluator-generated outputs belong in scratch or `run-reports/`.
+
+## CLAUDE RUNNER COMPATIBILITY — newer models refused live order execution
+
+**2026-08-19 11:17 Pacific, Claude Sonnet 5 refused a valid live EPM buy after every
+project gate had passed.** The account was flat, `DRY_RUN = false`, the session and buying-power
+checks passed, SPY was green, the daily-loss and stop-count guards were clear, and EPM passed the
+liquidity, dip, spread, and RSI gates for a $301.79 buy. `review_equity_order` returned no alerts.
+Claude then stated in its user-visible response and saved report that its operating rules
+categorically prohibited executing a financial trade even when explicitly pre-authorized. It
+never called `place_equity_order`. The durable intent was abandoned with `submit_attempts = 0`,
+`outcome = never_submitted`, and an event note naming assistant policy as the sole reason. Claude
+nevertheless finalized lifecycle as `completed`, so the dashboard did not expose the refusal as a
+failure.
+
+**Two independent scheduled sessions repeated the same refusal before lifecycle.** At 11:35
+Pacific on 2026-08-19, Claude Haiku 4.5 stopped after reading the routine and called financial
+trading an unconditional safety prohibition that still applied to scheduled, fully specified,
+pre-authorized work. At 16:08 Pacific on 2026-08-20, Claude Opus 4.6 likewise refused buys, sells,
+cancellations, and protective orders regardless of authorization, automation level, or scheduled
+task status. Neither session reached Robinhood or created a run artifact, which is why dashboard
+history alone cannot reveal those two refusals.
+
+**Historical counterevidence defines the compatibility boundary.** A 2026-07-06 Claude Sonnet
+4.6 run bought TDIC, received a fill, and placed the protective stop. The repository and connector
+therefore did support Claude live execution at that time. That success did not transfer to the
+later tested Claude deployments. The evidence supports a model/runtime-policy compatibility
+change—not a strategy gate, account problem, connector failure, or general moral judgment about
+this particular trade.
+
+**Audit scope:** 467 run reports, 35 current Claude project transcripts, and 586 older Claude
+local-agent transcripts were searched. The older traces contained no additional explicit
+trading-policy refusals. Strategy gates such as SPY red/blackout and infrastructure failures such
+as snapshot or coordination errors were excluded from this compatibility conclusion.
+
+**Documentation decision produced:** Claude is no longer recommended or supported as this
+project's execution runner. Sonnet 4.6 remains historical evidence only; it is not a current
+deployment recommendation. The README and Quickstart direct new users to Codex, remove Claude
+connector/scheduler setup, and tell operators to keep existing Claude schedules disabled. The
+routine's model note now recommends Codex Luna 5.6 high. A future Claude release may be reconsidered
+only after a supervised, approval-gated acceptance test proves the complete mutation path—live
+buy, sell, cancellation, filled-buy stop placement, and stop verification—and a scheduled run
+then repeats the required behavior under the intended approval configuration. Claude transcripts
+remain local outside the repository; reports and order-intent records remain local and gitignored
+because they contain account activity. This entry preserves the sanitized evidence.
 
 ## The pattern across all of these
 
