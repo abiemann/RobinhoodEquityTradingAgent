@@ -155,7 +155,6 @@ def write_test_source(directory, name, *, value=None, raw=None):
     if scratch is not None:
         run_cli(BROKER_SNAPSHOT, [
             "commit-source", "--scratch", scratch, "--purpose", purpose,
-            "--reservation-id", receipt["reservation_id"],
         ])
     return path
 
@@ -173,7 +172,6 @@ def commit_test_source_purpose(scratch, purpose, value):
         handle.write("\n")
     committed = json.loads(run_cli(BROKER_SNAPSHOT, [
         "commit-source", "--scratch", scratch, "--purpose", purpose,
-        "--reservation-id", reserved["reservation_id"],
     ]))
     return reserved, committed
 
@@ -5084,11 +5082,13 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, receipt)
         return receipt
 
-    def commit_source(self, scratch, purpose, reservation_id):
-        proc, receipt = self.invoke(
+    def commit_source(self, scratch, purpose, reservation_id=None):
+        arguments = [
             'commit-source', '--scratch', scratch, '--purpose', purpose,
-            '--reservation-id', reservation_id,
-        )
+        ]
+        if reservation_id is not None:
+            arguments.extend(['--reservation-id', reservation_id])
+        proc, receipt = self.invoke(*arguments)
         self.assertEqual(proc.returncode, 0, receipt)
         return receipt
 
@@ -5105,9 +5105,7 @@ class BrokerSnapshotTests(unittest.TestCase):
         ) as handle:
             json.dump(document, handle, separators=(',', ':'), sort_keys=True)
             handle.write('\n')
-        committed = self.commit_source(
-            scratch, purpose, reserved['reservation_id']
-        )
+        committed = self.commit_source(scratch, purpose)
         return reserved, committed
 
     def test_source_handoff_journal_reserve_lookup_commit_and_idempotency(self):
@@ -5164,18 +5162,14 @@ class BrokerSnapshotTests(unittest.TestCase):
                 recoverable['reservation_id'], reserved['reservation_id']
             )
 
-            committed = self.commit_source(
-                scratch, purpose, reserved['reservation_id']
-            )
+            committed = self.commit_source(scratch, purpose)
             self.assertEqual(committed['status'], 'committed')
             self.assertFalse(committed['idempotent'])
             self.assertEqual(
                 committed['source_sha256'],
                 hashlib.sha256(Path(reserved['source']).read_bytes()).hexdigest(),
             )
-            repeated = self.commit_source(
-                scratch, purpose, reserved['reservation_id']
-            )
+            repeated = self.commit_source(scratch, purpose)
             self.assertTrue(repeated['idempotent'])
             self.assertEqual(
                 repeated['source_sha256'], committed['source_sha256']
@@ -5204,6 +5198,48 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(
                 duplicate['error']['code'], 'source_purpose_duplicate'
+            )
+
+    def test_commit_source_self_correlates_and_keeps_explicit_id_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            purpose = 'spy-red-check'
+            reserved = self.reserve_source(scratch, purpose)
+
+            proc, missing = self.invoke(
+                'commit-source', '--scratch', scratch, '--purpose', purpose,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(missing['error']['code'], 'source_file_missing')
+
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump({'data': {'results': []}}, handle)
+                handle.write('\n')
+
+            proc, mismatch = self.invoke(
+                'commit-source', '--scratch', scratch, '--purpose', purpose,
+                '--reservation-id', '00000000-0000-4000-8000-000000000000',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                mismatch['error']['code'], 'source_reservation_mismatch'
+            )
+
+            committed = self.commit_source(
+                scratch, purpose, reserved['reservation_id']
+            )
+            self.assertEqual(
+                committed['reservation_id'], reserved['reservation_id']
+            )
+            self.assertFalse(committed['idempotent'])
+            repeated = self.commit_source(scratch, purpose)
+            self.assertTrue(repeated['idempotent'])
+            self.assertEqual(
+                repeated['reservation_id'], reserved['reservation_id']
             )
 
     def test_source_handoff_abort_and_global_pending_fence(self):
@@ -11683,6 +11719,24 @@ class MarketClockTests(unittest.TestCase):
             'JavaScript',
             launcher,
         )
+        launcher_code = launcher.split(
+            '**CODEX WINDOWS LAUNCHER BIND — EXACT:**', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
+        launcher_markers = (
+            'store(BOOTSTRAP_KEY, null);',
+            'const resolverInitial = await tools.exec_command({',
+            'const resolverProcess = await drainCommand(resolverInitial);',
+            'resolverReceipt = JSON.parse(resolverProcess.output)',
+            'store(BOOTSTRAP_KEY, {schema_version: 1, phase: "launcher-bound"',
+            'const rebound = load(BOOTSTRAP_KEY);',
+            'text(JSON.stringify({schema_version: 1, action: '
+            '"launcher-state-bound", ok: true}));',
+        )
+        launcher_positions = [
+            launcher_code.index(marker) for marker in launcher_markers
+        ]
+        self.assertEqual(launcher_positions, sorted(launcher_positions))
+        self.assertNotIn('text(resolverProcess.output)', launcher_code)
         lifecycle_start = routine.split(
             '### INVOCATION LIFECYCLE', 1
         )[1].split('A failed lifecycle start is terminal', 1)[0]
@@ -12052,7 +12106,28 @@ class MarketClockTests(unittest.TestCase):
             'file-change target',
             post_bind_recipe,
         )
-        self.assertIn('invoke `broker_snapshot.py commit-source', post_bind_recipe)
+        self.assertIn(
+            'invoke exactly `broker_snapshot.py commit-source', post_bind_recipe
+        )
+        self.assertIn(
+            'invoke exactly `broker_snapshot.py commit-source --scratch '
+            '<same loaded scratch> --purpose <same purpose>`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'Do not pass `--reservation-id` to `commit-source`',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'helper loads the one immutable reservation identified by scratch '
+            'plus purpose',
+            post_bind_recipe,
+        )
+        self.assertIn(
+            'explicitly supplied `--reservation-id` remains a checked '
+            'backward-compatibility assertion',
+            post_bind_recipe,
+        )
         self.assertIn(
             '`broker_snapshot.py lookup-source --scratch <loaded scratch> '
             '--purpose <purpose>`',
@@ -13181,7 +13256,7 @@ class MarketClockTests(unittest.TestCase):
             '& \'<PYTHON_EXE>\' run_performance.py observe-task '
             '--invocation-id \'<INVOCATION_ID>\' '
             '--task-duration-ms <DURATION_MS> --runner codex '
-            '--model \'gpt-5.6-luna\' '
+            '--model \'gpt-5.6-sol\' '
             '--configuration \'reasoning=high\' '
             '--identity-source manual-ui '
             '--clock-source codex-worked-for'
@@ -13240,7 +13315,7 @@ class MarketClockTests(unittest.TestCase):
             readme = f.read()
         self.assertIn(
             'currently recommended deployment candidate is '
-            '**Codex Luna 5.6 (reasoning high)**',
+            '**Codex Sol 5.6 (reasoning high)**',
             readme,
         )
         self.assertIn(
@@ -13268,7 +13343,7 @@ class MarketClockTests(unittest.TestCase):
             'scheduler\'s **Instructions**.', 1
         )[0]
         codex_declaration = (
-            'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna '
+            'TIMING_IDENTITY: runner=codex model=gpt-5.6-sol '
             'config=reasoning=high'
         )
         self.assertEqual(codex_prompt.count('TIMING_IDENTITY:'), 1)
@@ -13327,28 +13402,17 @@ class MarketClockTests(unittest.TestCase):
             'at any point',
         ):
             self.assertIn(required, launch_boundary)
-        codex_setup_image = os.path.join(
-            ROOT, 'images', 'codex-automation-setup.png'
-        )
-        self.assertTrue(os.path.isfile(codex_setup_image))
-        self.assertGreater(os.path.getsize(codex_setup_image), 0)
         self.assertIn(
-            '![ChatGPT/Codex automation identity example showing '
-            'matching TIMING_IDENTITY, GPT-5.6 Luna, and High '
-            'reasoning](images/codex-automation-setup.png)',
-            codex_prompt,
-        )
-        self.assertIn(
-            '**Model: GPT-5.6 Luna** maps to '
-            '`model=gpt-5.6-luna`', codex_prompt
+            '**Model: GPT-5.6 Sol** maps to '
+            '`model=gpt-5.6-sol`', codex_prompt
         )
         self.assertIn(
             '**Reasoning: High** maps to '
             '`config=reasoning=high`', codex_prompt
         )
         self.assertIn(
-            '**Identity-mapping reference only:** use the complete '
-            'maintained prompt above as the copyable source of truth',
+            'Use the complete maintained prompt above as the copyable '
+            'source of truth',
             codex_prompt,
         )
         self.assertIn(
@@ -13375,7 +13439,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('does not switch the model', scheduling)
         self.assertIn(
             'Codex automation uses the exact OpenAI model ID '
-            '`gpt-5.6-luna` and '
+            '`gpt-5.6-sol` and '
             '`config=reasoning=high`', scheduling
         )
         self.assertIn(
@@ -13830,6 +13894,12 @@ class MarketClockTests(unittest.TestCase):
             "read another file",
             "write any file or state",
             "an early chunk never authorizes an early action",
+            "CONTIGUOUS READ CURSOR — EXACT",
+            "initialize `NEXT_ROUTINE_LINE = 1`",
+            "requested first line to equal that exact integer",
+            "every returned line number to be consecutive",
+            "only then set `NEXT_ROUTINE_LINE = <last returned line> + 1`",
+            "If a gap is ever detected",
         ):
             self.assertIn(required, memory_policy)
 
@@ -13973,7 +14043,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("zero-prefix/zero-decoration", scan_phase)
         self.assertIn("any `text(...)`, `yield_control`", scan_phase)
         self.assertIn(
-            'call `commit-source` with the same purpose and reservation ID',
+            'call self-correlating `commit-source` with the same purpose and '
+            'no reservation-ID argument',
             scan_phase,
         )
         self.assertIn(
@@ -13989,7 +14060,8 @@ class MarketClockTests(unittest.TestCase):
             'call `reserve-source` for purpose `run-scan`',
             'only then await `run_scan`',
             'write it once to the reservation receipt\'s exact source variable',
-            'call `commit-source` with the same purpose and reservation ID',
+            'call self-correlating `commit-source` with the same purpose and '
+            'no reservation-ID argument',
             'invoke `filter_scan.py --scan-purpose run-scan`',
         )
         scan_positions = [scan_save.index(marker) for marker in scan_order]
@@ -14092,8 +14164,54 @@ class MarketClockTests(unittest.TestCase):
             "FIRST completion boundary",
             "bind `FIRST_COMPLETE`",
             "MUST NOT be fetched again",
+            "Producer authority is final",
+            'The exact strings `"0"`, `"0.0"`, and `"0.0000"` are valid',
+            "positivity/nonzero logic, truthiness, or an all-zero rejection",
         ):
             self.assertIn(required, portfolio)
+
+        pre_second = routine.split(
+            "**PRE-SECOND ENTRY-FEASIBILITY GATES", 1
+        )[1].split("When ANY pre-SECOND gate skips entry", 1)[0]
+        for required in (
+            "SPY red-day gate — deterministic quote contract",
+            "connector_contract.py quote --scratch '<scratch>' "
+            "--source-purpose spy-red-check --symbol SPY",
+            '`action: "quote"`, and `ok: true`',
+            "below_previous_close",
+            "change_percent_display",
+            "SPY $X vs prev close $Y ($Z%)",
+            "complete signed Z string",
+            "Do not access or probe `content`, `structuredContent`, `data`, "
+            "`results`, `quote`, `last_trade_price`, or `previous_close`",
+            "successful committed response whose helper contract fails is "
+            "not fetched again",
+        ):
+            self.assertIn(required, pre_second)
+
+        evaluation = routine.split(
+            "6. Run the authoritative evaluation using ONLY", 1
+        )[1].split("Only these deterministic failures", 1)[0]
+        for required in (
+            "const evaluationCommandParts = Object.freeze([",
+            "const evaluationCommand = evaluationCommandParts.join(\"\");",
+            "Never append, prepend, reassign, or otherwise mutate "
+            "`evaluationCommand`",
+            "empty frozen `quoteSegments` array",
+        ):
+            self.assertIn(required, evaluation)
+        self.assertNotIn("evaluationCommand +=", routine)
+
+        for required in (
+            "--phase entry-scan",
+            "--phase entry-evaluation",
+            "Durable failure attribution",
+            "FAILURE_ORIGIN_PHASE",
+            "failure origin unavailable",
+            "constants_receipt.values.DRY_RUN",
+            "do not author or run a separate cleanup/finalization cell",
+        ):
+            self.assertIn(required, routine)
 
         first = routine.split("**FIRST — manage what I already hold", 1)[1].split(
             "**PRE-SECOND", 1
@@ -14163,16 +14281,34 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn('`action: "positions-set"`', first)
 
         await_boundary = routine.split(
-            "**CODEX LOCAL-COMMAND AWAIT BOUNDARY — EXACT:**", 1
+            "**CODEX POST-BIND LOCAL-COMMAND SHAPE — EXACT AND UNIVERSAL:**", 1
         )[1].split("Only a final read/scan connector failure", 1)[0]
         self.assertIn(
             "const initialProcess = await tools.exec_command(commandArguments);",
             await_boundary,
         )
         self.assertIn(
-            "const process = await drainCommand(initialProcess);",
+            'let output = String(process.output ?? "");',
             await_boundary,
         )
+        self.assertIn("while (process.session_id !== undefined)", await_boundary)
+        self.assertIn("await tools.write_stdin({", await_boundary)
+        self.assertIn(
+            "never assume a `drainCommand` declaration from an earlier cell "
+            "exists",
+            await_boundary,
+        )
+        self.assertNotIn(
+            "await drainCommand(initialProcess)", await_boundary
+        )
+        self.assertIn(
+            "return Object.freeze({process, receipt});", await_boundary
+        )
+        for forbidden in (
+            "runHelper", "runJson", "{r, j}", "direct `commandResult.exit_code`",
+            "direct `commandResult.output`",
+        ):
+            self.assertIn(forbidden, await_boundary)
         self.assertIn("`committed` + `consume`", await_boundary)
         self.assertIn("`aborted` + `none`", await_boundary)
         self.assertIn(
@@ -14451,7 +14587,7 @@ class MarketClockTests(unittest.TestCase):
             'Do not create or enable a Claude schedule',
             'Existing Claude schedules should remain paused or be disabled',
             'Use this scheduler prompt in Codex',
-            'TIMING_IDENTITY: runner=codex model=gpt-5.6-luna',
+            'TIMING_IDENTITY: runner=codex model=gpt-5.6-sol',
             'both `place_equity_order` and `cancel_equity_order` '
             'approval-gated',
         ):
@@ -14734,7 +14870,7 @@ class MarketClockTests(unittest.TestCase):
             self.assertIn(required, compatibility)
         self.assertIn(
             'The currently recommended deployment candidate is '
-            '**Codex Luna 5.6 (reasoning high)**',
+            '**Codex Sol 5.6 (reasoning high)**',
             readme,
         )
         for required in (
@@ -14762,11 +14898,11 @@ class MarketClockTests(unittest.TestCase):
             self.assertIn(required, quickstart)
 
         routine = documents['robinhood-momentum-routine-autonomous.md']
-        model_note = 'Use **Codex Luna 5.6 (high)**' + routine.split(
-            'Use **Codex Luna 5.6 (high)**', 1
+        model_note = 'Use **Codex Sol 5.6 (high)**' + routine.split(
+            'Use **Codex Sol 5.6 (high)**', 1
         )[1].split('\n', 1)[0]
         for required in (
-            'Use **Codex Luna 5.6 (high)** for this routine',
+            'Use **Codex Sol 5.6 (high)** for this routine',
             'Claude is not a recommended or supported deployment runner',
             'Sonnet 4.6 historically completed live buys and protective '
             'stops',
@@ -14774,6 +14910,8 @@ class MarketClockTests(unittest.TestCase):
             'higher-priority model-policy boundary despite explicit '
             'authorization',
             'Repository instructions cannot override that boundary',
+            'Codex Luna 5.6 remains the efficient high-volume option',
+            'not the current unattended recommendation',
         ):
             self.assertIn(required, model_note)
         for required in (
@@ -14824,6 +14962,32 @@ class MarketClockTests(unittest.TestCase):
             'reports and order-intent records remain local and gitignored',
         ):
             self.assertIn(required, incident)
+
+        luna_incident = incidents.split(
+            '## 2026-08-26 CODEX LUNA ORCHESTRATION COHORT — FAIL-CLOSED, '
+            'NOT RELIABLE', 1
+        )[1].split('## The pattern across all of these', 1)[0]
+        luna_incident = re.sub(r'\s+', ' ', luna_incident)
+        for required in (
+            'Eight scheduled attempts',
+            'one normal SPY-red completion and seven failed or materially '
+            'degraded paths',
+            'No attempt placed, cancelled, reviewed, or otherwise mutated a '
+            'broker order',
+            'did not clear, parse, store, and reload the required bootstrap '
+            'state',
+            '`equity_value: "0"`',
+            'declared `evaluationCommand` with `const` and then used `+=`',
+            'nonexistent `reservation.id`',
+            'mixed a raw process returned by `runHelper` with a caller '
+            'expecting `{process, receipt}`',
+            'skipped routine lines 1600–1649',
+            'manually probed the wrong MCP-envelope path',
+            'self-correlates from immutable scratch plus purpose',
+            '`connector_contract.py quote`',
+            'moved from Luna to Sol high',
+        ):
+            self.assertIn(required, luna_incident)
 
         for filename in ('README.md', 'QUICKSTART.md'):
             with self.subTest(no_claude_setup=filename):

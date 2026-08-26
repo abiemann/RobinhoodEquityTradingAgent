@@ -9,6 +9,10 @@ must otherwise be interpreted by an LLM:
 ``portfolio``
     Normalize the authoritative account totals to exact decimal strings.
 
+``quote``
+    Normalize exactly one requested equity quote and deterministically compare
+    its current trade price with its official previous close.
+
 ``page``
     Validate one committed positions/orders page and normalize its pagination
     state.  In particular, an omitted or empty ``data.next`` is a valid
@@ -40,7 +44,7 @@ import argparse
 import json
 import re
 import sys
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping, Sequence
 
 from broker_snapshot import (
@@ -234,6 +238,60 @@ def normalize_portfolio(payload: Mapping[str, Any]) -> dict[str, Any]:
         "action": "portfolio",
         "ok": True,
         "values": values,
+    }
+
+
+def inspect_quote(payload: Mapping[str, Any], symbol: str) -> dict[str, Any]:
+    """Normalize one requested quote and own the previous-close comparison."""
+
+    expected_symbol = _nonempty_text(symbol, "--symbol")
+    if expected_symbol != expected_symbol.upper():
+        raise ContractError("--symbol: expected an uppercase symbol")
+
+    data = _mapping(payload.get("data"), "quote.data")
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ContractError("quote.data.results: expected an array")
+    if len(results) != 1:
+        raise ContractError("quote.data.results: expected exactly one result")
+
+    result = _mapping(results[0], "quote.data.results[0]")
+    quote = _mapping(result.get("quote"), "quote.data.results[0].quote")
+    actual_symbol = _nonempty_text(
+        quote.get("symbol"), "quote.data.results[0].quote.symbol"
+    )
+    if actual_symbol != expected_symbol:
+        raise ContractError(
+            "quote.data.results[0].quote.symbol: does not match --symbol"
+        )
+
+    current_text = _finite_decimal_string(
+        quote.get("last_trade_price"),
+        "quote.data.results[0].quote.last_trade_price",
+        positive=True,
+    )
+    previous_text = _finite_decimal_string(
+        quote.get("previous_close"),
+        "quote.data.results[0].quote.previous_close",
+        positive=True,
+    )
+    current = Decimal(current_text)
+    previous = Decimal(previous_text)
+    change_percent = (current - previous) * Decimal(100) / previous
+    display = change_percent.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if display == 0:
+        display = abs(display)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "quote",
+        "ok": True,
+        "symbol": actual_symbol,
+        "current_price": current_text,
+        "previous_close": previous_text,
+        "change_percent": _finite_decimal_string(change_percent, "quote change"),
+        "change_percent_display": format(display, ".2f"),
+        "below_previous_close": current < previous,
     }
 
 
@@ -681,6 +739,13 @@ def _parser() -> JsonArgumentParser:
     portfolio.add_argument("--scratch", required=True)
     portfolio.add_argument("--source-purpose", required=True)
 
+    quote = subparsers.add_parser(
+        "quote", help="normalize one committed quote response"
+    )
+    quote.add_argument("--scratch", required=True)
+    quote.add_argument("--source-purpose", required=True)
+    quote.add_argument("--symbol", required=True)
+
     page = subparsers.add_parser(
         "page", help="inspect one committed positions/orders page"
     )
@@ -761,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         and arguments[0]
         in {
             "portfolio",
+            "quote",
             "page",
             "first-positions-set",
             "scan",
@@ -810,6 +876,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _load_payload(args.scratch, args.source_purpose)
             if args.action == "portfolio":
                 result = normalize_portfolio(payload)
+            elif args.action == "quote":
+                result = inspect_quote(payload, args.symbol)
             elif args.action == "page":
                 result = inspect_page(
                     payload,

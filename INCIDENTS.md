@@ -1824,12 +1824,60 @@ as snapshot or coordination errors were excluded from this compatibility conclus
 project's execution runner. Sonnet 4.6 remains historical evidence only; it is not a current
 deployment recommendation. The README and Quickstart direct new users to Codex, remove Claude
 connector/scheduler setup, and tell operators to keep existing Claude schedules disabled. The
-routine's model note now recommends Codex Luna 5.6 high. A future Claude release may be reconsidered
+routine's model note then recommended Codex Luna 5.6 high; the 2026-08-26 incident below superseded
+that unattended recommendation. A future Claude release may be reconsidered
 only after a supervised, approval-gated acceptance test proves the complete mutation path—live
 buy, sell, cancellation, filled-buy stop placement, and stop verification—and a scheduled run
 then repeats the required behavior under the intended approval configuration. Claude transcripts
 remain local outside the repository; reports and order-intent records remain local and gitignored
 because they contain account activity. This entry preserves the sanitized evidence.
+
+## 2026-08-26 CODEX LUNA ORCHESTRATION COHORT — FAIL-CLOSED, NOT RELIABLE
+
+**Eight scheduled attempts from 06:04 through the 10:07 start produced one normal SPY-red
+completion and seven failed or materially degraded paths.** No attempt placed, cancelled, reviewed,
+or otherwise mutated a broker order, and the account remained flat. That is important: the lease,
+source journal, deterministic consumers, and conservative gates prevented bad glue from becoming a
+bad trade. It is not an acceptable reliability result for an unattended scheduler, however.
+
+The failures were separate model-authored orchestration defects rather than one broker outage:
+
+- At 06:04 the launcher resolver succeeded, but the cell merely printed its output. It did not
+  clear, parse, store, and reload the required bootstrap state, so the successful launcher could
+  not be used safely by lifecycle. A separate scheduled attempt lost bootstrap state before
+  lifecycle and therefore remained outside dashboard history.
+- At 07:04 the checked-in portfolio contract correctly normalized a flat account with
+  `equity_value: "0"`. Runner JavaScript invented an extra finite/nonzero regular-expression test
+  and rejected that valid zero as a snapshot failure.
+- At 07:34 runner code declared `evaluationCommand` with `const` and then used `+=`, raising a
+  JavaScript `TypeError` after the required inputs had already been committed.
+- At 08:06 the response write succeeded, but commit argv used nonexistent `reservation.id` rather
+  than the receipt's `reservation_id`, passing an undefined value across a boundary the helper
+  should have owned itself.
+- At 09:04 DAILY-LOSS actually completed successfully. THIRD then mixed a raw process returned by
+  `runHelper` with a caller expecting `{process, receipt}` and crashed before `get_scans`. The saved
+  report incorrectly blamed DAILY-LOSS, proving the model's narration was not a reliable phase
+  authority.
+- At 09:35 the flat-account SPY-red path completed normally.
+- The 10:07 attempt skipped routine lines 1600–1649 during its claimed complete read, then saved and
+  committed a valid SPY response but manually probed the wrong MCP-envelope path and falsely called
+  the quote invalid. Its post-finish code also referenced `STATE_KEY` outside the lexical block that
+  declared it. It placed no order, but a safe skip was reached through unnecessary recovery and a
+  finalization exception rather than the intended deterministic path.
+
+**Repair produced:** the Windows launcher now has one exact clear → resolve/drain → parse → store →
+reload/verify cell before lifecycle. The routine carries an exact monotone read cursor through EOF.
+`commit-source` now self-correlates from immutable scratch plus purpose, while the optional explicit
+UUID remains only a compatibility assertion and `abort-source` stays strictly ID-bound. Every
+post-bind local JSON command uses one frozen `{process, receipt}` vocabulary. Portfolio helper
+output is producer-authoritative and zero-valid, evaluation commands are one-shot frozen joins,
+and the SPY comparison is owned by `connector_contract.py quote` instead of raw envelope probing.
+THIRD/FOURTH write durable lifecycle phases for report attribution, report mode comes only from the
+validated constants receipt, and the exact final telemetry block owns its own state identifiers.
+The unattended recommendation moved from Luna to Sol high, but that model change does not replace
+the required supervised dry-run and scheduled acceptance tests. Regression tests cover each
+deterministic boundary; the incident is not closed operationally until the post-repair cohort runs
+cleanly.
 
 ## The pattern across all of these
 

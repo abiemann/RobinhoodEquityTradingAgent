@@ -104,6 +104,58 @@ class PortfolioContractTests(unittest.TestCase):
             )
 
 
+class QuoteContractTests(unittest.TestCase):
+    def payload(self, **overrides):
+        quote = {
+            "symbol": "SPY",
+            "last_trade_price": "765.180000",
+            "previous_close": "765.910000",
+        }
+        quote.update(overrides)
+        return {"data": {"results": [{"quote": quote, "close": None}]}}
+
+    def test_compares_exact_prices_and_formats_the_gate_change(self):
+        receipt = connector_contract.inspect_quote(self.payload(), "SPY")
+        self.assertEqual(
+            receipt,
+            {
+                "schema_version": 1,
+                "action": "quote",
+                "ok": True,
+                "symbol": "SPY",
+                "current_price": "765.180000",
+                "previous_close": "765.910000",
+                "change_percent": "-0.09531145957096786828739669152",
+                "change_percent_display": "-0.10",
+                "below_previous_close": True,
+            },
+        )
+
+    def test_accepts_zero_change_without_negative_zero_display(self):
+        receipt = connector_contract.inspect_quote(
+            self.payload(last_trade_price="12.50", previous_close="12.50"),
+            "SPY",
+        )
+        self.assertEqual(receipt["change_percent"], "0")
+        self.assertEqual(receipt["change_percent_display"], "0.00")
+        self.assertFalse(receipt["below_previous_close"])
+
+    def test_rejects_wrong_cardinality_symbol_and_nonexact_prices(self):
+        invalid_payloads = (
+            {"data": {"results": []}},
+            {"data": {"results": [None]}},
+            self.payload(symbol="QQQ"),
+            self.payload(last_trade_price=765.18),
+            self.payload(previous_close="0"),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(connector_contract.ContractError):
+                    connector_contract.inspect_quote(payload, "SPY")
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_quote(self.payload(), "spy")
+
+
 class PageContractTests(unittest.TestCase):
     def inspect(
         self,
@@ -580,6 +632,41 @@ class ConnectorContractCliTests(unittest.TestCase):
         self.assertTrue(receipt["ok"])
         validate.assert_called_once_with(
             "session-scratch", ["first-portfolio"]
+        )
+
+    def test_quote_cli_consumes_the_committed_response_without_raw_probing(self):
+        document = {
+            "structuredContent": {
+                "data": {
+                    "results": [
+                        {
+                            "quote": {
+                                "symbol": "SPY",
+                                "last_trade_price": "765.18",
+                                "previous_close": "765.91",
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        status, receipt, validate = self.invoke(
+            [
+                "quote",
+                "--scratch",
+                "session-scratch",
+                "--source-purpose",
+                "spy-red-check",
+                "--symbol",
+                "SPY",
+            ],
+            document,
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(receipt["below_previous_close"])
+        self.assertEqual(receipt["change_percent_display"], "-0.10")
+        validate.assert_called_once_with(
+            "session-scratch", ["spy-red-check"]
         )
 
     def test_scan_cli_emits_one_compact_receipt(self):

@@ -4671,7 +4671,11 @@ def _reserve_source_locked(
 
 def _commit_source(args: argparse.Namespace) -> dict[str, Any]:
     purpose = _validated_source_purpose(args.purpose)
-    reservation_id = _validated_reservation_id(args.reservation_id)
+    reservation_id = (
+        _validated_reservation_id(args.reservation_id)
+        if args.reservation_id is not None
+        else None
+    )
     scratch, scratch_marker, transport_marker, source_root = (
         _validated_source_journal_context(args.scratch)
     )
@@ -4681,7 +4685,10 @@ def _commit_source(args: argparse.Namespace) -> dict[str, Any]:
         transport_marker=transport_marker,
         purpose=purpose,
     )
-    if reservation['reservation_id'] != reservation_id:
+    if (
+        reservation_id is not None
+        and reservation['reservation_id'] != reservation_id
+    ):
         raise SourceHandoffError(
             'source_reservation_mismatch',
             f'{purpose}: reservation id does not match the immutable journal',
@@ -5025,7 +5032,13 @@ def _parser() -> JsonArgumentParser:
     )
     commit_source.add_argument('--scratch', required=True)
     commit_source.add_argument('--purpose', required=True)
-    commit_source.add_argument('--reservation-id', required=True)
+    commit_source.add_argument(
+        '--reservation-id',
+        help=(
+            'optional compatibility check; when omitted, commit the immutable '
+            'reservation bound to --scratch and --purpose'
+        ),
+    )
 
     abort_source = subparsers.add_parser(
         'abort-source',
