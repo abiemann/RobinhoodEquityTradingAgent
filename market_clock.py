@@ -5,7 +5,8 @@ Every time-dependent decision in robinhood-momentum-routine-autonomous.md
 (opening blackout, session-aware order style, "filled today" counting,
 re-entry cooldown, dust lookback, ledger timestamps, report header) reads
 its time from THIS script. The routine captures one start clock for all
-run-wide timestamps and historical windows, then invokes the same script
+run-wide timestamps and the deterministic historical-data start boundary,
+then invokes the same script
 immediately before each buy so a long run cannot use a stale session verdict.
 It never derives the time any other way.
 
@@ -156,16 +157,17 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    try:
+        validated_constants = validate_constants_file(args.constants)
+    except ConstantsValidationError as exc:
+        print(
+            f"market_clock.py: ERROR: constants validation failed: "
+            f"{exc.errors[0]}",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.no_buy_first_minutes is None:
-        try:
-            validated_constants = validate_constants_file(args.constants)
-        except ConstantsValidationError as exc:
-            print(
-                f"market_clock.py: ERROR: constants validation failed: "
-                f"{exc.errors[0]}",
-                file=sys.stderr,
-            )
-            return 2
         blackout_minutes = validated_constants.values["NO_BUY_FIRST_MINUTES"]
         constants_sha256 = validated_constants.source_sha256
     else:
@@ -210,6 +212,23 @@ def main():
     )
     state, since_open, calendar_status, entry_session_open, regular_close = session_state(et)
 
+    lookback_days = max(
+        validated_constants.values["VOLUME_LOOKBACK_DAYS"],
+        validated_constants.values["HIGH_LOOKBACK_DAYS"],
+    )
+    # Convert the configured trading-day requirement to a conservative
+    # calendar window.  One base week covers short windows; each additional
+    # 20 requested sessions adds another calendar day of closure margin so
+    # large, still-valid lookbacks cannot be starved by accumulated holidays.
+    # With the current 20-day lookbacks this remains exactly 35 calendar days.
+    closure_margin_days = 7 + (lookback_days - 1) // 20
+    historical_calendar_days = (
+        (lookback_days * 7 + 4) // 5 + closure_margin_days
+    )
+    historicals_start_time = (
+        utc - timedelta(days=historical_calendar_days)
+    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
     in_blackout = (state == "regular" and since_open is not None
                    and since_open < blackout_minutes)
 
@@ -223,6 +242,7 @@ def main():
         ).isoformat(timespec="seconds"),
         "date_et": et.strftime("%Y-%m-%d"),
         "date_pt": pt.strftime("%Y-%m-%d"),
+        "historicals_start_time": historicals_start_time,
         "constants_sha256": constants_sha256,
         "session": state,
         "calendar_status": calendar_status,

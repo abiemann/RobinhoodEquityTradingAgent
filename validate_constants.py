@@ -71,8 +71,8 @@ BOOLEAN_CONSTANTS = frozenset(
 STRING_CONSTANTS = frozenset({"AGENTIC_ACCOUNT_NAME", "SCAN_TITLE"})
 INTEGER_BOUNDS: Mapping[str, tuple[int | None, int | None]] = {
     "TOP_N": (1, None),
-    "HIGH_LOOKBACK_DAYS": (1, None),
-    "VOLUME_LOOKBACK_DAYS": (1, None),
+    "HIGH_LOOKBACK_DAYS": (1, 1000),
+    "VOLUME_LOOKBACK_DAYS": (1, 1000),
     "RSI_PERIOD": (2, None),
     "RSI_LOOKBACK_BARS": (2, None),
     "RSI_CONFIRM_BARS": (1, None),

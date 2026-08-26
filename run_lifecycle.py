@@ -64,6 +64,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -73,6 +74,8 @@ from market_clock import PACIFIC_STD_OFFSET, zone_time
 
 SCHEMA_VERSION = 1
 PROJECTION_LIMIT = 512
+PROJECTION_REPLACE_RETRY_DELAY_SECONDS = 1.0
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE_FILE = os.path.join(
     ROOT, "run-reports", "rhmra-run-lifecycle.sqlite3"
@@ -1110,7 +1113,20 @@ def _atomic_write_projection(path: str, document: Mapping[str, Any]) -> None:
         validate_projection(readback)
         if readback != document:
             raise LifecycleError("projection readback did not match serialized data")
-        os.replace(temporary, absolute)
+        try:
+            os.replace(temporary, absolute)
+        except OSError as exc:
+            # A Windows reader can briefly deny replacement of an otherwise
+            # valid projection. Retry the already-fsynced temporary file once;
+            # never replay the journal mutation that triggered publication.
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None)
+                not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+            ):
+                raise
+            time.sleep(PROJECTION_REPLACE_RETRY_DELAY_SECONDS)
+            os.replace(temporary, absolute)
         temporary = ""
     finally:
         if descriptor >= 0:

@@ -1323,6 +1323,192 @@ Legacy keyed maps remain accepted for compatibility, not authored by the automat
 supersedes only the normal-path transport procedure from the 2026-07-28/29 incidents; their strict
 JSON and fail-loud lessons remain in force.
 
+**2026-08-25 10:54, a successful Codex run spent most of its 23:01 recovering from
+model-authored contract drift.** The scheduler still supplied an older abbreviated prompt, so the
+runner opened automation memory, read the roughly 258 KiB routine in one operation, and then read
+the routine again in the required bounded sequence. During execution it rejected a valid portfolio
+because Robinhood's numeric fields were decimal strings and made a redundant portfolio read
+(roughly 51 seconds). It counted 33 historical stop orders instead of stops filled on the current
+Pacific date and corrected that with another complete order read (roughly 54 seconds). The named
+scan already reported scalar `sorting: "Relative volume desc"`, but the runner inspected invented
+alternate fields and performed an unnecessary saved-scan update (roughly 27 seconds). It also sent
+three invalid historical argument combinations before succeeding with `symbols`, `interval: "day"`,
+`bounds: "regular"`, and `start_time`, began SECOND-phase daily-loss discovery before FIRST had
+completed, and recovered from several local JavaScript wrapper, syntax, and report-assembly errors.
+
+The account was flat. No order review, placement, cancellation, or account mutation occurred; the
+only external write was the idempotent saved-scan sort update, and the final strategy result was
+valid. The report nevertheless omitted much of that recovery history and printed an unsupported
+5,548-token estimate even though the runner exposed no complete token counter. Safety controls
+contained every error, but the run showed that successful recovery can hide substantial wasted
+work and that the report must distinguish a clean run from a recovered one.
+
+**Deterministic hardening produced:** the maintained scheduler prompt now treats an injected
+automation-memory path as metadata and requires each pre-EOF read call to contain exactly one
+contiguous routine chunk and nothing else. `connector_contract.py` is the sole authority for
+canonical portfolio decimal strings, required visible scan columns, scalar scan sorting, and
+scan-update confirmation; a runner-side semantic mistake cannot trigger a duplicate successful
+read. `daily_loss.py` derives the Pacific-date stop count and stopped-symbol set from the same FINAL
+deduplicated order snapshot that produces the daily-loss verdict, eliminating the separate
+historical-order count. START CLOCK now emits one deterministic `historicals_start_time`, and Step 8
+copies it into the exact `{symbols, interval, bounds, start_time}` payload with at most one identical
+retry—no `span`, `end_time`, date arithmetic, or schema discovery. SECOND/daily-loss work is barred
+until FIRST is explicitly complete. Every report now includes ordered Recovery diagnostics even
+when retry succeeded, including whether a broker call occurred or mutation was possible; token use
+is exact when the runner exposes a complete counter and otherwise explicitly unavailable, never
+estimated.
+
+**2026-08-25 12:53, Codex rejected a valid flat positions page after the deterministic
+transport had already committed and staged it successfully.** Robinhood returned the documented
+positions envelope at `data.positions: []` and omitted `data.next`, which is a valid terminal page.
+The stage receipt correctly proved `complete: true`, one file, and `next_cursor: null`. Runner-authored
+JavaScript nevertheless looked for FIRST rows at an invented `data.results` path and treated a missing
+raw `next` property as schema failure rather than terminal pagination. It then used a forbidden generic
+polymorphic stage wrapper, skipped the whole-generation B semantic retry, and misclassified the
+post-persistence semantic error as `snapshot-write-failed`. No broker mutation or order occurred; a
+later refresh confirmed the account was flat.
+
+Finalization compounded the false failure. The correct lifecycle-bound 12:53 report was created, but
+the runner read a hard-coded report from an older 10:34 invocation, inferred a collision that did not
+exist, and finished lifecycle without binding the newly written report or status snapshot. This was
+not a Robinhood outage, an invalid broker response, or a failed save transport; both failures were
+model-authored schema/path reconstruction after authoritative checked-in state already existed.
+
+**Deterministic hardening produced:** every committed positions/orders page now passes through
+`connector_contract.py page`. That helper owns the actual `data.positions` / `data.orders` envelope,
+normalizes missing, null, or empty `data.next` to terminal `next_cursor: null`, and is the sole source
+of subsequent cursors. In DAILY-LOSS only, each stage receipt is cross-bound to that page's exact
+committed purpose, row count, next/request cursors, hashes, provenance, and output. After FIRST reaches
+the terminal page, `first-positions-set` validates every page and cursor together, rejects cross-page duplicate
+symbols, and returns the sole compact projection containing symbol, exact quantities, and average buy
+price, so the runner never parses or model-deduplicates the broker envelope. FIRST goes directly from
+the terminal page helper to `first-positions-set` and never stages. In DAILY-LOSS, a successful page helper
+plus stage receipt cannot be rejected by a second raw-response parser; exact semantic, missing-source, and
+local-orchestration failures have distinct outcomes, and only a genuine post-persistence semantic A
+failure consumes whole generation B. Codex report creation and read-back now run in one composed
+operation: both targets come from the same live lifecycle `expected_report_file`, overwrite is refused,
+exact read-back transitions to a terminal report state, and broker/source transport stays closed while
+status and lifecycle finalization complete. Claude retains its native Write/Read tools under the same
+single-binding rule; trading strategy and broker behavior are unchanged.
+
+**2026-08-25 13:47, lifecycle preflight committed but its dashboard projection did not publish.**
+The append-only journal durably recorded the exact 13:47:44 Pacific binding, but the event command
+returned failure before its success receipt. The one authorized read-only `status` recovery then
+rejected the stale JSON projection, so Codex correctly finished `coordination-halt` /
+`coordination-state` before lease acquisition. Finalization later republished all three lifecycle
+events and restored a healthy projection. No scratch/source root, report, status snapshot, Robinhood
+request, order-intent action, notification, or broker mutation occurred. The runner's compact wrapper
+discarded the helper's structured error, so the precise inner OS error cannot be proven; the exposed
+Windows publication boundary had no retry for transient atomic-replace sharing/access/lock denial.
+
+**Rule produced:** the lifecycle projection writer now retains its already validated, fsynced
+temporary file and retries `os.replace` exactly once after a short bounded delay only for Windows
+WinError 5, 32, or 33. It never replays the already committed journal event. A non-transient or second
+failure remains terminal and leaves the prior projection untouched; the temporary file is cleaned up.
+Runner glue must preserve the helper's bounded safe `recorded`, `reason`, and `detail` diagnostic
+instead of reducing a publication failure to generic coordination state, but that diagnostic never
+authorizes an event replay, lease acquisition, or broker call.
+
+**2026-08-25 14:33, Codex invented an unsupported aggregate action during DAILY-LOSS.**
+FIRST completed flat and the run entered SECOND normally. A model-authored generic `pageSet(kind,
+pages)` wrapper then changed `kind = orders` into `connector_contract.py orders-set`, even though
+the helper exposed no such action. The same wrapper also expected `output_paths` from connector-
+contract set receipts, but FIRST's positions projection returns rows rather than staged file paths.
+The run halted `coordination-halt` / `coordination-state` after nine successful read-only Robinhood
+calls. It made no scan, review, placement, cancellation, order-intent mutation, or other broker
+mutation; report/status persistence, lease release, and lifecycle finalization succeeded.
+
+The first unsupported command hid additional defects in the same cell: it bypassed the exact stage
+receipt binder, failed to aggregate-seal multi-page inputs, constructed incomplete daily-loss argv,
+treated a normal nonempty discovery symbol set as an error instead of fetching quotes, omitted those
+quotes from evaluation, and supplied no valid generation-B semantic retry. Merely adding an
+`orders-set` command would therefore have moved the failure rather than repaired the workflow.
+
+**Rule produced:** `positions-set` was narrowed and renamed to `first-positions-set`, which rejects
+purposes outside FIRST's ordered page namespace and deliberately returns no file paths. DAILY-LOSS
+has a closed connector-contract action matrix: positions and orders use only the literal `page`
+action; `orders-set` and `first-orders-set` do not exist; action names may never be synthesized from
+the response kind; and generic page/set wrappers are forbidden. Singleton and multi-page file inputs
+come only from the exact `bindStageOutputPaths` result, with multi-page sets aggregate-sealed by
+`broker_snapshot.py stage`. A missing binding is local coordination failure and cannot authorize a
+broker retry or generation B. A nonempty discovery symbol set is normal and requires bounded quote
+fetching, staging, and inclusion in the final deterministic evaluation.
+
+**2026-08-25 16:04, Codex staged a FIRST page that required no staging and crashed on an
+unavailable runtime global.** Robinhood's FIRST positions call succeeded with the account flat.
+The complete response was written and committed as `first-positions-0`, and the deterministic page
+contract proved `complete: true`, `row_count: 0`, and `next_cursor: null`. The required next action
+was therefore `first-positions-set`, which consumes committed purposes directly. Instead, model-
+authored JavaScript imported DAILY-LOSS staging into FIRST and tried to build an output filename with
+`crypto.randomUUID()`. Codex's fresh V8 executor exposes only its listed globals and did not expose
+`crypto`, so the cell threw `ReferenceError` before any stage command ran.
+
+Two recovery cells then defined a drain wrapper around an unawaited `tools.exec_command` Promise.
+Each fabricated an empty process-shaped result immediately, so neither lookup actually ran and both
+falsely reported the committed source unavailable. Read-only replay proved the journal still returned
+`status: committed`, `recovery_action: consume`; both `connector_contract.py page` and
+`first-positions-set` succeeded against the exact retained source. The report and dashboard also
+misclassified these runner errors as `snapshot-failure` / `snapshot-write-failed`, even though source
+transport had succeeded. The correct outcome was `coordination-halt` / `coordination-state`.
+
+Only `get_accounts` and one read-only `get_equity_positions` call occurred. No retry, quote, order,
+review, placement, cancellation, scan mutation, notification, or other broker mutation occurred.
+
+**Rule produced:** FIRST now has a closed action matrix: reserve/write/commit each positions page,
+validate it with literal `connector_contract.py page`, and after the terminal page invoke
+`first-positions-set` immediately. FIRST may never stage, carry a snapshot generation, allocate an
+output path, inspect stage fields, or use random/clock/runtime-global identifiers. Its one explicit
+connector retry uses only the exact `first-positions-N-retry` purpose; the helper rejects every other
+suffix. Per-page projection was removed from `connector_contract.py page`, leaving rows exclusively
+to `first-positions-set`. Every Codex local command must be awaited before its concrete process result
+is drained, and recovery accepts only the exact helper-owned `status` / `recovery_action` pair. A runner-wrapper or
+receipt-binding failure after a committed source is coordination failure and cannot masquerade as a
+write failure or authorize another broker call. For the DAILY-LOSS staging that genuinely remains,
+`broker_snapshot.py stage --auto-output-scratch` now allocates fresh direct-child output names and marks the
+receipt `output_mode: helper-allocated`; unattended runner code no longer constructs staged paths.
+The helper also binds every page to the complete request-cursor chain, rejects repeated current/next
+cursors and a continuation at the exact 1,000-page ceiling before another read, and preserves exact
+source-journal state codes. FIRST purpose names are canonical zero-based page names with at most one
+exact `-retry` suffix and are positions-only. Every reservation binds the full request-cursor chain,
+requires its index to match that chain, and rejects page 1,000 before a broker call; leading-zero,
+alternate-suffix, and chained-retry forms are likewise rejected. A FIRST retry reservation now requires an exact `--retry-of` base; under
+the reservation lock, before the retry broker call, the helper proves that base was already immutably
+aborted for `connector-failed` with no response file, and consumers repeat the proof. Staging now emits
+separate input, response-envelope, semantic, binding, internal-allocation, retry-state, and write failure codes. Failure
+receipts bind the actual helper kind and generation; the helper atomically persists the one B
+authorization before emitting it, rejects B without that marker, and rejects any later A. Only a
+recognized successful connector envelope with invalid broker semantics consumes B. Error/unknown envelopes and caller cursor binding are coordination
+failures, while lost transport remains terminal without being collapsed into a runner error.
+Reservation of a later FIRST page now revalidates every prior committed positions page and proves
+the submitted cursor is the exact preceding broker-returned `next_cursor` before it issues a new
+response path; page and final-set consumers rebind their arguments to the immutable reservation
+hashes. DAILY-LOSS generation state is likewise enforced before reads: the helper parses the closed
+lowercase purpose namespace, shares one lock between A→B authorization and reservation, rejects B
+before authorization and A afterward, and persists B exhaustion before a terminal B semantic
+receipt. This closes the adjacent cases where a correct eventual validator could still have allowed
+one unnecessary broker read first, or where runner memory could have silently recreated the retry
+budget.
+
+**Pre-release review of the 16:04 hardening found two adjacent fail-closed defects before the next
+scheduled run.** The FIRST page consumer initially used the final-set journal validator: page 1
+supplied one current purpose plus its two-cursor chain, while that validator correctly required
+equal purpose and cursor counts for a completed set. Every paginated FIRST census would therefore
+have halted at page 1 after a successful committed read. Page validation now has its own journal
+binder—one current purpose whose index equals the full chain length minus one—while
+`first-positions-set` retains the one-purpose-per-cursor contract. Real Windows subprocess tests
+cover both a normal page 1 and its authorized connector-failed retry.
+
+The second defect was that `daily_loss.py` returned the same exit-2/human-stderr shape for semantic
+reconciliation, staged-provenance/input loss, output publication failure, bad binding, and a helper
+invariant. A runner could not grant the one semantic retry without also risking consumption of B
+for an I/O or orchestration fault. Unattended calls now opt into one exact phase-typed JSON failure
+receipt. Only exact `daily_loss_semantic_invalid` with matching mode, generation, and recovery
+action can transition the generation; input/output, binding, and internal codes never do. Internal
+invariants have a distinct exception type, staged provenance is classified as input integrity, and
+every external generation transition or B completion is persisted in the same binding operation
+before narration or another action. These review findings made no broker call and had no account or
+order effect.
+
 **2026-08-21, the post-run performance audit retained the complete-read safety boundary while
 removing half of its normal round trips.** The 11:33 incident above remains controlling evidence
 that a one-shot routine read is unsafe: that read stopped around 30,000 of roughly 52,000 tokens

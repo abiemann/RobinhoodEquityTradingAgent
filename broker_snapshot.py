@@ -26,17 +26,22 @@ a transport binding::
 
     python broker_snapshot.py stage --kind portfolio \
         --generation A \
-        --source C:\\tool-results\\portfolio.json \
-        --output C:\\scratch\\portfolio.json
+        --source-purpose daily-loss-a-final-portfolio-0 \
+        --auto-output-scratch C:\\scratch
 
-For a complete paginated response, repeat ``--source``, ``--output``, and
-``--request-cursor`` in request order.  The first request cursor is the literal
-``FIRST``; every later value is the cursor returned by the preceding page::
+The unattended routine always uses ``--auto-output-scratch`` so this helper,
+not model-authored JavaScript, allocates fresh direct-child output names.  The
+explicit ``--output`` form remains available for compatibility and tests.
+
+For a complete paginated response, repeat ``--source`` and
+``--request-cursor`` in request order; helper allocation creates one output per
+source.  The first request cursor is the literal ``FIRST``; every later value
+is the cursor returned by the preceding page::
 
     python broker_snapshot.py stage --kind positions \
         --generation A \
         --source positions-result-1.json --source positions-result-2.json \
-        --output positions-1.json --output positions-2.json \
+        --auto-output-scratch C:\\scratch \
         --request-cursor FIRST --request-cursor cursor-from-page-1
 
 ``--allow-more`` is available only for deliberately staging an incomplete
@@ -61,6 +66,18 @@ A successful ``stage`` receipt keeps detailed provenance records in ``files``
 and exposes their exact ordered path strings separately in ``output_paths``.
 Consumers must use ``output_paths`` for argv/path handoffs; a ``files`` entry is
 a descriptor object, never a pathname.
+
+Stage failures are phase-typed: ``stage_input_failed`` means the bound source,
+scratch, or prior staged input was unavailable; ``stage_response_invalid``
+means the committed object was an error or not a recognized complete connector
+result; ``stage_semantic_invalid`` means a valid result envelope failed
+deterministic broker semantics;
+``stage_binding_invalid`` means caller pagination arguments do not bind those
+validated pages; ``stage_internal_failed`` means helper-owned metadata
+allocation failed locally; and
+``stage_write_failed`` means validated bytes could not be atomically written.
+Only the semantic code is eligible for the routine's one whole-generation
+retry.
 """
 
 from __future__ import annotations
@@ -103,7 +120,29 @@ SOURCE_TERMINAL_MARKER_PREFIX = '.rhmra-broker-response-source-terminal-'
 SOURCE_TERMINAL_MARKER_NAME = 'rhmra-broker-response-source-terminal'
 SOURCE_RESERVE_LOCK = '.rhmra-broker-response-source-reserve-lock.json'
 SOURCE_RESERVE_LOCK_NAME = 'rhmra-broker-response-source-reserve-lock'
+STAGE_RETRY_MARKER = '.rhmra-broker-snapshot-stage-retry.json'
+STAGE_RETRY_MARKER_NAME = 'rhmra-broker-snapshot-stage-retry'
+STAGE_RETRY_EXHAUSTED_MARKER = (
+    '.rhmra-broker-snapshot-stage-retry-exhausted.json'
+)
+STAGE_RETRY_EXHAUSTED_MARKER_NAME = (
+    'rhmra-broker-snapshot-stage-retry-exhausted'
+)
+STAGE_RETRY_REASON = 'daily-loss-semantic-invalid'
+STAGE_RETRY_OUTCOMES = frozenset({'completed', 'failed'})
 SOURCE_PURPOSE_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,47}$')
+DAILY_LOSS_PURPOSE_RE = re.compile(
+    r'^daily-loss-([ab])-(?:discovery-(?:positions|orders)|marks-quotes|'
+    r'final-(?:portfolio|positions|orders))-(0|[1-9][0-9]{0,2})$'
+)
+FIRST_POSITIONS_PURPOSE_PREFIX = 'first-positions-'
+FIRST_POSITIONS_BASE_RE = re.compile(
+    r'^first-positions-(0|[1-9][0-9]*)$'
+)
+FIRST_POSITIONS_RETRY_RE = re.compile(
+    r'^first-positions-(0|[1-9][0-9]*)-retry$'
+)
+MAX_FIRST_POSITIONS_PAGE_COUNT = 1000
 SOURCE_ABORT_REASONS = frozenset(
     {'connector-failed', 'serialization-failed', 'file-change-failed'}
 )
@@ -197,6 +236,58 @@ class SourceHandoffError(SnapshotError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class StageError(SnapshotError):
+    """Base class for one precisely classified staging phase failure."""
+
+    code = "invalid_snapshot"
+
+
+class StageInputError(StageError):
+    """The bound source, scratch, or prior staged input was unavailable."""
+
+    code = "stage_input_failed"
+
+
+class StageSemanticError(StageError):
+    """Persisted inputs failed deterministic broker-snapshot semantics."""
+
+    code = "stage_semantic_invalid"
+
+    def __init__(self, message: str, recovery_action: str) -> None:
+        super().__init__(message)
+        self.recovery_action = recovery_action
+
+
+class StageResponseError(StageError):
+    """The committed object was not a successful recognized connector result."""
+
+    code = "stage_response_invalid"
+
+
+class StageBindingError(StageError):
+    """Caller pagination arguments do not bind the validated staged pages."""
+
+    code = "stage_binding_invalid"
+
+
+class StageInternalError(StageError):
+    """Helper-owned staging metadata/allocation failed locally."""
+
+    code = "stage_internal_failed"
+
+
+class StageWriteError(StageError):
+    """Validated snapshot bytes could not be atomically persisted."""
+
+    code = "stage_write_failed"
+
+
+class StageRetryStateError(StageError):
+    """The invocation-wide one-generation semantic retry state is invalid."""
+
+    code = "stage_retry_state_failed"
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -777,12 +868,9 @@ def _validate_pagination(
     return cursors
 
 
-def _validate_payloads(
-    kind: str,
-    payloads: Sequence[Mapping[str, Any]],
-    request_cursors: Sequence[str] | None,
-    allow_more: bool,
-) -> tuple[list[dict[str, Any]], list[str] | None]:
+def _validate_payload_documents(
+    kind: str, payloads: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
     if not payloads:
         raise SnapshotError("at least one --source is required")
     if kind == "portfolio":
@@ -795,6 +883,16 @@ def _validate_payloads(
         metadata = _validate_quotes(payloads)
     else:
         raise SnapshotError(f"unsupported snapshot kind {kind!r}")
+    return metadata
+
+
+def _validate_payloads(
+    kind: str,
+    payloads: Sequence[Mapping[str, Any]],
+    request_cursors: Sequence[str] | None,
+    allow_more: bool,
+) -> tuple[list[dict[str, Any]], list[str] | None]:
+    metadata = _validate_payload_documents(kind, payloads)
     cursors = _validate_pagination(kind, metadata, request_cursors, allow_more)
     return metadata, cursors
 
@@ -1113,6 +1211,78 @@ def _validated_source_purpose(value: Any, context: str = '--purpose') -> str:
     return value
 
 
+def _daily_loss_purpose_binding(
+    purpose: str,
+) -> tuple[str, str] | None:
+    match = DAILY_LOSS_PURPOSE_RE.fullmatch(purpose)
+    if match is None:
+        if purpose.startswith('daily-loss-'):
+            raise SourceHandoffError(
+                'source_purpose_invalid',
+                f'{purpose}: DAILY-LOSS purpose must use one canonical '
+                'generation/phase/kind/index combination',
+            )
+        return None
+    parts = purpose.split('-')
+    generation = 'A' if match.group(1) == 'a' else 'B'
+    kind = parts[-2]
+    return generation, kind
+
+
+def _validated_first_request_cursor_chain(
+    values: Sequence[str] | None, purpose: str
+) -> tuple[str, ...] | None:
+    first_match = (
+        FIRST_POSITIONS_BASE_RE.fullmatch(purpose)
+        or FIRST_POSITIONS_RETRY_RE.fullmatch(purpose)
+    )
+    if first_match is None:
+        if values:
+            raise SourceHandoffError(
+                'source_purpose_invalid',
+                '--first-request-cursor is valid only for a FIRST positions purpose',
+            )
+        return None
+    if not values:
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST reservation requires its complete request-cursor chain',
+        )
+    cursors = tuple(values)
+    if any(
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        for value in cursors
+    ):
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST request cursors must be nonempty exact strings',
+        )
+    if cursors[0] != 'FIRST' or len(set(cursors)) != len(cursors):
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST cursor chain must start with FIRST and be unique',
+        )
+    if len(cursors) > MAX_FIRST_POSITIONS_PAGE_COUNT:
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST cursor chain exceeds the '
+            f'{MAX_FIRST_POSITIONS_PAGE_COUNT}-page limit',
+        )
+    index_match = re.search(r'first-positions-([0-9]+)', purpose)
+    if index_match is None or int(index_match.group(1)) != len(cursors) - 1:
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST page index must equal the zero-based cursor position',
+        )
+    return cursors
+
+
+def _first_request_cursors_sha256(cursors: Sequence[str]) -> str:
+    return _sha256(_canonical_bytes(list(cursors)))
+
+
 def _source_purpose_key(purpose: str) -> str:
     return hashlib.sha256(purpose.encode('ascii')).hexdigest()
 
@@ -1136,8 +1306,9 @@ def _source_filename(reservation_id: str) -> str:
 def _source_reservation_document(
     *, scratch_id: str, source_root_id: str, purpose: str,
     reservation_id: str,
+    first_request_cursors: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    document: dict[str, Any] = {
         'schema_version': Decimal(SCHEMA_VERSION),
         'marker': SOURCE_RESERVATION_MARKER_NAME,
         'scratch_id': scratch_id,
@@ -1146,6 +1317,14 @@ def _source_reservation_document(
         'reservation_id': reservation_id,
         'source_filename': _source_filename(reservation_id),
     }
+    if first_request_cursors is not None:
+        document.update({
+            'first_request_cursor_count': Decimal(len(first_request_cursors)),
+            'first_request_cursors_sha256': _first_request_cursors_sha256(
+                first_request_cursors
+            ),
+        })
+    return document
 
 
 def _source_committed_document(
@@ -1479,17 +1658,35 @@ def _validated_source_reservation_at_path(
     expected_purpose: str | None = None,
 ) -> Mapping[str, Any]:
     document, _raw = _read_immutable_journal_marker(path, scratch)
-    if set(document) != {
+    base_fields = {
         'schema_version', 'marker', 'scratch_id', 'source_root_id', 'purpose',
         'reservation_id', 'source_filename',
-    }:
+    }
+    purpose = document.get('purpose')
+    first_purpose = (
+        isinstance(purpose, str)
+        and purpose.startswith(FIRST_POSITIONS_PURPOSE_PREFIX)
+    )
+    expected_fields = set(base_fields)
+    if first_purpose:
+        expected_fields.update({
+            'first_request_cursor_count', 'first_request_cursors_sha256',
+        })
+    if set(document) != expected_fields:
         raise SourceHandoffError(
             'source_journal_invalid',
             f'{path}: invalid source-reservation marker fields',
         )
-    purpose = document.get('purpose')
     reservation_id = document.get('reservation_id')
     source_filename = document.get('source_filename')
+    first_cursor_count = document.get('first_request_cursor_count')
+    first_cursor_sha256 = document.get('first_request_cursors_sha256')
+    canonical_first_match = (
+        FIRST_POSITIONS_BASE_RE.fullmatch(purpose)
+        or FIRST_POSITIONS_RETRY_RE.fullmatch(purpose)
+        if isinstance(purpose, str)
+        else None
+    )
     if (
         document.get('schema_version') != Decimal(SCHEMA_VERSION)
         or document.get('marker') != SOURCE_RESERVATION_MARKER_NAME
@@ -1502,6 +1699,21 @@ def _validated_source_reservation_at_path(
         or _UUID_RE.fullmatch(reservation_id) is None
         or source_filename != _source_filename(reservation_id)
         or path != _source_reservation_marker_path(scratch, purpose)
+        or (
+            first_purpose
+            and (
+                canonical_first_match is None
+                or isinstance(first_cursor_count, bool)
+                or not isinstance(first_cursor_count, Decimal)
+                or first_cursor_count != first_cursor_count.to_integral_value()
+                or first_cursor_count < 1
+                or first_cursor_count > MAX_FIRST_POSITIONS_PAGE_COUNT
+                or int(canonical_first_match.group(1))
+                != int(first_cursor_count) - 1
+                or not isinstance(first_cursor_sha256, str)
+                or re.fullmatch(r'[0-9a-f]{64}', first_cursor_sha256) is None
+            )
+        )
     ):
         raise SourceHandoffError(
             'source_journal_invalid',
@@ -1963,6 +2175,388 @@ def validate_bound_external_json_purposes(
     ]
 
 
+def _validate_source_retry_authorization_in_context(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    base_purpose: str,
+    retry_purpose: str,
+) -> Mapping[str, Any]:
+    base = _validated_source_purpose(base_purpose, 'base source purpose')
+    retry = _validated_source_purpose(retry_purpose, 'retry source purpose')
+    if retry != base + '-retry':
+        raise SourceHandoffError(
+            'source_retry_not_authorized',
+            f'{retry}: retry purpose must exactly equal {base}-retry',
+        )
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=base,
+    )
+    terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=reservation,
+    )
+    source_path = source_root / reservation['source_filename']
+    if terminal is None:
+        if os.path.lexists(source_path):
+            _read_reserved_source(source_root, reservation)
+            raise SourceHandoffError(
+                'source_commit_required',
+                f'{base}: reserved source exists but is not committed',
+            )
+        raise SourceHandoffError(
+            'source_handoff_pending',
+            f'{base}: source handoff has no terminal outcome',
+        )
+    if terminal['status'] != 'aborted' or terminal.get('reason') != 'connector-failed':
+        raise SourceHandoffError(
+            'source_retry_not_authorized',
+            f'{base}: retry requires an aborted connector-failed handoff',
+        )
+    if os.path.lexists(source_path):
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{source_path}: aborted source unexpectedly exists',
+        )
+    return reservation
+
+
+def validate_bound_source_retry_authorization(
+    scratch_path: os.PathLike[str] | str,
+    base_purpose: str,
+    retry_purpose: str,
+) -> None:
+    '''Prove that one ``-retry`` source follows an aborted connector read.
+
+    The retry name alone is not authority.  Its exact base reservation must
+    have reached the immutable ``aborted`` / ``connector-failed`` outcome and
+    must still have no response file.  Reservation calls enforce this before
+    the retry broker read; consumers repeat it as defense in depth.
+    '''
+
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    base_reservation = _validate_source_retry_authorization_in_context(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        base_purpose=base_purpose,
+        retry_purpose=retry_purpose,
+    )
+    retry_reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=retry_purpose,
+    )
+    if (
+        retry_reservation.get('first_request_cursor_count')
+        != base_reservation.get('first_request_cursor_count')
+        or retry_reservation.get('first_request_cursors_sha256')
+        != base_reservation.get('first_request_cursors_sha256')
+    ):
+        raise SourceHandoffError(
+            'source_retry_not_authorized',
+            f'{retry_purpose}: retry cursor binding differs from its base',
+        )
+
+
+def _raise_first_request_binding(message: str) -> None:
+    raise SourceHandoffError('request_binding_invalid', message)
+
+
+def _validate_first_reservation_cursor_binding(
+    reservation: Mapping[str, Any], request_cursors: Sequence[str]
+) -> None:
+    purpose = reservation.get('purpose')
+    if (
+        reservation.get('first_request_cursor_count')
+        != Decimal(len(request_cursors))
+        or reservation.get('first_request_cursors_sha256')
+        != _first_request_cursors_sha256(request_cursors)
+    ):
+        _raise_first_request_binding(
+            f'{purpose}: immutable FIRST reservation does not bind the '
+            'submitted request-cursor chain'
+        )
+
+
+def _validated_committed_first_page_in_context(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    page_index: int,
+    request_cursors: Sequence[str],
+) -> tuple[str, Any]:
+    base_purpose = f'first-positions-{page_index}'
+    try:
+        base_reservation = _validated_source_reservation(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            purpose=base_purpose,
+        )
+    except SourceHandoffError as exc:
+        if exc.code == 'source_reservation_missing':
+            _raise_first_request_binding(
+                f'{base_purpose}: prior FIRST page was not reserved and '
+                'committed before the next page'
+            )
+        raise
+    prefix = tuple(request_cursors[:page_index + 1])
+    _validate_first_reservation_cursor_binding(base_reservation, prefix)
+    base_terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=base_reservation,
+    )
+    if base_terminal is None:
+        raise SourceHandoffError(
+            'source_handoff_pending',
+            f'{base_purpose}: prior FIRST page has no terminal outcome',
+        )
+    if base_terminal['status'] == 'committed':
+        _path, document, _raw = _verify_committed_source(
+            source_root, base_reservation, base_terminal
+        )
+        return base_purpose, document
+    if base_terminal.get('reason') != 'connector-failed':
+        _raise_first_request_binding(
+            f'{base_purpose}: prior FIRST page did not produce a committed '
+            'positions response'
+        )
+    base_source = source_root / base_reservation['source_filename']
+    if os.path.lexists(base_source):
+        raise SourceHandoffError(
+            'source_file_invalid',
+            f'{base_source}: aborted source unexpectedly exists',
+        )
+
+    retry_purpose = base_purpose + '-retry'
+    _validate_source_retry_authorization_in_context(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        base_purpose=base_purpose,
+        retry_purpose=retry_purpose,
+    )
+    try:
+        retry_reservation = _validated_source_reservation(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            purpose=retry_purpose,
+        )
+    except SourceHandoffError as exc:
+        if exc.code == 'source_reservation_missing':
+            _raise_first_request_binding(
+                f'{retry_purpose}: prior FIRST retry was not committed before '
+                'the next page'
+            )
+        raise
+    _validate_first_reservation_cursor_binding(retry_reservation, prefix)
+    retry_terminal = _validated_source_terminal(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        reservation=retry_reservation,
+    )
+    if retry_terminal is None:
+        raise SourceHandoffError(
+            'source_handoff_pending',
+            f'{retry_purpose}: prior FIRST retry has no terminal outcome',
+        )
+    if retry_terminal['status'] != 'committed':
+        _raise_first_request_binding(
+            f'{retry_purpose}: prior FIRST retry did not produce a committed '
+            'positions response'
+        )
+    _path, document, _raw = _verify_committed_source(
+        source_root, retry_reservation, retry_terminal
+    )
+    return retry_purpose, document
+
+
+def _validate_first_prior_page_chain_in_context(
+    *,
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    source_root: Path,
+    request_cursors: Sequence[str],
+) -> None:
+    prior_count = len(request_cursors) - 1
+    if prior_count <= 0:
+        return
+    payloads: list[Mapping[str, Any]] = []
+    purposes: list[str] = []
+    for page_index in range(prior_count):
+        purpose, document = _validated_committed_first_page_in_context(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            page_index=page_index,
+            request_cursors=request_cursors,
+        )
+        try:
+            payload, _envelope = _unwrap_source(
+                document, f'source purpose {purpose!r}'
+            )
+        except SnapshotError as exc:
+            raise SourceHandoffError(
+                'source_contract_invalid',
+                f'{purpose}: committed FIRST response envelope is invalid: {exc}',
+            ) from exc
+        purposes.append(purpose)
+        payloads.append(payload)
+    try:
+        metadata = _validate_positions(payloads)
+    except SnapshotError as exc:
+        raise SourceHandoffError(
+            'source_contract_invalid',
+            f'{purposes[-1]}: committed FIRST positions chain is invalid: {exc}',
+        ) from exc
+    for page_index, page in enumerate(metadata):
+        expected_next = request_cursors[page_index + 1]
+        if page['next_cursor'] != expected_next:
+            _raise_first_request_binding(
+                f'{purposes[page_index]}: broker-returned next cursor does '
+                'not authorize the submitted next FIRST request cursor'
+            )
+
+
+def validate_bound_first_positions_request_binding(
+    scratch_path: os.PathLike[str] | str,
+    source_purposes: Sequence[str],
+    request_cursors: Sequence[str],
+) -> None:
+    '''Bind FIRST consumer cursor arguments to immutable reservations.
+
+    Reservation performs the pre-read proof against earlier committed page
+    payloads.  Consumers repeat the journal count/hash proof so a caller
+    cannot substitute a different cursor chain after the broker response was
+    saved.
+    '''
+
+    purposes = tuple(source_purposes)
+    cursors = tuple(request_cursors)
+    if not purposes or len(purposes) != len(cursors):
+        _raise_first_request_binding(
+            'FIRST source-purpose and request-cursor counts must be equal and '
+            'nonzero'
+        )
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    for page_index, purpose in enumerate(purposes):
+        match = (
+            FIRST_POSITIONS_BASE_RE.fullmatch(purpose)
+            or FIRST_POSITIONS_RETRY_RE.fullmatch(purpose)
+            if isinstance(purpose, str)
+            else None
+        )
+        if match is None or int(match.group(1)) != page_index:
+            _raise_first_request_binding(
+                'FIRST source purposes must be the ordered canonical page '
+                'namespace with at most one exact -retry suffix'
+            )
+        reservation = _validated_source_reservation(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            purpose=purpose,
+        )
+        _validate_first_reservation_cursor_binding(
+            reservation, cursors[:page_index + 1]
+        )
+        if FIRST_POSITIONS_RETRY_RE.fullmatch(purpose) is not None:
+            _validate_source_retry_authorization_in_context(
+                scratch=scratch,
+                scratch_marker=scratch_marker,
+                transport_marker=transport_marker,
+                source_root=source_root,
+                base_purpose=purpose[:-len('-retry')],
+                retry_purpose=purpose,
+            )
+
+
+def validate_bound_first_positions_page_request_binding(
+    scratch_path: os.PathLike[str] | str,
+    source_purpose: str,
+    request_cursors: Sequence[str],
+) -> None:
+    '''Bind one FIRST page consumer to its complete immutable cursor chain.
+
+    Unlike the final set consumer, a page consumer supplies one current source
+    purpose and the full request chain through that page.  The purpose index
+    must therefore equal ``len(request_cursors) - 1`` rather than the purpose
+    and cursor counts being equal.
+    '''
+
+    cursors = _validated_first_request_cursor_chain(
+        request_cursors, source_purpose
+    )
+    if cursors is None:  # The FIRST-only validator cannot return None here.
+        _raise_first_request_binding(
+            f'{source_purpose}: expected a canonical FIRST positions purpose'
+        )
+    scratch, scratch_marker, transport_marker, source_root = (
+        _validated_source_journal_context(scratch_path)
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+    )
+    _validate_first_prior_page_chain_in_context(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        source_root=source_root,
+        request_cursors=cursors,
+    )
+    reservation = _validated_source_reservation(
+        scratch=scratch,
+        scratch_marker=scratch_marker,
+        transport_marker=transport_marker,
+        purpose=source_purpose,
+    )
+    _validate_first_reservation_cursor_binding(reservation, cursors)
+    if FIRST_POSITIONS_RETRY_RE.fullmatch(source_purpose) is not None:
+        _validate_source_retry_authorization_in_context(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+            source_root=source_root,
+            base_purpose=source_purpose[:-len('-retry')],
+            retry_purpose=source_purpose,
+        )
+
+
 def _stage_metadata_path(path: str) -> str:
     return path + STAGE_METADATA_SUFFIX
 
@@ -2132,13 +2726,302 @@ def _absolute_distinct_paths(
     if normalized_sources.intersection(normalized_outputs):
         raise SnapshotError("a staged output must not overwrite a source result")
     for output in absolute_outputs:
-        if os.path.exists(output) or os.path.exists(_stage_metadata_path(output)):
-            raise SnapshotError(f"{output}: staged output already exists")
         parent = os.path.dirname(output)
         if not parent or not os.path.isdir(parent):
             raise SnapshotError(f"{output}: output directory does not exist")
     scratch, marker = _validated_output_scratch(absolute_outputs)
     return absolute_sources, absolute_outputs, scratch, marker
+
+
+def _ensure_stage_targets_absent(outputs: Sequence[str]) -> None:
+    for output in outputs:
+        if os.path.exists(output) or os.path.exists(_stage_metadata_path(output)):
+            raise SnapshotError(f"{output}: staged output already exists")
+
+
+def _helper_allocated_output_paths(
+    scratch: str, kind: str, generation: str, count: int
+) -> list[str]:
+    if count < 1:
+        raise SnapshotError("stage requires at least one source")
+    allocation_id = str(uuid.uuid4())
+    canonical_scratch, _marker = validate_scratch_directory(scratch)
+    return [
+        os.path.join(
+            os.fspath(canonical_scratch),
+            f"rhmra-stage-{generation.lower()}-{kind}-{allocation_id}-{index}.json",
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def _stage_retry_marker_document(scratch_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": Decimal(SCHEMA_VERSION),
+        "marker": STAGE_RETRY_MARKER_NAME,
+        "scratch_id": scratch_id,
+        "state": "generation-b-authorized",
+        "reason": STAGE_RETRY_REASON,
+    }
+
+
+def _stage_retry_exhausted_marker_document(
+    scratch_id: str, outcome: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": Decimal(SCHEMA_VERSION),
+        "marker": STAGE_RETRY_EXHAUSTED_MARKER_NAME,
+        "scratch_id": scratch_id,
+        "state": "generation-b-exhausted",
+        "outcome": outcome,
+    }
+
+
+def _validated_stage_retry_marker(
+    scratch: Path, marker: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    path = scratch / STAGE_RETRY_MARKER
+    if not os.path.lexists(path):
+        return None
+    try:
+        document, _raw = _read_immutable_journal_marker(path, scratch)
+    except (SourceHandoffError, SnapshotError, OSError) as exc:
+        raise StageRetryStateError(
+            f"{path}: cannot validate the semantic-retry marker: {exc}"
+        ) from exc
+    expected = _stage_retry_marker_document(str(marker["scratch_id"]))
+    if document != expected:
+        raise StageRetryStateError(
+            f"{path}: semantic-retry marker does not match this invocation"
+        )
+    return document
+
+
+def _validated_stage_retry_exhausted_marker(
+    scratch: Path, marker: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    path = scratch / STAGE_RETRY_EXHAUSTED_MARKER
+    if not os.path.lexists(path):
+        return None
+    try:
+        document, _raw = _read_immutable_journal_marker(path, scratch)
+    except (SourceHandoffError, SnapshotError, OSError) as exc:
+        raise StageRetryStateError(
+            f"{path}: cannot validate the exhausted retry marker: {exc}"
+        ) from exc
+    outcome = document.get("outcome")
+    if (
+        not isinstance(outcome, str)
+        or outcome not in STAGE_RETRY_OUTCOMES
+        or document
+        != _stage_retry_exhausted_marker_document(
+            str(marker["scratch_id"]), outcome
+        )
+    ):
+        raise StageRetryStateError(
+            f"{path}: exhausted retry marker does not match this invocation"
+        )
+    if _validated_stage_retry_marker(scratch, marker) is None:
+        raise StageRetryStateError(
+            f"{path}: exhausted retry marker has no authorization marker"
+        )
+    return document
+
+
+def _validate_stage_generation_authorization(
+    scratch: Path, marker: Mapping[str, Any], generation: str
+) -> None:
+    retry_marker = _validated_stage_retry_marker(scratch, marker)
+    exhausted_marker = _validated_stage_retry_exhausted_marker(scratch, marker)
+    if exhausted_marker is not None:
+        raise StageRetryStateError(
+            "generation B is exhausted and no later generation stage is allowed"
+        )
+    if generation == "A" and retry_marker is not None:
+        raise StageRetryStateError(
+            "generation A cannot restart after generation B was authorized"
+        )
+    if generation == "B" and retry_marker is None:
+        raise StageRetryStateError(
+            "generation B has no deterministic semantic-retry authorization"
+        )
+
+
+def _authorize_stage_generation_b(
+    scratch: Path, marker: Mapping[str, Any]
+) -> None:
+    if _validated_stage_retry_marker(scratch, marker) is not None:
+        raise StageRetryStateError(
+            "the one whole-generation semantic retry was already authorized"
+        )
+    path = scratch / STAGE_RETRY_MARKER
+    document = _stage_retry_marker_document(str(marker["scratch_id"]))
+    try:
+        _write_immutable_journal_marker(path, document, scratch)
+    except FileExistsError as exc:
+        # A concurrent claimant is still a spent retry, never permission for
+        # another A-to-B transition.
+        try:
+            _validated_stage_retry_marker(scratch, marker)
+        except StageRetryStateError:
+            raise
+        raise StageRetryStateError(
+            "the one whole-generation semantic retry was already authorized"
+        ) from exc
+    except (SourceHandoffError, SnapshotError, OSError) as exc:
+        raise StageRetryStateError(
+            f"{path}: cannot persist semantic-retry authorization: {exc}"
+        ) from exc
+
+
+def _exhaust_stage_generation_b(
+    scratch: Path, marker: Mapping[str, Any], outcome: str
+) -> bool:
+    if outcome not in STAGE_RETRY_OUTCOMES:
+        raise StageRetryStateError(
+            f"invalid generation-B terminal outcome {outcome!r}"
+        )
+    if _validated_stage_retry_marker(scratch, marker) is None:
+        raise StageRetryStateError(
+            "generation B cannot finish before it is authorized"
+        )
+    existing = _validated_stage_retry_exhausted_marker(scratch, marker)
+    if existing is not None:
+        if existing["outcome"] == outcome:
+            return True
+        raise StageRetryStateError(
+            "generation B was already exhausted with a different outcome"
+        )
+    path = scratch / STAGE_RETRY_EXHAUSTED_MARKER
+    document = _stage_retry_exhausted_marker_document(
+        str(marker["scratch_id"]), outcome
+    )
+    try:
+        _write_immutable_journal_marker(path, document, scratch)
+    except FileExistsError as exc:
+        existing = _validated_stage_retry_exhausted_marker(scratch, marker)
+        if existing is not None and existing["outcome"] == outcome:
+            return True
+        raise StageRetryStateError(
+            "generation B was exhausted concurrently with a different outcome"
+        ) from exc
+    except (SourceHandoffError, SnapshotError, OSError) as exc:
+        raise StageRetryStateError(
+            f"{path}: cannot persist exhausted retry state: {exc}"
+        ) from exc
+    _validated_stage_retry_exhausted_marker(scratch, marker)
+    return False
+
+
+def _authorize_stage_generation_b_transition(
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    *,
+    require_committed_a: bool = True,
+) -> bool:
+    reserve_lock = _acquire_source_reserve_lock(scratch, scratch_marker)
+    active_error = False
+    try:
+        _reject_pending_source_handoff(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+        )
+        if require_committed_a:
+            reservation_re = re.compile(
+                '^' + re.escape(SOURCE_RESERVATION_MARKER_PREFIX)
+                + r'[0-9a-f]{64}\.json$'
+            )
+            has_committed_a = False
+            try:
+                entries = list(scratch.iterdir())
+            except OSError as exc:
+                raise StageRetryStateError(
+                    f'{scratch}: cannot inspect generation-A evidence: {exc}'
+                ) from exc
+            for entry in entries:
+                if reservation_re.fullmatch(entry.name) is None:
+                    continue
+                reservation = _validated_source_reservation_at_path(
+                    entry,
+                    scratch=scratch,
+                    scratch_marker=scratch_marker,
+                    transport_marker=transport_marker,
+                )
+                binding = _daily_loss_purpose_binding(
+                    reservation['purpose']
+                )
+                if binding is None or binding[0] != 'A':
+                    continue
+                terminal = _validated_source_terminal(
+                    scratch=scratch,
+                    scratch_marker=scratch_marker,
+                    transport_marker=transport_marker,
+                    reservation=reservation,
+                )
+                if (
+                    terminal is not None
+                    and terminal['status'] == 'committed'
+                ):
+                    has_committed_a = True
+                    break
+            if not has_committed_a:
+                raise StageRetryStateError(
+                    'generation B requires at least one committed canonical '
+                    'DAILY-LOSS generation-A response'
+                )
+        if _validated_stage_retry_exhausted_marker(
+            scratch, scratch_marker
+        ) is not None:
+            raise StageRetryStateError("generation B is already exhausted")
+        idempotent = _validated_stage_retry_marker(
+            scratch, scratch_marker
+        ) is not None
+        if not idempotent:
+            _authorize_stage_generation_b(scratch, scratch_marker)
+        return idempotent
+    except BaseException:
+        active_error = True
+        raise
+    finally:
+        try:
+            _release_source_reserve_lock(
+                scratch, scratch_marker, reserve_lock
+            )
+        except Exception:
+            if not active_error:
+                raise
+
+
+def _finish_stage_generation_b_transition(
+    scratch: Path,
+    scratch_marker: Mapping[str, Any],
+    transport_marker: Mapping[str, Any],
+    outcome: str,
+) -> bool:
+    reserve_lock = _acquire_source_reserve_lock(scratch, scratch_marker)
+    active_error = False
+    try:
+        _reject_pending_source_handoff(
+            scratch=scratch,
+            scratch_marker=scratch_marker,
+            transport_marker=transport_marker,
+        )
+        return _exhaust_stage_generation_b(
+            scratch, scratch_marker, outcome
+        )
+    except BaseException:
+        active_error = True
+        raise
+    finally:
+        try:
+            _release_source_reserve_lock(
+                scratch, scratch_marker, reserve_lock
+            )
+        except Exception:
+            if not active_error:
+                raise
 
 
 def _prepare_atomic_files(
@@ -2218,7 +3101,9 @@ def _commit_atomic_files(prepared: Sequence[tuple[str, str, bytes]]) -> None:
         raise
 
 
-def _stage(args: argparse.Namespace) -> dict[str, Any]:
+def _stage_impl(
+    args: argparse.Namespace, stage_state: dict[str, Any]
+) -> dict[str, Any]:
     # Pagination flags are semantically inert for snapshot kinds that cannot
     # paginate.  Normalize them before validation and provenance generation.
     paginated = args.kind in {"positions", "orders"}
@@ -2226,19 +3111,58 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
     allow_more = args.allow_more if paginated else False
     prevalidated_documents: dict[str, tuple[Any, bytes]] = {}
     source_purposes: list[str] | None = args.source_purpose
+    source_arguments = source_purposes if source_purposes is not None else args.source
+    if args.auto_output_scratch is not None:
+        scratch, marker = validate_scratch_directory(
+            args.auto_output_scratch
+        )
+        output_mode = "helper-allocated"
+    else:
+        requested_outputs = args.output
+        absolute_outputs = [
+            os.path.abspath(path) for path in requested_outputs
+        ]
+        scratch, marker = _validated_output_scratch(absolute_outputs)
+        output_mode = "caller-supplied"
+    transport_marker = _validated_transport_marker(scratch, marker)
+    stage_state["scratch"] = scratch
+    stage_state["scratch_marker"] = marker
+    stage_state["transport_marker"] = transport_marker
+    _validate_stage_generation_authorization(
+        scratch, marker, args.generation
+    )
+    _reject_pending_source_handoff(
+        scratch=scratch,
+        scratch_marker=marker,
+        transport_marker=transport_marker,
+    )
+    if args.auto_output_scratch is not None:
+        requested_outputs = _helper_allocated_output_paths(
+            str(scratch),
+            args.kind,
+            args.generation,
+            len(source_arguments),
+        )
     if source_purposes is not None:
-        if len(source_purposes) != len(args.output):
+        if len(source_purposes) != len(requested_outputs):
             raise SnapshotError(
                 "--source-purpose and --output counts must match"
             )
-        absolute_outputs = [os.path.abspath(path) for path in args.output]
-        scratch, _marker = _validated_output_scratch(absolute_outputs)
+        for source_purpose in source_purposes:
+            binding = _daily_loss_purpose_binding(source_purpose)
+            if binding is not None and (
+                binding[0] != args.generation or binding[1] != args.kind
+            ):
+                raise StageBindingError(
+                    f'{source_purpose}: DAILY-LOSS purpose generation/kind '
+                    'does not match the stage command'
+                )
         validated_purposes = validate_bound_external_json_purposes(
             scratch, source_purposes
         )
         purpose_sources = [str(path) for path, _document, _raw in validated_purposes]
         sources, outputs, scratch, marker = _absolute_distinct_paths(
-            purpose_sources, args.output
+            purpose_sources, requested_outputs
         )
         prevalidated_documents = {
             source: (document, raw)
@@ -2248,14 +3172,8 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         sources, outputs, scratch, marker = _absolute_distinct_paths(
-            args.source, args.output
+            args.source, requested_outputs
         )
-    transport_marker = _validated_transport_marker(scratch, marker)
-    _reject_pending_source_handoff(
-        scratch=scratch,
-        scratch_marker=marker,
-        transport_marker=transport_marker,
-    )
     bound_source_root = Path(transport_marker['source_root'])
     external_documents: dict[str, tuple[Any, bytes]] = dict(
         prevalidated_documents
@@ -2288,9 +3206,9 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
                 source_arg=source,
             )
             external_documents[source] = (document, raw)
-    payloads: list[Mapping[str, Any]] = []
-    envelopes: list[str] = []
-    source_hashes: list[str] = []
+    source_documents: list[Any] = []
+    source_raws: list[bytes] = []
+    source_contexts: list[str] = []
     for source_index, source in enumerate(sources):
         if source in external_documents:
             document, source_raw = external_documents[source]
@@ -2301,19 +3219,32 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
             if source_purposes is None
             else f"source purpose {source_purposes[source_index]!r}"
         )
+        source_documents.append(document)
+        source_raws.append(source_raw)
+        source_contexts.append(source_context)
+
+    stage_state["phase"] = "response"
+    payloads: list[Mapping[str, Any]] = []
+    envelopes: list[str] = []
+    source_hashes: list[str] = []
+    for document, source_raw, source_context in zip(
+        source_documents, source_raws, source_contexts
+    ):
         payload, envelope = _unwrap_source(document, source_context)
         payloads.append(payload)
         envelopes.append(envelope)
         source_hashes.append(_sha256(source_raw))
 
-    metadata, request_cursors = _validate_payloads(
-        args.kind, payloads, request_cursors, allow_more
+    stage_state["phase"] = "semantic"
+    metadata = _validate_payload_documents(args.kind, payloads)
+    stage_state["phase"] = "binding"
+    request_cursors = _validate_pagination(
+        args.kind, metadata, request_cursors, allow_more
     )
+    stage_state["phase"] = "semantic"
     metadata_paths = [_stage_metadata_path(output) for output in outputs]
-    for metadata_path in metadata_paths:
-        if os.path.exists(metadata_path):
-            raise SnapshotError(f"{metadata_path}: staging provenance already exists")
     payload_raws = [_canonical_bytes(payload) for payload in payloads]
+    stage_state["phase"] = "internal"
     set_id = str(uuid.uuid4())
     complete = not allow_more
     metadata_documents = [
@@ -2337,12 +3268,15 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
             zip(outputs, payload_raws, metadata), 1
         )
     ]
+    stage_state["phase"] = "write"
+    _ensure_stage_targets_absent(outputs)
     all_prepared = _prepare_atomic_files(
         [*outputs, *metadata_paths], [*payloads, *metadata_documents]
     )
     prepared = all_prepared[:len(outputs)]
     _commit_atomic_files(all_prepared)
 
+    stage_state["phase"] = "receipt"
     files: list[dict[str, Any]] = []
     for index, (source, output, envelope, source_hash, page, prepared_item) in enumerate(
         zip(sources, outputs, envelopes, source_hashes, metadata, prepared), 1
@@ -2370,11 +3304,96 @@ def _stage(args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "kind": args.kind,
         "generation": args.generation,
+        "output_mode": output_mode,
         "set_id": set_id,
         "complete": not allow_more,
         "file_count": len(files),
         "output_paths": [entry["output"] for entry in files],
         "files": files,
+    }
+
+
+def _stage(args: argparse.Namespace) -> dict[str, Any]:
+    stage_state: dict[str, Any] = {"phase": "input"}
+    try:
+        return _stage_impl(args, stage_state)
+    except StageError:
+        raise
+    except SourceHandoffError:
+        raise
+    except (SnapshotError, OSError) as exc:
+        phase_error = {
+            "input": StageInputError,
+            "response": StageResponseError,
+            "semantic": StageSemanticError,
+            "binding": StageBindingError,
+            "internal": StageInternalError,
+            "write": StageWriteError,
+        }.get(stage_state["phase"])
+        if phase_error is None:
+            raise
+        if phase_error is StageSemanticError:
+            scratch = stage_state.get("scratch")
+            marker = stage_state.get("scratch_marker")
+            transport_marker = stage_state.get("transport_marker")
+            if (
+                not isinstance(scratch, Path)
+                or not isinstance(marker, Mapping)
+                or not isinstance(transport_marker, Mapping)
+            ):
+                raise StageRetryStateError(
+                    "semantic failure occurred without bound retry state"
+                ) from exc
+            if args.generation == "A":
+                _authorize_stage_generation_b_transition(
+                    scratch,
+                    marker,
+                    transport_marker,
+                    require_committed_a=False,
+                )
+                recovery_action = "generation-b"
+            else:
+                _finish_stage_generation_b_transition(
+                    scratch, marker, transport_marker, "failed"
+                )
+                recovery_action = "snapshot-second-attempt-failed"
+            raise StageSemanticError(str(exc), recovery_action) from exc
+        raise phase_error(str(exc)) from exc
+
+
+def _authorize_generation_b(args: argparse.Namespace) -> dict[str, Any]:
+    scratch, scratch_marker, transport_marker, _source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    idempotent = _authorize_stage_generation_b_transition(
+        scratch, scratch_marker, transport_marker
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "authorize-generation-b",
+        "ok": True,
+        "scratch": str(scratch),
+        "state": "generation-b-authorized",
+        "reason": STAGE_RETRY_REASON,
+        "idempotent": idempotent,
+    }
+
+
+def _finish_generation_b(args: argparse.Namespace) -> dict[str, Any]:
+    scratch, scratch_marker, transport_marker, _source_root = (
+        _validated_source_journal_context(args.scratch)
+    )
+    idempotent = _finish_stage_generation_b_transition(
+        scratch, scratch_marker, transport_marker, args.outcome
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "finish-generation-b",
+        "ok": True,
+        "scratch": str(scratch),
+        "state": "generation-b-exhausted",
+        "outcome": args.outcome,
+        "idempotent": idempotent,
     }
 
 
@@ -3395,7 +4414,7 @@ def _source_receipt_base(
     source_root: Path,
     reservation: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    receipt = {
         'schema_version': SCHEMA_VERSION,
         'action': action,
         'ok': True,
@@ -3407,6 +4426,16 @@ def _source_receipt_base(
         'reservation_id': reservation['reservation_id'],
         'source': str(source_root / reservation['source_filename']),
     }
+    if 'first_request_cursor_count' in reservation:
+        receipt.update({
+            'first_request_cursor_count': int(
+                reservation['first_request_cursor_count']
+            ),
+            'first_request_cursors_sha256': reservation[
+                'first_request_cursors_sha256'
+            ],
+        })
+    return receipt
 
 
 def _committed_source_receipt(
@@ -3441,6 +4470,41 @@ def _committed_source_receipt(
 
 def _reserve_source(args: argparse.Namespace) -> dict[str, Any]:
     purpose = _validated_source_purpose(args.purpose)
+    daily_loss_binding = _daily_loss_purpose_binding(purpose)
+    retry_of = (
+        _validated_source_purpose(args.retry_of, '--retry-of')
+        if args.retry_of is not None
+        else None
+    )
+    first_base = FIRST_POSITIONS_BASE_RE.fullmatch(purpose) is not None
+    first_retry = FIRST_POSITIONS_RETRY_RE.fullmatch(purpose) is not None
+    if (
+        purpose.startswith(FIRST_POSITIONS_PURPOSE_PREFIX)
+        and not first_base
+        and not first_retry
+    ):
+        raise SourceHandoffError(
+            'source_purpose_invalid',
+            f'{purpose}: FIRST purpose must be first-positions-N or '
+            'first-positions-N-retry with a canonical zero-based index',
+        )
+    if first_retry and retry_of is None:
+        raise SourceHandoffError(
+            'source_retry_not_authorized',
+            f'{purpose}: FIRST retry reservation requires --retry-of',
+        )
+    if retry_of is not None and (
+        not first_retry
+        or FIRST_POSITIONS_BASE_RE.fullmatch(retry_of) is None
+        or purpose != retry_of + '-retry'
+    ):
+        raise SourceHandoffError(
+            'source_retry_not_authorized',
+            f'{purpose}: --retry-of must name its canonical FIRST base purpose',
+        )
+    first_request_cursors = _validated_first_request_cursor_chain(
+        args.first_request_cursor, purpose
+    )
     scratch, scratch_marker, transport_marker, source_root = (
         _validated_source_journal_context(args.scratch)
     )
@@ -3452,13 +4516,49 @@ def _reserve_source(args: argparse.Namespace) -> dict[str, Any]:
             scratch_marker=scratch_marker,
             transport_marker=transport_marker,
         )
-        return _reserve_source_locked(
+        if daily_loss_binding is not None:
+            _validate_stage_generation_authorization(
+                scratch, scratch_marker, daily_loss_binding[0]
+            )
+        if first_request_cursors is not None:
+            _validate_first_prior_page_chain_in_context(
+                scratch=scratch,
+                scratch_marker=scratch_marker,
+                transport_marker=transport_marker,
+                source_root=source_root,
+                request_cursors=first_request_cursors,
+            )
+        if retry_of is not None:
+            base_reservation = _validate_source_retry_authorization_in_context(
+                scratch=scratch,
+                scratch_marker=scratch_marker,
+                transport_marker=transport_marker,
+                source_root=source_root,
+                base_purpose=retry_of,
+                retry_purpose=purpose,
+            )
+            if (
+                first_request_cursors is None
+                or base_reservation.get('first_request_cursor_count')
+                != Decimal(len(first_request_cursors))
+                or base_reservation.get('first_request_cursors_sha256')
+                != _first_request_cursors_sha256(first_request_cursors)
+            ):
+                raise SourceHandoffError(
+                    'source_retry_not_authorized',
+                    f'{purpose}: retry cursor chain does not match its base',
+                )
+        receipt = _reserve_source_locked(
             purpose=purpose,
+            first_request_cursors=first_request_cursors,
             scratch=scratch,
             scratch_marker=scratch_marker,
             transport_marker=transport_marker,
             source_root=source_root,
         )
+        if retry_of is not None:
+            receipt['retry_of'] = retry_of
+        return receipt
     except BaseException:
         active_error = True
         raise
@@ -3478,6 +4578,7 @@ def _reserve_source(args: argparse.Namespace) -> dict[str, Any]:
 def _reserve_source_locked(
     *,
     purpose: str,
+    first_request_cursors: Sequence[str] | None,
     scratch: Path,
     scratch_marker: Mapping[str, Any],
     transport_marker: Mapping[str, Any],
@@ -3529,6 +4630,7 @@ def _reserve_source_locked(
         source_root_id=transport_marker['source_root_id'],
         purpose=purpose,
         reservation_id=reservation_id,
+        first_request_cursors=first_request_cursors,
     )
     try:
         _write_immutable_journal_marker(
@@ -3907,6 +5009,15 @@ def _parser() -> JsonArgumentParser:
     )
     reserve_source.add_argument('--scratch', required=True)
     reserve_source.add_argument('--purpose', required=True)
+    reserve_source.add_argument(
+        '--retry-of',
+        help='authorize PURPOSE-retry from an aborted connector-failed PURPOSE',
+    )
+    reserve_source.add_argument(
+        '--first-request-cursor',
+        action='append',
+        help='repeat the complete FIRST positions cursor chain before its read',
+    )
 
     commit_source = subparsers.add_parser(
         'commit-source',
@@ -3932,6 +5043,21 @@ def _parser() -> JsonArgumentParser:
     lookup_source.add_argument('--scratch', required=True)
     lookup_source.add_argument('--purpose', required=True)
 
+    authorize_generation_b = subparsers.add_parser(
+        'authorize-generation-b',
+        help='persist the one DAILY-LOSS semantic retry authorization',
+    )
+    authorize_generation_b.add_argument('--scratch', required=True)
+
+    finish_generation_b = subparsers.add_parser(
+        'finish-generation-b',
+        help='persist the terminal outcome of the one DAILY-LOSS B generation',
+    )
+    finish_generation_b.add_argument('--scratch', required=True)
+    finish_generation_b.add_argument(
+        '--outcome', choices=sorted(STAGE_RETRY_OUTCOMES), required=True
+    )
+
     stage = subparsers.add_parser("stage", help="unwrap, validate, and stage snapshots")
     stage.add_argument("--kind", choices=SNAPSHOT_KINDS, required=True)
     stage.add_argument("--generation", choices=("A", "B"), required=True)
@@ -3941,7 +5067,13 @@ def _parser() -> JsonArgumentParser:
         "--source-purpose", action="append", metavar="PURPOSE",
         help="repeat committed response-source purposes in request order",
     )
-    stage.add_argument("--output", action="append", required=True, metavar="FILE")
+    stage_output = stage.add_mutually_exclusive_group(required=True)
+    stage_output.add_argument("--output", action="append", metavar="FILE")
+    stage_output.add_argument(
+        "--auto-output-scratch",
+        metavar="SCRATCH",
+        help="allocate one fresh direct-child output per source in SCRATCH",
+    )
     stage.add_argument(
         "--request-cursor",
         action="append",
@@ -3956,10 +5088,18 @@ def _parser() -> JsonArgumentParser:
     return parser
 
 
-def _error_result(action: str, exc: Exception) -> dict[str, Any]:
+def _error_result(
+    action: str,
+    exc: Exception,
+    *,
+    stage_kind: str | None = None,
+    stage_generation: str | None = None,
+) -> dict[str, Any]:
     if isinstance(exc, CliError):
         code = "usage_error"
     elif isinstance(exc, SourceHandoffError):
+        code = exc.code
+    elif isinstance(exc, StageError):
         code = exc.code
     elif isinstance(exc, ScratchCreateError):
         code = "scratch_create_failed"
@@ -3967,7 +5107,7 @@ def _error_result(action: str, exc: Exception) -> dict[str, Any]:
         code = "account_scope_failed"
     else:
         code = "invalid_snapshot"
-    return {
+    result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "action": action,
         "ok": False,
@@ -3976,6 +5116,16 @@ def _error_result(action: str, exc: Exception) -> dict[str, Any]:
             "message": str(exc),
         },
     }
+    if (
+        action == "stage"
+        and stage_kind in SNAPSHOT_KINDS
+        and stage_generation in {"A", "B"}
+    ):
+        result["kind"] = stage_kind
+        result["generation"] = stage_generation
+        if isinstance(exc, StageSemanticError):
+            result["recovery_action"] = exc.recovery_action
+    return result
 
 
 def _print_json(result: Mapping[str, Any]) -> None:
@@ -4008,10 +5158,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments[0]
         if arguments and arguments[0] in {
             'preflight', 'bind-transport', 'reserve-source', 'commit-source',
-            'abort-source', 'lookup-source', 'stage',
+            'abort-source', 'lookup-source', 'authorize-generation-b',
+            'finish-generation-b', 'stage',
         }
         else "unknown"
     )
+    args: argparse.Namespace | None = None
     try:
         _reject_hyphenated_stage_action(arguments)
         args = _parser().parse_args(arguments)
@@ -4027,12 +5179,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = _abort_source(args)
         elif args.action == 'lookup-source':
             result = _lookup_source(args)
+        elif args.action == 'authorize-generation-b':
+            result = _authorize_generation_b(args)
+        elif args.action == 'finish-generation-b':
+            result = _finish_generation_b(args)
         else:
             result = _stage(args)
         _print_json(result)
         return 0
     except (SnapshotError, OSError) as exc:
-        _print_json(_error_result(action, exc))
+        _print_json(
+            _error_result(
+                action,
+                exc,
+                stage_kind=(
+                    args.kind if action == "stage" and args is not None else None
+                ),
+                stage_generation=(
+                    args.generation
+                    if action == "stage" and args is not None else None
+                ),
+            )
+        )
         return 2
 
 

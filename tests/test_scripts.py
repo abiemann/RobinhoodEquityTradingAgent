@@ -26,7 +26,7 @@ import tempfile
 import threading
 import unittest
 import uuid
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -45,6 +45,7 @@ VALIDATE_CONSTANTS = os.path.join(ROOT, "validate_constants.py")
 DASHBOARD = os.path.join(ROOT, "dashboard", "serve.py")
 
 BROKER_SNAPSHOT = os.path.join(ROOT, 'broker_snapshot.py')
+CONNECTOR_CONTRACT = os.path.join(ROOT, 'connector_contract.py')
 RUN_LIFECYCLE = os.path.join(ROOT, 'run_lifecycle.py')
 RESOLVE_PYTHON = os.path.join(ROOT, 'resolve_python.ps1')
 
@@ -59,6 +60,7 @@ from evaluate_candidates import (
 )
 import validate_constants as constants_validator
 import broker_snapshot as broker_snapshot_module
+import daily_loss as daily_loss_module
 from broker_snapshot import (
     SourceHandoffError,
     SnapshotError,
@@ -400,6 +402,8 @@ class ConstantsValidatorTests(unittest.TestCase):
             ("PRICE_MIN", "02.5", "plain nonnegative decimal"),
             ("RSI_INTERVAL", "30 minute", "must be one of"),
             ("NO_BUY_FIRST_MINUTES", "391", "must be <= 390"),
+            ("HIGH_LOOKBACK_DAYS", "1001", "must be <= 1000"),
+            ("VOLUME_LOOKBACK_DAYS", "1001", "must be <= 1000"),
             ("AGENTIC_ACCOUNT_NAME", '""', "nonempty trimmed string"),
             (
                 "AGENTIC_ACCOUNT_NAME",
@@ -501,6 +505,9 @@ class DailyLossTests(unittest.TestCase):
         *,
         state=None,
         cumulative_quantity=None,
+        order_type="market",
+        trigger=None,
+        stop_price=None,
     ):
         if cumulative_quantity is None:
             cumulative_quantity = sum(
@@ -518,16 +525,22 @@ class DailyLossTests(unittest.TestCase):
                 if cumulative_decimal > 0
                 else "confirmed"
             )
-        return {
+        document = {
             "id": order_id,
             "symbol": symbol,
             "side": side,
+            "type": order_type,
             "created_at": created_at,
             "state": state,
             "cumulative_quantity": str(cumulative_quantity),
             "fees": "999.99",  # cumulative order fee must never be added to execution fees
             "executions": executions,
         }
+        if trigger is not None:
+            document["trigger"] = trigger
+        if stop_price is not None:
+            document["stop_price"] = str(stop_price)
+        return document
 
     @classmethod
     def quote(cls, symbol, current, previous, *, nonreg=None,
@@ -560,7 +573,8 @@ class DailyLossTests(unittest.TestCase):
         return {"data": {name: rows, "next": next_value}}
 
     def invoke(self, *, positions=None, orders=None, quotes=None,
-               total_value="1000", halt_pct="5", expected_success=True):
+               total_value="1000", halt_pct="5", stop_date_pt=None,
+               expected_success=True):
         positions = positions or [self.page("positions", [])]
         orders = orders or [self.page("orders", [])]
         quotes = quotes or []
@@ -590,6 +604,7 @@ class DailyLossTests(unittest.TestCase):
                 args += ["--quotes", *quote_paths]
             args += [
                 "--trading-date", self.TRADING_DATE,
+                "--stop-date-pt", stop_date_pt or self.TRADING_DATE,
                 "--as-of-utc", self.AS_OF_UTC,
                 "--halt-pct", halt_pct,
                 "--json-out", output_path,
@@ -764,6 +779,125 @@ class DailyLossTests(unittest.TestCase):
         nonfinite = self.invoke(total_value=float("nan"), expected_success=False)
         self.assertIn("non-finite JSON constant", nonfinite.stderr)
 
+    def test_failure_json_keeps_binding_input_and_output_failures_out_of_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            positions_path = os.path.join(td, "positions.json")
+            orders_path = os.path.join(td, "orders.json")
+            portfolio_path = os.path.join(td, "portfolio.json")
+            for path, document in (
+                (positions_path, self.page("positions", [])),
+                (orders_path, self.page("orders", [])),
+                (portfolio_path, {"data": {"total_value": "1000"}}),
+            ):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(document, handle)
+
+            common = [
+                "--portfolio", portfolio_path,
+                "--orders", orders_path,
+                "--trading-date", self.TRADING_DATE,
+                "--stop-date-pt", self.TRADING_DATE,
+                "--as-of-utc", self.AS_OF_UTC,
+                "--halt-pct", "5",
+                "--failure-json",
+            ]
+            cases = (
+                (
+                    "binding",
+                    ["--positions", positions_path, "--json-out", positions_path],
+                    "daily_loss_binding_invalid",
+                ),
+                (
+                    "input",
+                    [
+                        "--positions", os.path.join(td, "missing.json"),
+                        "--json-out", os.path.join(td, "input-out.json"),
+                    ],
+                    "daily_loss_input_failed",
+                ),
+                (
+                    "output",
+                    [
+                        "--positions", positions_path,
+                        "--json-out", os.path.join(td, "missing", "out.json"),
+                    ],
+                    "daily_loss_output_failed",
+                ),
+            )
+            for label, specific, expected_code in cases:
+                with self.subTest(phase=label):
+                    proc = subprocess.run(
+                        [sys.executable, DAILY_LOSS, *common, *specific],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertEqual(proc.stderr, "")
+                    self.assertEqual(proc.stdout.count("\n"), 1)
+                    receipt = json.loads(proc.stdout)
+                    self.assertEqual(
+                        set(receipt),
+                        {
+                            "schema_version", "action", "ok", "mode",
+                            "generation", "error",
+                        },
+                    )
+                    self.assertEqual(receipt["schema_version"], 1)
+                    self.assertEqual(receipt["action"], "daily-loss")
+                    self.assertIs(receipt["ok"], False)
+                    self.assertEqual(receipt["mode"], "calculation")
+                    self.assertIsNone(receipt["generation"])
+                    self.assertEqual(
+                        set(receipt["error"]), {"code", "message"}
+                    )
+                    self.assertEqual(receipt["error"]["code"], expected_code)
+                    self.assertNotIn("recovery_action", receipt)
+
+    def test_failure_json_classifies_helper_invariant_as_internal(self):
+        with tempfile.TemporaryDirectory() as td:
+            positions_path = os.path.join(td, "positions.json")
+            orders_path = os.path.join(td, "orders.json")
+            portfolio_path = os.path.join(td, "portfolio.json")
+            output_path = os.path.join(td, "daily-loss.json")
+            for path, document in (
+                (positions_path, self.page("positions", [])),
+                (orders_path, self.page("orders", [])),
+                (portfolio_path, {"data": {"total_value": "1000"}}),
+            ):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(document, handle)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                daily_loss_module,
+                "calculate_daily_loss",
+                side_effect=daily_loss_module.DailyLossInternalError(
+                    "internal test invariant"
+                ),
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                status = daily_loss_module.main(
+                    [
+                        "--portfolio", portfolio_path,
+                        "--positions", positions_path,
+                        "--orders", orders_path,
+                        "--trading-date", self.TRADING_DATE,
+                        "--stop-date-pt", self.TRADING_DATE,
+                        "--as-of-utc", self.AS_OF_UTC,
+                        "--halt-pct", "5",
+                        "--json-out", output_path,
+                        "--failure-json",
+                    ]
+                )
+            self.assertEqual(status, 2)
+            self.assertEqual(stderr.getvalue(), "")
+            receipt = json.loads(stdout.getvalue())
+            self.assertEqual(
+                receipt["error"]["code"], "daily_loss_internal_failed"
+            )
+            self.assertNotIn("recovery_action", receipt)
+            self.assertFalse(os.path.exists(output_path))
+
     def test_discovery_mode_outputs_the_reconciled_quote_set(self):
         with tempfile.TemporaryDirectory() as td:
             positions_path = os.path.join(td, "positions.json")
@@ -789,6 +923,7 @@ class DailyLossTests(unittest.TestCase):
                     "--positions", positions_path,
                     "--orders", orders_path,
                     "--trading-date", self.TRADING_DATE,
+                    "--stop-date-pt", self.TRADING_DATE,
                     "--as-of-utc", self.AS_OF_UTC,
                     "--symbols-out", symbols_path,
                 ],
@@ -839,6 +974,7 @@ class DailyLossTests(unittest.TestCase):
                         "--positions", positions_path,
                         "--orders", orders_path,
                         "--trading-date", self.TRADING_DATE,
+                        "--stop-date-pt", self.TRADING_DATE,
                         "--as-of-utc", self.AS_OF_UTC,
                         "--symbols-out", output_path,
                         *extra,
@@ -887,6 +1023,159 @@ class DailyLossTests(unittest.TestCase):
             expected_success=False,
         )
         self.assertIn("timestamp is later than as-of", future.stderr)
+
+    def test_stop_fill_summary_uses_distinct_orders_and_pacific_execution_day(self):
+        normalized_stop = self.order(
+            "normalized-stop",
+            "ALPHA",
+            "sell",
+            [
+                self.execution(
+                    "normalized-fill-1",
+                    "9",
+                    "1",
+                    timestamp="2026-07-31T07:00:00.000000001Z",
+                ),
+                self.execution(
+                    "normalized-fill-2",
+                    "9",
+                    "1",
+                    timestamp="2026-07-31T15:00:00.708917Z",
+                ),
+            ],
+            order_type="stop_market",
+            stop_price="9",
+        )
+        legacy_stop = self.order(
+            "legacy-stop",
+            "BETA",
+            "sell",
+            [self.execution("legacy-fill", "9", "1")],
+            state="cancelled",
+            order_type="market",
+            trigger="stop",
+            stop_price="9",
+        )
+        prior_pacific_stop = self.order(
+            "prior-pacific-stop",
+            "OLD",
+            "sell",
+            [
+                self.execution(
+                    "prior-pacific-fill",
+                    "9",
+                    "1",
+                    timestamp="2026-07-31T06:59:59.999999999Z",
+                )
+            ],
+            order_type="stop_limit",
+            stop_price="9",
+        )
+        ordinary_sell = self.order(
+            "ordinary-sell",
+            "PROFIT",
+            "sell",
+            [self.execution("ordinary-fill", "9", "1")],
+            order_type="limit",
+            trigger="immediate",
+            stop_price="0",
+        )
+        matching_buys = [
+            self.order(
+                "buy-alpha",
+                "ALPHA",
+                "buy",
+                [self.execution("buy-alpha-fill", "9", "2")],
+            ),
+            self.order(
+                "buy-beta",
+                "BETA",
+                "buy",
+                [self.execution("buy-beta-fill", "9", "1")],
+            ),
+            self.order(
+                "buy-old",
+                "OLD",
+                "buy",
+                [self.execution("buy-old-fill", "9", "1")],
+            ),
+            self.order(
+                "buy-profit",
+                "PROFIT",
+                "buy",
+                [self.execution("buy-profit-fill", "9", "1")],
+            ),
+        ]
+        result = self.invoke(
+            orders=[self.page(
+                "orders",
+                [
+                    normalized_stop,
+                    normalized_stop,
+                    legacy_stop,
+                    prior_pacific_stop,
+                    ordinary_sell,
+                    *matching_buys,
+                ],
+            )],
+        )
+        self.assertEqual(result["stop_count_date_pt"], self.TRADING_DATE)
+        self.assertEqual(result["stop_fills_today"], 2)
+        self.assertEqual(result["stopped_out_symbols"], ["ALPHA", "BETA"])
+
+    def test_relevant_sell_with_indeterminate_stop_identity_fails_closed(self):
+        matching_buy = self.order(
+            "matching-buy",
+            "BAD",
+            "buy",
+            [self.execution("matching-buy-fill", "9", "1")],
+        )
+        missing_type = self.order(
+            "missing-type",
+            "BAD",
+            "sell",
+            [self.execution("missing-type-fill", "9", "1")],
+        )
+        missing_type.pop("type")
+        positive_price_without_marker = self.order(
+            "unmarked-stop-price",
+            "BAD",
+            "sell",
+            [self.execution("unmarked-fill", "9", "1")],
+            stop_price="8",
+        )
+        contradictory = self.order(
+            "contradictory-stop",
+            "BAD",
+            "sell",
+            [self.execution("contradictory-fill", "9", "1")],
+            order_type="stop_market",
+            trigger="immediate",
+            stop_price="8",
+        )
+        cases = (
+            (missing_type, "missing or malformed"),
+            (positive_price_without_marker, "no recognized stop marker"),
+            (contradictory, "type and trigger are contradictory"),
+        )
+        for sell, reason in cases:
+            with self.subTest(order=sell["id"]):
+                proc = self.invoke(
+                    orders=[self.page("orders", [matching_buy, sell])],
+                    expected_success=False,
+                )
+                self.assertIn("stop classification is indeterminate", proc.stderr)
+                self.assertIn(reason, proc.stderr)
+
+    def test_stop_date_must_match_final_as_of_pacific_date(self):
+        proc = self.invoke(
+            stop_date_pt="2026-07-30",
+            expected_success=False,
+        )
+        self.assertIn(
+            "as-of UTC does not fall on --stop-date-pt in US Pacific time",
+            proc.stderr,
+        )
 
     def test_conflicting_duplicate_execution_id_fails_closed(self):
         conflict = self.invoke(
@@ -1083,8 +1372,177 @@ class DailyLossTests(unittest.TestCase):
         self.assertNotIn("const runJson", block)
         self.assertNotIn(".r.exit_code", block)
         self.assertIn("SOLE authority is therefore `daily_loss.py`", block)
+        self.assertIn(
+            "DEFINITION ONLY — THIS BLOCK IMPLEMENTS SECOND AND MUST NOT "
+            "EXECUTE HERE",
+            block,
+        )
+        self.assertIn(
+            "recording the `position-management` lifecycle event, does not "
+            "authorize",
+            block,
+        )
+        self.assertEqual(block.count("--stop-date-pt <START date_pt>"), 2)
+        self.assertIn("stop_count_date_pt", block)
+        self.assertIn("stop_fills_today", block)
+        self.assertIn("stopped_out_symbols", block)
+        self.assertIn("successful FINAL `daily_loss.py` receipt is the SOLE authority", block)
+        self.assertIn("Never issue a separate `get_equity_orders` call", block)
+        self.assertIn("count historical order rows", block)
+        connector_failures = routine.split("### CONNECTOR FAILURES", 1)[1].split(
+            "### ORDER HANDLING", 1
+        )[0]
+        self.assertIn(
+            "FIRST's initial Step 1 `get_equity_positions` census only",
+            connector_failures,
+        )
+        self.assertIn(
+            "Every later positions failure—DAILY-LOSS, pre-buy revalidation, "
+            "order-intent reconciliation, or FINAL STATUS REFRESH",
+            connector_failures,
+        )
+        self.assertIn("MUST NEVER reuse `first-portfolio`", connector_failures)
+        timestamp_contract = routine.split("### BROKER TIMESTAMPS", 1)[1].split(
+            "### BROKER ORDER OBJECTS", 1
+        )[0]
+        self.assertNotIn('stop-count "filled today"', timestamp_contract)
+        self.assertIn("stop-count guard is explicitly excluded", timestamp_contract)
+        returned_order_contract = routine.split(
+            "### BROKER ORDER OBJECTS", 1
+        )[1].split("### TRADE LEDGER", 1)[0]
+        self.assertIn(
+            "stop-count guard is not a runner-side filter", returned_order_contract
+        )
         self.assertIn("use NO `created_at_gte`, `state`, `symbol`, or `placed_agent` filter", block)
-        self.assertIn("Follow `data.next` until it is absent/empty", block)
+        self.assertIn(
+            "Follow the helper-returned `next_cursor` until it is null",
+            block,
+        )
+        page_contract = block.split(
+            "**DETERMINISTIC POSITIONS/ORDERS PAGE CONTRACT", 1
+        )[1].split("For positions and orders, stage each returned page", 1)[0]
+        for required in (
+            "`connector_contract.py page` with `--scratch '<scratch>'`",
+            "sourceReservation.purpose",
+            "--kind <positions|orders>",
+            "repeated `--request-cursor <FIRST|exact prior next_cursor>`",
+            "repeated, or overlong submitted request-cursor chain",
+            "continuation at the exact 1,000-page ceiling",
+            "Missing, null, and empty raw `data.next` are all valid terminal pages",
+            "`next_cursor: null`, `complete: true`",
+            "Its `complete` is the SOLE authority",
+            "its `next_cursor` is the SOLE authority",
+            "Never inspect or re-parse `fullToolResult`",
+            "never define `getNext`, `sourceData`",
+            "semantic generation failure",
+            "`request_binding_invalid`",
+            "`pagination_stopped`",
+            "`source_file_missing`, `source_file_changed`, or",
+            "generic `source_unavailable`",
+            "`snapshot-write-failed` without B",
+            "`coordination-halt` / `coordination-state`",
+        ):
+            self.assertIn(required, page_contract)
+        action_matrix = block.split(
+            "**CLOSED DAILY-LOSS CONNECTOR-CONTRACT ACTION MATRIX:**", 1
+        )[1].split("`broker_snapshot.py` accepts exactly nine actions", 1)[0]
+        for required in (
+            "only with the literal",
+            "`connector_contract.py page` action",
+            "`first-positions-set` belongs only to FIRST",
+            "deliberately has no `output_paths`",
+            "`orders-set`",
+            "`first-orders-set` do not exist",
+            "Never synthesize an action name from `kind`",
+            "`pageSet`, `positionSet`, `positionsSet`, `orderSet`, or `ordersSet`",
+            "exact frozen `stagedOutputPaths` returned by",
+            "`bindStageOutputPaths`",
+            "outside `bindStageOutputPaths`",
+            "without another\nbroker call and without consuming generation B",
+        ):
+            self.assertIn(required, action_matrix)
+        self.assertNotIn("const getNext", block)
+        self.assertNotIn("const sourceData", block)
+        stage_binding = block.split(
+            "const bindStageOutputPaths = (", 1
+        )[1].split("const stagedOutputPaths", 1)[0]
+        for required in (
+            "expectedPageBinding",
+            "expectedFileCount",
+            'stageReceipt.output_mode !== "helper-allocated"',
+            "descriptor.source_purpose !== expectedPageBinding.source_purpose",
+            "descriptor.row_count !== expectedPageBinding.row_count",
+            "descriptor.next_cursor !== expectedPageBinding.next_cursor",
+            "descriptor.request_cursor !== expectedPageBinding.request_cursor",
+            "descriptor.source_sha256",
+            "descriptor.payload_sha256",
+            "descriptor.provenance",
+            "pageStageBinding",
+            'code === "stage_semantic_invalid"',
+            'code === "stage_input_failed"',
+            '"stage_binding_invalid"',
+            '"stage_response_invalid"',
+            '"stage_retry_state_failed"',
+            '"stage_internal_failed"',
+            'code === "stage_write_failed"',
+            '"source_file_missing"',
+            '"source_file_changed"',
+            '"source_file_invalid"',
+            '["action", "error", "generation", "kind", "ok", "schema_version"]',
+            'hasExactJsonKeys(receipt, expectedFailureKeys)',
+            '["action", "error", "generation", "kind", "ok", "recovery_action", "schema_version"]',
+            'hasExactJsonKeys(receipt.error, ["code", "message"])',
+            'receipt.kind === expectedKind',
+            'receipt.generation === expectedGeneration',
+            'receipt.recovery_action === expectedSemanticRecovery',
+            'recovery_action: receipt.recovery_action',
+            'receipt.error.message.trim().length > 0',
+            'trustedStageFailureCodes.includes(receipt.error.code)',
+            '"generation-b"',
+            '"snapshot-second-attempt-failed"',
+            '"snapshot-write-failed"',
+            '"coordination-state"',
+        ):
+            self.assertIn(required, stage_binding)
+        daily_loss_failure_binding = block.split(
+            "const bindDailyLossCommandFailure = (", 1
+        )[1].split("The stage failure binder runs", 1)[0]
+        for required in (
+            'commandResult.process.exit_code === 2',
+            'receipt.action === "daily-loss"',
+            'receipt.mode === expectedMode',
+            'receipt.generation === expectedGeneration',
+            '"daily_loss_semantic_invalid"',
+            '"daily_loss_binding_invalid"',
+            '"daily_loss_input_failed"',
+            '"daily_loss_output_failed"',
+            '"daily_loss_internal_failed"',
+            'receipt.recovery_action === expectedRecovery',
+            'failure: "daily-loss-command-unclassified"',
+            'recovery_action: "coordination-state"',
+        ):
+            self.assertIn(required, daily_loss_failure_binding)
+        self.assertEqual(block.count("--failure-json"), 3)
+        self.assertIn(
+            "every allowed external A semantic outcome",
+            block,
+        )
+        self.assertIn(
+            "same binding operation must obtain and validate the exact "
+            "`authorize-generation-b` receipt",
+            block,
+        )
+        self.assertIn(
+            "same composed operation that binds a successful B evaluation "
+            "must persist `finish-generation-b "
+            "--outcome completed` before continuing",
+            block,
+        )
+        self.assertIn(
+            "Never infer semantic failure from stderr, an exception message, "
+            "exit code 2",
+            block,
+        )
         self.assertIn("execution timestamp rather than order creation time", block)
         self.assertIn("`intraday_quantity`", block)
         self.assertIn("`adjusted_previous_close`", block)
@@ -1113,6 +1571,18 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("use one proved terminal batch directly", quote_discovery_step)
         self.assertIn(
             "aggregate-seal only when there are multiple quote batches",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "A nonempty bound discovery `symbols` array is normal",
+            quote_discovery_step,
+        )
+        self.assertIn(
+            'not an "unexpected held symbols" condition',
+            quote_discovery_step,
+        )
+        self.assertIn(
+            "the bound quote paths in the final `daily_loss.py --quotes` arguments",
             quote_discovery_step,
         )
         final_step = block.split("5. Now re-fetch", 1)[1].split(
@@ -1145,6 +1615,21 @@ class DailyLossTests(unittest.TestCase):
             "transport-envelope, and `guide` fields",
             block,
         )
+        ordered = routine.split("### RUN THESE STEPS IN ORDER", 1)[1]
+        first = ordered.split("**SECOND — circuit breaker check**", 1)[0]
+        second = ordered.split("**SECOND — circuit breaker check**", 1)[1].split(
+            "**THIRD —", 1
+        )[0]
+        self.assertIn("FIRST completion boundary", first)
+        self.assertIn("bind `FIRST_COMPLETE`", first)
+        self.assertIn("require `FIRST_COMPLETE`", second)
+        self.assertIn(
+            "execute the DAILY-LOSS CIRCUIT BREAKER block above", second
+        )
+        dust = first.split("**Dust sweep", 1)[1].split(
+            "**Deterministic portfolio normalization", 1
+        )[0]
+        self.assertIn("never start SECOND/stop-count work", dust)
         self.assertIn("The field is literally `file_count`, never `count`", block)
         self.assertIn(
             "positive integer `file_count` equal to both the length of `files` "
@@ -1252,7 +1737,13 @@ class DailyLossTests(unittest.TestCase):
             receipt_binding,
         )
         self.assertIn("descriptor.output !== outputPath", receipt_binding)
-        self.assertIn("outputPath !== requestedOutputs[i]", receipt_binding)
+        self.assertIn("seenOutputPaths.has(outputPath)", receipt_binding)
+        self.assertIn("seenOutputPaths.add(outputPath)", receipt_binding)
+        self.assertNotIn("requestedOutputs", receipt_binding)
+        self.assertIn(
+            'stageReceipt.output_mode !== "helper-allocated"',
+            receipt_binding,
+        )
         self.assertIn(
             "const stagedOutputPaths = stageBinding.output_paths;",
             receipt_binding,
@@ -1335,6 +1826,14 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("--kind quotes", quotes_command)
         self.assertIn("--kind <positions|orders>", page_command)
         self.assertIn("--kind <positions|orders>", aggregate_command)
+        for command in (
+            portfolio_command,
+            quotes_command,
+            page_command,
+            aggregate_command,
+        ):
+            self.assertIn("--auto-output-scratch '<scratch>'", command)
+            self.assertNotIn("--output ", command)
         for command in (portfolio_command, quotes_command):
             self.assertNotIn("--request-cursor", command)
             self.assertNotIn("--allow-more", command)
@@ -1543,15 +2042,15 @@ class DailyLossTests(unittest.TestCase):
         self.assertNotIn('never make a new API call for the snapshot', snapshot)
 
         normalization = routine.split(
-            '**Portfolio buying-power normalization', 1
+            '**Deterministic portfolio normalization', 1
         )[1].split('**PRE-SECOND ENTRY-FEASIBILITY GATES', 1)[0]
         self.assertIn('`data.buying_power.buying_power`', normalization)
-        self.assertIn('legacy scalar', normalization)
+        self.assertIn('older scalar `data.buying_power`', normalization)
         self.assertIn(
-            'Never substitute or combine `unleveraged_buying_power`',
+            'never substitutes `unleveraged_buying_power`',
             normalization,
         )
-        self.assertIn('status `account.buying_power`', normalization)
+        self.assertIn('reports, and status account fields', normalization)
 
 
 class EvaluateCandidatesTests(unittest.TestCase):
@@ -4561,10 +5060,27 @@ class BrokerSnapshotTests(unittest.TestCase):
     def source_root_id(self, scratch):
         return self._transport_root_ids[os.path.abspath(scratch)]
 
-    def reserve_source(self, scratch, purpose):
-        proc, receipt = self.invoke(
+    def reserve_source(
+        self, scratch, purpose, *, retry_of=None, first_request_cursors=None
+    ):
+        arguments = [
             'reserve-source', '--scratch', scratch, '--purpose', purpose
+        ]
+        if retry_of is not None:
+            arguments.extend(['--retry-of', retry_of])
+        match = re.fullmatch(
+            r'first-positions-(0|[1-9][0-9]*)(?:-retry)?', purpose
         )
+        if match is not None:
+            if first_request_cursors is None:
+                page_index = int(match.group(1))
+                first_request_cursors = [
+                    'FIRST',
+                    *(f'test-cursor-{index}' for index in range(1, page_index + 1)),
+                ]
+            for cursor in first_request_cursors:
+                arguments.extend(['--first-request-cursor', cursor])
+        proc, receipt = self.invoke(*arguments)
         self.assertEqual(proc.returncode, 0, receipt)
         return receipt
 
@@ -4576,8 +5092,14 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, receipt)
         return receipt
 
-    def reserve_write_commit(self, scratch, purpose, document):
-        reserved = self.reserve_source(scratch, purpose)
+    def reserve_write_commit(
+        self, scratch, purpose, document, *, retry_of=None,
+        first_request_cursors=None,
+    ):
+        reserved = self.reserve_source(
+            scratch, purpose, retry_of=retry_of,
+            first_request_cursors=first_request_cursors,
+        )
         with open(
             reserved['source'], 'w', encoding='utf-8', newline='\n'
         ) as handle:
@@ -4601,6 +5123,10 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertEqual(reserved['status'], 'reserved')
             self.assertEqual(reserved['purpose'], purpose)
             self.assertFalse(reserved['idempotent'])
+            self.assertEqual(reserved['first_request_cursor_count'], 1)
+            self.assertRegex(
+                reserved['first_request_cursors_sha256'], r'^[0-9a-f]{64}$'
+            )
             self.assertRegex(
                 reserved['reservation_id'],
                 r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
@@ -4672,7 +5198,8 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.assertEqual(plural, [by_purpose])
 
             proc, duplicate = self.invoke(
-                'reserve-source', '--scratch', scratch, '--purpose', purpose
+                'reserve-source', '--scratch', scratch, '--purpose', purpose,
+                '--first-request-cursor', 'FIRST',
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(
@@ -4689,6 +5216,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             proc, fenced = self.invoke(
                 'reserve-source', '--scratch', scratch,
                 '--purpose', 'first-positions-0',
+                '--first-request-cursor', 'FIRST',
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(
@@ -4748,6 +5276,350 @@ class BrokerSnapshotTests(unittest.TestCase):
             self.commit_source(
                 scratch, 'first-positions-0', second['reservation_id']
             )
+
+    def test_retry_authorization_requires_connector_failed_base_without_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            def fresh_scratch(name):
+                path = os.path.join(td, name)
+                os.mkdir(path)
+                self.preflight(path)
+                return path
+
+            scratch = fresh_scratch('authorized')
+
+            base = self.reserve_source(scratch, 'first-positions-0')
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+                '--reservation-id', base['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+            proc, unauthorized = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0-retry',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                unauthorized['error']['code'], 'source_retry_not_authorized'
+            )
+
+            retry_reserved, _retry_committed = self.reserve_write_commit(
+                scratch,
+                'first-positions-0-retry',
+                {'data': {'positions': [], 'next': None}},
+                retry_of='first-positions-0',
+            )
+            self.assertEqual(retry_reserved['retry_of'], 'first-positions-0')
+            broker_snapshot_module.validate_bound_source_retry_authorization(
+                scratch, 'first-positions-0', 'first-positions-0-retry'
+            )
+
+            scratch = fresh_scratch('committed-base')
+            self.reserve_write_commit(
+                scratch,
+                'first-positions-0',
+                {'data': {'positions': [], 'next': None}},
+            )
+            proc, committed_base = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0-retry',
+                '--retry-of', 'first-positions-0',
+                '--first-request-cursor', 'FIRST',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                committed_base['error']['code'], 'source_retry_not_authorized'
+            )
+
+            scratch = fresh_scratch('wrong-reason')
+            other = self.reserve_source(scratch, 'first-positions-0')
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+                '--reservation-id', other['reservation_id'],
+                '--reason', 'serialization-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+            proc, wrong_reason = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0-retry',
+                '--retry-of', 'first-positions-0',
+                '--first-request-cursor', 'FIRST',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                wrong_reason['error']['code'], 'source_retry_not_authorized'
+            )
+
+            scratch = fresh_scratch('pending-base')
+            pending = self.reserve_source(scratch, 'first-positions-0')
+            proc, pending_base = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0-retry',
+                '--retry-of', 'first-positions-0',
+                '--first-request-cursor', 'FIRST',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                pending_base['error']['code'], 'source_handoff_pending'
+            )
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+                '--reservation-id', pending['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+            scratch = fresh_scratch('missing-base')
+            proc, missing_base = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0-retry',
+                '--retry-of', 'first-positions-0',
+                '--first-request-cursor', 'FIRST',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                missing_base['error']['code'], 'source_reservation_missing'
+            )
+            # The failed retry authorization did not create a reservation or
+            # pending fence that could acquire authority retroactively.
+            later_base = self.reserve_source(scratch, 'first-positions-0')
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-0',
+                '--reservation-id', later_base['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+            scratch = fresh_scratch('invalid-purpose')
+            for invalid_purpose in (
+                'first-positions-00',
+                'first-positions-00-retry',
+                'first-positions-0-retry2',
+                'first-positions-0-retry-retry',
+            ):
+                with self.subTest(invalid_purpose=invalid_purpose):
+                    arguments = [
+                        'reserve-source', '--scratch', scratch,
+                        '--purpose', invalid_purpose,
+                    ]
+                    if invalid_purpose.endswith('-retry-retry'):
+                        arguments.extend([
+                            '--retry-of', 'first-positions-0-retry'
+                        ])
+                    proc, invalid = self.invoke(*arguments)
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(
+                        invalid['error']['code'], 'source_purpose_invalid'
+                    )
+
+            scratch = fresh_scratch('cursor-mismatch')
+            self.reserve_write_commit(
+                scratch,
+                'first-positions-0',
+                {
+                    'data': {
+                        'positions': [],
+                        'next': (
+                            'https://api.robinhood.com/positions/'
+                            '?cursor=cursor-a'
+                        ),
+                    }
+                },
+            )
+            base = self.reserve_source(
+                scratch, 'first-positions-1',
+                first_request_cursors=['FIRST', 'cursor-a'],
+            )
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'first-positions-1',
+                '--reservation-id', base['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+            proc, mismatch = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-1-retry',
+                '--retry-of', 'first-positions-1',
+                '--first-request-cursor', 'FIRST',
+                '--first-request-cursor', 'cursor-b',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                mismatch['error']['code'], 'request_binding_invalid'
+            )
+
+    def test_first_reservation_binds_page_index_before_broker_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+
+            cases = (
+                ('first-positions-1', ['FIRST'], False),
+                (
+                    'first-positions-1000',
+                    ['FIRST', *(f'cursor-{index}' for index in range(1, 1000))],
+                    True,
+                ),
+            )
+            for purpose, cursors, invoke_in_process in cases:
+                with self.subTest(purpose=purpose):
+                    arguments = [
+                        'reserve-source', '--scratch', scratch,
+                        '--purpose', purpose,
+                    ]
+                    for cursor in cursors:
+                        arguments.extend(['--first-request-cursor', cursor])
+                    if invoke_in_process:
+                        # A thousand repeated cursor flags exceed Windows'
+                        # CreateProcess command-line limit before the helper
+                        # can inspect them.  Exercise the identical parser and
+                        # action in-process so the helper's exact page ceiling
+                        # remains covered on every platform.
+                        stdout = io.StringIO()
+                        with redirect_stdout(stdout):
+                            returncode = broker_snapshot_module.main(arguments)
+                        rejected = json.loads(stdout.getvalue())
+                    else:
+                        proc, rejected = self.invoke(*arguments)
+                        returncode = proc.returncode
+                    self.assertNotEqual(returncode, 0)
+                    self.assertEqual(
+                        rejected['error']['code'], 'source_purpose_invalid'
+                    )
+                    proc, missing = self.invoke(
+                        'lookup-source', '--scratch', scratch,
+                        '--purpose', purpose,
+                    )
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(
+                        missing['error']['code'], 'source_reservation_missing'
+                    )
+
+    def test_first_reservation_rejects_invented_next_cursor_before_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'first-positions-0',
+                {
+                    'data': {
+                        'positions': [],
+                        'next': (
+                            'https://api.robinhood.com/positions/'
+                            '?cursor=broker-cursor'
+                        ),
+                    }
+                },
+                first_request_cursors=['FIRST'],
+            )
+
+            proc, rejected = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'first-positions-1',
+                '--first-request-cursor', 'FIRST',
+                '--first-request-cursor', 'invented-cursor',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                rejected['error']['code'], 'request_binding_invalid'
+            )
+            proc, missing = self.invoke(
+                'lookup-source', '--scratch', scratch,
+                '--purpose', 'first-positions-1',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                missing['error']['code'], 'source_reservation_missing'
+            )
+
+            reserved = self.reserve_source(
+                scratch,
+                'first-positions-1',
+                first_request_cursors=['FIRST', 'broker-cursor'],
+            )
+            self.assertEqual(reserved['first_request_cursor_count'], 2)
+
+    def test_first_page_one_consumer_binds_full_chain_for_base_and_retry(self):
+        for use_retry in (False, True):
+            with self.subTest(use_retry=use_retry), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                self.reserve_write_commit(
+                    scratch,
+                    'first-positions-0',
+                    {
+                        'data': {
+                            'positions': [],
+                            'next': (
+                                'https://api.robinhood.com/positions/'
+                                '?cursor=broker-cursor'
+                            ),
+                        }
+                    },
+                    first_request_cursors=['FIRST'],
+                )
+                purpose = 'first-positions-1'
+                if use_retry:
+                    base = self.reserve_source(
+                        scratch,
+                        purpose,
+                        first_request_cursors=['FIRST', 'broker-cursor'],
+                    )
+                    proc, aborted = self.invoke(
+                        'abort-source', '--scratch', scratch,
+                        '--purpose', purpose,
+                        '--reservation-id', base['reservation_id'],
+                        '--reason', 'connector-failed',
+                    )
+                    self.assertEqual(proc.returncode, 0, aborted)
+                    purpose += '-retry'
+                    self.reserve_write_commit(
+                        scratch,
+                        purpose,
+                        {'data': {'positions': [], 'next': None}},
+                        retry_of='first-positions-1',
+                        first_request_cursors=['FIRST', 'broker-cursor'],
+                    )
+                else:
+                    self.reserve_write_commit(
+                        scratch,
+                        purpose,
+                        {'data': {'positions': [], 'next': None}},
+                        first_request_cursors=['FIRST', 'broker-cursor'],
+                    )
+
+                proc = subprocess.run(
+                    [
+                        sys.executable, CONNECTOR_CONTRACT, 'page',
+                        '--scratch', scratch,
+                        '--source-purpose', purpose,
+                        '--kind', 'positions',
+                        '--request-cursor', 'FIRST',
+                        '--request-cursor', 'broker-cursor',
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                receipt = json.loads(proc.stdout)
+                self.assertEqual(receipt['action'], 'page')
+                self.assertEqual(receipt['source_purpose'], purpose)
+                self.assertEqual(
+                    receipt['request_cursors'], ['FIRST', 'broker-cursor']
+                )
+                self.assertEqual(receipt['request_cursor'], 'broker-cursor')
+                self.assertIs(receipt['complete'], True)
 
     def test_source_handoff_concurrent_reservations_have_one_winner(self):
         with tempfile.TemporaryDirectory() as td:
@@ -6297,6 +7169,23 @@ class BrokerSnapshotTests(unittest.TestCase):
                 }
             }
             for generation in ('A', 'B'):
+                if generation == 'B':
+                    retry_source = self.write_json(
+                        source_root,
+                        'authorize-generation-b.json',
+                        {'data': {'total_value': '1500.01'}},
+                    )
+                    retry_output = os.path.join(
+                        scratch, 'authorize-generation-b-out.json'
+                    )
+                    failed, failure = self.stage(
+                        'portfolio', [retry_source], [retry_output],
+                        generation='A',
+                    )
+                    self.assertNotEqual(failed.returncode, 0, failure)
+                    self.assertEqual(
+                        failure['error']['code'], 'stage_semantic_invalid'
+                    )
                 generation_source = self.write_json(
                     source_root, f'portfolio-{generation}.json', payload
                 )
@@ -6482,6 +7371,625 @@ class BrokerSnapshotTests(unittest.TestCase):
         args += list(extra)
         return self.invoke(*args)
 
+    def auto_stage(
+        self, kind, scratch, sources, *extra, generation='A', by_purpose=False
+    ):
+        args = ['stage', '--kind', kind, '--generation', generation]
+        source_flag = '--source-purpose' if by_purpose else '--source'
+        for source in sources:
+            args += [source_flag, source]
+        args += ['--auto-output-scratch', scratch, *extra]
+        return self.invoke(*args)
+
+    def test_helper_allocates_fresh_stage_outputs_for_committed_purposes(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-discovery-positions-0',
+                {'data': {'positions': [], 'next': None}},
+            )
+
+            proc, receipt = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-a-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                by_purpose=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, (receipt, proc.stderr))
+            self.assertEqual(receipt['output_mode'], 'helper-allocated')
+            self.assertEqual(receipt['file_count'], 1)
+            output = receipt['output_paths'][0]
+            self.assertEqual(os.path.dirname(output), os.path.abspath(scratch))
+            self.assertRegex(
+                os.path.basename(output),
+                r'^rhmra-stage-a-positions-[0-9a-f-]{36}-1\.json$',
+            )
+            self.assertTrue(os.path.isfile(output))
+            self.assertTrue(os.path.isfile(output + '.rhmra-stage.json'))
+            self.assertEqual(receipt['files'][0]['output'], output)
+            self.assertEqual(
+                receipt['files'][0]['source_purpose'],
+                'daily-loss-a-discovery-positions-0',
+            )
+
+    def test_helper_allocates_aggregate_outputs_for_staged_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            source_root = self.source_root(scratch)
+            next_url = 'https://agent.robinhood.com/orders?cursor=two'
+            source_one = self.write_json(
+                source_root,
+                'orders-one.json',
+                {'data': {'orders': [], 'next': next_url}},
+            )
+            source_two = self.write_json(
+                source_root,
+                'orders-two.json',
+                {'data': {'orders': [], 'next': None}},
+            )
+            first_proc, first = self.auto_stage(
+                'orders', scratch, [source_one],
+                '--request-cursor', 'FIRST', '--allow-more',
+            )
+            second_proc, second = self.auto_stage(
+                'orders', scratch, [source_two],
+                '--request-cursor', 'two',
+            )
+            self.assertEqual(first_proc.returncode, 0, first)
+            self.assertEqual(second_proc.returncode, 0, second)
+
+            sealed_proc, sealed = self.auto_stage(
+                'orders',
+                scratch,
+                [first['output_paths'][0], second['output_paths'][0]],
+                '--request-cursor', 'FIRST',
+                '--request-cursor', 'two',
+            )
+            self.assertEqual(sealed_proc.returncode, 0, sealed)
+            self.assertEqual(sealed['output_mode'], 'helper-allocated')
+            self.assertEqual(sealed['file_count'], 2)
+            self.assertEqual(len(set(sealed['output_paths'])), 2)
+            self.assertTrue(
+                all(
+                    os.path.dirname(path) == os.path.abspath(scratch)
+                    for path in sealed['output_paths']
+                )
+            )
+            validate_generation_inputs(
+                {'orders': sealed['output_paths']}, 'A'
+            )
+
+    def test_stage_error_codes_preserve_transport_and_separate_other_phases(self):
+        with self.subTest(phase='input'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            reserved, _committed = self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            os.unlink(reserved['source'])
+            proc, error = self.auto_stage(
+                'portfolio',
+                scratch,
+                ['daily-loss-a-final-portfolio-0'],
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'source_file_missing')
+            self.assertEqual(error['kind'], 'portfolio')
+            self.assertEqual(error['generation'], 'A')
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+        with self.subTest(phase='journal'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            pending = self.reserve_source(
+                scratch, 'daily-loss-a-final-portfolio-1'
+            )
+            proc, error = self.auto_stage(
+                'portfolio',
+                scratch,
+                ['daily-loss-a-final-portfolio-0'],
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'source_handoff_pending')
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+            proc, aborted = self.invoke(
+                'abort-source', '--scratch', scratch,
+                '--purpose', 'daily-loss-a-final-portfolio-1',
+                '--reservation-id', pending['reservation_id'],
+                '--reason', 'connector-failed',
+            )
+            self.assertEqual(proc.returncode, 0, aborted)
+
+        with self.subTest(phase='changed-input'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            reserved, _committed = self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                json.dump(
+                    {'data': {
+                        'total_value': '2', 'cash': '2', 'buying_power': '2'
+                    }},
+                    handle,
+                    separators=(',', ':'),
+                    sort_keys=True,
+                )
+                handle.write('\n')
+            proc, error = self.auto_stage(
+                'portfolio', scratch,
+                ['daily-loss-a-final-portfolio-0'], by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'source_file_changed')
+
+        with self.subTest(phase='invalid-input'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            reserved, _committed = self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            with open(
+                reserved['source'], 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                handle.write('not-json\n')
+            proc, error = self.auto_stage(
+                'portfolio', scratch,
+                ['daily-loss-a-final-portfolio-0'], by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'source_file_invalid')
+
+        with self.subTest(phase='response'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {
+                    'isError': True,
+                    'structuredContent': {
+                        'data': {
+                            'total_value': '1',
+                            'cash': '1',
+                            'buying_power': '1',
+                        }
+                    },
+                },
+            )
+            proc, error = self.auto_stage(
+                'portfolio', scratch,
+                ['daily-loss-a-final-portfolio-0'], by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'stage_response_invalid')
+            self.assertEqual(error['kind'], 'portfolio')
+            self.assertEqual(error['generation'], 'A')
+            self.assertEqual(
+                set(error),
+                {'schema_version', 'action', 'ok', 'kind', 'generation', 'error'},
+            )
+            self.assertEqual(set(error['error']), {'code', 'message'})
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+        with self.subTest(phase='atomic-link'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            stdout = io.StringIO()
+            with mock.patch.object(
+                broker_snapshot_module.os,
+                'link',
+                side_effect=OSError('simulated atomic-link failure'),
+            ), redirect_stdout(stdout):
+                status = broker_snapshot_module.main(
+                    [
+                        'stage', '--kind', 'portfolio', '--generation', 'A',
+                        '--source-purpose', 'daily-loss-a-final-portfolio-0',
+                        '--auto-output-scratch', scratch,
+                    ]
+                )
+            self.assertEqual(status, 2)
+            error = json.loads(stdout.getvalue())
+            self.assertEqual(error['error']['code'], 'stage_write_failed')
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-') or name.endswith('.tmp')
+                for name in os.listdir(scratch)
+            ))
+
+        with self.subTest(phase='internal'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            allocation_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+            stdout = io.StringIO()
+            with mock.patch.object(
+                broker_snapshot_module.uuid,
+                'uuid4',
+                side_effect=[
+                    allocation_id,
+                    OSError('simulated helper metadata allocation failure'),
+                ],
+            ), redirect_stdout(stdout):
+                status = broker_snapshot_module.main(
+                    [
+                        'stage', '--kind', 'portfolio', '--generation', 'A',
+                        '--source-purpose', 'daily-loss-a-final-portfolio-0',
+                        '--auto-output-scratch', scratch,
+                    ]
+                )
+            self.assertEqual(status, 2)
+            error = json.loads(stdout.getvalue())
+            self.assertEqual(error['error']['code'], 'stage_internal_failed')
+            self.assertEqual(
+                set(error),
+                {
+                    'schema_version', 'action', 'ok', 'kind', 'generation',
+                    'error',
+                },
+            )
+            self.assertEqual(set(error['error']), {'code', 'message'})
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, broker_snapshot_module.STAGE_RETRY_MARKER
+            )))
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+        with self.subTest(phase='semantic'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-discovery-positions-0',
+                {'data': {'positions': 'not-an-array', 'next': None}},
+            )
+            proc, error = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-a-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'stage_semantic_invalid')
+            self.assertEqual(error['recovery_action'], 'generation-b')
+            self.assertTrue(os.path.isfile(os.path.join(
+                scratch, broker_snapshot_module.STAGE_RETRY_MARKER
+            )))
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-b-discovery-positions-0',
+                {'data': {'positions': 'still-not-an-array', 'next': None}},
+            )
+            proc, error = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-b-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                generation='B',
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'stage_semantic_invalid')
+            self.assertEqual(
+                error['recovery_action'], 'snapshot-second-attempt-failed'
+            )
+            self.assertTrue(os.path.isfile(os.path.join(
+                scratch, broker_snapshot_module.STAGE_RETRY_EXHAUSTED_MARKER
+            )))
+
+            proc, error = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-b-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                generation='B',
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                error['error']['code'], 'stage_retry_state_failed'
+            )
+            self.assertEqual(
+                set(error),
+                {
+                    'schema_version', 'action', 'ok', 'kind', 'generation',
+                    'error',
+                },
+            )
+            self.assertEqual(set(error['error']), {'code', 'message'})
+
+            proc, error = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-a-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                generation='A',
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                error['error']['code'], 'stage_retry_state_failed'
+            )
+
+        with self.subTest(phase='unauthorized-b'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            proc, error = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'daily-loss-b-final-portfolio-0',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                error['error']['code'], 'stage_retry_state_failed'
+            )
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': 'not-a-number'}},
+            )
+            proc, authorized = self.invoke(
+                'authorize-generation-b', '--scratch', scratch
+            )
+            self.assertEqual(proc.returncode, 0, authorized)
+            self.assertEqual(authorized['state'], 'generation-b-authorized')
+            self.assertFalse(authorized['idempotent'])
+            proc, repeated = self.invoke(
+                'authorize-generation-b', '--scratch', scratch
+            )
+            self.assertEqual(proc.returncode, 0, repeated)
+            self.assertTrue(repeated['idempotent'])
+            proc, stale_a = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'daily-loss-a-final-portfolio-0',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                stale_a['error']['code'], 'stage_retry_state_failed'
+            )
+
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-b-final-portfolio-0',
+                {'data': {
+                    'total_value': '1', 'cash': '1', 'buying_power': '1'
+                }},
+            )
+            proc, staged = self.auto_stage(
+                'portfolio', scratch,
+                ['daily-loss-b-final-portfolio-0'],
+                generation='B', by_purpose=True,
+            )
+            self.assertEqual(proc.returncode, 0, staged)
+            proc, finished = self.invoke(
+                'finish-generation-b', '--scratch', scratch,
+                '--outcome', 'completed',
+            )
+            self.assertEqual(proc.returncode, 0, finished)
+            self.assertFalse(finished['idempotent'])
+            proc, repeated_finish = self.invoke(
+                'finish-generation-b', '--scratch', scratch,
+                '--outcome', 'completed',
+            )
+            self.assertEqual(proc.returncode, 0, repeated_finish)
+            self.assertTrue(repeated_finish['idempotent'])
+            proc, exhausted = self.invoke(
+                'reserve-source', '--scratch', scratch,
+                '--purpose', 'daily-loss-b-final-portfolio-1',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(
+                exhausted['error']['code'], 'stage_retry_state_failed'
+            )
+            self.assertTrue(os.path.isfile(staged['output_paths'][0]))
+
+        with self.subTest(phase='binding'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-discovery-positions-0',
+                {'data': {'positions': [], 'next': None}},
+            )
+            proc, error = self.auto_stage(
+                'positions',
+                scratch,
+                ['daily-loss-a-discovery-positions-0'],
+                '--request-cursor',
+                'FIRST',
+                '--allow-more',
+                by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'stage_binding_invalid')
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+        with self.subTest(phase='write'), tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            stdout = io.StringIO()
+            with mock.patch.object(
+                broker_snapshot_module.tempfile,
+                'mkstemp',
+                side_effect=OSError('simulated stage write failure'),
+            ), redirect_stdout(stdout):
+                status = broker_snapshot_module.main(
+                    [
+                        'stage', '--kind', 'portfolio', '--generation', 'A',
+                        '--source-purpose', 'daily-loss-a-final-portfolio-0',
+                        '--auto-output-scratch', scratch,
+                    ]
+                )
+            self.assertEqual(status, 2)
+            error = json.loads(stdout.getvalue())
+            self.assertEqual(error['error']['code'], 'stage_write_failed')
+            self.assertFalse(any(
+                name.startswith('rhmra-stage-')
+                for name in os.listdir(scratch)
+            ))
+
+    def test_auto_output_requires_exact_bound_scratch_and_excludes_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            wrong = os.path.join(td, 'wrong')
+            os.mkdir(scratch)
+            os.mkdir(wrong)
+            self.preflight(scratch)
+            source = self.write_json(
+                self.source_root(scratch),
+                'portfolio.json',
+                {'data': {'total_value': '1', 'cash': '1', 'buying_power': '1'}},
+            )
+            proc, rejected = self.auto_stage(
+                'portfolio', wrong, [source]
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(rejected['ok'])
+            self.assertEqual(rejected['error']['code'], 'stage_input_failed')
+
+            explicit = os.path.join(scratch, 'explicit.json')
+            proc, rejected = self.invoke(
+                'stage', '--kind', 'portfolio', '--generation', 'A',
+                '--source', source, '--output', explicit,
+                '--auto-output-scratch', scratch,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(rejected['error']['code'], 'usage_error')
+
+            proc, rejected = self.auto_stage(
+                'portfolio', 'relative-scratch', [source]
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(rejected['ok'])
+            self.assertEqual(rejected['error']['code'], 'stage_input_failed')
+            self.assertIn(
+                'scratch directory must be an absolute path',
+                rejected['error']['message'],
+            )
+
+    def test_daily_loss_purpose_namespace_and_stage_binding_are_closed(self):
+        valid = {
+            'daily-loss-a-discovery-positions-0': ('A', 'positions'),
+            'daily-loss-a-discovery-orders-999': ('A', 'orders'),
+            'daily-loss-a-marks-quotes-0': ('A', 'quotes'),
+            'daily-loss-b-final-portfolio-999': ('B', 'portfolio'),
+            'daily-loss-b-final-positions-0': ('B', 'positions'),
+            'daily-loss-b-final-orders-999': ('B', 'orders'),
+        }
+        for purpose, expected in valid.items():
+            with self.subTest(valid=purpose):
+                self.assertEqual(
+                    broker_snapshot_module._daily_loss_purpose_binding(purpose),
+                    expected,
+                )
+        for purpose in (
+            'daily-loss-c-final-portfolio-0',
+            'daily-loss-a-final-quotes-0',
+            'daily-loss-a-marks-portfolio-0',
+            'daily-loss-a-final-portfolio-00',
+            'daily-loss-a-final-portfolio-1000',
+        ):
+            with self.subTest(invalid=purpose), self.assertRaises(
+                broker_snapshot_module.SourceHandoffError
+            ) as caught:
+                broker_snapshot_module._daily_loss_purpose_binding(purpose)
+            self.assertEqual(caught.exception.code, 'source_purpose_invalid')
+
+        with tempfile.TemporaryDirectory() as td:
+            scratch = os.path.join(td, 'scratch')
+            os.mkdir(scratch)
+            self.preflight(scratch)
+            self.reserve_write_commit(
+                scratch,
+                'daily-loss-a-final-portfolio-0',
+                {'data': {
+                    'total_value': '1', 'cash': '1', 'buying_power': '1'
+                }},
+            )
+            proc, error = self.auto_stage(
+                'quotes', scratch,
+                ['daily-loss-a-final-portfolio-0'], by_purpose=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(error['error']['code'], 'stage_binding_invalid')
+            self.assertFalse(os.path.exists(os.path.join(
+                scratch, broker_snapshot_module.STAGE_RETRY_MARKER
+            )))
+
     def test_strict_transport_envelopes_are_unwrapped_without_rekeying(self):
         with tempfile.TemporaryDirectory() as td:
             scratch = os.path.join(td, 'scratch')
@@ -6500,6 +8008,7 @@ class BrokerSnapshotTests(unittest.TestCase):
             raw_output = os.path.join(scratch, 'raw-out.json')
             proc, result = self.stage('portfolio', [raw_source], [raw_output])
             self.assertEqual(proc.returncode, 0, result)
+            self.assertEqual(result['output_mode'], 'caller-supplied')
             self.assertEqual(result['files'][0]['transport'], 'raw')
 
             positions = {'data': {'positions': [], 'next': None}}
@@ -6585,10 +8094,6 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def test_portfolio_stage_rejects_malformed_nested_buying_power(self):
         with tempfile.TemporaryDirectory() as td:
-            scratch = os.path.join(td, 'scratch')
-            os.mkdir(scratch)
-            self.preflight(scratch)
-            source_root = self.source_root(scratch)
             malformed = (
                 ('missing', {'display_currency': 'USD'}),
                 ('null', {'buying_power': None}),
@@ -6597,6 +8102,10 @@ class BrokerSnapshotTests(unittest.TestCase):
                 ('negative', {'buying_power': '-0.01'}),
             )
             for label, buying_power in malformed:
+                scratch = os.path.join(td, label)
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                source_root = self.source_root(scratch)
                 source = self.write_json(
                     source_root,
                     f'{label}-buying-power.json',
@@ -6608,10 +8117,14 @@ class BrokerSnapshotTests(unittest.TestCase):
                     },
                 )
                 output = os.path.join(scratch, f'{label}-rejected.json')
-                proc, result = self.stage('portfolio', [source], [output])
+                proc, result = self.stage(
+                    'portfolio', [source], [output], generation='A',
+                )
                 with self.subTest(case=label):
                     self.assertNotEqual(proc.returncode, 0)
-                    self.assertEqual(result['error']['code'], 'invalid_snapshot')
+                    self.assertEqual(
+                        result['error']['code'], 'stage_semantic_invalid'
+                    )
                     self.assertIn(
                         'portfolio.data.buying_power.buying_power',
                         result['error']['message'],
@@ -6620,15 +8133,15 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def test_portfolio_stage_rejects_missing_or_null_outer_buying_power(self):
         with tempfile.TemporaryDirectory() as td:
-            scratch = os.path.join(td, 'scratch')
-            os.mkdir(scratch)
-            self.preflight(scratch)
-            source_root = self.source_root(scratch)
             malformed = (
                 ('missing', {}),
                 ('null', {'buying_power': None}),
             )
             for label, fields in malformed:
+                scratch = os.path.join(td, label)
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                source_root = self.source_root(scratch)
                 source = self.write_json(
                     source_root,
                     f'{label}-outer-buying-power.json',
@@ -6640,10 +8153,14 @@ class BrokerSnapshotTests(unittest.TestCase):
                     },
                 )
                 output = os.path.join(scratch, f'{label}-outer-rejected.json')
-                proc, result = self.stage('portfolio', [source], [output])
+                proc, result = self.stage(
+                    'portfolio', [source], [output], generation='A',
+                )
                 with self.subTest(case=label):
                     self.assertNotEqual(proc.returncode, 0)
-                    self.assertEqual(result['error']['code'], 'invalid_snapshot')
+                    self.assertEqual(
+                        result['error']['code'], 'stage_semantic_invalid'
+                    )
                     self.assertIn(
                         'portfolio.data.buying_power',
                         result['error']['message'],
@@ -6698,10 +8215,6 @@ class BrokerSnapshotTests(unittest.TestCase):
 
     def test_strict_json_and_malformed_semantic_shapes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            scratch = os.path.join(td, 'scratch')
-            os.mkdir(scratch)
-            self.preflight(scratch)
-            source_root = self.source_root(scratch)
             quote = chr(34)
             duplicate = (
                 '{' + quote + 'data' + quote + ':{' + quote + 'total_value' +
@@ -6715,114 +8228,94 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             malformed = '{'
             cases = [
+                ('portfolio', 'duplicate.json', duplicate, True),
+                ('portfolio', 'nonfinite.json', nonfinite, True),
+                ('portfolio', 'malformed.json', malformed, True),
                 (
-                    'portfolio',
-                    self.write_text(source_root, 'duplicate.json', duplicate),
+                    'positions', 'positions-shape.json',
+                    {'data': {'positions': {}, 'next': None}}, False,
                 ),
                 (
-                    'portfolio',
-                    self.write_text(source_root, 'nonfinite.json', nonfinite),
+                    'orders', 'orders-shape.json',
+                    {
+                        'data': {
+                            'orders': [
+                                {
+                                    'id': 'order-1',
+                                    'state': 'filled',
+                                    'symbol': 'TEST',
+                                    'side': 'sell',
+                                    'cumulative_quantity': '2',
+                                    'executions': [
+                                        {
+                                            'id': 'execution-1',
+                                            'quantity': '1',
+                                            'price': '10',
+                                            'fees': '0',
+                                            'timestamp': '2026-08-04T16:00:00Z',
+                                        }
+                                    ],
+                                }
+                            ],
+                            'next': None,
+                        }
+                    }, False,
                 ),
                 (
-                    'portfolio',
-                    self.write_text(source_root, 'malformed.json', malformed),
+                    'quotes', 'quotes-shape.json',
+                    {'data': {'results': [{}] * 21}}, False,
                 ),
                 (
-                    'positions',
-                    self.write_json(
-                        source_root, 'positions-shape.json',
-                        {'data': {'positions': {}, 'next': None}},
-                    ),
+                    'portfolio', 'ambiguous-envelope.json',
+                    {
+                        'content': [
+                            {'type': 'text', 'text': '{}'},
+                            {'type': 'text', 'text': '{}'},
+                        ]
+                    }, False,
                 ),
                 (
-                    'orders',
-                    self.write_json(
-                        source_root,
-                        'orders-shape.json',
-                        {
-                            'data': {
-                                'orders': [
-                                    {
-                                        'id': 'order-1',
-                                        'state': 'filled',
-                                        'symbol': 'TEST',
-                                        'side': 'sell',
-                                        'cumulative_quantity': '2',
-                                        'executions': [
-                                            {
-                                                'id': 'execution-1',
-                                                'quantity': '1',
-                                                'price': '10',
-                                                'fees': '0',
-                                                'timestamp': '2026-08-04T16:00:00Z',
-                                            }
-                                        ],
-                                    }
-                                ],
-                                'next': None,
-                            }
+                    'portfolio', 'tool-error.json',
+                    {
+                        'isError': True,
+                        'structuredContent': {
+                            'data': {'total_value': '1500.01'}
                         },
-                    ),
+                    }, False,
                 ),
                 (
-                    'quotes',
-                    self.write_json(
-                        source_root, 'quotes-shape.json',
-                        {'data': {'results': [{}] * 21}},
-                    ),
-                ),
-                (
-                    'portfolio',
-                    self.write_json(
-                        source_root,
-                        'ambiguous-envelope.json',
-                        {
-                            'content': [
-                                {'type': 'text', 'text': '{}'},
-                                {'type': 'text', 'text': '{}'},
-                            ]
+                    'portfolio', 'invalid-error-flag.json',
+                    {
+                        'isError': 'false',
+                        'structuredContent': {
+                            'data': {'total_value': '1500.01'}
                         },
-                    ),
-                ),
-                (
-                    'portfolio',
-                    self.write_json(
-                        source_root,
-                        'tool-error.json',
-                        {
-                            'isError': True,
-                            'structuredContent': {
-                                'data': {'total_value': '1500.01'}
-                            },
-                        },
-                    ),
-                ),
-                (
-                    'portfolio',
-                    self.write_json(
-                        source_root,
-                        'invalid-error-flag.json',
-                        {
-                            'isError': 'false',
-                            'structuredContent': {
-                                'data': {'total_value': '1500.01'}
-                            },
-                        },
-                    ),
+                    }, False,
                 ),
             ]
-            for index, (kind, source) in enumerate(cases):
+            for index, (kind, name, value, is_text) in enumerate(cases):
+                scratch = os.path.join(td, f'case-{index}')
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                source_root = self.source_root(scratch)
+                source = (
+                    self.write_text(source_root, name, value)
+                    if is_text
+                    else self.write_json(source_root, name, value)
+                )
                 output = os.path.join(scratch, f'rejected-{index}.json')
                 with self.subTest(kind=kind, source=os.path.basename(source)):
-                    proc, result = self.stage(kind, [source], [output])
+                    proc, result = self.stage(
+                        kind, [source], [output], generation='A'
+                    )
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertFalse(result['ok'])
                     expected_code = (
                         'source_unregistered'
-                        if os.path.basename(source) in {
-                            'duplicate.json', 'nonfinite.json', 'malformed.json'
-                        }
-                        else 'invalid_snapshot'
+                        if index < 3
+                        else 'stage_response_invalid'
+                        if index >= 6
+                        else 'stage_semantic_invalid'
                     )
                     self.assertEqual(result['error']['code'], expected_code)
                     self.assertFalse(os.path.exists(output))
@@ -7068,6 +8561,7 @@ class BrokerSnapshotTests(unittest.TestCase):
                     '--orders', orders_output,
                     '--snapshot-generation', 'A',
                     '--trading-date', '2026-08-04',
+                    '--stop-date-pt', '2026-08-04',
                     '--as-of-utc', '2026-08-04T19:00:00Z',
                     '--symbols-out', symbols_output,
                 ],
@@ -7090,6 +8584,153 @@ class BrokerSnapshotTests(unittest.TestCase):
             )
             with open(symbols_output, encoding='utf-8') as handle:
                 self.assertEqual(json.load(handle), [])
+
+    def test_daily_loss_failure_json_authorizes_only_typed_semantic_a_or_b(self):
+        for generation, expected_recovery in (
+            ('A', 'generation-b'),
+            ('B', 'snapshot-second-attempt-failed'),
+        ):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, 'scratch')
+                os.mkdir(scratch)
+                self.preflight(scratch)
+                if generation == 'B':
+                    self.reserve_write_commit(
+                        scratch,
+                        'daily-loss-a-discovery-positions-0',
+                        {'data': {'positions': [], 'next': None}},
+                    )
+                    proc, authorization = self.invoke(
+                        'authorize-generation-b', '--scratch', scratch
+                    )
+                    self.assertEqual(proc.returncode, 0, authorization)
+
+                slug = generation.lower()
+                positions_purpose = (
+                    f'daily-loss-{slug}-discovery-positions-0'
+                )
+                orders_purpose = f'daily-loss-{slug}-discovery-orders-0'
+                positions_document = DailyLossTests.page(
+                    'positions',
+                    [DailyLossTests.position('BAD', '10', '5')],
+                )
+                orders_document = DailyLossTests.page(
+                    'orders',
+                    [
+                        DailyLossTests.order(
+                            'order-buy',
+                            'BAD',
+                            'buy',
+                            [
+                                DailyLossTests.execution(
+                                    'execution-buy', '10', '4'
+                                )
+                            ],
+                        )
+                    ],
+                )
+                self.reserve_write_commit(
+                    scratch, positions_purpose, positions_document
+                )
+                self.reserve_write_commit(
+                    scratch, orders_purpose, orders_document
+                )
+                positions_proc, positions_receipt = self.auto_stage(
+                    'positions', scratch, [positions_purpose],
+                    '--request-cursor', 'FIRST', generation=generation,
+                    by_purpose=True,
+                )
+                orders_proc, orders_receipt = self.auto_stage(
+                    'orders', scratch, [orders_purpose],
+                    '--request-cursor', 'FIRST', generation=generation,
+                    by_purpose=True,
+                )
+                self.assertEqual(
+                    positions_proc.returncode, 0, positions_receipt
+                )
+                self.assertEqual(orders_proc.returncode, 0, orders_receipt)
+                portfolio_purpose = f'daily-loss-{slug}-final-portfolio-0'
+                self.reserve_write_commit(
+                    scratch,
+                    portfolio_purpose,
+                    {
+                        'data': {
+                            'total_value': '1000',
+                            'cash': '1000',
+                            'equity_value': '0',
+                            'buying_power': {'buying_power': '1000'},
+                        }
+                    },
+                )
+                portfolio_proc, portfolio_receipt = self.auto_stage(
+                    'portfolio', scratch, [portfolio_purpose],
+                    generation=generation, by_purpose=True,
+                )
+                self.assertEqual(
+                    portfolio_proc.returncode, 0, portfolio_receipt
+                )
+
+                common = [
+                    sys.executable, DAILY_LOSS,
+                    '--positions', positions_receipt['output_paths'][0],
+                    '--orders', orders_receipt['output_paths'][0],
+                    '--snapshot-generation', generation,
+                    '--trading-date', DailyLossTests.TRADING_DATE,
+                    '--stop-date-pt', DailyLossTests.TRADING_DATE,
+                    '--as-of-utc', DailyLossTests.AS_OF_UTC,
+                    '--failure-json',
+                ]
+                cases = (
+                    (
+                        'discovery',
+                        [
+                            '--symbols-out',
+                            os.path.join(scratch, f'symbols-{slug}.json'),
+                        ],
+                    ),
+                    (
+                        'calculation',
+                        [
+                            '--portfolio',
+                            portfolio_receipt['output_paths'][0],
+                            '--halt-pct', '5',
+                            '--json-out',
+                            os.path.join(scratch, f'daily-loss-{slug}.json'),
+                        ],
+                    ),
+                )
+                for expected_mode, mode_arguments in cases:
+                    with self.subTest(
+                        generation=generation, mode=expected_mode
+                    ):
+                        proc = subprocess.run(
+                            [*common, *mode_arguments],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(proc.returncode, 2, proc.stderr)
+                        self.assertEqual(proc.stderr, '')
+                        receipt = json.loads(proc.stdout)
+                        self.assertEqual(
+                            set(receipt),
+                            {
+                                'schema_version', 'action', 'ok', 'mode',
+                                'generation', 'error', 'recovery_action',
+                            },
+                        )
+                        self.assertEqual(receipt['action'], 'daily-loss')
+                        self.assertIs(receipt['ok'], False)
+                        self.assertEqual(receipt['mode'], expected_mode)
+                        self.assertEqual(receipt['generation'], generation)
+                        self.assertEqual(
+                            receipt['error']['code'],
+                            'daily_loss_semantic_invalid',
+                        )
+                        self.assertEqual(
+                            receipt['recovery_action'], expected_recovery
+                        )
+                        self.assertFalse(os.path.exists(mode_arguments[-1]))
 
     def test_daily_loss_rejects_cross_generation_staged_inputs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7114,6 +8755,23 @@ class BrokerSnapshotTests(unittest.TestCase):
                 )[0].returncode,
                 0,
             )
+            invalid_source = self.write_json(
+                source_root,
+                'invalid-a.json',
+                {'data': {'positions': 'not-an-array', 'next': None}},
+            )
+            semantic_proc, semantic_error = self.stage(
+                'positions', [invalid_source],
+                [os.path.join(scratch, 'invalid-a-output.json')],
+                '--request-cursor', 'FIRST', generation='A',
+            )
+            self.assertNotEqual(semantic_proc.returncode, 0)
+            self.assertEqual(
+                semantic_error['error']['code'], 'stage_semantic_invalid'
+            )
+            self.assertEqual(
+                semantic_error['recovery_action'], 'generation-b'
+            )
             self.assertEqual(
                 self.stage(
                     'orders', [orders_source], [orders_b],
@@ -7129,15 +8787,23 @@ class BrokerSnapshotTests(unittest.TestCase):
                     '--orders', orders_b,
                     '--snapshot-generation', 'A',
                     '--trading-date', '2026-08-04',
+                    '--stop-date-pt', '2026-08-04',
                     '--as-of-utc', '2026-08-04T19:00:00Z',
                     '--symbols-out', symbols,
+                    '--failure-json',
                 ],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
             )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn('generation B does not match A', proc.stderr)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stderr, '')
+            receipt = json.loads(proc.stdout)
+            self.assertEqual(
+                receipt['error']['code'], 'daily_loss_input_failed'
+            )
+            self.assertIn('generation B does not match A', receipt['error']['message'])
+            self.assertNotIn('recovery_action', receipt)
             self.assertFalse(os.path.exists(symbols))
 
 
@@ -7187,6 +8853,173 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(document['phase'], 'scheduled')
         self.assertIsNone(document['run_start_pt'])
         return document
+
+    @staticmethod
+    def windows_replace_error(winerror):
+        error = PermissionError(f'simulated Windows replace error {winerror}')
+        error.winerror = winerror
+        return error
+
+    def test_projection_replace_recovers_once_without_replaying_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = lifecycle_module.start_invocation(
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc='2026-08-25T20:46:49Z',
+            )
+            real_replace = lifecycle_module.os.replace
+            attempts = 0
+
+            def transient_then_success(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise self.windows_replace_error(32)
+                return real_replace(source, destination)
+
+            with (
+                mock.patch.object(lifecycle_module.os, 'name', 'nt'),
+                mock.patch.object(
+                    lifecycle_module.os,
+                    'replace',
+                    side_effect=transient_then_success,
+                ),
+                mock.patch.object(lifecycle_module.time, 'sleep') as delay,
+            ):
+                bound = lifecycle_module.record_event(
+                    invocation_id=started['invocation_id'],
+                    phase='preflight',
+                    run_start_pt='2026-08-25T13:47:44-07:00',
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    now_utc='2026-08-25T20:48:01Z',
+                )
+
+            self.assertTrue(bound['ok'])
+            self.assertEqual(bound['phase'], 'preflight')
+            self.assertEqual(attempts, 2)
+            delay.assert_called_once_with(
+                lifecycle_module.PROJECTION_REPLACE_RETRY_DELAY_SECONDS
+            )
+            connection = sqlite3.connect(state_file)
+            try:
+                rows = connection.execute(
+                    'SELECT event_type, phase FROM lifecycle_events '
+                    'WHERE invocation_id = ? ORDER BY sequence',
+                    (started['invocation_id'],),
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(rows, [('start', 'scheduled'), ('event', 'preflight')])
+            projection = lifecycle_module.validate_current_projection_read_only(
+                state_file, projection_file
+            )
+            self.assertEqual(projection['records'][0]['latest_phase'], 'preflight')
+
+    def test_projection_replace_retry_exhaustion_is_terminal_and_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = lifecycle_module.start_invocation(
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc='2026-08-25T20:46:49Z',
+            )
+            with open(projection_file, 'rb') as handle:
+                original_projection = handle.read()
+            replace_error = self.windows_replace_error(33)
+
+            with (
+                mock.patch.object(lifecycle_module.os, 'name', 'nt'),
+                mock.patch.object(
+                    lifecycle_module.os,
+                    'replace',
+                    side_effect=replace_error,
+                ) as replace,
+                mock.patch.object(lifecycle_module.time, 'sleep') as delay,
+            ):
+                with self.assertRaises(
+                    lifecycle_module.ProjectionPublishError
+                ) as raised:
+                    lifecycle_module.record_event(
+                        invocation_id=started['invocation_id'],
+                        phase='preflight',
+                        run_start_pt='2026-08-25T13:47:44-07:00',
+                        state_file=state_file,
+                        projection_file=projection_file,
+                        now_utc='2026-08-25T20:48:01Z',
+                    )
+
+            self.assertIn('projection publication failed', str(raised.exception))
+            self.assertEqual(replace.call_count, 2)
+            delay.assert_called_once_with(
+                lifecycle_module.PROJECTION_REPLACE_RETRY_DELAY_SECONDS
+            )
+            with open(projection_file, 'rb') as handle:
+                self.assertEqual(handle.read(), original_projection)
+            self.assertFalse(
+                any(
+                    name.startswith('.rhmra-run-lifecycle-')
+                    for name in os.listdir(td)
+                )
+            )
+            connection = sqlite3.connect(state_file)
+            try:
+                event_count = connection.execute(
+                    'SELECT count(*) FROM lifecycle_events '
+                    'WHERE invocation_id = ?',
+                    (started['invocation_id'],),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(event_count, 2)
+
+            lifecycle_module.publish_projection(state_file, projection_file)
+            repaired = lifecycle_module.validate_current_projection_read_only(
+                state_file, projection_file
+            )
+            self.assertEqual(repaired['records'][0]['latest_phase'], 'preflight')
+
+    def test_projection_replace_does_not_retry_nontransient_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            started = lifecycle_module.start_invocation(
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc='2026-08-25T20:46:49Z',
+            )
+            replace_error = self.windows_replace_error(2)
+
+            with (
+                mock.patch.object(lifecycle_module.os, 'name', 'nt'),
+                mock.patch.object(
+                    lifecycle_module.os,
+                    'replace',
+                    side_effect=replace_error,
+                ) as replace,
+                mock.patch.object(lifecycle_module.time, 'sleep') as delay,
+            ):
+                with self.assertRaises(lifecycle_module.ProjectionPublishError):
+                    lifecycle_module.record_event(
+                        invocation_id=started['invocation_id'],
+                        phase='preflight',
+                        run_start_pt='2026-08-25T13:47:44-07:00',
+                        state_file=state_file,
+                        projection_file=projection_file,
+                        now_utc='2026-08-25T20:48:01Z',
+                    )
+
+            replace.assert_called_once()
+            delay.assert_not_called()
+            self.assertFalse(
+                any(
+                    name.startswith('.rhmra-run-lifecycle-')
+                    for name in os.listdir(td)
+                )
+            )
 
     def test_state_filesystem_preflight_rejects_fuse_before_live_state(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8920,6 +10753,9 @@ class MarketClockTests(unittest.TestCase):
         self.assertEqual(c["pt_iso"], "2026-07-21T08:07:00-07:00")
         self.assertEqual(c["date_et"], "2026-07-21")
         self.assertEqual(c["date_pt"], "2026-07-21")
+        self.assertEqual(
+            c["historicals_start_time"], "2026-06-16T15:07:00.000Z"
+        )
         self.assertEqual(c["session"], "regular")
         self.assertEqual(c["calendar_status"], "normal")
         self.assertEqual(c["regular_close_et"], "16:00")
@@ -8927,6 +10763,63 @@ class MarketClockTests(unittest.TestCase):
         self.assertTrue(c["entry_session_open"])
         self.assertEqual(c["minutes_since_open"], 97)
         self.assertRegex(c["constants_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_historicals_start_time_expands_with_configured_lookback(self):
+        with open(os.path.join(ROOT, "constants.md"), encoding="utf-8") as f:
+            constants_text = f.read()
+        constants_text = ConstantsValidatorTests.replace_value(
+            constants_text, "VOLUME_LOOKBACK_DAYS", "40"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            constants = os.path.join(td, "constants.md")
+            with open(constants, "w", encoding="utf-8") as f:
+                f.write(constants_text)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    CLOCK,
+                    "--constants",
+                    constants,
+                    "--now-utc",
+                    "2026-07-21T15:07:00Z",
+                    "--json",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["historicals_start_time"],
+            "2026-05-18T15:07:00.000Z",
+        )
+
+        long_text = ConstantsValidatorTests.replace_value(
+            constants_text, "VOLUME_LOOKBACK_DAYS", "180"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            constants = os.path.join(td, "constants.md")
+            with open(constants, "w", encoding="utf-8") as f:
+                f.write(long_text)
+            long_result = subprocess.run(
+                [
+                    sys.executable,
+                    CLOCK,
+                    "--constants",
+                    constants,
+                    "--now-utc",
+                    "2028-12-29T18:00:00Z",
+                    "--json",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(long_result.returncode, 0, long_result.stderr)
+        self.assertEqual(
+            json.loads(long_result.stdout)["historicals_start_time"],
+            "2028-04-06T18:00:00.000Z",
+        )
 
     def test_winter_offsets_are_standard(self):
         c = self.clock("2026-01-15T15:07:00Z")
@@ -9260,6 +11153,20 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn(
             "a CONFIGURATION HALT, never a generic clock failure",
+            clock_contract,
+        )
+        self.assertIn(
+            "`date_pt`, `historicals_start_time`, `constants_sha256`",
+            clock_contract,
+        )
+        self.assertIn(
+            "deterministic `historicals_start_time` computed from the larger "
+            "configured bar lookback",
+            clock_contract,
+        )
+        self.assertIn(
+            "None of these later readings changes START CLOCK's historicals "
+            "window",
             clock_contract,
         )
 
@@ -10425,9 +12332,13 @@ class MarketClockTests(unittest.TestCase):
             status_handoff,
         )
         self.assertIn(
-            'Exact verify success—whether after the initial publish or '
-            'after the permitted second publish—must store '
-            '`phase: "status-published"`',
+            'Exact publish or verify success—whether initial or after the '
+            'permitted second publish—must store the complete '
+            '`status_binding`',
+            status_handoff,
+        )
+        self.assertIn(
+            'sees `status-candidate-saved`, it may continue directly',
             status_handoff,
         )
 
@@ -10692,13 +12603,13 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             'const lease = load(LEASE_KEY);',
             'state.phase !== "transport-bound"',
-            'state.phase.startsWith("status-")',
             'lease.phase !== "lease-owned"',
             '!uuid4.test(invocationId)',
             'lease.invocation_id !== invocationId',
             'const quotedRunLockToken = quote(lease.run_lock_token);',
         ):
             self.assertIn(required, active_precondition)
+        self.assertNotIn('state.phase.startsWith("status-")', active_precondition)
         self.assertNotIn('state.phase !== "terminal"', active_precondition)
 
         release_code = later_contract.split(
@@ -10730,6 +12641,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertLess(released_store, released_output)
         self.assertLess(lost_store, lost_output)
         self.assertNotIn("run_lock_token:", release_code)
+        self.assertIn("reportSequenceStarted", release_code)
+        self.assertIn("reportTerminal", release_code)
+        self.assertIn("status-published", release_code)
+        self.assertIn("status-unavailable", release_code)
         for line in release_code.splitlines():
             if "text(" in line:
                 self.assertNotIn("runLockToken", line)
@@ -10979,6 +12894,12 @@ class MarketClockTests(unittest.TestCase):
             'const lease = load(LEASE_KEY);',
             'bootstrap.context_receipt.expected_report_file',
             'state.context_receipt.expected_report_file !== expectedReportFile',
+            'state.phase === "status-published"',
+            'state.phase === "status-unavailable"',
+            'state.report_binding.expected_report_file !== expectedReportFile',
+            'state.report_binding.persisted !== true',
+            'state.report_binding.read_back !== true',
+            'state.status_binding.status_file !== expectedStatusFile',
             'lease.phase !== "lease-released"',
             'lease.phase !== "lease-lost"',
             'Object.prototype.hasOwnProperty.call(lease, "run_lock_token")',
@@ -11361,7 +13282,14 @@ class MarketClockTests(unittest.TestCase):
                     prompt.index('TIMING_IDENTITY:'),
                 )
                 for required in (
+                    'scheduler-injected `Automation memory:` line and path '
+                    'are metadata, not a request',
+                    'ignore them without opening the path',
                     'bounded chunks of at most 100 lines',
+                    'Each pre-EOF tool call must read exactly one contiguous '
+                    'bounded chunk of that file and nothing else',
+                    'never combine it with memory, another file or command, '
+                    'or a whole-file read',
                     'exact next unread line',
                     'final read to prove EOF',
                     'first in chunks of at most 50 lines',
@@ -11647,6 +13575,8 @@ class MarketClockTests(unittest.TestCase):
             "Never use `run_lifecycle.py export`, a second START CLOCK, "
             "direct SQLite/projection access, a context summary",
             "Never pass the test-only lifecycle path overrides",
+            'reason: "projection_publication_failed"',
+            "must never repeat the lifecycle event",
             "-RecoverActiveContext",
             "exact raw `RUN_LOCK_TOKEN` remains retained",
             "exactly these twelve fields",
@@ -11803,7 +13733,7 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn("InvalidArgument: un-specified asset class", routine)
         self.assertIn(
-            "`broker_snapshot.py` accepts exactly seven actions", routine
+            "`broker_snapshot.py` accepts exactly nine actions", routine
         )
         self.assertIn("never hyphenate it onto the action", routine)
         self.assertIn(
@@ -11904,6 +13834,10 @@ class MarketClockTests(unittest.TestCase):
             "LOAD THIS ENTIRE FILE BEFORE ACTING",
             "sequentially from line 1",
             "bounded chunks of at most 100 lines",
+            "Each pre-EOF tool call must read exactly one contiguous bounded "
+            "chunk of this file and nothing else",
+            "never combine a chunk with `memory.md`, another file, another "
+            "command, or a whole-file read",
             "exact next unread line through EOF",
             "final read to prove that EOF was reached",
             "re-read the missing interval first in bounded chunks of at "
@@ -11953,6 +13887,13 @@ class MarketClockTests(unittest.TestCase):
             readme = f.read()
         self.assertIn("Treat every run as stateless", readme)
         self.assertEqual(readme.count("do not call a framework memory tool"), 2)
+        self.assertEqual(
+            readme.count(
+                "scheduler-injected `Automation memory:` line and path are "
+                "metadata, not a request"
+            ),
+            2,
+        )
         self.assertNotIn("never append scan or account details", readme)
 
     def test_every_contiguous_100_line_routine_block_is_at_most_40_kib(self):
@@ -11993,6 +13934,25 @@ class MarketClockTests(unittest.TestCase):
             'Never use a harness-advertised path, search for a result file',
             routine,
         )
+
+        scan_contract = routine.split(
+            "4. Resolve and validate the saved scan deterministically", 1
+        )[1].split("6. `run_scan`", 1)[0]
+        for required in (
+            "connector_contract.py scan --scratch '<scratch>' --source-purpose "
+            "scan-definition --title '<exact SCAN_TITLE>'",
+            "scalar `sorting`",
+            "`sort_valid: true` means the saved scalar is already exactly "
+            "`\"Relative volume desc\"`",
+            "`update_scan_config` MUST NOT be called",
+            "call `update_scan_config` at most once",
+            "sorting_column: \"Relative volume\"",
+            "sorting_direction: \"desc\"",
+            "connector_contract.py scan-update",
+            "returned `data.result.sorted_by`",
+            "Never retry this mutation, re-read the scans",
+        ):
+            self.assertIn(required, scan_contract)
 
         scan_phase = routine.split("6. `run_scan`", 1)[1].split("**FOURTH", 1)[0]
         filter_command = next(
@@ -12087,6 +14047,19 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn("under the current scratch directory", scan_phase)
         prefilter = routine.split("8. **Pre-filter the WORKING LIST", 1)[1].split("**The next three bullets", 1)[0]
         self.assertIn("unrounded `volume` × `last`", prefilter)
+        for required in (
+            '"symbols": [<that batch\'s exact symbols>]',
+            '"interval": "day"',
+            '"bounds": "regular"',
+            '"start_time": "<START CLOCK historicals_start_time copied '
+            'byte-for-byte>"',
+            'Never send `span`, `end_time`, or `account_number`',
+            'exactly one immediate retry',
+            'byte-identical broker payload',
+            'Never add, remove, reorder, or change an argument',
+            'successful response is committed once and is never refetched',
+        ):
+            self.assertIn(required, prefilter)
         self.assertIn("Only the FINAL RSI-enabled `evaluate_candidates.py --json-out`", routine)
         self.assertIn("Transient JSON handoffs are deliberately different", routine)
         self.assertIn(
@@ -12116,6 +14089,224 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('--scratch', pre_rsi_command)
         self.assertNotIn('py -3 evaluate_candidates.py', pre_rsi_command)
         self.assertNotIn('python3 evaluate_candidates.py', pre_rsi_command)
+
+    def test_routine_pins_connector_contracts_and_truthful_recovery(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as f:
+            routine = f.read()
+
+        portfolio = routine.split(
+            "**Deterministic portfolio normalization", 1
+        )[1].split("**PRE-SECOND", 1)[0]
+        for required in (
+            "connector_contract.py portfolio --scratch '<scratch>' "
+            "--source-purpose '<committed-purpose>'",
+            "values.total_value",
+            "values.cash",
+            "values.equity_value",
+            "values.buying_power",
+            "FIRST completion boundary",
+            "bind `FIRST_COMPLETE`",
+            "MUST NOT be fetched again",
+        ):
+            self.assertIn(required, portfolio)
+
+        first = routine.split("**FIRST — manage what I already hold", 1)[1].split(
+            "**PRE-SECOND", 1
+        )[0]
+        for required in (
+            "**FIRST deterministic positions contract:**",
+            "**CLOSED FIRST POSITIONS ACTION MATRIX:**",
+            "first-positions-<zero-based page>",
+            "connector_contract.py page --scratch '<scratch>'",
+            "connector_contract.py first-positions-set --scratch '<scratch>'",
+            "repeated `--source-purpose '<first-positions-N[-retry]>'`",
+            "repeated `--request-cursor <FIRST|exact prior helper next_cursor>`",
+            '`action: "first-positions-set"`, `ok: true`',
+            "`rows` array",
+            "`symbol`, `quantity`, `intraday_quantity`, and `average_buy_price`",
+            "Use only this final first-positions-set receipt's rows",
+            "Never\nmodel-dedupe rows",
+            "`structuredContent.data.results`",
+            "connector's positions array is not named `results`",
+            "Missing/null/empty `next`",
+            "must not be fetched again",
+            "`snapshot-failure` / `snapshot-validation-failed`",
+            "`source_file_missing`, `source_file_changed`, or",
+            "`source_retry_not_authorized`",
+            "`request_binding_invalid`",
+            "`pagination_stopped`",
+        ):
+            self.assertIn(required, first)
+        first_matrix = first.split(
+            "**CLOSED FIRST POSITIONS ACTION MATRIX:**", 1
+        )[1].split("After and only after the helper proves a terminal page", 1)[0]
+        for required in (
+            "exact CODEX\nLATER TOKEN PRECONDITION",
+            "successful normal\npath, the only local actions are `reserve-source`",
+            "`commit-source`, and\n`connector_contract.py page`",
+            "only exceptional local actions are\n`abort-source`",
+            "authorized retry `reserve-source --retry-of` immediately after",
+            "`lookup-source` after an interrupted/uncertain boundary",
+            "FIRST MUST NOT call `broker_snapshot.py stage`",
+            "read `output_paths` or `files`",
+            "DAILY-LOSS staging rules do not apply to FIRST",
+            "--purpose first-positions-<N>-retry --retry-of first-positions-<N>",
+            "normal FIRST reserve receipt plus `retry_of` exactly equal to",
+            "`first-positions-<N>`",
+            "under its\nreservation lock",
+            "failed reserve means no\nretry broker call",
+            "There is no other suffix",
+            "uses only the exact awaited `lookup-source` recovery matrix",
+        ):
+            self.assertIn(required, first_matrix)
+        self.assertIn(
+            "That `first-positions-set` call is FIRST's immediate and only "
+            "continuation",
+            first,
+        )
+        self.assertIn(
+            "deliberately returns rows without any\nfile path",
+            first,
+        )
+        self.assertIn(
+            "`coordination-halt` /\n`coordination-state`",
+            first,
+        )
+        self.assertNotIn("broker_snapshot.py stage --", first)
+        self.assertNotIn(" --output ", first)
+        self.assertNotIn("connector_contract.py positions-set", first)
+        self.assertNotIn('`action: "positions-set"`', first)
+
+        await_boundary = routine.split(
+            "**CODEX LOCAL-COMMAND AWAIT BOUNDARY — EXACT:**", 1
+        )[1].split("Only a final read/scan connector failure", 1)[0]
+        self.assertIn(
+            "const initialProcess = await tools.exec_command(commandArguments);",
+            await_boundary,
+        )
+        self.assertIn(
+            "const process = await drainCommand(initialProcess);",
+            await_boundary,
+        )
+        self.assertIn("`committed` + `consume`", await_boundary)
+        self.assertIn("`aborted` + `none`", await_boundary)
+        self.assertIn(
+            "`coordination-halt` / `coordination-state`",
+            await_boundary,
+        )
+        self.assertNotIn("drain(tools.exec_command(", routine)
+        self.assertNotIn("drainCommand(tools.exec_command(", routine)
+        javascript_blocks = "\n".join(
+            routine.split("```javascript")[index].split("```", 1)[0]
+            for index in range(1, len(routine.split("```javascript")))
+        )
+        self.assertNotIn("crypto.randomUUID()", javascript_blocks)
+        for line in javascript_blocks.splitlines():
+            if "tools.exec_command(" in line:
+                self.assertRegex(line, r"\bawait tools\.exec_command\(")
+
+        final_refresh = routine.split(
+            "**FINAL STATUS REFRESH — ONE COHERENT POST-MUTATION GENERATION:**",
+            1,
+        )[1].split("**Finalize lifecycle", 1)[0]
+        self.assertIn("Invoke `connector_contract.py portfolio`", final_refresh)
+        self.assertIn(
+            "Never re-fetch a successfully committed portfolio", final_refresh
+        )
+        self.assertIn(
+            "`connector_contract.py portfolio` receipt is the SOLE source",
+            final_refresh,
+        )
+
+        report = routine.split("Then produce the report:", 1)[1].split(
+            "**Save the report to disk", 1
+        )[0]
+        self.assertIn("ordered **Recovery diagnostics** section", report)
+        self.assertIn("number of extra broker calls", report)
+        self.assertIn("whether a broker mutation might have occurred", report)
+        self.assertIn(
+            "Total tokens used: unavailable — runtime did not expose a "
+            "complete total",
+            report,
+        )
+        self.assertIn("Never estimate tokens", report)
+        self.assertNotIn("rough `(estimate)`", report)
+
+        summary = routine.split("### FINAL ON-SCREEN RUN SUMMARY", 1)[1]
+        self.assertIn("`token usage unavailable`", summary)
+        self.assertIn("Never estimate token usage", summary)
+        self.assertNotIn("~N tokens (estimate)", summary)
+        self.assertIn("including `::inbox-item`", summary)
+
+        report_handoff = routine.split(
+            "**CODEX REPORT MACHINE HANDOFF — REQUIRED, ONE CELL:**", 1
+        )[1].split("**Non-Codex equivalent:**", 1)[0]
+        report_code = report_handoff.split("```javascript", 1)[1].split(
+            "```", 1
+        )[0]
+        for required in (
+            'const state = load(STATE_KEY);',
+            "state.context_receipt.expected_report_file",
+            "const reportMarkdown = REPORT_JSON_STRING;",
+            'const reportPath = state.project_root + separator + "run-reports"',
+            'phase: "report-write-started"',
+            'writingState.phase !== "report-write-started"',
+            'phase: "report-persisted"',
+            "const patchTarget = reportPath.replaceAll",
+            "await tools.apply_patch(patch)",
+            "quote(reportPath)",
+            "readBack !== payload",
+            "expected_report_file: expectedReportFile",
+            "persisted: true",
+            "read_back: true",
+        ):
+            self.assertIn(required, report_code)
+        self.assertEqual(report_code.count("tools.apply_patch"), 1)
+        self.assertEqual(report_code.count("tools.exec_command"), 1)
+        self.assertLess(
+            report_code.index("await tools.apply_patch(patch)"),
+            report_code.index("await tools.exec_command(readArgs)"),
+        )
+        self.assertNotRegex(
+            report_code,
+            r"rhmra-log-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}\.md",
+        )
+        status_handoff = routine.split(
+            "**CODEX STATUS MACHINE HANDOFF — REQUIRED:**", 1
+        )[1].split("If a later cell sees", 1)[0]
+        self.assertIn(
+            "state.report_binding.expected_report_file === "
+            "state.context_receipt.expected_report_file",
+            status_handoff,
+        )
+        self.assertIn('require `phase: "report-persisted"`', status_handoff)
+        self.assertIn('phase: "status-published"', status_handoff)
+        self.assertIn("status_binding", status_handoff)
+        finalization = routine.split(
+            "**Publish the STATUS SNAPSHOT", 1
+        )[1].split("### PERFORMANCE TELEMETRY", 1)[0]
+        self.assertIn("sees `status-candidate-saved`", finalization)
+        self.assertIn(
+            "continue directly to the one initial publish", finalization
+        )
+        self.assertIn("keep the already verified report immutable", finalization)
+        self.assertIn('phase: "status-unavailable"', finalization)
+        self.assertNotIn("update the report with the file-writing tool", finalization)
+
+        with open(os.path.join(ROOT, "rules_version.py"), encoding="utf-8") as f:
+            rules_version_helper = f.read()
+        for filename in (
+            "market_calendar.py",
+            "market_clock.py",
+            "daily_loss.py",
+            "connector_contract.py",
+            "filter_scan.py",
+            "evaluate_candidates.py",
+        ):
+            self.assertIn(f'"{filename}"', rules_version_helper)
 
     def test_routine_surfaces_missing_mcp_tools_with_reconnection_help(self):
         with open(

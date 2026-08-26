@@ -22,6 +22,7 @@ after positions and executions have been reconciled:
 
        python daily_loss.py --positions positions-1.json \
            --orders orders-1.json --trading-date 2026-07-31 \
+           --stop-date-pt 2026-07-31 \
            --as-of-utc 2026-07-31T16:00:00Z \
            --symbols-out quote-symbols.json
 
@@ -30,6 +31,7 @@ after positions and executions have been reconciled:
        python daily_loss.py --portfolio portfolio.json \
            --positions positions-1.json --orders orders-1.json \
            --quotes quotes-1.json --trading-date 2026-07-31 \
+           --stop-date-pt 2026-07-31 \
            --as-of-utc 2026-07-31T16:00:00Z --halt-pct 5 \
            --json-out daily-loss.json
 
@@ -40,11 +42,17 @@ malformed or unreconciled input fails without publishing a usable result.
 Both modes emit exactly one compact machine-readable JSON object on stdout
 after their atomic output write; the discovery receipt contains the exact
 ordered quote-symbol array as well as its count and time binding.
+When ``--failure-json`` is supplied, an expected CLI failure likewise emits
+one phase-typed JSON object on stdout so orchestration can distinguish broker
+semantic inconsistency from binding, input, and output failures.  Without that
+flag, failures retain the human-readable stderr interface.
 
-The importable entry points are :func:`discover_required_symbols` and
-:func:`calculate_daily_loss`.  They accept already-decoded raw connector
-documents.  :func:`load_json` preserves JSON-number precision for callers
-loading those documents from disk.
+The calculation result also derives the Pacific-day stop-fill count and
+stopped-out symbols from the same reconciled FINAL order pages, so the caller
+never needs a second order read.  The importable entry points are
+:func:`discover_required_symbols` and :func:`calculate_daily_loss`.  They
+accept already-decoded raw connector documents.  :func:`load_json` preserves
+JSON-number precision for callers loading those documents from disk.
 """
 
 from __future__ import annotations
@@ -68,7 +76,12 @@ from broker_snapshot import (
     validate_generation_inputs,
 )
 from market_calendar import core_session_schedule
-from market_clock import EASTERN_STD_OFFSET, session_state, zone_time
+from market_clock import (
+    EASTERN_STD_OFFSET,
+    PACIFIC_STD_OFFSET,
+    session_state,
+    zone_time,
+)
 
 
 SCHEMA_VERSION = 1
@@ -100,6 +113,10 @@ _UTC_RE = re.compile(
 
 class DailyLossError(ValueError):
     """Raised when broker input cannot support a safe daily-loss verdict."""
+
+
+class DailyLossInternalError(DailyLossError):
+    """Raised when a helper-owned invariant fails rather than broker semantics."""
 
 
 def _reject_nonfinite_json(token: str) -> None:
@@ -153,7 +170,9 @@ def decimal_string(value: Decimal) -> str:
     """Return a canonical, exponent-free exact decimal string."""
 
     if not isinstance(value, Decimal) or not value.is_finite():
-        raise DailyLossError("internal error: output decimal is not finite")
+        raise DailyLossInternalError(
+            "internal error: output decimal is not finite"
+        )
     if value == 0:
         return "0"
     rendered = format(value, "f")
@@ -266,6 +285,13 @@ def _eastern_datetime(instant: UtcInstant) -> datetime:
         instant.whole_second, EASTERN_STD_OFFSET, "EST", "EDT"
     )
     return eastern
+
+
+def _pacific_date(instant: UtcInstant) -> date:
+    pacific, _name, _offset = zone_time(
+        instant.whole_second, PACIFIC_STD_OFFSET, "PST", "PDT"
+    )
+    return pacific.date()
 
 
 def previous_nyse_session(trading_day: date | str) -> date:
@@ -439,11 +465,14 @@ class ReconciledSymbol:
 @dataclass(frozen=True)
 class Reconciliation:
     trading_day: date
+    stop_day_pt: date
     previous_session: date
     as_of: UtcInstant
     symbols: tuple[ReconciledSymbol, ...]
     unique_order_count: int
     today_execution_count: int
+    stop_fills_today: int
+    stopped_out_symbols: tuple[str, ...]
 
     @property
     def required_symbols(self) -> list[str]:
@@ -475,11 +504,87 @@ def _positions(pages: Sequence[Mapping[str, Any]]) -> dict[str, Position]:
     return positions
 
 
+def _returned_sell_is_stop(
+    order: Mapping[str, Any], order_id: str
+) -> bool:
+    """Classify one fill-bearing sell using the pinned returned-order shape."""
+
+    type_value = order.get("type")
+    if (
+        not isinstance(type_value, str)
+        or not type_value
+        or type_value != type_value.strip()
+    ):
+        raise DailyLossError(
+            f"order {order_id}: stop classification is indeterminate "
+            "because type is missing or malformed"
+        )
+    order_type = type_value.lower()
+
+    trigger_value = order.get("trigger")
+    if trigger_value is None:
+        trigger: str | None = None
+    elif (
+        isinstance(trigger_value, str)
+        and trigger_value
+        and trigger_value == trigger_value.strip()
+    ):
+        trigger = trigger_value.lower()
+    else:
+        raise DailyLossError(
+            f"order {order_id}: stop classification is indeterminate "
+            "because trigger is malformed"
+        )
+
+    raw_stop_price = order.get("stop_price")
+    has_positive_stop_price = False
+    if raw_stop_price is not None:
+        stop_price = _decimal(
+            raw_stop_price,
+            f"order {order_id}.stop_price",
+            nonnegative=True,
+        )
+        has_positive_stop_price = stop_price > 0
+
+    if order_type in {"stop_market", "stop_limit"}:
+        if trigger not in {None, "stop"}:
+            raise DailyLossError(
+                f"order {order_id}: stop classification is indeterminate "
+                "because type and trigger are contradictory"
+            )
+        return True
+
+    if order_type not in {"market", "limit"}:
+        raise DailyLossError(
+            f"order {order_id}: stop classification is indeterminate "
+            f"because type {type_value!r} is unrecognized"
+        )
+    if trigger == "stop":
+        if order_type != "market":
+            raise DailyLossError(
+                f"order {order_id}: stop classification is indeterminate "
+                "because type and trigger are contradictory"
+            )
+        return True
+    if trigger not in {None, "immediate"}:
+        raise DailyLossError(
+            f"order {order_id}: stop classification is indeterminate "
+            f"because trigger {trigger_value!r} is unrecognized"
+        )
+    if has_positive_stop_price:
+        raise DailyLossError(
+            f"order {order_id}: stop classification is indeterminate "
+            "because a positive stop_price has no recognized stop marker"
+        )
+    return False
+
+
 def _execution_rows(
     pages: Sequence[Mapping[str, Any]],
     trading_day: date,
+    stop_day_pt: date,
     as_of: UtcInstant,
-) -> tuple[dict[str, Flow], int, int]:
+) -> tuple[dict[str, Flow], int, int, int, tuple[str, ...]]:
     order_rows = _page_rows(pages, "orders")
     orders_by_id: dict[str, Mapping[str, Any]] = {}
     unique_orders: list[Mapping[str, Any]] = []
@@ -502,6 +607,8 @@ def _execution_rows(
         str, tuple[str, str, str, Mapping[str, Any]]
     ] = {}
     today_execution_count = 0
+    stop_order_ids_today: set[str] = set()
+    stopped_out_symbols: set[str] = set()
 
     for order in unique_orders:
         order_id = order["id"]
@@ -527,6 +634,7 @@ def _execution_rows(
         symbol: str | None = None
         side: str | None = None
         order_execution_quantity = Decimal(0)
+        has_execution_on_stop_day = False
 
         for execution_index, raw_execution in enumerate(executions, 1):
             if raw_execution is None:
@@ -585,6 +693,8 @@ def _execution_rows(
                 raise DailyLossError(
                     f"execution {execution_id}: timestamp is later than as-of"
                 )
+            if _pacific_date(timestamp) == stop_day_pt:
+                has_execution_on_stop_day = True
             execution_day = _eastern_date(timestamp)
             if execution_day < trading_day:
                 continue
@@ -637,7 +747,19 @@ def _execution_rows(
                 "quantity"
             )
 
-    return flows, len(unique_orders), today_execution_count
+        if has_execution_on_stop_day:
+            assert symbol is not None and side is not None
+            if side == "sell" and _returned_sell_is_stop(order, order_id):
+                stop_order_ids_today.add(order_id)
+                stopped_out_symbols.add(symbol)
+
+    return (
+        flows,
+        len(unique_orders),
+        today_execution_count,
+        len(stop_order_ids_today),
+        tuple(sorted(stopped_out_symbols)),
+    )
 
 
 def _reconcile(
@@ -645,19 +767,29 @@ def _reconcile(
     order_pages: Sequence[Mapping[str, Any]],
     trading_date: date | str,
     as_of_utc: str,
+    stop_date_pt: date | str,
 ) -> Reconciliation:
     trading_day = _parse_date(trading_date)
+    stop_day_pt = _parse_date(stop_date_pt, "stop date PT")
     previous_session = previous_nyse_session(trading_day)
     as_of = parse_utc_instant(as_of_utc, "as-of UTC")
     if _eastern_date(as_of) != trading_day:
         raise DailyLossError(
             "as-of UTC does not fall on --trading-date in US Eastern time"
         )
+    if _pacific_date(as_of) != stop_day_pt:
+        raise DailyLossError(
+            "as-of UTC does not fall on --stop-date-pt in US Pacific time"
+        )
 
     positions = _positions(position_pages)
-    flows, unique_order_count, today_execution_count = _execution_rows(
-        order_pages, trading_day, as_of
-    )
+    (
+        flows,
+        unique_order_count,
+        today_execution_count,
+        stop_fills_today,
+        stopped_out_symbols,
+    ) = _execution_rows(order_pages, trading_day, stop_day_pt, as_of)
 
     reconciled: list[ReconciledSymbol] = []
     for symbol in sorted(set(positions) | set(flows)):
@@ -704,11 +836,14 @@ def _reconcile(
 
     return Reconciliation(
         trading_day=trading_day,
+        stop_day_pt=stop_day_pt,
         previous_session=previous_session,
         as_of=as_of,
         symbols=tuple(reconciled),
         unique_order_count=unique_order_count,
         today_execution_count=today_execution_count,
+        stop_fills_today=stop_fills_today,
+        stopped_out_symbols=stopped_out_symbols,
     )
 
 
@@ -717,11 +852,12 @@ def discover_required_symbols(
     order_pages: Sequence[Mapping[str, Any]],
     trading_date: date | str,
     as_of_utc: str,
+    stop_date_pt: date | str,
 ) -> list[str]:
     """Return sorted symbols needing quotes after exact share reconciliation."""
 
     return _reconcile(
-        position_pages, order_pages, trading_date, as_of_utc
+        position_pages, order_pages, trading_date, as_of_utc, stop_date_pt
     ).required_symbols
 
 
@@ -1008,6 +1144,7 @@ def calculate_daily_loss(
     trading_date: date | str,
     as_of_utc: str,
     halt_pct: Decimal | str | int,
+    stop_date_pt: date | str,
 ) -> dict[str, Any]:
     """Calculate and return a schema-versioned fail-closed daily-loss result.
 
@@ -1020,7 +1157,11 @@ def calculate_daily_loss(
     total_value = _portfolio_total(portfolio_doc)
     halt_percentage = _decimal(halt_pct, "halt percentage", positive=True)
     reconciliation = _reconcile(
-        position_pages, order_pages, trading_date, as_of_utc
+        position_pages,
+        order_pages,
+        trading_date,
+        as_of_utc,
+        stop_date_pt,
     )
     quotes = _quote_results(quote_batches)
 
@@ -1121,6 +1262,9 @@ def calculate_daily_loss(
         "status": "tripped" if halt_new_buys else "clear",
         "halt_new_buys": halt_new_buys,
         "trading_date_et": reconciliation.trading_day.isoformat(),
+        "stop_count_date_pt": reconciliation.stop_day_pt.isoformat(),
+        "stop_fills_today": reconciliation.stop_fills_today,
+        "stopped_out_symbols": list(reconciliation.stopped_out_symbols),
         "as_of_utc": reconciliation.as_of.canonical,
         "previous_session_date": reconciliation.previous_session.isoformat(),
         "total_value": decimal_string(total_value),
@@ -1235,6 +1379,11 @@ def _parser() -> argparse.ArgumentParser:
         "--trading-date", required=True, help="trading date in US Eastern, YYYY-MM-DD"
     )
     parser.add_argument(
+        "--stop-date-pt",
+        required=True,
+        help="START CLOCK Pacific date for stop-fill counting, YYYY-MM-DD",
+    )
+    parser.add_argument(
         "--as-of-utc",
         required=True,
         help="calculation cutoff as an ISO-8601 UTC timestamp",
@@ -1250,6 +1399,14 @@ def _parser() -> argparse.ArgumentParser:
             "generation provenance"
         ),
     )
+    parser.add_argument(
+        "--failure-json",
+        action="store_true",
+        help=(
+            "emit one phase-typed JSON failure receipt on stdout instead of "
+            "human-readable stderr"
+        ),
+    )
     output_group = parser.add_mutually_exclusive_group(required=True)
     output_group.add_argument(
         "--json-out", help="write the final circuit-breaker result here"
@@ -1261,6 +1418,32 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failure_receipt(
+    *,
+    mode: str,
+    generation: str | None,
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    """Return the closed machine failure envelope used by unattended runs."""
+
+    receipt: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "action": "daily-loss",
+        "ok": False,
+        "mode": mode,
+        "generation": generation,
+        "error": {"code": code, "message": message},
+    }
+    if code == "daily_loss_semantic_invalid" and generation in {"A", "B"}:
+        receipt["recovery_action"] = (
+            "generation-b"
+            if generation == "A"
+            else "snapshot-second-attempt-failed"
+        )
+    return receipt
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -1270,6 +1453,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.quotes:
         inputs.extend(args.quotes)
     output = args.symbols_out or args.json_out
+    mode = "discovery" if args.symbols_out else "calculation"
+    phase = "binding"
 
     try:
         if args.symbols_out:
@@ -1286,6 +1471,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "option(s): " + ", ".join(unused_discovery_options)
                 )
         _validate_output_not_input(output, inputs)
+        _parse_date(args.trading_date, "--trading-date")
+        _parse_date(args.stop_date_pt, "--stop-date-pt")
+        parse_utc_instant(args.as_of_utc, "--as-of-utc")
+        if args.json_out:
+            missing_options = []
+            if not args.portfolio:
+                missing_options.append("--portfolio")
+            if args.halt_pct is None:
+                missing_options.append("--halt-pct")
+            if missing_options:
+                raise DailyLossError(
+                    "calculation mode requires " + ", ".join(missing_options)
+                )
+            _decimal(args.halt_pct, "--halt-pct", positive=True)
+
+        phase = "input"
         paths_by_kind = {
             "positions": list(args.positions),
             "orders": list(args.orders),
@@ -1310,14 +1511,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         position_pages = _load_many(args.positions)
         order_pages = _load_many(args.orders)
+        portfolio_document = load_json(args.portfolio) if args.portfolio else None
+        quote_batches = _load_many(args.quotes or [])
 
         if args.symbols_out:
-            symbols = discover_required_symbols(
+            phase = "semantic"
+            reconciliation = _reconcile(
                 position_pages,
                 order_pages,
                 args.trading_date,
                 args.as_of_utc,
+                args.stop_date_pt,
             )
+            symbols = reconciliation.required_symbols
+            phase = "output"
             _write_json_atomic(args.symbols_out, symbols)
             print(
                 json.dumps(
@@ -1337,25 +1544,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        missing_options = []
-        if not args.portfolio:
-            missing_options.append("--portfolio")
-        if args.halt_pct is None:
-            missing_options.append("--halt-pct")
-        if missing_options:
-            raise DailyLossError(
-                "calculation mode requires " + ", ".join(missing_options)
-            )
-
+        phase = "semantic"
         result = calculate_daily_loss(
-            load_json(args.portfolio),
+            portfolio_document,
             position_pages,
             order_pages,
-            _load_many(args.quotes or []),
+            quote_batches,
             args.trading_date,
             args.as_of_utc,
             args.halt_pct,
+            args.stop_date_pt,
         )
+        phase = "output"
         _write_json_atomic(args.json_out, result)
         print(
             json.dumps(
@@ -1368,7 +1568,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except (DailyLossError, OSError) as exc:
         _remove_failed_output(output, inputs)
-        print(f"daily_loss.py: ERROR: {exc}", file=sys.stderr)
+        if args.failure_json:
+            if isinstance(exc, DailyLossInternalError) or (
+                isinstance(exc, OSError) and phase == "semantic"
+            ):
+                code = "daily_loss_internal_failed"
+            else:
+                code = {
+                    "binding": "daily_loss_binding_invalid",
+                    "input": "daily_loss_input_failed",
+                    "semantic": "daily_loss_semantic_invalid",
+                    "output": "daily_loss_output_failed",
+                }.get(phase, "daily_loss_internal_failed")
+            print(
+                json.dumps(
+                    _failure_receipt(
+                        mode=mode,
+                        generation=args.snapshot_generation,
+                        code=code,
+                        message=str(exc),
+                    ),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            print(f"daily_loss.py: ERROR: {exc}", file=sys.stderr)
         return 2
 
 
