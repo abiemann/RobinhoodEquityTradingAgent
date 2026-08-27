@@ -648,6 +648,12 @@ class RunPerformanceTests(unittest.TestCase):
         self.assertEqual(sol["model"], "gpt-5.6-sol")
         self.assertIsNone(sol["identity_warning"])
 
+        terra = run_performance._resolve_identity_claims(
+            "absent", "absent", "Codex|Codex Terra 5.6|high"
+        )
+        self.assertEqual(terra["model"], "gpt-5.6-terra")
+        self.assertIsNone(terra["identity_warning"])
+
         missing_self = run_performance._resolve_identity_claims(
             "absent", "absent", "absent"
         )
@@ -680,6 +686,26 @@ class RunPerformanceTests(unittest.TestCase):
         )
         self.assertEqual(fallback["identity_source"], "declared")
         self.assertEqual(fallback["identity_warning"], "metadata-invalid")
+
+    def test_terra_schedule_declaration_resolves_as_complete_declared_identity(self):
+        resolved = run_performance._resolve_identity_claims(
+            "absent",
+            "codex|gpt-5.6-terra|reasoning=high",
+            "codex|unknown|unknown",
+        )
+        self.assertEqual(
+            resolved,
+            {
+                "runner": "codex",
+                "model": "gpt-5.6-terra",
+                "configuration": "reasoning=high",
+                "identity_source": "declared",
+                "identity_warning": None,
+                "runner_identity_source": "declared",
+                "model_identity_source": "declared",
+                "configuration_identity_source": "declared",
+            },
+        )
 
     def test_claude_runtime_environment_exact_effort_values_are_composite(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
