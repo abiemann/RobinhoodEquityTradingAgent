@@ -13,6 +13,11 @@ must otherwise be interpreted by an LLM:
     Normalize exactly one requested equity quote and deterministically compare
     its current trade price with its official previous close.
 
+``review``
+    Bind one committed ``review_equity_order`` response to the exact requested
+    order shape and expose its authoritative ``order_checks`` object without
+    asking runner-authored code to guess an alerts envelope.
+
 ``page``
     Validate one committed positions/orders page and normalize its pagination
     state.  In particular, an omitted or empty ``data.next`` is a valid
@@ -34,8 +39,9 @@ must otherwise be interpreted by an LLM:
     Bind an ``update_scan_config`` response to the expected scan id and expose
     whether its authoritative ``data.result.sorted_by`` value is correct.
 
-Every invocation prints exactly one JSON object.  The helper is stdlib-only;
-it never calls Robinhood and never mutates the saved scan or brokerage account.
+Every invocation prints exactly one ASCII-safe JSON object while preserving
+strict JSON numbers in nested broker checks.  The helper is stdlib-only; it
+never calls Robinhood and never mutates the saved scan or brokerage account.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from broker_snapshot import (
     validate_bound_first_positions_request_binding,
     validate_bound_source_retry_authorization,
 )
+from order_intents import OrderIntentError, validate_order
 
 
 SCHEMA_VERSION = 1
@@ -292,6 +299,195 @@ def inspect_quote(payload: Mapping[str, Any], symbol: str) -> dict[str, Any]:
         "change_percent": _finite_decimal_string(change_percent, "quote change"),
         "change_percent_display": format(display, ".2f"),
         "below_previous_close": current < previous,
+    }
+
+
+def _bound_positive_decimal(
+    actual: Any,
+    expected: Any,
+    *,
+    actual_context: str,
+    expected_context: str,
+) -> str:
+    """Return ``actual`` after exact positive-decimal request binding."""
+
+    actual_text = _finite_decimal_string(
+        actual, actual_context, positive=True
+    )
+    expected_text = _finite_decimal_string(
+        expected, expected_context, positive=True
+    )
+    if Decimal(actual_text) != Decimal(expected_text):
+        raise ContractError(f"{actual_context}: does not match {expected_context}")
+    return actual_text
+
+
+def inspect_review(
+    payload: Mapping[str, Any],
+    symbol: str,
+    side: str,
+    order_type: str,
+    market_hours: str,
+    time_in_force: str,
+    *,
+    quantity: Any = None,
+    dollar_amount: Any = None,
+    limit_price: Any = None,
+    stop_price: Any = None,
+) -> dict[str, Any]:
+    """Validate and bind one committed ``review_equity_order`` response."""
+
+    expected_order = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "market_hours": market_hours,
+        "time_in_force": time_in_force,
+    }
+    for field, value in (
+        ("quantity", quantity),
+        ("dollar_amount", dollar_amount),
+        ("limit_price", limit_price),
+        ("stop_price", stop_price),
+    ):
+        if value is not None:
+            expected_order[field] = value
+    try:
+        expected_order = validate_order(expected_order)
+    except OrderIntentError as exc:
+        raise ContractError(f"review request: {exc}") from exc
+
+    expected_symbol = expected_order["symbol"]
+    expected_side = expected_order["side"]
+    expected_type = expected_order["type"]
+    expected_market_hours = expected_order["market_hours"]
+    expected_time_in_force = expected_order["time_in_force"]
+    has_quantity = "quantity" in expected_order
+    has_dollars = "dollar_amount" in expected_order
+
+    data = _mapping(payload.get("data"), "review.data")
+    actual_symbol = _nonempty_text(data.get("symbol"), "review.data.symbol")
+    if actual_symbol != expected_symbol:
+        raise ContractError("review.data.symbol: does not match --symbol")
+    actual_side = _nonempty_text(data.get("side"), "review.data.side")
+    if actual_side != expected_side:
+        raise ContractError("review.data.side: does not match --side")
+    actual_type = _nonempty_text(data.get("type"), "review.data.type")
+    if actual_type != expected_type:
+        raise ContractError("review.data.type: does not match --order-type")
+
+    normalized_quantity: str | None = None
+    normalized_dollars: str | None = None
+    if has_quantity:
+        if "quantity" not in data:
+            raise ContractError("review.data.quantity: missing")
+        normalized_quantity = _bound_positive_decimal(
+            data["quantity"],
+            expected_order["quantity"],
+            actual_context="review.data.quantity",
+            expected_context="--quantity",
+        )
+        if data.get("dollar_amount") is not None:
+            raise ContractError(
+                "review.data.dollar_amount: unexpected for quantity review"
+            )
+    else:
+        if "dollar_amount" not in data:
+            raise ContractError("review.data.dollar_amount: missing")
+        normalized_dollars = _bound_positive_decimal(
+            data["dollar_amount"],
+            expected_order["dollar_amount"],
+            actual_context="review.data.dollar_amount",
+            expected_context="--dollar-amount",
+        )
+        if data.get("quantity") is not None:
+            raise ContractError(
+                "review.data.quantity: unexpected for dollar review"
+            )
+
+    normalized_prices: dict[str, str | None] = {}
+    for field, expected, argument in (
+        ("limit_price", expected_order.get("limit_price"), "--limit-price"),
+        ("stop_price", expected_order.get("stop_price"), "--stop-price"),
+    ):
+        if expected is None:
+            if data.get(field) is not None:
+                raise ContractError(f"review.data.{field}: unexpected")
+            normalized_prices[field] = None
+        else:
+            if field not in data:
+                raise ContractError(f"review.data.{field}: missing")
+            normalized_prices[field] = _bound_positive_decimal(
+                data[field],
+                expected,
+                actual_context=f"review.data.{field}",
+                expected_context=argument,
+            )
+
+    order_checks = _mapping(
+        data.get("order_checks"), "review.data.order_checks"
+    )
+    alert_type: str | None = None
+    current_alert_type: str | None = None
+    legacy_alert_type: str | None = None
+    if "alert_type" in order_checks:
+        current_alert_type = _nonempty_text(
+            order_checks["alert_type"],
+            "review.data.order_checks.alert_type",
+        )
+    if "alertType" in order_checks:
+        legacy_alert_type = _nonempty_text(
+            order_checks["alertType"], "review.data.order_checks.alertType"
+        )
+    if (
+        current_alert_type is not None
+        and legacy_alert_type is not None
+        and current_alert_type != legacy_alert_type
+    ):
+        raise ContractError(
+            "review.data.order_checks: conflicting alert type aliases"
+        )
+    alert_type = current_alert_type or legacy_alert_type
+    clean = not bool(order_checks)
+
+    disclosure = data.get("market_data_disclosure")
+    if disclosure is not None and not isinstance(disclosure, str):
+        raise ContractError(
+            "review.data.market_data_disclosure: expected a string or null"
+        )
+
+    if "quote_data" not in data:
+        raise ContractError("review.data.quote_data: missing")
+    quote_data = data["quote_data"]
+    if quote_data is not None:
+        quote = _mapping(quote_data, "review.data.quote_data")
+        if "symbol" not in quote:
+            raise ContractError("review.data.quote_data.symbol: missing")
+        quote_symbol = _nonempty_text(
+            quote["symbol"], "review.data.quote_data.symbol"
+        )
+        if quote_symbol != expected_symbol:
+            raise ContractError(
+                "review.data.quote_data.symbol: does not match --symbol"
+            )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": "review",
+        "ok": True,
+        "symbol": actual_symbol,
+        "side": actual_side,
+        "order_type": actual_type,
+        "market_hours": expected_market_hours,
+        "time_in_force": expected_time_in_force,
+        "quantity": normalized_quantity,
+        "dollar_amount": normalized_dollars,
+        "limit_price": normalized_prices["limit_price"],
+        "stop_price": normalized_prices["stop_price"],
+        "clean": clean,
+        "alert_type": alert_type,
+        "order_checks": dict(order_checks),
+        "market_data_disclosure": disclosure,
     }
 
 
@@ -746,6 +942,32 @@ def _parser() -> JsonArgumentParser:
     quote.add_argument("--source-purpose", required=True)
     quote.add_argument("--symbol", required=True)
 
+    review = subparsers.add_parser(
+        "review", help="validate one committed order-review response"
+    )
+    review.add_argument("--scratch", required=True)
+    review.add_argument("--source-purpose", required=True)
+    review.add_argument("--symbol", required=True)
+    review.add_argument("--side", choices=("buy", "sell"), required=True)
+    review.add_argument(
+        "--order-type",
+        choices=("market", "limit", "stop_market"),
+        required=True,
+    )
+    review.add_argument(
+        "--market-hours",
+        choices=("regular_hours", "extended_hours"),
+        required=True,
+    )
+    review.add_argument(
+        "--time-in-force", choices=("gfd", "gtc"), required=True
+    )
+    review_amount = review.add_mutually_exclusive_group(required=True)
+    review_amount.add_argument("--quantity")
+    review_amount.add_argument("--dollar-amount")
+    review.add_argument("--limit-price")
+    review.add_argument("--stop-price")
+
     page = subparsers.add_parser(
         "page", help="inspect one committed positions/orders page"
     )
@@ -807,15 +1029,39 @@ def _error_result(action: str, exc: Exception) -> dict[str, Any]:
     }
 
 
-def _print_json(result: Mapping[str, Any]) -> None:
-    print(
-        json.dumps(
-            result,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+def _receipt_json(value: Any) -> str:
+    """Serialize one receipt as ASCII-safe strict JSON with exact numbers."""
+
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ContractError("receipt: non-finite JSON number")
+        return str(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, list):
+        return "[" + ",".join(_receipt_json(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ContractError("receipt: JSON object keys must be strings")
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=True) + ":" + _receipt_json(value[key])
+            for key in sorted(value)
+        ) + "}"
+    raise ContractError(
+        f"receipt: unsupported JSON value type {type(value).__name__}"
     )
+
+
+def _print_json(result: Mapping[str, Any]) -> None:
+    print(_receipt_json(result))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -827,6 +1073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         in {
             "portfolio",
             "quote",
+            "review",
             "page",
             "first-positions-set",
             "scan",
@@ -878,6 +1125,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = normalize_portfolio(payload)
             elif args.action == "quote":
                 result = inspect_quote(payload, args.symbol)
+            elif args.action == "review":
+                result = inspect_review(
+                    payload,
+                    args.symbol,
+                    args.side,
+                    args.order_type,
+                    args.market_hours,
+                    args.time_in_force,
+                    quantity=args.quantity,
+                    dollar_amount=args.dollar_amount,
+                    limit_price=args.limit_price,
+                    stop_price=args.stop_price,
+                )
             elif args.action == "page":
                 result = inspect_page(
                     payload,

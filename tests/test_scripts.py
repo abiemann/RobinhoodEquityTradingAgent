@@ -8890,6 +8890,25 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIsNone(document['run_start_pt'])
         return document
 
+    def test_start_cli_emits_exactly_one_json_stdout_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            proc, document = self.invoke(
+                state_file,
+                projection_file,
+                'start',
+                now='2026-08-27T15:34:18Z',
+            )
+
+            self.assertEqual(proc.returncode, 0, (document, proc.stderr))
+            self.assertEqual(proc.stderr, '')
+            stdout_lines = [line for line in proc.stdout.splitlines() if line]
+            self.assertEqual(len(stdout_lines), 1, proc.stdout)
+            self.assertEqual(json.loads(stdout_lines[0]), document)
+            self.assertEqual(document['action'], 'start')
+            self.assertTrue(document['ok'])
+
     @staticmethod
     def windows_replace_error(winerror):
         error = PermissionError(f'simulated Windows replace error {winerror}')
@@ -11656,6 +11675,20 @@ class MarketClockTests(unittest.TestCase):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
 
+        entry_eligible_fence = routine.split(
+            '**ENTRY-ELIGIBLE NEXT-ACTION FENCE:**', 1
+        )[1].split('**THIRD — build this run', 1)[0]
+        for required in (
+            'the next local operation must be the SECOND renewal',
+            'followed on success by the first prescribed DAILY-LOSS operation',
+            'only after a named attempted helper/connector operation returns',
+            'It may not elect to omit the chain',
+            'An unattempted DAILY-LOSS chain is runner omission',
+            '`final-status-unavailable` remains legal only when',
+            'FINAL refresh or status publication was actually attempted',
+        ):
+            self.assertIn(required, entry_eligible_fence)
+
         startup = routine.split(
             '### STARTUP SEQUENCE — complete exactly before normal account or broker access', 1
         )[1].split('### ACCOUNT SCOPE', 1)[0]
@@ -11755,6 +11788,55 @@ class MarketClockTests(unittest.TestCase):
             'model-authored key array',
             lifecycle_start,
         )
+        lifecycle_start_code = routine.split(
+            '**CODEX LIFECYCLE START BIND — EXACT:**', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
+        lifecycle_start_markers = (
+            'const bootstrap = load(BOOTSTRAP_KEY);',
+            'bootstrap.phase !== "launcher-bound"',
+            'const pythonExe = bootstrap.resolver_receipt.python;',
+            'const commandArguments = {',
+            'let lifecycleProcess = await tools.exec_command(commandArguments);',
+            'while (lifecycleProcess.session_id !== undefined)',
+            'lifecycleReceipt = JSON.parse(lifecycleProcess.output)',
+            'const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;',
+            'store(BOOTSTRAP_KEY, {...bootstrap, phase: "lifecycle-bound"',
+            'const rebound = load(BOOTSTRAP_KEY);',
+            'text(JSON.stringify({schema_version: 1, action: "lifecycle-state-bound", ok: true}));',
+        )
+        lifecycle_start_positions = [
+            lifecycle_start_code.index(marker)
+            for marker in lifecycle_start_markers
+        ]
+        self.assertEqual(
+            lifecycle_start_positions, sorted(lifecycle_start_positions)
+        )
+        self.assertEqual(lifecycle_start_code.count('tools.exec_command('), 1)
+        self.assertEqual(lifecycle_start_code.count('tools.write_stdin('), 1)
+        self.assertEqual(lifecycle_start_code.count('run_lifecycle.py start'), 1)
+        self.assertIn(
+            'lifecycle_receipt: lifecycleReceipt', lifecycle_start_code
+        )
+        self.assertIn(
+            'rebound.lifecycle_receipt.invocation_id !== '
+            'lifecycleReceipt.invocation_id',
+            lifecycle_start_code,
+        )
+        for forbidden in (
+            'Object.keys',
+            'expectedKeys',
+            'text(lifecycleProcess.output)',
+            'text(lifecycleReceipt)',
+            'resolve_python',
+            '--invocation-id',
+            '--state-file',
+            '--projection-file',
+            '--now-utc',
+            'functions.wait',
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/',
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/',
+        ):
+            self.assertNotIn(forbidden, lifecycle_start_code)
         self.assertIn('Do not create or preflight scratch', startup)
         self.assertIn('touch the order-intent journal', startup)
         self.assertIn('before successful lease acquisition', startup)
@@ -14189,6 +14271,80 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, pre_second)
 
+        order_handling = routine.split(
+            "### ORDER HANDLING — AUTONOMOUS, WITH NOTIFICATION", 1
+        )[1].split("### DRY RUN", 1)[0]
+        for required in (
+            "connector_contract.py review --scratch '<scratch>' "
+            "--source-purpose '<committed-review-purpose>'",
+            "--symbol '<exact symbol>' --side '<buy|sell>' "
+            "--order-type '<market|limit|stop_market>'",
+            "--market-hours '<regular_hours|extended_hours>' "
+            "--time-in-force '<gfd|gtc>'",
+            "exactly one of `--quantity '<exact quantity>'` or "
+            "`--dollar-amount '<exact amount>'`",
+            "response-bound exact symbol/side/order type and amount/price",
+            "connector response does not echo session/TIF",
+            "The current review schema is direct `data.order_checks`, an "
+            "object; there is no `alerts` array",
+            "must never access, probe, or fallback among raw `content`, "
+            "`structuredContent`, `data`, `result`, `alerts`, `order_checks`",
+            "An empty `order_checks: {}` produces `clean: true`",
+            "Every nonempty object produces `clean: false`",
+            "unknown never means clean",
+            "successful committed review whose helper contract fails is not "
+            "fetched again",
+            "explicit review transport error may invoke `abort-source` with "
+            "fixed reason `connector-failed`",
+            "do not retry that review call",
+            "review-specific exception to the generic read retry",
+            "Only `clean: true` authorizes the dependent order path",
+            "helper `alert_type` exactly equal to "
+            "`EQUITY_FRACTIONALLY_UNTRADABLE_ERROR_BUY`",
+            "helper `alert_type` exactly equal to "
+            "`EQUITY_MAX_SELL_SHARES_EXCEEDED`",
+            "unchanged PREPARED profit-take sell under a new committed source "
+            "purpose",
+            "cancellation recovery independently proved exact terminal "
+            "`cancelled` with zero cumulative fill",
+            "A recovered `partially_filled_rest_cancelled` stop makes the "
+            "prepared sell quantity stale",
+            "abandon it, refresh the position and order baseline",
+            "These are new logical reviews after valid broker responses, not "
+            "retries of a failed transport call",
+            "Normally prepare the durable intent only after a clean "
+            "`connector_contract.py review` receipt whose response-bound "
+            "fields and helper-validated session/TIF match",
+            "matching that unchanged prepared payload before `begin`",
+        ):
+            self.assertIn(required, order_handling)
+        self.assertNotIn("Array.isArray(review.alerts)", routine)
+        for required in (
+            "For broker reads, retry the failed call exactly once",
+            "`review_equity_order` is the named exception governed by ORDER "
+            "HANDLING",
+            "one broker attempt per logical review and no transport retry",
+            "two new logical reviews allowed after specific valid broker "
+            "checks",
+            "Never apply this generic retry paragraph to "
+            "`review_equity_order`, `place_equity_order`, or "
+            "`cancel_equity_order`",
+            "a review abort fails its dependent order path without another "
+            "review call",
+        ):
+            self.assertIn(required, routine)
+
+        pre_place = routine.split(
+            "After `review_equity_order` has produced a clean", 1
+        )[1].split("### REPORT", 1)[0]
+        for required in (
+            "response-bound fields and helper-validated session/TIF match the "
+            "complete intended payload",
+            "merely absent guessed alert is never a clean-review receipt",
+            "cannot authorize placement",
+        ):
+            self.assertIn(required, pre_place)
+
         evaluation = routine.split(
             "6. Run the authoritative evaluation using ONLY", 1
         )[1].split("Only these deterministic failures", 1)[0]
@@ -14282,7 +14438,10 @@ class MarketClockTests(unittest.TestCase):
 
         await_boundary = routine.split(
             "**CODEX POST-BIND LOCAL-COMMAND SHAPE — EXACT AND UNIVERSAL:**", 1
-        )[1].split("Only a final read/scan connector failure", 1)[0]
+        )[1].split("Only a final read/scan connector failure, or", 1)[0]
+        universal_wrapper_code = await_boundary.split(
+            "```javascript", 1
+        )[1].split("```", 1)[0]
         self.assertIn(
             "const initialProcess = await tools.exec_command(commandArguments);",
             await_boundary,
@@ -14304,6 +14463,27 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn(
             "return Object.freeze({process, receipt});", await_boundary
         )
+        universal_wrapper_markers = (
+            "const initialProcess = await tools.exec_command(commandArguments);",
+            'let output = String(process.output ?? "");',
+            "while (process.session_id !== undefined)",
+            'output += String(next.output ?? "");',
+            "process = next;",
+            "process = Object.freeze({...process, output});",
+            "receipt = JSON.parse(process.output)",
+            "return Object.freeze({process, receipt});",
+        )
+        universal_wrapper_positions = [
+            universal_wrapper_code.index(marker)
+            for marker in universal_wrapper_markers
+        ]
+        self.assertEqual(
+            universal_wrapper_positions, sorted(universal_wrapper_positions)
+        )
+        self.assertEqual(universal_wrapper_code.count('tools.exec_command('), 1)
+        self.assertEqual(universal_wrapper_code.count('tools.write_stdin('), 1)
+        for forbidden in ('text(', 'notify(', 'yield_control('):
+            self.assertNotIn(forbidden, universal_wrapper_code)
         for forbidden in (
             "runHelper", "runJson", "{r, j}", "direct `commandResult.exit_code`",
             "direct `commandResult.output`",
@@ -14342,6 +14522,18 @@ class MarketClockTests(unittest.TestCase):
         report = routine.split("Then produce the report:", 1)[1].split(
             "**Save the report to disk", 1
         )[0]
+        for required in (
+            "For every review helper receipt, report its "
+            "`market_data_disclosure` even when the review is clean",
+            "Whenever `order_checks` is nonempty, report the complete "
+            "unchanged object and its `alert_type`",
+            "including `alert_type: null` for an unknown check",
+            "both the fractional correction's first receipt and its "
+            "whole-share receipt",
+            "both profit-take settlement reviews when that exception fires",
+            "Do not reconstruct an `alerts` array",
+        ):
+            self.assertIn(required, report)
         self.assertIn("ordered **Recovery diagnostics** section", report)
         self.assertIn("number of extra broker calls", report)
         self.assertIn("whether a broker mutation might have occurred", report)
@@ -14989,6 +15181,32 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, luna_incident)
 
+        review_incident = incidents.split(
+            '## 2026-08-27 09:19 PT CODEX SOL — VALID ORDER REVIEW, '
+            'INVENTED ALERTS ENVELOPE', 1
+        )[1].split('## The pattern across all of these', 1)[0]
+        review_incident = re.sub(r'\s+', ' ', review_incident)
+        for required in (
+            'APYX passed every deterministic entry gate',
+            'valid $301.79 market-buy review',
+            '`order_checks: {}`',
+            'required `review.alerts` to be an array',
+            'No order intent was prepared or begun',
+            'no placement or cancellation was attempted',
+            '09:34 `overlap skipped` entry was not another defect',
+            '`connector_contract.py review` now owns the committed review '
+            'response',
+            'treats only an empty object as clean',
+            'validates/carries the request\'s non-echoed session and '
+            'time-in-force',
+            'matching clean helper receipt is mandatory before `begin` or '
+            'placement and normally precedes `prepare`',
+            'named profit-take exception prepares first',
+            'pre-commit review transport failure aborts its still-empty '
+            'reservation and fails that dependent order path without retry',
+        ):
+            self.assertIn(required, review_incident)
+
         for filename in ('README.md', 'QUICKSTART.md'):
             with self.subTest(no_claude_setup=filename):
                 text = documents[filename]
@@ -15013,7 +15231,8 @@ class MarketClockTests(unittest.TestCase):
         )[0]
         self.assertIn(
             "Never apply this generic retry paragraph to "
-            "`place_equity_order` or `cancel_equity_order`",
+            "`review_equity_order`, `place_equity_order`, or "
+            "`cancel_equity_order`",
             connector,
         )
 

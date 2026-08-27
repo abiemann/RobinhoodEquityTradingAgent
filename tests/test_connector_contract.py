@@ -25,6 +25,28 @@ def portfolio_payload(**overrides):
     return {"data": data}
 
 
+def review_payload(**overrides):
+    data = {
+        "symbol": "APYX",
+        "side": "buy",
+        "type": "market",
+        "dollar_amount": "301.79",
+        "order_checks": {},
+        "quote_data": {
+            "symbol": "APYX",
+            "last_trade_price": "2.96",
+            "bid_price": "2.96",
+            "ask_price": "2.97",
+        },
+        "market_data_disclosure": (
+            "Bid $2.96 × 300 Q · Ask $2.97 × 400 Q · "
+            "Last $2.96 × 100 P. Updated 12:33 PM ET."
+        ),
+    }
+    data.update(overrides)
+    return {"data": data}
+
+
 def saved_scan(**overrides):
     scan = {
         "scan_id": "scan-id",
@@ -154,6 +176,265 @@ class QuoteContractTests(unittest.TestCase):
                     connector_contract.inspect_quote(payload, "SPY")
         with self.assertRaises(connector_contract.ContractError):
             connector_contract.inspect_quote(self.payload(), "spy")
+
+
+class ReviewContractTests(unittest.TestCase):
+    def inspect(self, payload=None, **arguments):
+        request = {
+            "symbol": "APYX",
+            "side": "buy",
+            "order_type": "market",
+            "market_hours": "regular_hours",
+            "time_in_force": "gfd",
+            "dollar_amount": "301.79",
+        }
+        request.update(arguments)
+        return connector_contract.inspect_review(
+            review_payload() if payload is None else payload,
+            **request,
+        )
+
+    def test_clean_review_binds_exact_order_and_disclosure(self):
+        receipt = self.inspect()
+        self.assertEqual(
+            receipt,
+            {
+                "schema_version": 1,
+                "action": "review",
+                "ok": True,
+                "symbol": "APYX",
+                "side": "buy",
+                "order_type": "market",
+                "market_hours": "regular_hours",
+                "time_in_force": "gfd",
+                "quantity": None,
+                "dollar_amount": "301.79",
+                "limit_price": None,
+                "stop_price": None,
+                "clean": True,
+                "alert_type": None,
+                "order_checks": {},
+                "market_data_disclosure": (
+                    "Bid $2.96 × 300 Q · Ask $2.97 × 400 Q · "
+                    "Last $2.96 × 100 P. Updated 12:33 PM ET."
+                ),
+            },
+        )
+
+    def test_nonempty_checks_are_never_clean_and_preserve_known_alert(self):
+        checks = {
+            "alert_type": "EQUITY_OVERNIGHT_MARKET_BUY_FTUX_POPUP",
+            "equity_overnight_market_buy_ftux_popup_alert_details": {},
+        }
+        receipt = self.inspect(
+            review_payload(order_checks=checks)
+        )
+        self.assertFalse(receipt["clean"])
+        self.assertEqual(
+            receipt["alert_type"],
+            "EQUITY_OVERNIGHT_MARKET_BUY_FTUX_POPUP",
+        )
+        self.assertEqual(receipt["order_checks"], checks)
+
+        fractional = self.inspect(
+            review_payload(
+                order_checks={
+                    "alert_type": "EQUITY_FRACTIONALLY_UNTRADABLE_ERROR_BUY"
+                }
+            )
+        )
+        self.assertFalse(fractional["clean"])
+        self.assertEqual(
+            fractional["alert_type"],
+            "EQUITY_FRACTIONALLY_UNTRADABLE_ERROR_BUY",
+        )
+
+        unknown = {"newBrokerCheck": {"reason": "future schema"}}
+        receipt = self.inspect(review_payload(order_checks=unknown))
+        self.assertFalse(receipt["clean"])
+        self.assertIsNone(receipt["alert_type"])
+        self.assertEqual(receipt["order_checks"], unknown)
+
+        legacy = self.inspect(
+            review_payload(
+                order_checks={"alertType": "LEGACY_CONNECTOR_ALERT"}
+            )
+        )
+        self.assertEqual(legacy["alert_type"], "LEGACY_CONNECTOR_ALERT")
+
+        matching_aliases = self.inspect(
+            review_payload(
+                order_checks={
+                    "alert_type": "SAME_ALERT",
+                    "alertType": "SAME_ALERT",
+                }
+            )
+        )
+        self.assertEqual(matching_aliases["alert_type"], "SAME_ALERT")
+
+        with self.assertRaises(connector_contract.ContractError):
+            self.inspect(
+                review_payload(
+                    order_checks={
+                        "alert_type": "CURRENT_ALERT",
+                        "alertType": "DIFFERENT_LEGACY_ALERT",
+                    }
+                )
+            )
+
+    def test_binds_quantity_limit_and_stop_reviews(self):
+        limit = connector_contract.inspect_review(
+            review_payload(
+                side="sell",
+                type="limit",
+                dollar_amount=None,
+                quantity="3.00",
+                limit_price="3.10",
+            ),
+            "APYX",
+            "sell",
+            "limit",
+            "regular_hours",
+            "gfd",
+            quantity="3",
+            limit_price="3.100",
+        )
+        self.assertEqual(limit["quantity"], "3.00")
+        self.assertEqual(limit["limit_price"], "3.10")
+        self.assertTrue(limit["clean"])
+
+        stop = connector_contract.inspect_review(
+            review_payload(
+                side="sell",
+                type="stop_market",
+                dollar_amount=None,
+                quantity="3",
+                stop_price="2.50",
+            ),
+            "APYX",
+            "sell",
+            "stop_market",
+            "regular_hours",
+            "gtc",
+            quantity="3.0",
+            stop_price="2.5",
+        )
+        self.assertEqual(stop["stop_price"], "2.50")
+        self.assertTrue(stop["clean"])
+
+    def test_rejects_missing_or_nonobject_order_checks(self):
+        for checks in (None, [], "", "clean"):
+            with self.subTest(checks=checks):
+                with self.assertRaises(connector_contract.ContractError):
+                    self.inspect(review_payload(order_checks=checks))
+        missing = review_payload()
+        del missing["data"]["order_checks"]
+        with self.assertRaises(connector_contract.ContractError):
+            self.inspect(missing)
+
+    def test_rejects_response_identity_amount_price_and_metadata_mismatches(self):
+        invalid_payloads = (
+            review_payload(symbol="OTHER"),
+            review_payload(side="sell"),
+            review_payload(type="limit"),
+            review_payload(dollar_amount="301.78"),
+            review_payload(quantity="1"),
+            review_payload(quote_data={"symbol": "OTHER"}),
+            review_payload(quote_data={}),
+            review_payload(market_data_disclosure=[]),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(connector_contract.ContractError):
+                    self.inspect(payload)
+
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_review(
+                review_payload(
+                    side="sell",
+                    type="limit",
+                    dollar_amount=None,
+                    quantity="3",
+                    limit_price="3.11",
+                ),
+                "APYX",
+                "sell",
+                "limit",
+                "regular_hours",
+                "gfd",
+                quantity="3",
+                limit_price="3.10",
+            )
+
+    def test_requires_nullable_quote_data_and_preserves_optional_disclosure(self):
+        missing_quote = review_payload()
+        del missing_quote["data"]["quote_data"]
+        with self.assertRaises(connector_contract.ContractError):
+            self.inspect(missing_quote)
+
+        null_quote = self.inspect(review_payload(quote_data=None))
+        self.assertTrue(null_quote["clean"])
+
+        empty_disclosure = self.inspect(
+            review_payload(market_data_disclosure="")
+        )
+        self.assertEqual(empty_disclosure["market_data_disclosure"], "")
+
+        absent_disclosure_payload = review_payload()
+        del absent_disclosure_payload["data"]["market_data_disclosure"]
+        absent_disclosure = self.inspect(absent_disclosure_payload)
+        self.assertIsNone(absent_disclosure["market_data_disclosure"])
+
+    def test_rejects_ambiguous_or_incoherent_request_shapes(self):
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_review(
+                review_payload(),
+                "APYX",
+                "buy",
+                "market",
+                "regular_hours",
+                "gfd",
+            )
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_review(
+                review_payload(),
+                "APYX",
+                "buy",
+                "market",
+                "regular_hours",
+                "gfd",
+                quantity="1",
+                dollar_amount="301.79",
+            )
+        with self.assertRaises(connector_contract.ContractError):
+            self.inspect(market_hours="extended_hours")
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_review(
+                review_payload(
+                    side="sell",
+                    type="stop_market",
+                    dollar_amount=None,
+                    quantity="3",
+                    stop_price="2.50",
+                ),
+                "APYX",
+                "sell",
+                "stop_market",
+                "regular_hours",
+                "gfd",
+                quantity="3",
+                stop_price="2.50",
+            )
+        with self.assertRaises(connector_contract.ContractError):
+            connector_contract.inspect_review(
+                review_payload(),
+                "APYX",
+                "sell",
+                "market",
+                "regular_hours",
+                "gfd",
+                dollar_amount="301.79",
+            )
 
 
 class PageContractTests(unittest.TestCase):
@@ -668,6 +949,165 @@ class ConnectorContractCliTests(unittest.TestCase):
         validate.assert_called_once_with(
             "session-scratch", ["spy-red-check"]
         )
+
+    def test_review_cli_consumes_real_envelope_without_runner_schema_guessing(self):
+        data = review_payload()["data"]
+        document = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {"data": data, "guide": "review only"},
+                        separators=(",", ":"),
+                    ),
+                }
+            ],
+            "structuredContent": {
+                "data": data,
+                "guide": "review only",
+            },
+        }
+        status, receipt, validate = self.invoke(
+            [
+                "review",
+                "--scratch",
+                "session-scratch",
+                "--source-purpose",
+                "buy-review-apyx-0",
+                "--symbol",
+                "APYX",
+                "--side",
+                "buy",
+                "--order-type",
+                "market",
+                "--market-hours",
+                "regular_hours",
+                "--time-in-force",
+                "gfd",
+                "--dollar-amount",
+                "301.79",
+            ],
+            document,
+        )
+        self.assertEqual(status, 0, receipt)
+        self.assertEqual(receipt["action"], "review")
+        self.assertTrue(receipt["clean"])
+        self.assertIsNone(receipt["alert_type"])
+        self.assertEqual(receipt["order_checks"], {})
+        self.assertEqual(receipt["dollar_amount"], "301.79")
+        self.assertEqual(receipt["market_hours"], "regular_hours")
+        self.assertEqual(receipt["time_in_force"], "gfd")
+        self.assertIn("Updated 12:33 PM ET.", receipt["market_data_disclosure"])
+        validate.assert_called_once_with(
+            "session-scratch", ["buy-review-apyx-0"]
+        )
+
+    def test_review_cli_preserves_nested_numeric_checks_as_json_numbers(self):
+        document = {
+            "structuredContent": review_payload(
+                order_checks={
+                    "alert_type": "BROKER_TIMING_CHECK",
+                    "timing_alert_details": {
+                        "seconds": Decimal("2"),
+                        "ratio": Decimal("1.25"),
+                    },
+                }
+            )
+        }
+        status, receipt, _validate = self.invoke(
+            [
+                "review",
+                "--scratch",
+                "session-scratch",
+                "--source-purpose",
+                "buy-review-apyx-0",
+                "--symbol",
+                "APYX",
+                "--side",
+                "buy",
+                "--order-type",
+                "market",
+                "--market-hours",
+                "regular_hours",
+                "--time-in-force",
+                "gfd",
+                "--dollar-amount",
+                "301.79",
+            ],
+            document,
+        )
+        self.assertEqual(status, 0, receipt)
+        self.assertFalse(receipt["clean"])
+        details = receipt["order_checks"]["timing_alert_details"]
+        self.assertEqual(details["seconds"], 2)
+        self.assertEqual(details["ratio"], 1.25)
+        self.assertNotIsInstance(details["seconds"], str)
+
+    def test_receipt_stdout_is_ascii_safe_and_json_round_trips_unicode(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            connector_contract._print_json(
+                {
+                    "disclosure": "Bid × Ask",
+                    "details": {"seconds": Decimal("2.50")},
+                }
+            )
+        raw = stdout.getvalue()
+        raw.encode("ascii")
+        self.assertIn(r"\u00d7", raw)
+        self.assertIn('"seconds":2.50', raw)
+        parsed = json.loads(raw)
+        self.assertEqual(parsed["disclosure"], "Bid × Ask")
+        self.assertEqual(parsed["details"]["seconds"], 2.5)
+
+    def test_review_cli_rejects_ambiguous_amount_and_bad_envelopes(self):
+        common = [
+            "review",
+            "--scratch",
+            "session-scratch",
+            "--source-purpose",
+            "buy-review-apyx-0",
+            "--symbol",
+            "APYX",
+            "--side",
+            "buy",
+            "--order-type",
+            "market",
+            "--market-hours",
+            "regular_hours",
+            "--time-in-force",
+            "gfd",
+        ]
+        for amount_arguments in (
+            (),
+            ("--quantity", "1", "--dollar-amount", "301.79"),
+        ):
+            with self.subTest(amount_arguments=amount_arguments):
+                status, receipt, validate = self.invoke(
+                    [*common, *amount_arguments],
+                    {"structuredContent": review_payload()},
+                )
+                self.assertEqual(status, 2)
+                self.assertEqual(receipt["error"]["code"], "usage_error")
+                validate.assert_not_called()
+
+        bad_documents = (
+            {
+                "isError": True,
+                "content": [{"type": "text", "text": "broker rejected"}],
+            },
+            {"content": [{"type": "text", "text": "not JSON"}]},
+        )
+        for document in bad_documents:
+            with self.subTest(document=document):
+                status, receipt, validate = self.invoke(
+                    [*common, "--dollar-amount", "301.79"], document
+                )
+                self.assertEqual(status, 2)
+                self.assertEqual(receipt["error"]["code"], "invalid_contract")
+                validate.assert_called_once_with(
+                    "session-scratch", ["buy-review-apyx-0"]
+                )
 
     def test_scan_cli_emits_one_compact_receipt(self):
         document = {

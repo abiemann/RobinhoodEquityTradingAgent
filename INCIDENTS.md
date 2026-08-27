@@ -1879,6 +1879,93 @@ the required supervised dry-run and scheduled acceptance tests. Regression tests
 deterministic boundary; the incident is not closed operationally until the post-repair cohort runs
 cleanly.
 
+## 2026-08-27 CODEX TERRA MORNING COHORT — VALID HELPERS, DRIFTED RUNNER GLUE
+
+**Six scheduled attempts from 06:04 through 08:34 produced one normal scan and five runner-authored
+failures or degraded paths.** The task was configured as `gpt-5.6-terra` with high reasoning even
+though the maintained unattended deployment candidate was Codex Sol 5.6 high. This was not an
+overlap, Robinhood outage, Python failure, corrupt lifecycle store, or time-zone problem. Failed
+runs had ended or released before the next firing, and the 08:03 attempt completed the same helper,
+connector, daily-loss, scan, report, status, lease, and lifecycle path normally.
+
+Four failures were the same transcription defect expressed with different malformed regular
+expressions. At 06:04 and 07:34 the runner altered the canonical UUIDv4 check in the exact
+order-intent startup recipe, rejected its own valid invocation/lease state, and never invoked
+`order_intents.py`. At 07:07 and 08:34 `run_lifecycle.py start` committed one valid invocation, but
+an ad-hoc lifecycle-start cell omitted or shortened a UUID group and falsely rejected the valid
+receipt. Those two invocations were left as `running` / `scheduled`, which the dashboard truthfully
+rendered as unfinished lifecycle. The two identical JSON lines visible in the nested shell card at
+08:34 were a live/final UI rendering echo: the helper emitted once, the lifecycle journal recorded
+one start event, the command returned before a nested session poll was needed, and the validator's
+malformed regex was independently sufficient to cause the halt.
+
+The 06:33 path was a separate control-flow omission. Startup, the order-intent check, account scope,
+FIRST positions, portfolio, and the pre-SECOND eligibility check all succeeded. The runner then
+skipped the mandatory DAILY-LOSS chain entirely, entered report fencing, and labeled final status
+unavailable. `daily_loss.py` did not fail; it was never invoked. At 08:03 the runner copied the
+canonical UUID validator correctly, completed DAILY-LOSS and the full scan/evaluator path, screened
+15 candidates, and placed no order because every candidate failed a deterministic strategy gate.
+
+No audited attempt reviewed, placed, cancelled, or otherwise mutated a broker order. The account
+remained flat. The fencing, journals, deterministic consumers, and fail-closed terminal paths again
+prevented unreliable runner glue from becoming an unsafe trade, but five failures in six attempts
+is not acceptable unattended reliability.
+
+**Rules produced:** lifecycle start now has one complete exact Codex cell beside the exact launcher
+cell. It loads only machine-carried launcher state, invokes and drains the helper once, uses the one
+canonical UUIDv4 validator, stores the complete unchanged receipt, reloads it, and emits only a
+compact path- and ID-free result. Every fenced Codex block labeled EXACT is executable source and
+may not be shortened, minified, reformatted, or regenerated. Regression coverage pins lifecycle
+operation order, command and drain cardinality, the exact UUID validator, retained receipt, compact
+output, and the helper's one-line stdout guarantee. An entry-eligible pre-SECOND result now has one
+explicit next-action fence: SECOND renewal followed by the prescribed DAILY-LOSS operation; an
+unattempted chain cannot be invented as a snapshot or final-status failure. The scheduled deployment
+was corrected from Terra to the documented Sol high candidate and remains paused until the required supervised
+`DRY_RUN = true` acceptance and an eligible scheduled-run acceptance succeed. A stronger model is
+defense in depth, not a substitute for moving more orchestration into deterministic checked-in
+code; the incident remains open until a clean early-session cohort proves the repaired boundary.
+
+## 2026-08-27 09:19 PT CODEX SOL — VALID ORDER REVIEW, INVENTED ALERTS ENVELOPE
+
+**APYX passed every deterministic entry gate, and Robinhood returned a valid $301.79 market-buy
+review, but the runner rejected that successful response after guessing the wrong schema.** This
+attempt used the intended `gpt-5.6-sol` model with high reasoning and had already crossed the
+repaired startup boundaries. The complete committed response contained direct order identity,
+`order_checks: {}`, quote data, and a nonempty market-data disclosure. Its save was journaled and
+hash-bound successfully. There was no Robinhood outage, write failure, corrupt response, or
+compliance alert.
+
+After commit, model-authored JavaScript correctly found the response's direct `data` object and
+then required `review.alerts` to be an array. The connector does not return that field: its current
+contract is the `data.order_checks` object, where `{}` means clean and a nonempty object carries a
+broker check under current `alert_type` or historical `alertType`. The invented `alerts[]`
+requirement therefore converted a clean
+review into `coordination-halt`. No order intent was prepared or begun, no placement or cancellation
+was attempted, and the account remained flat. Final refresh, report/status publication, lease
+release, and lifecycle finish all succeeded.
+
+The 09:34 `overlap skipped` entry was not another defect. Updating/activating the automation around
+09:15 launched an off-grid run whose lifecycle began at 09:19; that run renewed its lease at 09:33,
+so the normal 09:30 schedule occurrence correctly declined to overlap it.
+
+**Rule produced:** `connector_contract.py review` now owns the committed review response. It binds
+the exact symbol, side, order type, exclusive quantity/dollar amount, and applicable limit/stop
+price from the response and validates/carries the request's non-echoed session and time-in-force
+through the intent journal's canonical order validator. It requires `data.order_checks` to be an
+object; treats only an empty object as clean; preserves unknown nonempty checks as blocked;
+normalizes only validated current `alert_type` and historical `alertType` aliases; requires the
+nullable `quote_data` field; normalizes absent/null disclosure to null; and preserves empty or
+nonempty disclosure strings exactly. Its Decimal-aware ASCII-safe receipt serializer also preserves
+nested numeric check details as JSON numbers and Unicode disclosures across the Windows console
+boundary. The routine explicitly forbids runner code from probing raw
+MCP envelope, `alerts`, or `order_checks` fields. A matching clean helper receipt is mandatory
+before `begin` or placement and normally precedes `prepare`; the named profit-take exception prepares
+first so its protective stop can be cancelled safely, then requires the matching clean receipt
+before `begin`. A semantic helper rejection after a successfully committed review cannot trigger
+another broker read. A pre-commit review transport failure aborts its still-empty reservation and
+fails that dependent order path without retry; the fractional-routing and profit-take settlement
+corrections remain the two named new-review exceptions after valid broker responses.
+
 ## The pattern across all of these
 
 Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One
