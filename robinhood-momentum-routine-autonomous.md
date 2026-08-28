@@ -173,7 +173,161 @@ text(JSON.stringify({schema_version: 1, action: "lifecycle-state-bound", ok: tru
 }
 ```
 
-A missing reload is a failed launcher bind, not permission to continue. The exact cell emits only its compact state result; never emit the lifecycle receipt, invocation ID, Python path, or raw helper output.
+**CODEX CONFIGURATION STATE BIND — EXACT:** run this complete cell immediately after the exact lifecycle-start cell, with no narration, search, file read, discovery call, or other tool call between them. A standalone `validate_constants.py --json` result is never sufficient and never authorizes identity resolution, START CLOCK, lease acquisition, or broker work. This operation loads only the retained `lifecycle-bound` state, invokes the validator once with its machine-carried Python executable, stores the complete unchanged producer receipt in one newly constructed `configuration-bound` state, reloads and compares the complete stored state, and emits only a compact path-, ID-, hash-, and value-free result. The checked-in validator remains the sole complete constants schema/type/range authority; this cell checks only the producer's core success discriminator and binding fields.
+
+If validation cannot run, exits nonzero, or returns a malformed/core-invalid receipt, the same cell raw-finishes the machine-carried pre-lease invocation exactly once as `configuration-halt` / `configuration-invalid`. If validation succeeds but the complete state cannot be stored and reloaded unchanged, it raw-finishes exactly once as `coordination-halt` / `coordination-state`. A successful finish or a `recorded: true` projection-publication failure proves the lifecycle event is committed and forbids a finish retry. Either compact `configuration-state-failed` result is terminal: make no further tool call, do not read or update automation memory, and return the matching concise halt. If entry state is missing or malformed, or finish commitment cannot be proven, throw and stop for conservative later reconciliation; never reconstruct the Python path or invocation ID from visible output.
+
+```javascript
+{
+const BOOTSTRAP_KEY = "rhmra.bootstrap-state.v1";
+const bootstrap = load(BOOTSTRAP_KEY);
+const absolute = value => typeof value === "string" &&
+  (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"));
+if (!bootstrap || bootstrap.schema_version !== 1 ||
+    bootstrap.phase !== "lifecycle-bound" ||
+    !bootstrap.resolver_receipt || !bootstrap.lifecycle_receipt ||
+    bootstrap.resolver_receipt.schema_version !== 1 ||
+    bootstrap.resolver_receipt.status !== "valid" ||
+    !absolute(bootstrap.resolver_receipt.python) ||
+    bootstrap.resolver_receipt.python.toLowerCase().includes(
+      "microsoft\\windowsapps"
+    ) ||
+    typeof bootstrap.resolver_receipt.version !== "string" ||
+    !/^3(?:\.|$)/.test(bootstrap.resolver_receipt.version) ||
+    bootstrap.lifecycle_receipt.schema_version !== 1 ||
+    bootstrap.lifecycle_receipt.action !== "start" ||
+    bootstrap.lifecycle_receipt.ok !== true ||
+    bootstrap.lifecycle_receipt.classification !== "running" ||
+    bootstrap.lifecycle_receipt.phase !== "scheduled" ||
+    typeof bootstrap.lifecycle_receipt.invocation_id !== "string" ||
+    bootstrap.lifecycle_receipt.invocation_id.length === 0) {
+  throw new Error("validated lifecycle state is unavailable");
+}
+const pythonExe = bootstrap.resolver_receipt.python;
+const invocationId = bootstrap.lifecycle_receipt.invocation_id;
+const isWindows = /^[A-Za-z]:[\\/]/.test(pythonExe);
+const psq = value => "'" + String(value).replaceAll("'", "''") + "'";
+const shq = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
+const quote = isWindows ? psq : shq;
+const runCommand = async cmd => {
+  const commandArguments = {
+    cmd,
+    yield_time_ms: 30000,
+    max_output_tokens: 2000
+  };
+  if (isWindows) commandArguments.shell = "powershell.exe";
+  let process = await tools.exec_command(commandArguments);
+  let output = String(process.output ?? "");
+  while (process.session_id !== undefined) {
+    const next = await tools.write_stdin({
+      session_id: process.session_id,
+      chars: "",
+      yield_time_ms: 30000,
+      max_output_tokens: 2000
+    });
+    output += String(next.output ?? "");
+    process = next;
+  }
+  return Object.freeze({...process, output});
+};
+const finishBeforeLease = async (classification, reasonCode) => {
+  const finishCommand = (isWindows ? "& " : "") + quote(pythonExe) +
+    " run_lifecycle.py finish --invocation-id " + quote(invocationId) +
+    " --classification " + quote(classification) +
+    " --reason-code " + quote(reasonCode);
+  let finishProcess = null;
+  try { finishProcess = await runCommand(finishCommand); } catch {}
+  let finishReceipt = null;
+  try { finishReceipt = JSON.parse(finishProcess?.output ?? ""); } catch {}
+  const projectionPublished = !!finishProcess &&
+    finishProcess.exit_code === 0 && !!finishReceipt &&
+    finishReceipt.schema_version === 1 &&
+    finishReceipt.action === "finish" && finishReceipt.ok === true &&
+    finishReceipt.invocation_id === invocationId &&
+    finishReceipt.classification === classification &&
+    finishReceipt.phase === "finished" &&
+    finishReceipt.reason_code === reasonCode &&
+    Number.isSafeInteger(finishReceipt.sequence) &&
+    finishReceipt.sequence > 0 &&
+    typeof finishReceipt.finished_at_utc === "string" &&
+    finishReceipt.finished_at_utc.length > 0 &&
+    finishReceipt.report_file === null && finishReceipt.status_file === null;
+  const projectionFailedAfterCommit = !!finishProcess &&
+    finishProcess.exit_code === 1 && !!finishReceipt &&
+    finishReceipt.schema_version === 1 &&
+    finishReceipt.action === "finish" && finishReceipt.ok === false &&
+    finishReceipt.recorded === true &&
+    finishReceipt.invocation_id === invocationId &&
+    finishReceipt.reason === "projection_publication_failed" &&
+    typeof finishReceipt.detail === "string" &&
+    finishReceipt.detail.length > 0;
+  if (!projectionPublished && !projectionFailedAfterCommit) {
+    throw new Error(
+      "configuration-state failure; lifecycle terminalization unconfirmed"
+    );
+  }
+  store(BOOTSTRAP_KEY, null);
+  text(JSON.stringify({
+    schema_version: 1,
+    action: "configuration-state-failed",
+    ok: false,
+    classification,
+    reason_code: reasonCode,
+    lifecycle_recorded: true,
+    projection_published: projectionPublished
+  }));
+  exit();
+};
+let constantsProcess = null;
+try {
+  constantsProcess = await runCommand(
+    (isWindows ? "& " : "") + quote(pythonExe) +
+      " validate_constants.py --json"
+  );
+} catch {}
+let constantsReceipt = null;
+try { constantsReceipt = JSON.parse(constantsProcess?.output ?? ""); } catch {}
+const validConstants = !!constantsProcess &&
+  constantsProcess.exit_code === 0 && !!constantsReceipt &&
+  typeof constantsReceipt === "object" &&
+  !Array.isArray(constantsReceipt) &&
+  constantsReceipt.schema_version === 1 &&
+  constantsReceipt.status === "valid" &&
+  constantsReceipt.constant_count === 31 &&
+  constantsReceipt.source === "constants.md" &&
+  typeof constantsReceipt.source_sha256 === "string" &&
+  /^[0-9a-f]{64}$/.test(constantsReceipt.source_sha256) &&
+  !!constantsReceipt.values &&
+  typeof constantsReceipt.values === "object" &&
+  !Array.isArray(constantsReceipt.values);
+if (!validConstants) {
+  await finishBeforeLease("configuration-halt", "configuration-invalid");
+}
+const nextBootstrap = {
+  schema_version: 1,
+  phase: "configuration-bound",
+  resolver_receipt: bootstrap.resolver_receipt,
+  lifecycle_receipt: bootstrap.lifecycle_receipt,
+  constants_receipt: constantsReceipt
+};
+let retained = false;
+try {
+  store(BOOTSTRAP_KEY, nextBootstrap);
+  const rebound = load(BOOTSTRAP_KEY);
+  retained = JSON.stringify(rebound) === JSON.stringify(nextBootstrap);
+} catch {}
+if (!retained) {
+  await finishBeforeLease("coordination-halt", "coordination-state");
+}
+text(JSON.stringify({
+  schema_version: 1,
+  action: "configuration-state-bound",
+  ok: true
+}));
+}
+```
+
+A missing reload in any of the three exact startup cells is a failed state bind, not permission to continue. Each exact cell emits only its compact state result; never emit a lifecycle/configuration receipt, invocation ID, Python path, constants hash/values, or raw helper output.
 
 The start action performs one conservative abandoned-invocation sweep before appending the new invocation. `reconciled_abandoned_count` reports how many old, idle, unleased invocations it finalized; `reconciliation_blocked_by_live_lease: true` means a current lease prevented the sweep. Both fields are diagnostic outputs from checked-in code. A blocked sweep neither authorizes broker work nor decides that this invocation owns or overlaps the run: continue the normal startup sequence and let the later owner-fenced `acquire-bind-context` action make the sole current overlap decision. Never skip, bypass, or reinterpret that acquire because start reported either Boolean value.
 
@@ -197,11 +351,11 @@ Terminalize the invocation exactly once on every terminal path. Use `completed` 
 
 Use only these exact terminal pairs: normal completion/skips = `completed` with **no reason code**; daily loss = `risk-halt` / `daily-loss-tripped`; stop count = `risk-halt` / `stop-count-tripped`; order-state guard = `risk-halt` / `order-state-guard`; save-transport failure = `snapshot-failure` / `snapshot-write-failed`; terminal deterministic page/snapshot validation failure = `snapshot-failure` / `snapshot-validation-failed`; exhausted whole snapshot retry = `snapshot-failure` / `snapshot-second-attempt-failed`; post-create scratch sentinel = `snapshot-failure` / `scratch-preflight-failed`; invalid configuration/hash = `configuration-halt` / `configuration-invalid`; active owner = `overlap` / `active-run`; START CLOCK unavailable = `coordination-halt` / `clock-unavailable`; account resolution/scope failure = `coordination-halt` / `account-scope-failed`; local lease or helper-reported scratch creation state = `coordination-halt` / `coordination-state`; lease renewal failure = `lease-lost` / `lease-renewal-failed`; proven token/ownership loss = `lease-lost` / `lease-ownership-lost`; final broker refresh unavailable = `final-status-unavailable` / `final-refresh-failed`; and status write/read-back failure = `final-status-unavailable` / `status-write-failed`. Never guess another accepted helper reason.
 
-**Mandatory configuration preflight (immediately after lifecycle start and before ALL other actions):** Before identity resolution, `market_clock.py`, `get_accounts`, any broker/market call, or any order review/cancel/place action, run the checked-in validator from the project folder with the already-bound launcher: `& '<PYTHON_EXE>' validate_constants.py --json` on Windows/PowerShell or `'<PYTHON_EXE>' validate_constants.py --json` on Linux/macOS. Launcher resolution plus the checked-in lifecycle/configuration helpers and the one non-authoritative identity resolver are the only permitted pre-START-CLOCK helper actions. Do not construct a PowerShell, regex, prose, or ad-hoc replacement validator.
+**Mandatory configuration preflight (immediately after lifecycle start and before ALL other actions):** Before identity resolution, `market_clock.py`, `get_accounts`, any broker/market call, or any order review/cancel/place action, Codex MUST execute the complete **CODEX CONFIGURATION STATE BIND — EXACT** cell above as the immediate next tool call after the exact lifecycle-start cell. Do not narrate, search this file, inspect state, or run the validator standalone between those cells. Other supported runners must perform one equivalent opaque load → validate → retain operation with the already-bound launcher: `& '<PYTHON_EXE>' validate_constants.py --json` on Windows/PowerShell or `'<PYTHON_EXE>' validate_constants.py --json` on Linux/macOS. Launcher resolution plus the checked-in lifecycle/configuration operations and the one non-authoritative identity resolver are the only permitted pre-START-CLOCK helper actions. Do not construct a PowerShell, regex, prose, or ad-hoc replacement validator.
 
 The preflight succeeds only when the command exits zero and stdout is exactly one JSON object whose `schema_version` is exactly `1`, `status` is exactly `"valid"`, `constant_count` is exactly `31`, `source` is exactly `"constants.md"`, `source_sha256` is a 64-character lowercase hexadecimal string, and `values` is an object. The checked-in validator has already enforced the complete 31-name set, JSON types, exact decimal strings, ranges, and coupled safety constraints before it emits that success. The runner must not repeat those checks with `Object.keys`, copied name/type buckets, regex, or ad-hoc JavaScript; doing so can only contradict the deterministic authority. Store the complete parsed receipt unchanged. Use `values` as the SOLE configuration authority for orchestration throughout the run: booleans are JSON booleans, integers are JSON integers, exact decimal literals are strings, and configured text/interval values are strings. Never independently re-read or re-parse table rows, retype a value from prose, or override the validator's result. The checked-in `market_clock.py` is the only permitted later file reader: it internally uses the same validator for its clock setting and must prove that the complete file's hash still matches this preflight.
 
-If the process exits nonzero, cannot run, emits missing/malformed/extra stdout, or fails any envelope/key/type check, **FULL-RUN HALT immediately**. This is NOT DRY RUN: make no account or market calls, do not review, place, or cancel any order (including profit-takes, stop repairs, and dust sweeps), and use no defaults, cached values, or guesses. Finish `INVOCATION_ID` as `configuration-halt` / `configuration-invalid`, then return only a concise CONFIGURATION HALT quoting the validator's exact first diagnostic when available. Never declare the checked-in validator wrong and continue within a scheduled run; fix and test the repository before the next run. This override supersedes CURRENT TIME, FIRST/SECOND, the normal report, ledger, status snapshot, and final file-card rules.
+If the process exits nonzero, cannot run, emits missing/malformed/extra stdout, or fails any envelope/key/type check, **FULL-RUN HALT immediately**. This is NOT DRY RUN: make no account or market calls, do not review, place, or cancel any order (including profit-takes, stop repairs, and dust sweeps), and use no defaults, cached values, or guesses. The exact Codex cell finishes `INVOCATION_ID` once as `configuration-halt` / `configuration-invalid`; an equivalent runner must do the same, then return only a concise CONFIGURATION HALT quoting the validator's exact first diagnostic when that runner safely retained it. A valid receipt that cannot be retained is instead `coordination-halt` / `coordination-state`; valid configuration must never be mislabeled invalid. Never declare the checked-in validator wrong and continue within a scheduled run; fix and test the repository before the next run. This override supersedes CURRENT TIME, FIRST/SECOND, the normal report, ledger, status snapshot, and final file-card rules.
 
 Note the `DRY_RUN` rule stated there: its committed value is always `true`; trading live is a local, uncommitted edit to that line.
 
@@ -217,7 +371,7 @@ This is the one canonical startup order. Complete and validate each numbered ite
 
 1. Bind the verified absolute `PYTHON_EXE` as specified by PYTHON LAUNCHER BOOTSTRAP.
 2. Run `run_lifecycle.py start` and bind its returned `INVOCATION_ID`.
-3. Run `validate_constants.py --json` and bind its validated values and source hash.
+3. In Codex, execute **CODEX CONFIGURATION STATE BIND — EXACT** immediately with no intervening action; in another supported runner, perform its one equivalent `validate_constants.py --json` operation. Bind the complete validated receipt, values, and source hash before item 4. A standalone displayed validator result is not a binding.
 4. Run `run_performance.py resolve-identity --invocation-id <INVOCATION_ID> --self-identity '<SELF_IDENTITY>' --declared-identity '<DECLARED_IDENTITY>' --metadata-identity '<METADATA_IDENTITY>'` exactly once and retain its invocation-bound diagnostic receipt; on failure retain all-unknown identity and continue without retry.
 5. Run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` and bind START CLOCK.
 6. Run `run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>` with START CLOCK's unchanged `pt_iso`, then bind its exact `run_start_pt`, `artifact_stamp`, and expected report/gate/status filenames.

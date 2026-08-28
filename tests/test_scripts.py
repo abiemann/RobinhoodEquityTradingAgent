@@ -13055,6 +13055,122 @@ class MarketClockTests(unittest.TestCase):
             '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/',
         ):
             self.assertNotIn(forbidden, lifecycle_start_code)
+
+        configuration_code = routine.split(
+            '**CODEX CONFIGURATION STATE BIND — EXACT:**', 1
+        )[1].split('```javascript', 1)[1].split('```', 1)[0]
+        self.assertLess(
+            launcher.index('**CODEX LIFECYCLE START BIND — EXACT:**'),
+            launcher.index('**CODEX CONFIGURATION STATE BIND — EXACT:**'),
+        )
+        self.assertIn(
+            'with no narration, search, file read, discovery call, or other '
+            'tool call between them',
+            launcher,
+        )
+        self.assertIn(
+            'A standalone `validate_constants.py --json` result is never '
+            'sufficient',
+            launcher,
+        )
+        configuration_markers = (
+            'const bootstrap = load(BOOTSTRAP_KEY);',
+            'bootstrap.phase !== "lifecycle-bound"',
+            'bootstrap.resolver_receipt.python.toLowerCase().includes(',
+            '"microsoft\\\\windowsapps"',
+            'typeof bootstrap.resolver_receipt.version !== "string"',
+            '!/^3(?:\\.|$)/.test(bootstrap.resolver_receipt.version)',
+            'const pythonExe = bootstrap.resolver_receipt.python;',
+            'const invocationId = bootstrap.lifecycle_receipt.invocation_id;',
+            'constantsProcess = await runCommand(',
+            '" validate_constants.py --json"',
+            'constantsReceipt = JSON.parse(constantsProcess?.output ?? "")',
+            'constantsReceipt.schema_version === 1',
+            'constantsReceipt.status === "valid"',
+            'constantsReceipt.constant_count === 31',
+            'constantsReceipt.source === "constants.md"',
+            '/^[0-9a-f]{64}$/.test(constantsReceipt.source_sha256)',
+            '!Array.isArray(constantsReceipt.values)',
+            'const nextBootstrap = {',
+            'phase: "configuration-bound"',
+            'resolver_receipt: bootstrap.resolver_receipt',
+            'lifecycle_receipt: bootstrap.lifecycle_receipt',
+            'constants_receipt: constantsReceipt',
+            'store(BOOTSTRAP_KEY, nextBootstrap);',
+            'const rebound = load(BOOTSTRAP_KEY);',
+            'JSON.stringify(rebound) === JSON.stringify(nextBootstrap)',
+            'action: "configuration-state-bound"',
+        )
+        configuration_positions = [
+            configuration_code.index(marker)
+            for marker in configuration_markers
+        ]
+        self.assertEqual(
+            configuration_positions, sorted(configuration_positions)
+        )
+        self.assertEqual(
+            configuration_code.count('validate_constants.py --json'), 1
+        )
+        self.assertEqual(configuration_code.count('tools.exec_command('), 1)
+        self.assertEqual(configuration_code.count('tools.write_stdin('), 1)
+        self.assertEqual(configuration_code.count('runCommand(finishCommand)'), 1)
+        self.assertIn(
+            'await finishBeforeLease("configuration-halt", '
+            '"configuration-invalid")',
+            configuration_code,
+        )
+        self.assertIn(
+            'await finishBeforeLease("coordination-halt", '
+            '"coordination-state")',
+            configuration_code,
+        )
+        self.assertIn(
+            'finishReceipt.recorded === true', configuration_code
+        )
+        self.assertIn(
+            'finishReceipt.reason === "projection_publication_failed"',
+            configuration_code,
+        )
+        self.assertNotIn(
+            'finishReceipt.detail.length <=', configuration_code
+        )
+        self.assertIn(
+            'if (!projectionPublished && !projectionFailedAfterCommit)',
+            configuration_code,
+        )
+        self.assertIn('store(BOOTSTRAP_KEY, null);', configuration_code)
+        self.assertIn('exit();', configuration_code)
+        for forbidden in (
+            'Object.keys',
+            'expectedKeys',
+            'MIN_REL_VOLUME',
+            'STOP_LOSS_PCT',
+            'AGENTIC_ACCOUNT_NAME',
+            'text(constantsProcess',
+            'text(constantsReceipt',
+            'text(finishProcess',
+            'text(finishReceipt',
+            'resolve_python',
+            'run_lifecycle.py start',
+            'market_clock.py',
+            'get_accounts',
+            'ALL_TOOLS',
+            'memory.md',
+            'functions.wait',
+            '--state-file',
+            '--projection-file',
+            '--now-utc',
+        ):
+            self.assertNotIn(forbidden, configuration_code)
+        self.assertNotIn(
+            '{...bootstrap, phase: "configuration-bound"',
+            configuration_code,
+        )
+        self.assertIn(
+            'A valid receipt that cannot be retained is instead '
+            '`coordination-halt` / `coordination-state`',
+            routine,
+        )
         self.assertIn('Do not create or preflight scratch', startup)
         self.assertIn('touch the order-intent journal', startup)
         self.assertIn('before successful combined lease acquisition', startup)
@@ -16947,6 +17063,39 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, cohort_text)
 
+        binding_incident = incidents.split(
+            "## 2026-08-28 13:52 PT CODEX TERRA — VALID CONFIGURATION, "
+            "MISSING CONFIGURATION-BIND OPERATION",
+            1,
+        )[1].split("## The pattern across all of these", 1)[0]
+        binding_text = " ".join(binding_incident.split())
+        for required in (
+            "validator then returned exit zero with its valid 31-value "
+            "`constants.md` receipt",
+            "ran `validate_constants.py --json` as a standalone call",
+            "raw-finished at 20:53:29Z as `coordination-halt` / "
+            "`coordination-state`, 51 seconds after lifecycle start",
+            "The lifecycle contains only its `start` and safe pre-lease "
+            "`finish` events",
+            "Identity resolution, START CLOCK, lease acquisition, scratch "
+            "creation, order-intent work, every broker request, scanning, "
+            "review, placement, cancellation, and run artifacts were never "
+            "reached",
+            "restarted at lines 1–50 rather than continuing from the exact "
+            "next unread cursor",
+            "opened and appended to the scheduler-advertised `memory.md`",
+            "memory edit did not cause the configuration halt",
+            "third consecutive exact cell immediately after the exact "
+            "lifecycle-start cell",
+            "A standalone validator result never authorizes identity, "
+            "clock, lease, or broker work",
+            "valid configuration whose complete state cannot be retained "
+            "makes one raw `coordination-halt` / `coordination-state` "
+            "finish attempt",
+            "No new Python wrapper was added",
+        ):
+            self.assertIn(required, binding_text)
+
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
             readme = f.read()
         tested_on = readme.split("## Tested On", 1)[1].split(
@@ -16960,10 +17109,17 @@ class MarketClockTests(unittest.TestCase):
             "A later 11:16 PT SPY-red skip completed cleanly",
             "did not exercise the entry-eligible DAILY-LOSS, scan-evaluation, "
             "or order path",
-            "The schedule was paused and returned to the Sol/high deployment "
-            "candidate",
+            "The schedule remained paused while later Terra tests were "
+            "launched manually",
             "only a supervised entry-eligible run can accept the repaired "
             "path",
+            "A 2026-08-28 13:52 PT manual after-hours attempt stopped 51 "
+            "seconds after lifecycle start despite a valid configuration "
+            "receipt",
+            "The new third exact startup cell owns validate → "
+            "complete-receipt store → reload/equality verification",
+            "separate post-terminal instruction violation, not the cause of "
+            "the configuration halt",
         ):
             self.assertIn(required, tested_on_text)
 

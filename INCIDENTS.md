@@ -2078,9 +2078,56 @@ phase. A missing, tripped, terminal, stale-owner, or malformed receipt stops `be
 broker submission. There is no production CLI bypass; profit-taking, dust sells, and protective
 stops retain their separate risk-reducing paths rather than depending on an entry-only clearance.
 
-The schedule was paused and changed from Terra/high to the maintained Sol/high candidate. That
-model correction is containment, not proof of repair: the full supervised dry-run and one clean
-entry-eligible scheduled acceptance remain required before unattended live scheduling resumes.
+At that point the schedule was paused and changed from Terra/high to the maintained Sol/high
+candidate; later Terra tests were launched manually while the schedule remained paused. That
+temporary model correction was containment, not proof of repair: the full supervised dry-run and
+one clean entry-eligible scheduled acceptance remain required before unattended live scheduling
+resumes.
+
+## 2026-08-28 13:52 PT CODEX TERRA — VALID CONFIGURATION, MISSING CONFIGURATION-BIND OPERATION
+
+**The resolver, lifecycle start, and deterministic constants validator all succeeded, but the
+routine did not provide an exact executable Codex transition from `lifecycle-bound` to
+`configuration-bound` state.** Lifecycle invocation
+`854b2b94-5e10-42f8-b7e5-bc03aed28c3b` started at 20:52:38Z. The validator then returned exit zero
+with its valid 31-value `constants.md` receipt. Instead of a prescribed state-binding operation,
+Terra searched the already-read routine, ran `validate_constants.py --json` as a standalone call,
+and concluded that it could not prove the receipt had been retained. It raw-finished at 20:53:29Z
+as `coordination-halt` / `coordination-state`, 51 seconds after lifecycle start.
+
+This was not invalid configuration, a market-hours/scanner result, a Python failure, a lifecycle
+database failure, or a Robinhood outage. The lifecycle contains only its `start` and safe pre-lease
+`finish` events. `run_start_pt`, report, and status are null. Identity resolution, START CLOCK,
+lease acquisition, scratch creation, order-intent work, every broker request, scanning, review,
+placement, cancellation, and run artifacts were never reached. The account remained untouched.
+
+The task also committed two separate instruction violations. After one failed chunk read, it
+restarted at lines 1–50 rather than continuing from the exact next unread cursor. After lifecycle
+terminalization, it opened and appended to the scheduler-advertised `memory.md` even though the
+no-memory rule appeared directly in the scheduler prompt and again at routine line 5, and the task
+had read the routine through EOF. The memory edit did not cause the configuration halt and is not
+a permitted durable record; it is independent evidence that this Terra execution did not reliably
+follow explicit instructions. Adding more memory prose is therefore not the repair for the startup
+gap.
+
+**Rule produced:** Codex startup now has a third consecutive exact cell immediately after the exact
+lifecycle-start cell. No narration, search, discovery, file read, or other tool call may intervene.
+The cell loads only machine-carried `lifecycle-bound` state, invokes the checked-in validator once
+with the retained resolver executable, checks only the producer's core success fields, constructs
+one exact `configuration-bound` object containing the complete unchanged resolver, lifecycle, and
+constants receipts, and reloads and compares the complete serialized state. It emits no path,
+invocation ID, constants hash, values, or raw helper output. A standalone validator result never
+authorizes identity, clock, lease, or broker work.
+
+The same operation owns its pre-lease failure closure. Validator/process/receipt failure makes one
+raw `configuration-halt` / `configuration-invalid` finish attempt. A valid configuration whose
+complete state cannot be retained makes one raw `coordination-halt` / `coordination-state` finish
+attempt. An exact successful finish or `recorded: true` projection-publication failure proves the
+event is committed and forbids replay; an untrusted/missing entry state or unconfirmed finish is
+left for conservative later reconciliation rather than reconstructed from visible output. No new
+Python wrapper was added: it could not write executor-local `store`/`load` state, while the existing
+validator and lifecycle helper already own deterministic validation, canonical identity,
+ownership, append, and projection behavior.
 
 ## The pattern across all of these
 
