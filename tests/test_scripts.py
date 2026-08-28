@@ -9431,6 +9431,315 @@ class RunLifecycleTests(unittest.TestCase):
             with open(projection_file, 'rb') as handle:
                 self.assertEqual(handle.read(), before_projection)
 
+    def test_acquire_bind_context_accepts_incident_uuid_and_keeps_token_private(self):
+        self.assertEqual(
+            lifecycle_module.DEFAULT_LOCK_FILE,
+            lifecycle_module.run_lock_module.DEFAULT_LOCK_FILE,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            invocation_id = '7483a5a7-32e3-4c1f-bd8f-fa3ac30a2293'
+            proc, started = self.invoke(
+                state_file, projection_file, 'start',
+                '--invocation-id', invocation_id,
+                now='2026-08-04T16:00:00Z',
+            )
+            self.assertEqual(proc.returncode, 0, (started, proc.stderr))
+            self.bind(state_file, projection_file, invocation_id)
+
+            proc, receipt = self.invoke(
+                state_file, projection_file, 'acquire-bind-context',
+                '--invocation-id', invocation_id,
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+
+            self.assertEqual(proc.returncode, 0, (receipt, proc.stderr))
+            self.assertEqual(receipt['action'], 'acquire-bind-context')
+            self.assertTrue(receipt['ok'])
+            run_token = receipt['run_lock_token']
+            self.assertEqual(str(uuid.UUID(run_token)), run_token)
+            self.assertEqual(uuid.UUID(run_token).version, 4)
+            context = receipt['context_receipt']
+            self.assertEqual(context['action'], 'bind-context')
+            self.assertEqual(context['invocation_id'], invocation_id)
+            self.assertEqual(context['phase'], 'preflight')
+
+            connection = sqlite3.connect(lock_file)
+            try:
+                owner = connection.execute(
+                    'SELECT token FROM run_lease WHERE singleton = 1'
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(owner, run_token)
+            with open(context_file, encoding='utf-8') as handle:
+                private_context = json.load(handle)
+            self.assertNotIn(run_token, json.dumps(private_context))
+            self.assertEqual(
+                private_context['lease_token_sha256'],
+                hashlib.sha256(run_token.encode()).hexdigest(),
+            )
+
+    def test_acquire_bind_context_reports_active_owner_without_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+            self.write_active_lease(lock_file, 'existing-owner')
+
+            proc, receipt = self.invoke(
+                state_file, projection_file, 'acquire-bind-context',
+                '--invocation-id', started['invocation_id'],
+                '--context-file', context_file,
+                '--lock-file', lock_file,
+                now='2026-08-04T16:00:02Z',
+            )
+
+            self.assertEqual(proc.returncode, 2, (receipt, proc.stderr))
+            self.assertEqual(
+                receipt,
+                {
+                    'schema_version': 1,
+                    'action': 'acquire-bind-context',
+                    'ok': False,
+                    'reason': 'active_run',
+                    'holder': {
+                        'acquired_at': '2026-08-04T16:00:01Z',
+                        'renewed_at': '2026-08-04T16:00:01Z',
+                        'expires_at': '2026-08-04T16:20:01Z',
+                    },
+                },
+            )
+            self.assertNotIn('token', json.dumps(receipt))
+            self.assertFalse(os.path.exists(context_file))
+
+    def test_acquire_bind_context_releases_lease_when_bind_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+
+            with mock.patch.object(
+                lifecycle_module,
+                'bind_active_context',
+                side_effect=lifecycle_module.LifecycleError('simulated bind failure'),
+            ):
+                receipt = lifecycle_module.acquire_and_bind_active_context(
+                    invocation_id=started['invocation_id'],
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    context_file=context_file,
+                    lock_file=lock_file,
+                    now_utc='2026-08-04T16:00:02Z',
+                )
+
+            self.assertEqual(
+                receipt,
+                {
+                    'schema_version': 1,
+                    'action': 'acquire-bind-context',
+                    'ok': False,
+                    'reason': 'bind_context_failed',
+                    'lease_released': True,
+                },
+            )
+            self.assertNotIn('token', json.dumps(receipt))
+            connection = sqlite3.connect(lock_file)
+            try:
+                count = connection.execute(
+                    'SELECT count(*) FROM run_lease'
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(count, 0)
+
+    def test_acquire_bind_context_reports_unconfirmed_cleanup_without_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+
+            with (
+                mock.patch.object(
+                    lifecycle_module,
+                    'bind_active_context',
+                    side_effect=lifecycle_module.LifecycleError(
+                        'simulated bind failure'
+                    ),
+                ),
+                mock.patch.object(
+                    lifecycle_module.run_lock_module,
+                    'release',
+                    return_value={'schema_version': 1, 'action': 'release',
+                                  'ok': False, 'reason': 'ownership_lost'},
+                ),
+            ):
+                receipt = lifecycle_module.acquire_and_bind_active_context(
+                    invocation_id=started['invocation_id'],
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    context_file=context_file,
+                    lock_file=lock_file,
+                    now_utc='2026-08-04T16:00:02Z',
+                )
+
+            self.assertEqual(
+                receipt,
+                {
+                    'schema_version': 1,
+                    'action': 'acquire-bind-context',
+                    'ok': False,
+                    'reason': 'bind_context_failed_release_unconfirmed',
+                    'lease_released': False,
+                },
+            )
+            self.assertNotIn('token', json.dumps(receipt))
+            connection = sqlite3.connect(lock_file)
+            try:
+                count = connection.execute(
+                    'SELECT count(*) FROM run_lease'
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(count, 1)
+            self.assertFalse(os.path.exists(context_file))
+
+    def test_acquire_bind_context_rejects_non_preflight_before_lock_access(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+            lifecycle_module.record_event(
+                invocation_id=started['invocation_id'],
+                phase='daily-loss',
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc='2026-08-04T16:00:02Z',
+            )
+
+            with self.assertRaisesRegex(
+                lifecycle_module.LifecycleConflict,
+                'requires a running preflight invocation',
+            ):
+                lifecycle_module.acquire_and_bind_active_context(
+                    invocation_id=started['invocation_id'],
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    lock_file=lock_file,
+                    now_utc='2026-08-04T16:00:03Z',
+                )
+
+            self.assertFalse(os.path.exists(lock_file))
+
+    def test_acquire_bind_context_releases_if_phase_advances_during_bind(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+            preflight = lifecycle_module.invocation_status(
+                invocation_id=started['invocation_id'],
+                state_file=state_file,
+                projection_file=projection_file,
+            )
+            advanced = dict(preflight)
+            advanced['phase'] = 'daily-loss'
+
+            with mock.patch.object(
+                lifecycle_module,
+                'invocation_status',
+                side_effect=[preflight, advanced],
+            ):
+                receipt = lifecycle_module.acquire_and_bind_active_context(
+                    invocation_id=started['invocation_id'],
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    context_file=context_file,
+                    lock_file=lock_file,
+                    now_utc='2026-08-04T16:00:02Z',
+                )
+
+            self.assertEqual(
+                receipt,
+                {
+                    'schema_version': 1,
+                    'action': 'acquire-bind-context',
+                    'ok': False,
+                    'reason': 'bind_context_failed',
+                    'lease_released': True,
+                },
+            )
+            self.assertNotIn('token', json.dumps(receipt))
+            connection = sqlite3.connect(lock_file)
+            try:
+                count = connection.execute(
+                    'SELECT count(*) FROM run_lease'
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(count, 0)
+            self.assertFalse(os.path.exists(context_file))
+
+    def test_acquire_bind_context_releases_for_invalid_nested_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, 'lifecycle.sqlite3')
+            projection_file = os.path.join(td, 'lifecycle.json')
+            context_file = os.path.join(td, 'active-context.json')
+            lock_file = os.path.join(td, 'lease.sqlite3')
+            started = self.start(state_file, projection_file)
+            self.bind(state_file, projection_file, started['invocation_id'])
+
+            with mock.patch.object(
+                lifecycle_module,
+                'bind_active_context',
+                return_value={
+                    'schema_version': 1,
+                    'action': 'bind-context',
+                    'ok': True,
+                    'invocation_id': started['invocation_id'],
+                    'classification': 'running',
+                    'phase': 'daily-loss',
+                },
+            ):
+                receipt = lifecycle_module.acquire_and_bind_active_context(
+                    invocation_id=started['invocation_id'],
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    context_file=context_file,
+                    lock_file=lock_file,
+                    now_utc='2026-08-04T16:00:02Z',
+                )
+
+            self.assertEqual(receipt['reason'], 'bind_context_failed')
+            self.assertTrue(receipt['lease_released'])
+            self.assertNotIn('token', json.dumps(receipt))
+            connection = sqlite3.connect(lock_file)
+            try:
+                count = connection.execute(
+                    'SELECT count(*) FROM run_lease'
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(count, 0)
+
     def test_active_context_fails_closed_for_wrong_or_replaced_lease(self):
         with tempfile.TemporaryDirectory() as td:
             state_file = os.path.join(td, 'lifecycle.sqlite3')
@@ -11514,7 +11823,7 @@ class MarketClockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             for name in (
                 'resolve_python.ps1', 'run_lifecycle.py', 'market_clock.py',
-                'market_calendar.py', 'validate_constants.py',
+                'market_calendar.py', 'run_lock.py', 'validate_constants.py',
             ):
                 shutil.copy2(os.path.join(ROOT, name), os.path.join(td, name))
             report_dir = os.path.join(td, 'run-reports')
@@ -11700,8 +12009,8 @@ class MarketClockTests(unittest.TestCase):
             '<INVOCATION_ID>',
             '`market_clock.py --json --expected-constants-sha256',
             '`run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>`',
-            '`run_lock.py acquire`',
-            '`run_lifecycle.py bind-context --invocation-id <INVOCATION_ID> --run-token <RUN_LOCK_TOKEN>`',
+            '`run_lifecycle.py acquire-bind-context --invocation-id '
+            '<INVOCATION_ID>`',
             '`broker_snapshot.py preflight --create-scratch`',
             '`order_intents.py check`',
             '`order_intents.py pending --run-token <RUN_LOCK_TOKEN>`',
@@ -11774,8 +12083,8 @@ class MarketClockTests(unittest.TestCase):
             '### INVOCATION LIFECYCLE', 1
         )[1].split('A failed lifecycle start is terminal', 1)[0]
         self.assertIn(
-            'For this lifecycle-start receipt only, the checked-in `start` '
-            'action is the complete-schema authority',
+            'The checked-in `start` action owns its canonical UUID grammar '
+            'and complete schema',
             lifecycle_start,
         )
         self.assertIn(
@@ -11784,8 +12093,8 @@ class MarketClockTests(unittest.TestCase):
             lifecycle_start,
         )
         self.assertIn(
-            'do not count returned fields or compare them with a '
-            'model-authored key array',
+            'Runner glue must not recreate either one, count returned fields, '
+            'or compare them with a model-authored key array',
             lifecycle_start,
         )
         lifecycle_start_code = routine.split(
@@ -11799,7 +12108,8 @@ class MarketClockTests(unittest.TestCase):
             'let lifecycleProcess = await tools.exec_command(commandArguments);',
             'while (lifecycleProcess.session_id !== undefined)',
             'lifecycleReceipt = JSON.parse(lifecycleProcess.output)',
-            'const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;',
+            'typeof lifecycleReceipt.invocation_id !== "string"',
+            'lifecycleReceipt.invocation_id.length === 0',
             'store(BOOTSTRAP_KEY, {...bootstrap, phase: "lifecycle-bound"',
             'const rebound = load(BOOTSTRAP_KEY);',
             'text(JSON.stringify({schema_version: 1, action: "lifecycle-state-bound", ok: true}));',
@@ -11833,21 +12143,28 @@ class MarketClockTests(unittest.TestCase):
             '--projection-file',
             '--now-utc',
             'functions.wait',
+            'uuid4',
+            '[89ab]',
+            'RegExp',
             '/^[0-9a-f]{8}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/',
             '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/',
         ):
             self.assertNotIn(forbidden, lifecycle_start_code)
         self.assertIn('Do not create or preflight scratch', startup)
         self.assertIn('touch the order-intent journal', startup)
-        self.assertIn('before successful lease acquisition', startup)
+        self.assertIn('before successful combined lease acquisition', startup)
         self.assertIn('Never invent a placeholder token', startup)
-        self.assertIn('only the successful `run_lock.py acquire` result can supply it', startup)
         self.assertIn(
-            'Items 1–12 normally succeed before the one `get_accounts` '
+            'only the successful checked-in `acquire-bind-context` result '
+            'can supply it',
+            startup,
+        )
+        self.assertIn(
+            'Items 1–11 normally succeed before the one `get_accounts` '
             'transport canary',
             startup,
         )
-        self.assertIn('If item 10 or 11 fails', startup)
+        self.assertIn('If item 9 or 10 fails', startup)
         self.assertIn('named read-only positions/orders calls', startup)
         self.assertIn('is the sole exception', startup)
         self.assertIn('no broker mutation is permitted', startup)
@@ -11868,7 +12185,7 @@ class MarketClockTests(unittest.TestCase):
             startup,
         )
         self.assertIn(
-            'Load the exact machine-carried preflight state from item 9',
+            'Load the exact machine-carried preflight state from item 8',
             startup,
         )
         self.assertIn(
@@ -12255,19 +12572,27 @@ class MarketClockTests(unittest.TestCase):
             "### RUN COORDINATION — fenced single-flight lease", 1
         )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
         self.assertIn(
-            "before scratch creation or preflight, any order-intent journal command, "
+            "before scratch creation, any order-intent journal command, "
             "`rules_version`, `get_accounts`, or ANY broker call",
             coordination,
         )
         self.assertIn(
-            "A configuration validation/hash failure stops the full run "
-            "before lease acquisition",
+            "requires a running preflight binding, acquires the fenced "
+            "SQLite lease",
             coordination,
         )
-        self.assertIn("`& '<PYTHON_EXE>' run_lock.py acquire`", coordination)
-        self.assertIn("`'<PYTHON_EXE>' run_lock.py acquire`", coordination)
-        self.assertIn("`schema_version` exactly `1`", coordination)
-        self.assertIn("`ok` exactly the JSON boolean `true`", coordination)
+        self.assertIn(
+            "`& '<PYTHON_EXE>' run_lifecycle.py acquire-bind-context "
+            "--invocation-id '<INVOCATION_ID>'`",
+            coordination,
+        )
+        self.assertIn(
+            "`'<PYTHON_EXE>' run_lifecycle.py acquire-bind-context "
+            "--invocation-id '<INVOCATION_ID>'`",
+            coordination,
+        )
+        self.assertIn("`schema_version: 1`", coordination)
+        self.assertIn("`ok: true`", coordination)
         self.assertIn("`RUN_LOCK_TOKEN`", coordination)
         self.assertIn('`reason: "active_run"`', coordination)
         self.assertIn("OVERLAP HALT", coordination)
@@ -12291,7 +12616,7 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn("py -3 run_lock.py", coordination)
         self.assertNotIn("python3 run_lock.py", coordination)
 
-        self.assertIn('before scratch creation or preflight', coordination)
+        self.assertIn('before scratch creation', coordination)
         self.assertIn('any order-intent journal command', coordination)
         self.assertEqual(
             coordination.count('broker_snapshot.py preflight --create-scratch'),
@@ -12315,8 +12640,8 @@ class MarketClockTests(unittest.TestCase):
             'added cross-principal writer-only capability', coordination
         )
         self.assertIn(
-            'extend it with the complete unchanged parsed result as '
-            '`context_receipt` plus outer bootstrap `phase: "context-bound"`',
+            'extend bootstrap with the complete unchanged nested result as '
+            '`context_receipt` plus outer `phase: "context-bound"`',
             coordination,
         )
         preflight_recipe = coordination.split(
@@ -12431,7 +12756,16 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(field, coordination)
         self.assertIn('distinct resolved non-symlink direct children', coordination)
-        self.assertIn('canonical lowercase UUIDv4 strings', coordination)
+        self.assertIn(
+            '`scratch_id` and `source_root_id` as nonempty strings and retain '
+            'them unchanged',
+            coordination,
+        )
+        self.assertIn(
+            'checked-in preflight producer owns canonical identifier grammar; '
+            'runner glue must not recreate it',
+            coordination,
+        )
         self.assertIn(
             'Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and '
             '`SOURCE_ROOT_ID` only through the validated machine-carried '
@@ -12587,42 +12921,45 @@ class MarketClockTests(unittest.TestCase):
         )[1].split("```", 1)[0]
 
         clear_position = acquire_bind_code.index("store(LEASE_KEY, null);")
-        acquire_position = acquire_bind_code.index(
-            "const acquireResult = await drainCommand("
+        combined_position = acquire_bind_code.index(
+            "const combinedResult = await drainCommand("
         )
         lease_store_position = acquire_bind_code.index(
             'store(LEASE_KEY, {schema_version: 1, phase: "lease-owned"'
         )
-        bind_position = acquire_bind_code.index(
-            "const bindContextResult = await drainCommand("
+        context_position = acquire_bind_code.index(
+            "const receipt = combinedReceipt.context_receipt;"
         )
         compact_output_position = acquire_bind_code.index(
             'action: "context-state-bound", ok: true'
         )
-        self.assertLess(clear_position, acquire_position)
-        self.assertLess(acquire_position, lease_store_position)
-        self.assertLess(lease_store_position, bind_position)
-        self.assertLess(bind_position, compact_output_position)
+        self.assertLess(clear_position, combined_position)
+        self.assertLess(combined_position, lease_store_position)
+        self.assertLess(lease_store_position, context_position)
+        self.assertLess(context_position, compact_output_position)
         self.assertIn(
-            "run_lock_token: acquireReceipt.token", acquire_bind_code
+            "run_lock_token: combinedReceipt.run_lock_token",
+            acquire_bind_code,
         )
-        self.assertLess(
-            acquire_bind_code.index("!uuid4.test(invocationId)"),
-            acquire_bind_code.index("const acquireResult = await drainCommand("),
+        self.assertEqual(acquire_bind_code.count('tools.exec_command('), 1)
+        self.assertEqual(
+            acquire_bind_code.count('run_lifecycle.py acquire-bind-context'),
+            1,
         )
+        self.assertNotIn('run_lock.py acquire', acquire_bind_code)
+        self.assertNotIn('run_lifecycle.py bind-context', acquire_bind_code)
+        self.assertNotIn('uuid4', acquire_bind_code)
+        self.assertNotIn('[89ab]', acquire_bind_code)
+        self.assertNotIn('RegExp', acquire_bind_code)
         self.assertIn(
             'lease.phase !== "lease-owned"', acquire_bind_code
         )
         self.assertIn(
             'lease.invocation_id !== invocationId', acquire_bind_code
         )
-        self.assertIn(
-            '" --run-token " + quote(lease.run_lock_token)',
-            acquire_bind_code,
-        )
         for holder_field in ("acquired_at", "renewed_at", "expires_at"):
             self.assertIn(
-                f"acquireReceipt.holder.{holder_field}", acquire_bind_code
+                f"combinedReceipt.holder.{holder_field}", acquire_bind_code
             )
         self.assertIn(
             'reason: activeRun ? "active-run" : "coordination-state"',
@@ -12634,7 +12971,11 @@ class MarketClockTests(unittest.TestCase):
             "persist it",
             lease_contract,
         )
-        self.assertIn("`run_lock.py` owns the gitignored lease database", lease_contract)
+        self.assertIn(
+            "`run_lock.py`, called internally by lifecycle, owns the "
+            "gitignored lease database",
+            lease_contract,
+        )
         self.assertIn("`order_intents.py prepare` scratch intent", lease_contract)
         self.assertIn("Runner glue performs no other persistence", lease_contract)
         self.assertNotIn("tool receipt, or filesystem", lease_contract)
@@ -12643,7 +12984,7 @@ class MarketClockTests(unittest.TestCase):
         for line in acquire_bind_code.splitlines():
             if "text(" in line:
                 self.assertNotIn("run_lock_token", line)
-                self.assertNotIn("acquireReceipt.token", line)
+                self.assertNotIn("combinedReceipt.run_lock_token", line)
 
         preflight_code = coordination.split(
             "**CODEX MACHINE-CARRIED PREFLIGHT STATE — REQUIRED:**", 1
@@ -12653,7 +12994,10 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn('const lease = load(LEASE_KEY);', preflight_code)
         self.assertIn('lease.phase !== "lease-owned"', preflight_code)
-        self.assertIn('!uuid4.test(lease.invocation_id)', preflight_code)
+        self.assertIn(
+            'typeof lease.invocation_id !== "string"', preflight_code
+        )
+        self.assertIn('lease.invocation_id.length === 0', preflight_code)
         self.assertIn(
             'lease.invocation_id !== bootstrap.context_receipt.invocation_id',
             preflight_code,
@@ -12697,7 +13041,8 @@ class MarketClockTests(unittest.TestCase):
             '!absolute(state.python_exe)',
             '!absolute(state.project_root)',
             'lease.phase !== "lease-owned"',
-            '!uuid4.test(invocationId)',
+            'typeof invocationId !== "string"',
+            'invocationId.length === 0',
             'lease.invocation_id !== invocationId',
             'const runLockToken = lease.run_lock_token;',
             '"pending --run-token " + quote(runLockToken)',
@@ -12773,7 +13118,8 @@ class MarketClockTests(unittest.TestCase):
             'const lease = load(LEASE_KEY);',
             'state.phase !== "transport-bound"',
             'lease.phase !== "lease-owned"',
-            '!uuid4.test(invocationId)',
+            'typeof invocationId !== "string"',
+            'invocationId.length === 0',
             'lease.invocation_id !== invocationId',
             'const quotedRunLockToken = quote(lease.run_lock_token);',
         ):
@@ -12787,7 +13133,10 @@ class MarketClockTests(unittest.TestCase):
         release_guard = release_code.index(
             'action: "lease-release-prerequisite-failed"'
         )
-        self.assertIn("!uuid4.test(invocationId)", release_code)
+        self.assertIn(
+            'typeof invocationId !== "string"', release_code
+        )
+        self.assertIn('invocationId.length === 0', release_code)
         self.assertNotIn("|| !invocationId ||", release_code)
         release_call = release_code.index(
             "const releaseResult = await drainCommand("
@@ -12810,6 +13159,17 @@ class MarketClockTests(unittest.TestCase):
         self.assertLess(released_store, released_output)
         self.assertLess(lost_store, lost_output)
         self.assertNotIn("run_lock_token:", release_code)
+        self.assertNotIn('uuid4', routine)
+        self.assertNotIn('[89ab]', routine)
+        javascript_blocks = '\n'.join(
+            routine.split('```javascript')[index].split('```', 1)[0]
+            for index in range(1, len(routine.split('```javascript')))
+        )
+        for forbidden_uuid_grammar in (
+            '[0-9a-f]{8}', '[0-9A-Fa-f]{8}', '-4[0-9a-f]{3}-',
+            '-4[0-9A-Fa-f]{3}-',
+        ):
+            self.assertNotIn(forbidden_uuid_grammar, javascript_blocks)
         self.assertIn("reportSequenceStarted", release_code)
         self.assertIn("reportTerminal", release_code)
         self.assertIn("status-published", release_code)
@@ -12846,8 +13206,9 @@ class MarketClockTests(unittest.TestCase):
             'or broker access', 1
         )[1].split('### ACCOUNT SCOPE', 1)[0]
         self.assertIn(
-            'receipt `phase: "preflight"`; `context-bound` is the runner\'s '
-            'stored-state phase, never the receipt phase',
+            'nested receipt\'s lifecycle `phase` to remain `"preflight"`. '
+            '`context-bound` is the runner\'s stored-state phase, never the '
+            'receipt phase',
             startup,
         )
 
@@ -12855,20 +13216,23 @@ class MarketClockTests(unittest.TestCase):
             '### RUN COORDINATION — fenced single-flight lease', 1
         )[1].split('### ORDER-INTENT JOURNAL', 1)[0]
         bind_contract = coordination.split(
-            'Immediately after a successful acquisition and before scratch '
-            'creation', 1
+            'Successful stdout is one JSON object', 1
         )[1].split(
             'After the active-context receipt succeeds and before '
             '`rules_version`', 1
         )[0]
         self.assertIn(
-            'checked-in `bind-context` action is the sole '
-            'complete-schema/type/range authority',
+            'combined action is the canonical UUID/type/phase authority',
+            coordination,
+        )
+        self.assertIn(
+            'checked-in helper, not runner JavaScript, owns canonical UUID '
+            'validation',
             bind_contract,
         )
         self.assertIn(
-            'do not count returned fields, compare `Object.keys(...)`, build '
-            'a copied key/type list',
+            'must not create a UUID regular expression or independently '
+            'revalidate either identifier',
             bind_contract,
         )
         self.assertIn('`phase: "preflight"`', bind_contract)
@@ -12879,6 +13243,7 @@ class MarketClockTests(unittest.TestCase):
             bind_contract,
         )
         self.assertNotIn('exactly these thirteen fields', bind_contract)
+        self.assertNotIn('uuid4', bind_contract)
 
         bind_recipe = bind_contract.split(
             '```javascript', 1
@@ -13778,12 +14143,12 @@ class MarketClockTests(unittest.TestCase):
             coordination,
         )
         for required in (
-            "run_lifecycle.py bind-context --invocation-id "
-            "'<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'",
+            "run_lifecycle.py acquire-bind-context --invocation-id "
+            "'<INVOCATION_ID>'",
             '`action: "bind-context"`',
             "`python` exactly equal to `PYTHON_EXE`",
             "stores only a SHA-256 ownership binding, never the raw token",
-            "stop before scratch creation or any broker call",
+            "Any other nonzero, missing/unreadable/malformed JSON",
         ):
             self.assertIn(required, coordination)
         lifecycle_finish = report.split(
@@ -14629,7 +14994,7 @@ class MarketClockTests(unittest.TestCase):
             '### ORDER HANDLING', 1
         )[0]
         for required in (
-            'startup sequence reaches item 13 after items 1–12 have succeeded',
+            'startup sequence reaches item 12 after items 1–11 have succeeded',
             'not exposed or callable',
             'filtered `ALL_TOOLS` for the one canonical name',
             '`mcp__robinhood_mcp__get_accounts`',

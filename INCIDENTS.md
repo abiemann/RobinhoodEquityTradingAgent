@@ -1966,6 +1966,39 @@ another broker read. A pre-commit review transport failure aborts its still-empt
 fails that dependent order path without retry; the fractional-routing and profit-take settlement
 corrections remain the two named new-review exceptions after valid broker responses.
 
+## 2026-08-27 13:51 PT CODEX TERRA — EXACT LEASE BLOCK RE-AUTHORED AGAIN
+
+**A valid lifecycle invocation reached preflight, then the runner changed the UUID validator in
+the exact lease-acquisition cell and rejected its own valid state before the lock helper ran.**
+The lifecycle invocation was `7483a5a7-32e3-4c1f-bd8f-fa3ac30a2293`. The checked-in routine used
+the canonical UUIDv4 version group `-4[0-9a-f]{3}-`; Terra emitted
+`-[89ab][0-9a-f]{3}-` in that position instead. The invocation's valid `4c1f` group therefore
+failed the model-authored prerequisite with `validated launcher/config state is unavailable`.
+
+This was not a lock, lifecycle, Python, Robinhood, or account failure. `run_lock.py acquire` and
+`run_lifecycle.py bind-context` were never called. No lease or order intent existed, no broker tool
+was invoked, no report/status file was created, and lifecycle safely finished as
+`coordination-halt` / `coordination-state`. Terra identity telemetry was independently correct:
+`codex` / `gpt-5.6-terra` / `reasoning=high`. The earlier 13:04 Terra run had also completed
+normally, so this failure was not caused by an unknown model configuration.
+
+**Rule produced:** UUID grammar no longer appears anywhere in model-authored routine JavaScript.
+Checked-in producers and consumers remain the canonical UUID authorities; runner glue checks only
+nonempty producer strings and exact cross-receipt equality. Startup lease acquisition and active
+context binding now use one checked-in `run_lifecycle.py acquire-bind-context` action. It validates
+the invocation and preflight phase in Python, calls the fenced SQLite acquisition, binds the
+digest-only context receipt, returns the raw token only after both succeed, distinguishes an active
+owner with a token-free result, and performs one owner-fenced compensating release if binding
+fails. Regression coverage accepts the exact incident UUID, proves the success token is private,
+proves overlap output is token-free, proves bind-failure cleanup, and proves a non-preflight
+invocation cannot touch the lock. A process killed after acquisition can still leave the safe
+time-bounded lease until expiry; no recovery path deletes or edits the database.
+
+This extends the day's Terra cohort to eight attempts: two normal completions and six failed or
+degraded paths. It confirms that labeling a block exact is not enough when the runner can recreate
+its validation syntax. The maintained unattended candidate remains Sol high, and the new boundary
+still requires supervised acceptance before live scheduling.
+
 ## The pattern across all of these
 
 Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One

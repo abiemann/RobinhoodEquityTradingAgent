@@ -107,7 +107,7 @@ text(JSON.stringify({schema_version: 1, action: "launcher-state-bound", ok: true
 }
 ```
 
-**CODEX LIFECYCLE START BIND — EXACT:** the immediately following lifecycle-start cell is this complete cell. It loads `BOOTSTRAP_KEY`, requires the exact `launcher-bound` shape, and constructs its sole command from `bootstrap.resolver_receipt.python`; it may not accept a displayed resolver receipt or a second launcher. Copy this block byte-for-byte. Do not re-author or shorten its canonical UUIDv4 validator.
+**CODEX LIFECYCLE START BIND — EXACT:** the immediately following lifecycle-start cell is this complete cell. It loads `BOOTSTRAP_KEY`, requires the exact `launcher-bound` shape, and constructs its sole command from `bootstrap.resolver_receipt.python`; it may not accept a displayed resolver receipt or a second launcher. The checked-in `start` producer owns canonical invocation-ID validation. Runner JavaScript must not recreate that validation with a UUID regular expression.
 
 ```javascript
 {
@@ -145,11 +145,11 @@ while (lifecycleProcess.session_id !== undefined) {
 lifecycleProcess = Object.freeze({...lifecycleProcess, output: lifecycleOutput});
 let lifecycleReceipt = null;
 try { lifecycleReceipt = JSON.parse(lifecycleProcess.output); } catch {}
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 if (lifecycleProcess.exit_code !== 0 || !lifecycleReceipt ||
     lifecycleReceipt.schema_version !== 1 ||
     lifecycleReceipt.action !== "start" || lifecycleReceipt.ok !== true ||
-    !uuid4.test(lifecycleReceipt.invocation_id) ||
+    typeof lifecycleReceipt.invocation_id !== "string" ||
+    lifecycleReceipt.invocation_id.length === 0 ||
     lifecycleReceipt.classification !== "running" ||
     lifecycleReceipt.phase !== "scheduled") {
   throw new Error("lifecycle start failed");
@@ -178,7 +178,7 @@ A Windows-hosted checkout exposed inside a POSIX/FUSE sandbox is NOT a native Li
 
 ### INVOCATION LIFECYCLE — every attempt that reaches lifecycle start is visible
 
-As the FIRST helper action after the launcher bootstrap, before configuration validation, identity resolution, the market clock, lease acquisition, scratch creation, or any broker call, run the checked-in lifecycle helper with `& '<PYTHON_EXE>' run_lifecycle.py start` in PowerShell or `'<PYTHON_EXE>' run_lifecycle.py start` in a POSIX-style shell, including native Windows Git Bash, Linux, and macOS. Command prefix follows the current shell, not the host OS; native Windows Git Bash still uses the Windows resolver and executes its returned Windows path unchanged. Require exit zero and exactly one JSON object with `schema_version: 1`, `action: "start"`, `ok: true`, a canonical UUID `invocation_id`, classification `running`, and phase `scheduled`; retain that UUID exactly as `INVOCATION_ID`. For this lifecycle-start receipt only, the checked-in `start` action is the complete-schema authority; do not count returned fields or compare them with a model-authored key array. In Codex, store the entire parsed receipt unchanged as the bootstrap state's `lifecycle_receipt` before configuration validation. Do not pass state/projection paths, a timestamp override, free text, an account number, a lease token, credentials, or broker data. If lifecycle start fails, stop before all broker work with a concise COORDINATION HALT: an invocation that cannot record its own existence must not trade. A scheduler/model failure before this helper succeeds cannot appear in the lifecycle projection; the dashboard describes that boundary honestly rather than inventing a record.
+As the FIRST helper action after the launcher bootstrap, before configuration validation, identity resolution, the market clock, lease acquisition, scratch creation, or any broker call, run the checked-in lifecycle helper with `& '<PYTHON_EXE>' run_lifecycle.py start` in PowerShell or `'<PYTHON_EXE>' run_lifecycle.py start` in a POSIX-style shell, including native Windows Git Bash, Linux, and macOS. Command prefix follows the current shell, not the host OS; native Windows Git Bash still uses the Windows resolver and executes its returned Windows path unchanged. Require exit zero and exactly one JSON object with `schema_version: 1`, `action: "start"`, `ok: true`, a nonempty string `invocation_id`, classification `running`, and phase `scheduled`; retain that identifier exactly as `INVOCATION_ID`. The checked-in `start` action owns its canonical UUID grammar and complete schema. Runner glue must not recreate either one, count returned fields, or compare them with a model-authored key array. In Codex, store the entire parsed receipt unchanged as the bootstrap state's `lifecycle_receipt` before configuration validation. Do not pass state/projection paths, a timestamp override, free text, an account number, a lease token, credentials, or broker data. If lifecycle start fails, stop before all broker work with a concise COORDINATION HALT: an invocation that cannot record its own existence must not trade. A scheduler/model failure before this helper succeeds cannot appear in the lifecycle projection; the dashboard describes that boundary honestly rather than inventing a record.
 
 A failed lifecycle start is terminal for that execution context. After it fails, make no further tool call or state-file open, do not inspect or attempt to repair lifecycle SQLite, and do not create a report, status snapshot, gate record, memory update, or any other run artifact. Return only the concise COORDINATION HALT with the helper's exact diagnostic and its named host-native recovery action. Never advise deleting, renaming, copying over, editing, or bypassing a `.sqlite3`, `.sqlite3-journal`, `.sqlite3-wal`, or `.sqlite3-shm` file.
 
@@ -216,15 +216,14 @@ This is the one canonical startup order. Complete and validate each numbered ite
 4. Run `run_performance.py resolve-identity --invocation-id <INVOCATION_ID> --self-identity '<SELF_IDENTITY>' --declared-identity '<DECLARED_IDENTITY>' --metadata-identity '<METADATA_IDENTITY>'` exactly once and retain its invocation-bound diagnostic receipt; on failure retain all-unknown identity and continue without retry.
 5. Run `market_clock.py --json --expected-constants-sha256 <preflight source_sha256>` and bind START CLOCK.
 6. Run `run_lifecycle.py event --invocation-id <INVOCATION_ID> --phase preflight --run-start-pt <START CLOCK pt_iso>` with START CLOCK's unchanged `pt_iso`, then bind its exact `run_start_pt`, `artifact_stamp`, and expected report/gate/status filenames.
-7. Run `run_lock.py acquire` and bind only its returned lease-issued token as `RUN_LOCK_TOKEN`.
-8. Run `run_lifecycle.py bind-context --invocation-id <INVOCATION_ID> --run-token <RUN_LOCK_TOKEN>` and validate its lease-bound active-context receipt with receipt `phase: "preflight"`; `context-bound` is the runner's stored-state phase, never the receipt phase.
-9. Run the retained-interpreter command `broker_snapshot.py preflight --create-scratch` exactly once as RUN COORDINATION specifies. In Codex, the same orchestration call must validate and machine-store the exact parsed receipt; never expose either random path for later model substitution. In another runner, retain the validated receipt as one equivalent opaque structured value. Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and `SOURCE_ROOT_ID` only through that machine-carried receipt.
-10. Run `order_intents.py check`.
-11. Run `order_intents.py pending --run-token <RUN_LOCK_TOKEN>` using the exact token from item 7.
-12. Resolve `rules_version`.
-13. Load the exact machine-carried preflight state from item 9; never type or paste a path from its visible output. In Codex, resolve the exact canonical deferred `get_accounts` tool through `ALL_TOOLS` inside the pinned startup operation below; absence from the initially displayed tool namespace is never evidence that the tool is unavailable. Call `get_accounts` as the first broker operation through that uniquely resolved callable. An errored connector call may use the routine's one generic read retry inside the same orchestration recipe, but after the first successful response never call it again. Perform the one mandatory SAVE TRANSPORT BINDING below: mechanically derive the canary path from the loaded `SOURCE_ROOT`, save that COMPLETE unchanged successful response exactly once, and invoke `bind-transport` in that same operation with `scratch`, `source_root`, and `canary` taken only from loaded state. Bind transport and account scope only from the helper's validated receipt. Every later Codex source/status path is likewise formed from that loaded state; another runner uses its equivalent opaque structured value. Then handle every pending journal row before FIRST or any broker mutation.
+7. Run `run_lifecycle.py acquire-bind-context --invocation-id <INVOCATION_ID>` once. This checked-in action validates the invocation, acquires the fenced lease, binds active context, and compensating-releases the lease if binding fails. Machine-carry only its successful lease-issued token as `RUN_LOCK_TOKEN` and its complete unchanged `context_receipt`; require that nested receipt's lifecycle `phase` to remain `"preflight"`. `context-bound` is the runner's stored-state phase, never the receipt phase.
+8. Run the retained-interpreter command `broker_snapshot.py preflight --create-scratch` exactly once as RUN COORDINATION specifies. In Codex, the same orchestration call must validate and machine-store the exact parsed receipt; never expose either random path for later model substitution. In another runner, retain the validated receipt as one equivalent opaque structured value. Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and `SOURCE_ROOT_ID` only through that machine-carried receipt.
+9. Run `order_intents.py check`.
+10. Run `order_intents.py pending --run-token <RUN_LOCK_TOKEN>` using the exact token from item 7.
+11. Resolve `rules_version`.
+12. Load the exact machine-carried preflight state from item 8; never type or paste a path from its visible output. In Codex, resolve the exact canonical deferred `get_accounts` tool through `ALL_TOOLS` inside the pinned startup operation below; absence from the initially displayed tool namespace is never evidence that the tool is unavailable. Call `get_accounts` as the first broker operation through that uniquely resolved callable. An errored connector call may use the routine's one generic read retry inside the same orchestration recipe, but after the first successful response never call it again. Perform the one mandatory SAVE TRANSPORT BINDING below: mechanically derive the canary path from the loaded `SOURCE_ROOT`, save that COMPLETE unchanged successful response exactly once, and invoke `bind-transport` in that same operation with `scratch`, `source_root`, and `canary` taken only from loaded state. Bind transport and account scope only from the helper's validated receipt. Every later Codex source/status path is likewise formed from that loaded state; another runner uses its equivalent opaque structured value. Then handle every pending journal row before FIRST or any broker mutation.
 
-Do not create or preflight scratch, touch the order-intent journal, resolve `rules_version`, or call any broker tool before successful lease acquisition and active-context binding. Never invent a placeholder token or substitute `INVOCATION_ID`, another UUID, or a remembered token for `RUN_LOCK_TOKEN`; only the successful `run_lock.py acquire` result can supply it. Items 1–12 normally succeed before the one `get_accounts` transport canary. If item 10 or 11 fails, follow ORDER-INTENT JOURNAL's explicit ORDER-STATE HALT path: resolving the account and making only its named read-only positions/orders calls for a compact diagnostic report is the sole exception, and no broker mutation is permitted. After normal account resolution, allow only the broker reads required for pending-intent recovery until every returned journal row is handled; FIRST and all unrelated broker work wait. A startup step that fails follows its own section's terminal path; never skip forward and repair the sequence after broker access.
+Do not create or preflight scratch, touch the order-intent journal, resolve `rules_version`, or call any broker tool before successful combined lease acquisition and active-context binding. Never invent a placeholder token or substitute `INVOCATION_ID`, another UUID, or a remembered token for `RUN_LOCK_TOKEN`; only the successful checked-in `acquire-bind-context` result can supply it. Items 1–11 normally succeed before the one `get_accounts` transport canary. If item 9 or 10 fails, follow ORDER-INTENT JOURNAL's explicit ORDER-STATE HALT path: resolving the account and making only its named read-only positions/orders calls for a compact diagnostic report is the sole exception, and no broker mutation is permitted. After normal account resolution, allow only the broker reads required for pending-intent recovery until every returned journal row is handled; FIRST and all unrelated broker work wait. A startup step that fails follows its own section's terminal path; never skip forward and repair the sequence after broker access.
 
 ### ACCOUNT SCOPE — STRICT
 The single successful `get_accounts` response used for SAVE TRANSPORT BINDING is also the account-resolution authority. The deterministic helper consumes that saved response before privacy-deleting it and issues the only valid account-scope receipt. Do not call `get_accounts` again merely to resolve the account.
@@ -237,7 +236,7 @@ The single successful `get_accounts` response used for SAVE TRANSPORT BINDING is
 ### CONNECTOR FAILURES — retry reads once; mutations use their own recovery protocol
 
 **Unsupported Claude runner override:** when the current framework is Claude, keep the ACTION REQUIRED, no-request, authorization, and do-not-rerun statements below, but replace connector-repair instructions with: **“Claude is not a supported execution runner for this project because the current tested Claude models refuse the required financial-trade mutations under a higher-priority policy boundary. Pause or disable this Claude schedule and leave it disabled. Migrate the task to the recommended Codex runner on the native main checkout, authenticate the single Robinhood connector there, and require the documented supervised `DRY_RUN = true` acceptance before live use. Do not repair or rerun this Claude automation.”** Give only the recovery path for the framework actually running.
-When the canonical startup sequence reaches item 13 after items 1–12 have succeeded, if `get_accounts` is not exposed or callable, this is not an errored broker call and cannot use the generic retry below. In Codex, that condition is not established until the exact startup recipe has filtered `ALL_TOOLS` for the one canonical name `mcp__robinhood_mcp__get_accounts`, counted every exact metadata match without deduplicating, and checked the matching `tools[...]` property. Never infer absence from the initially displayed namespace, a fuzzy name/description search, narration, or a skipped lookup. Exactly one metadata match whose property is callable MUST proceed to the broker call; zero matches, duplicate matches, or one non-callable match MUST store the recipe's named terminal resolution failure, make no Robinhood request or retry, release the lease, and finish lifecycle as `coordination-halt` / `account-scope-failed`. Never choose among duplicates or substitute a similarly named tool.
+When the canonical startup sequence reaches item 12 after items 1–11 have succeeded, if `get_accounts` is not exposed or callable, this is not an errored broker call and cannot use the generic retry below. In Codex, that condition is not established until the exact startup recipe has filtered `ALL_TOOLS` for the one canonical name `mcp__robinhood_mcp__get_accounts`, counted every exact metadata match without deduplicating, and checked the matching `tools[...]` property. Never infer absence from the initially displayed namespace, a fuzzy name/description search, narration, or a skipped lookup. Exactly one metadata match whose property is callable MUST proceed to the broker call; zero matches, duplicate matches, or one non-callable match MUST store the recipe's named terminal resolution failure, make no Robinhood request or retry, release the lease, and finish lifecycle as `coordination-halt` / `account-scope-failed`. Never choose among duplicates or substitute a similarly named tool.
 
 For `get-accounts-zero-matches` or `get-accounts-noncallable-match`, the final user-facing COORDINATION HALT must state: **“ACTION REQUIRED — Robinhood MCP connection unavailable. No Robinhood request was attempted. Robinhood authorization may have expired, been revoked, or become invalid. In Codex, open Settings → Plugins → MCPs, select `robinhood-trading` (or the Robinhood server name shown there), choose Authenticate, restart Codex, then open a fresh task and verify `get_accounts` is callable. If it is still absent in that fresh task, remove and re-create the MCP connection, restart Codex, and test `get_accounts` again. Do not rerun this automation until that fresh-task check succeeds.”** For `get-accounts-duplicate-matches`, instead state: **“ACTION REQUIRED — Codex exposed duplicate exact Robinhood `get_accounts` registrations. No Robinhood request was attempted. Restart Codex, open a fresh task, and verify exactly one canonical `get_accounts` registration is callable. Do not choose one, change authorization, remove a connector, or rerun this automation until the duplicate is gone.”** Do not claim that the computer was offline, authorization failed, or Robinhood rejected a request without independent evidence.
 
@@ -299,20 +298,20 @@ The JSON object is a versioned deterministic receipt. On EVERY routine invocatio
 **Use these START-CLOCK values for every run-wide time decision** — the Eastern broker date for the daily-loss calculation, the Pacific stop-fill date, the deterministic historicals start time, the initial opening-blackout and session gates, the re-entry cooldown window, dust-sweep lookback, ledger timestamps, report header, and every output filename. Do NOT convert zones, apply DST offsets, subtract lookback days, or write an ad-hoc clock by hand. START CLOCK itself is mandatory: if its non-configuration execution or JSON validation fails, finish the still-unbound lifecycle as `coordination-halt` / `clock-unavailable` and stop before lease acquisition, scratch creation, broker calls, or normal report/status files. The only permitted later readings are (1) the two DAILY-LOSS readings in SECOND that bracket quote collection, (2) the mandatory PRE-BUY REVALIDATIONS in Step 11, and (3) fresh ORDER-INTENT readings immediately before an intent baseline or reconciliation snapshot. The first DAILY-LOSS reading gives discovery a cutoff after the broker snapshot; the second is captured after the quotes and becomes the final `as_of_utc`. Both must have the same `date_et` as START CLOCK. PRE-BUY readings control only whether a buy may be placed now and which session-specific order style applies. ORDER-INTENT readings supply only `baseline.observed_at_utc` or `observe --as-of-utc`; they do not reopen a closed entry window. None of these later readings changes START CLOCK's historicals window, run-start timestamp, Pacific report date, ledger windows, report name, or earlier protection work. If any required **later** clock reading fails or crosses to another Eastern date, make no new buys this run and report the clock failure — protection steps still run. A constants-related failure is NEVER a generic clock failure: it remains a FULL-RUN HALT under the configuration preflight.
 
 ### RUN COORDINATION — fenced single-flight lease
-Execute the canonical STARTUP SEQUENCE above without reordering it. Immediately after START CLOCK succeeds and its `pt_iso` is bound to lifecycle, and before scratch creation or preflight, any order-intent journal command, `rules_version`, `get_accounts`, or ANY broker call, acquire the checked-in cross-process lease. A configuration validation/hash failure stops the full run before lease acquisition under the mandatory preflight. A START CLOCK failure likewise stops before lease acquisition; neither failure reaches this section:
+Execute the canonical STARTUP SEQUENCE above without reordering it. Immediately after START CLOCK succeeds and its `pt_iso` is bound to lifecycle, and before scratch creation, any order-intent journal command, `rules_version`, `get_accounts`, or ANY broker call, invoke the checked-in combined lease/context action:
 
-- Windows/PowerShell: `& '<PYTHON_EXE>' run_lock.py acquire`
-- POSIX-style shell: `'<PYTHON_EXE>' run_lock.py acquire`
+- Windows/PowerShell: `& '<PYTHON_EXE>' run_lifecycle.py acquire-bind-context --invocation-id '<INVOCATION_ID>'`
+- POSIX-style shell: `'<PYTHON_EXE>' run_lifecycle.py acquire-bind-context --invocation-id '<INVOCATION_ID>'`
 
-The command's stdout must be one JSON object with `schema_version` exactly `1`, `action` exactly `"acquire"`, `ok` exactly the JSON boolean `true`, and a canonical lowercase UUIDv4 string `token`; retain that exact token as `RUN_LOCK_TOKEN`. Do not pass `--lock-file`, `--lease-seconds`, or `--now-utc` during a trading run. The default SQLite coordination file lives at `run-reports/rhmra-run-lock.sqlite3` and is local/gitignored.
+Do not invoke standalone `run_lock.py acquire` or `run_lifecycle.py bind-context` during startup. The combined action is the canonical UUID/type/phase authority: it validates the lifecycle invocation in checked-in Python, requires a running preflight binding, acquires the fenced SQLite lease, proves exact ownership while atomically writing `run-reports/rhmra-active-context.json`, and returns the raw token only after both operations succeed. The private context file stores only a SHA-256 ownership binding, never the raw token, account identity, credentials, or broker data. If binding fails after acquisition, the helper performs one owner-fenced compensating release and returns a bounded token-free failure. A process killed between acquisition and compensation can still leave the safe 20-minute lease until expiry; never delete, replace, or hand-edit the lock database to get past it. Do not pass test-only path or time overrides during a trading run.
 
-If acquisition exits nonzero because the validated JSON says `reason: "active_run"`, stop immediately with a concise **OVERLAP HALT** containing the current holder's acquisition/renewal/expiry times. Make no broker calls and do not create the normal report, ledger rows, gate record, or status snapshot — the owner run is responsible for those. If the command fails for any other reason, or its JSON is missing/unreadable/malformed or fails the checks above, stop with a concise **COORDINATION HALT** and likewise make no broker calls or normal outputs. These pre-broker halts supersede REPORT, its "every run" status-snapshot rule, and the final file-card line. Never delete, replace, or hand-edit the lock database to get past a halt.
+Successful stdout is one JSON object with `schema_version: 1`, `action: "acquire-bind-context"`, `ok: true`, a nonempty `run_lock_token`, and a complete `context_receipt`. Bind that exact private token as `RUN_LOCK_TOKEN`. The checked-in helper, not runner JavaScript, owns canonical UUID validation for both invocation and token. Runner glue must not create a UUID regular expression or independently revalidate either identifier. Check only the core action/status values, exact nonempty producer values, and exact equality to the already machine-carried Python and invocation. Require the nested context receipt's `action: "bind-context"`, `ok: true`, lifecycle `phase: "preflight"`, classification `running`, `python` exactly equal to `PYTHON_EXE`, and `invocation_id` exactly equal to `INVOCATION_ID`. Store that complete nested receipt unchanged. `context-bound` is only the surrounding bootstrap-state phase.
 
-Immediately after a successful acquisition and before scratch creation, bind the private active-context receipt using the still-bound launcher and raw token: PowerShell `& '<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`; POSIX-style shell `'<PYTHON_EXE>' run_lifecycle.py bind-context --invocation-id '<INVOCATION_ID>' --run-token '<RUN_LOCK_TOKEN>'`. Require exit zero and exactly one JSON object. For this startup receipt, the checked-in `bind-context` action is the sole complete-schema/type/range authority: do not count returned fields, compare `Object.keys(...)`, build a copied key/type list, or independently revalidate or compare the artifact fields. Runner glue checks only `schema_version: 1`, `action: "bind-context"`, `ok: true`, `phase: "preflight"`, classification `running`, `python` exactly equal to `PYTHON_EXE`, and `invocation_id` exactly equal to `INVOCATION_ID`. The receipt's `phase` is the lifecycle phase and MUST remain `"preflight"`; never require, rewrite, or compare it to `"context-bound"`. The helper proves current lease ownership and atomically writes `run-reports/rhmra-active-context.json`; it stores only a SHA-256 ownership binding, never the raw token, account identity, credentials, or broker data. Do not pass test-only path or time overrides. On any nonzero, non-JSON, or receipt failing those core checks, release the still-owned lease using the retained token, finish lifecycle as `coordination-halt` / `coordination-state`, and stop before scratch creation or any broker call.
+If the combined action exits nonzero because its validated token-free JSON says `reason: "active_run"`, stop immediately with a concise **OVERLAP HALT** containing the current holder's acquisition/renewal/expiry times. Make no broker calls and do not create the normal report, ledger rows, gate record, or status snapshot — the owner run is responsible for those. Any other nonzero, missing/unreadable/malformed JSON, compensated bind failure, unconfirmed cleanup, or core-check failure is a **COORDINATION HALT**. If a success envelope was returned and the private token was stored before a later runner core check failed, release only through the normal exact private-slot release path before lifecycle finish. These pre-broker halts supersede REPORT, its "every run" status-snapshot rule, and the final file-card line.
 
-**CODEX PRIVATE LEASE STATE — REQUIRED:** Codex must acquire and bind context inside one `functions.exec` orchestration. Before the sole acquire call, clear the fixed `rhmra.lease-state.v1` slot. Immediately after validating acquisition, store only one private lease object with the exact helper-returned token and lifecycle invocation; do this before constructing the bind command. The executor-private raw copy lives only in that slot: never add it to bootstrap or transport state, print it with `text`/`notify`, place it in narration, a model-visible compact receipt, report, status, or memory, write it with an ad-hoc file/database operation, or reconstruct it from any other UUID or receipt. Only the existing checked-in deterministic protocols may persist it: `run_lock.py` owns the gitignored lease database created by acquisition, while the mechanically built `order_intents.py prepare` scratch intent and helper-owned SQLite journal hold the fencing value exactly as ORDER-INTENT JOURNAL requires. Runner glue performs no other persistence. Every later token consumer loads the same private slot, proves `phase: "lease-owned"` and the exact invocation binding, and mechanically shell-quotes/inserts `run_lock_token`. No conditional, fallback, empty string, literal placeholder, model variable, context receipt, or remembered value may supply `--run-token`, `--token`, or the prepared intent's `run_token`.
+**CODEX PRIVATE LEASE STATE — REQUIRED:** Codex must invoke the combined action inside one `functions.exec` orchestration. Clear the fixed `rhmra.lease-state.v1` slot first. On a validated success envelope, store one private lease object with the exact helper-returned token and lifecycle invocation before validating or storing the nested context receipt. The executor-private raw copy lives only in that slot: never add it to bootstrap or transport state, print it with `text`/`notify`, place it in narration, a model-visible compact receipt, report, status, or memory, write it with an ad-hoc file/database operation, or reconstruct it from any other UUID or receipt. Only the existing checked-in deterministic protocols may persist it: `run_lock.py`, called internally by lifecycle, owns the gitignored lease database, while the mechanically built `order_intents.py prepare` scratch intent and helper-owned SQLite journal hold the fencing value exactly as ORDER-INTENT JOURNAL requires. Runner glue performs no other persistence. Every later token consumer loads the same private slot, proves `phase: "lease-owned"`, a nonempty token, and the exact invocation binding, and mechanically shell-quotes/inserts `run_lock_token`. No conditional, fallback, empty string, literal placeholder, model variable, context receipt, or remembered value may supply `--run-token`, `--token`, or the prepared intent's `run_token`.
 
-Use this exact acquisition/bind validation and store shape. It deliberately emits only a compact token-free success. `acquireResult` and `bindContextResult` are fully drained command results from the commands constructed here:
+Use this exact one-command validation and store shape. It deliberately emits only a compact token-free success. `combinedResult` is the fully drained command result constructed here:
 
 ```javascript
 {
@@ -322,11 +321,11 @@ store(LEASE_KEY, null);
 const bootstrap = load(BOOTSTRAP_KEY);
 const invocationId = bootstrap && bootstrap.lifecycle_receipt &&
   bootstrap.lifecycle_receipt.invocation_id;
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 if (!bootstrap || bootstrap.schema_version !== 1 ||
     bootstrap.phase !== "configuration-bound" ||
     !bootstrap.resolver_receipt || !bootstrap.lifecycle_receipt ||
-    !bootstrap.constants_receipt || !uuid4.test(invocationId)) {
+    !bootstrap.constants_receipt || typeof invocationId !== "string" ||
+    invocationId.length === 0) {
   throw new Error("validated launcher/config state is unavailable");
 }
 const pythonExe = bootstrap.resolver_receipt.python;
@@ -349,44 +348,45 @@ const commandArgs = command => {
   if (isWindows) args.shell = "powershell.exe";
   return args;
 };
-const acquireCommand = (isWindows ? "& " : "") + quote(pythonExe) +
-  " run_lock.py acquire";
-const acquireResult = await drainCommand(await tools.exec_command(commandArgs(acquireCommand)));
-let acquireReceipt;
-try { acquireReceipt = JSON.parse(acquireResult.output); } catch (ignored) {}
-const activeRun = acquireReceipt && acquireReceipt.schema_version === 1 &&
-  acquireReceipt.action === "acquire" && acquireReceipt.ok === false &&
-  acquireReceipt.reason === "active_run" && acquireReceipt.holder &&
-  typeof acquireReceipt.holder.acquired_at === "string" &&
-  typeof acquireReceipt.holder.renewed_at === "string" &&
-  typeof acquireReceipt.holder.expires_at === "string";
-if (acquireResult.exit_code !== 0 || !acquireReceipt ||
-    acquireReceipt.schema_version !== 1 || acquireReceipt.action !== "acquire" ||
-    acquireReceipt.ok !== true || !uuid4.test(acquireReceipt.token)) {
+const combinedCommand = (isWindows ? "& " : "") + quote(pythonExe) +
+  " run_lifecycle.py acquire-bind-context --invocation-id " + quote(invocationId);
+const combinedResult = await drainCommand(
+  await tools.exec_command(commandArgs(combinedCommand)));
+let combinedReceipt;
+try { combinedReceipt = JSON.parse(combinedResult.output); } catch (ignored) {}
+const activeRun = combinedReceipt && combinedReceipt.schema_version === 1 &&
+  combinedReceipt.action === "acquire-bind-context" &&
+  combinedReceipt.ok === false && combinedReceipt.reason === "active_run" &&
+  combinedReceipt.holder &&
+  typeof combinedReceipt.holder.acquired_at === "string" &&
+  typeof combinedReceipt.holder.renewed_at === "string" &&
+  typeof combinedReceipt.holder.expires_at === "string";
+if (combinedResult.exit_code !== 0 || !combinedReceipt ||
+    combinedReceipt.schema_version !== 1 ||
+    combinedReceipt.action !== "acquire-bind-context" ||
+    combinedReceipt.ok !== true ||
+    typeof combinedReceipt.run_lock_token !== "string" ||
+    combinedReceipt.run_lock_token.length === 0) {
   text(JSON.stringify({schema_version: 1, action: "lease-state-failed", ok: false,
     reason: activeRun ? "active-run" : "coordination-state",
-    holder: activeRun ? {acquired_at: acquireReceipt.holder.acquired_at,
-      renewed_at: acquireReceipt.holder.renewed_at,
-      expires_at: acquireReceipt.holder.expires_at} : null}));
+    holder: activeRun ? {acquired_at: combinedReceipt.holder.acquired_at,
+      renewed_at: combinedReceipt.holder.renewed_at,
+      expires_at: combinedReceipt.holder.expires_at} : null}));
   exit();
 }
 store(LEASE_KEY, {schema_version: 1, phase: "lease-owned",
-  invocation_id: invocationId, run_lock_token: acquireReceipt.token});
+  invocation_id: invocationId, run_lock_token: combinedReceipt.run_lock_token});
 const requireLease = () => {
   const lease = load(LEASE_KEY);
   if (!lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
-      lease.invocation_id !== invocationId || !uuid4.test(lease.run_lock_token))
+      lease.invocation_id !== invocationId ||
+      typeof lease.run_lock_token !== "string" || lease.run_lock_token.length === 0)
     throw new Error("private lease state is unavailable");
   return lease;
 };
 const lease = requireLease();
-const bindCommand = (isWindows ? "& " : "") + quote(pythonExe) +
-  " run_lifecycle.py bind-context --invocation-id " + quote(invocationId) +
-  " --run-token " + quote(lease.run_lock_token);
-const bindContextResult = await drainCommand(await tools.exec_command(commandArgs(bindCommand)));
-let receipt;
-try { receipt = JSON.parse(bindContextResult.output); } catch (ignored) {}
-if (bindContextResult.exit_code !== 0 || !receipt || receipt.schema_version !== 1 ||
+const receipt = combinedReceipt.context_receipt;
+if (!receipt || receipt.schema_version !== 1 ||
     receipt.action !== "bind-context" || receipt.ok !== true ||
     receipt.phase !== "preflight" || receipt.classification !== "running" ||
     receipt.python !== pythonExe || receipt.invocation_id !== invocationId) {
@@ -403,7 +403,7 @@ text(JSON.stringify({schema_version: 1, action: "context-state-bound", ok: true}
 }
 ```
 
-If this cell reports acquisition failure, follow the active-run or coordination path without another acquire. If bind fails, keep the private slot unchanged so the exact loaded owner token can be released; never expose the token while reporting the failure. On success, extend it with the complete unchanged parsed result as `context_receipt` plus outer bootstrap `phase: "context-bound"`; no artifact field is retyped. `receipt.phase === "preflight"` and the newly stored `bootstrap.phase === "context-bound"` are both required and describe different state machines. A missing, malformed, cleared, or wrong-phase lease slot after successful acquire is proven token loss: do not invoke bind, preflight, a journal helper, or any broker tool with an empty substitute.
+If this cell reports acquisition failure, follow the active-run or coordination path without another acquire. The combined helper has already compensating-released any lease whose context bind failed; do not invent a token or issue a second release for that token-free failure. If the helper succeeded but a later runner core check failed, keep the private slot unchanged so the exact loaded owner token can be released; never expose the token while reporting the failure. On success, extend bootstrap with the complete unchanged nested result as `context_receipt` plus outer `phase: "context-bound"`; no artifact field is retyped. `receipt.phase === "preflight"` and the newly stored `bootstrap.phase === "context-bound"` are both required and describe different state machines. A missing, malformed, cleared, or wrong-phase lease slot after successful combined acquisition is proven token loss: do not invoke preflight, a journal helper, or any broker tool with an empty substitute.
 
 After the active-context receipt succeeds and before `rules_version`, `get_accounts`, or any broker call, let the checked-in helper create and preflight both scratch and the response-source root in one operation. On Windows that same deterministic operation also prepares and verifies the least-privilege OS capability needed for the separate file-change facility to create fresh direct-child files in both directories while leaving helper-owned marker files outside the added cross-principal writer-only capability. On Windows/PowerShell run exactly `& '<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`; in a POSIX-style shell run exactly `'<PYTHON_EXE>' broker_snapshot.py preflight --create-scratch`. Use the retained `PYTHON_EXE`; do not probe or substitute `py -3`, `python3`, PATH, or another interpreter. Do not separately call `New-Item`, `mkdir`, `mktemp`, `mkdtemp`, a language temporary-directory API, `icacls`, an ACL API, or any file tool. Do not author, randomize, predict, set permissions on, or repair either path, and do not pass either path to this command.
 
@@ -417,16 +417,15 @@ const STATE_KEY = "rhmra.transport-state.v1";
 store(STATE_KEY, null);
 const bootstrap = load(BOOTSTRAP_KEY);
 const lease = load(LEASE_KEY);
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context-bound" ||
     !bootstrap.resolver_receipt || !bootstrap.lifecycle_receipt ||
     !bootstrap.constants_receipt || !bootstrap.context_receipt ||
     typeof bootstrap.resolver_receipt.python !== "string" ||
     !bootstrap.constants_receipt.values || !lease || lease.schema_version !== 1 ||
     lease.phase !== "lease-owned" ||
-    !uuid4.test(lease.invocation_id) ||
+    typeof lease.invocation_id !== "string" || lease.invocation_id.length === 0 ||
     lease.invocation_id !== bootstrap.context_receipt.invocation_id ||
-    !uuid4.test(lease.run_lock_token))
+    typeof lease.run_lock_token !== "string" || lease.run_lock_token.length === 0)
   throw new Error("validated launcher/config/private lease state is unavailable");
 const pythonExe = bootstrap.resolver_receipt.python;
 const configuredAccountName = bootstrap.constants_receipt.values.AGENTIC_ACCOUNT_NAME;
@@ -474,7 +473,9 @@ if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) =>
     !absolute(pythonExe) || !absolute(projectRoot) || typeof configuredAccountName !== "string" || configuredAccountName.length === 0 ||
     !absolute(receipt.scratch) || !absolute(receipt.source_root) || receipt.scratch === receipt.source_root ||
     !basename(receipt.scratch).startsWith("rhmra-session-") || !basename(receipt.source_root).startsWith("rhmra-source-") ||
-    !uuid4.test(receipt.scratch_id) || !uuid4.test(receipt.source_root_id) || !hash.test(receipt.sentinel_sha256) ||
+    typeof receipt.scratch_id !== "string" || receipt.scratch_id.length === 0 ||
+    typeof receipt.source_root_id !== "string" || receipt.source_root_id.length === 0 ||
+    !hash.test(receipt.sentinel_sha256) ||
     receipt.write_read_parse !== true || receipt.cleanup_verified !== true) {
   throw new Error("preflight receipt failed the pinned machine-state contract");
 }
@@ -498,7 +499,6 @@ const STATE_KEY = "rhmra.transport-state.v1";
 const bootstrap = load(BOOTSTRAP_KEY);
 const lease = load(LEASE_KEY);
 const state = load(STATE_KEY);
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const absolute = value => typeof value === "string" &&
   (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"));
 const invocationId = bootstrap && bootstrap.context_receipt &&
@@ -511,8 +511,9 @@ if (!bootstrap || bootstrap.schema_version !== 1 || bootstrap.phase !== "context
     state.context_receipt.invocation_id !== invocationId ||
     state.lease_binding.invocation_id !== invocationId ||
     !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
-    !uuid4.test(invocationId) || lease.invocation_id !== invocationId ||
-    !uuid4.test(lease.run_lock_token)) {
+    typeof invocationId !== "string" || invocationId.length === 0 ||
+    lease.invocation_id !== invocationId ||
+    typeof lease.run_lock_token !== "string" || lease.run_lock_token.length === 0) {
   text(JSON.stringify({schema_version: 1, action: "order-intent-prerequisite-failed", ok: false}));
   exit();
 }
@@ -585,7 +586,7 @@ Never replace `quote(runLockToken)` with `quote("")`, a ternary, `state.context_
 
 The JavaScript checks the helper's exact envelope, types, IDs, hashes, and basic absolute-path/prefix invariants; it does not replace the checked-in helper's native filesystem proof. The helper itself creates the directories, resolves the native-temp parent, rejects links/replacements, and persists instance identity, and `bind-transport` revalidates those facts before account scope. Do not add model-authored path normalization, `lstat`, ACL inspection, or another probe.
 
-On success require the underlying helper result to be exit zero and exactly one JSON object with exactly these ten fields: `schema_version`, `action`, `ok`, `scratch`, `scratch_id`, `source_root`, `source_root_id`, `sentinel_sha256`, `write_read_parse`, and `cleanup_verified`. Require `schema_version: 1`, `action: "preflight"`, `ok: true`; require `scratch` and `source_root` to be distinct resolved non-symlink direct children of the resolved native runtime temporary directory, both outside the project, named respectively with the `rhmra-session-` and `rhmra-source-` prefixes; require `scratch_id` and `source_root_id` as canonical lowercase UUIDv4 strings; require a lowercase 64-character `sentinel_sha256`; and require both `write_read_parse` and `cleanup_verified` exactly the JSON boolean `true`. The helper proves `source_root` is its unchanged empty directory, persists its identity binding beside the scratch marker, and on Windows has prepared the checked OS capability on both directories. That preparation is not proof that the separate writer can save this run's broker data: the one real `get_accounts` canary below remains the sole end-to-end sensitive-write proof. Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and `SOURCE_ROOT_ID` only through the validated machine-carried receipt and retain it as opaque invocation state. Every later operation must receive the exact loaded value it needs programmatically; never type, copy, shorten, reconstruct, normalize, or re-transcribe either path or identifier from narration, display text, memory, or a prior run. No later phase may replace either directory or reuse an earlier one. This one helper call creates both new directories, proves scratch can write, fsync, read, strictly parse, and remove a sentinel, and leaves the helper-owned markers required by later commands. The daily-loss snapshot in SECOND, the scan/evaluator handoffs later in the run, and the REPORT status candidate reuse the exact receipt-issued directories.
+On success require the underlying helper result to be exit zero and exactly one JSON object with exactly these ten fields: `schema_version`, `action`, `ok`, `scratch`, `scratch_id`, `source_root`, `source_root_id`, `sentinel_sha256`, `write_read_parse`, and `cleanup_verified`. Require `schema_version: 1`, `action: "preflight"`, `ok: true`; require `scratch` and `source_root` to be distinct resolved non-symlink direct children of the resolved native runtime temporary directory, both outside the project, named respectively with the `rhmra-session-` and `rhmra-source-` prefixes; require `scratch_id` and `source_root_id` as nonempty strings and retain them unchanged; require a lowercase 64-character `sentinel_sha256`; and require both `write_read_parse` and `cleanup_verified` exactly the JSON boolean `true`. The checked-in preflight producer owns canonical identifier grammar; runner glue must not recreate it. The helper proves `source_root` is its unchanged empty directory, persists its identity binding beside the scratch marker, and on Windows has prepared the checked OS capability on both directories. That preparation is not proof that the separate writer can save this run's broker data: the one real `get_accounts` canary below remains the sole end-to-end sensitive-write proof. Bind `<scratch>`, `SCRATCH_ID`, `SOURCE_ROOT`, and `SOURCE_ROOT_ID` only through the validated machine-carried receipt and retain it as opaque invocation state. Every later operation must receive the exact loaded value it needs programmatically; never type, copy, shorten, reconstruct, normalize, or re-transcribe either path or identifier from narration, display text, memory, or a prior run. No later phase may replace either directory or reuse an earlier one. This one helper call creates both new directories, proves scratch can write, fsync, read, strictly parse, and remove a sentinel, and leaves the helper-owned markers required by later commands. The daily-loss snapshot in SECOND, the scan/evaluator handoffs later in the run, and the REPORT status candidate reuse the exact receipt-issued directories.
 
 On failure, a classifiable helper envelope is exactly one JSON object with exactly these four top-level fields: `schema_version`, `action`, `ok`, and `error`; require `schema_version: 1`, `action: "preflight"`, `ok: false`, and `error` as an object with exactly the two nonempty string fields `code` and `message`. If that strict object has `error.code` exactly `"scratch_create_failed"`, it proves the helper could not create or prepare one of its two native-temp directories: release the lease, finish as `coordination-halt` / `coordination-state`, and return a concise COORDINATION HALT without making a broker call. A valid post-create failure with `error.code` exactly `"invalid_snapshot"`, any other code, or any nonzero/missing/non-JSON/malformed/extra-fielded/mismatched result that cannot prove the creation/preparation failure, releases the lease and finishes as `snapshot-failure` / `scratch-preflight-failed`. Return a concise SNAPSHOT PREFLIGHT HALT without making a broker call. Never retry with `--scratch`, create another scratch or source directory, or create, edit, copy, change permissions on, or repair either helper directory or marker by hand.
 
@@ -626,10 +627,10 @@ const requireState = (...phases) => {
 };
 const requireLease = invocationId => {
   const current = load(LEASE_KEY);
-  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!current || current.schema_version !== 1 || current.phase !== "lease-owned" ||
-      !uuid4.test(invocationId) || current.invocation_id !== invocationId ||
-      !uuid4.test(current.run_lock_token))
+      typeof invocationId !== "string" || invocationId.length === 0 ||
+      current.invocation_id !== invocationId ||
+      typeof current.run_lock_token !== "string" || current.run_lock_token.length === 0)
     throw new Error("private lease state is unavailable");
   return current;
 };
@@ -759,7 +760,7 @@ The underlying `bind-transport` success is still exactly one JSON object with ex
 
 **POST-BIND COMPOSED JSON SAVE RECIPE:** every later Codex broker read, scan, historicals, complete quote or RSI response, placement response, or other `SOURCE_ROOT` write uses the checked-in append-only source-handoff journal; executor state never allocates a filename, sequence, pending key, or call/response phase. Begin the one composed operation by loading `rhmra.transport-state.v1`, requiring `phase: "transport-bound"`, and choosing one lowercase invocation-local purpose matching `^[a-z0-9][a-z0-9-]{0,47}$`, such as `snapshot-a-positions-0`, `run-scan`, `historicals-0`, `candidate-quotes-0`, `rsi-0`, or `placement-response-0`. Before the broker/read call, invoke `broker_snapshot.py reserve-source --scratch <machine-loaded scratch> --purpose <purpose>` with the loaded Python/project/shell values and validate its success receipt. Use only that receipt's returned `source` variable as the file-change target; never derive, normalize, copy, emit, or retype it. A duplicate purpose is terminal and is never renamed around. The helper also refuses every new reservation while any earlier purpose lacks an immutable committed/aborted terminal marker; every consumer likewise refuses to run while any purpose is pending, so an older committed response cannot bypass uncertainty from a newer call.
 
-The four source-handoff actions are checked-in complete-receipt authorities. Do not use `Object.keys`, count returned fields, copy a required-name array, or rebuild their schema/types in model-authored glue. After exit zero, require exactly one parsed JSON object with integer `schema_version: 1`, the requested `action`, JSON-boolean `ok: true`, `scratch` equal to the loaded scratch, and `purpose` equal to the requested purpose, then retain that whole object unchanged. For `reserve-source`, additionally require `status: "reserved"`, `idempotent: false`, a canonical lowercase UUIDv4 `reservation_id`, and a nonempty string `source`. Every FIRST positions reservation also requires positive safe-integer `first_request_cursor_count` equal to the submitted chain length and lowercase 64-hex `first_request_cursors_sha256`; the one FIRST retry reservation additionally requires `retry_of` exactly equal to its matching base purpose. For `commit-source`, require a canonical returned `reservation_id`, `status: "committed"`, a lowercase 64-hex `source_sha256`, and a nonnegative integer `source_size`; the helper, not runner glue, correlates that ID to the immutable scratch/purpose reservation. For `abort-source`, require the same ID, `status: "aborted"`, the requested fixed `reason`, and JSON null `source`. For `lookup-source`, accept only the documented status/recovery-action pair below and use its unchanged source only for that recovery. Helper-owned extra bookkeeping fields are not a failure and are never copied into a model-authored validator.
+The four source-handoff actions are checked-in complete-receipt authorities. Do not use `Object.keys`, count returned fields, copy a required-name array, or rebuild their schema/types in model-authored glue. After exit zero, require exactly one parsed JSON object with integer `schema_version: 1`, the requested `action`, JSON-boolean `ok: true`, `scratch` equal to the loaded scratch, and `purpose` equal to the requested purpose, then retain that whole object unchanged. For `reserve-source`, additionally require `status: "reserved"`, `idempotent: false`, a nonempty string `reservation_id`, and a nonempty string `source`. Every FIRST positions reservation also requires positive safe-integer `first_request_cursor_count` equal to the submitted chain length and lowercase 64-hex `first_request_cursors_sha256`; the one FIRST retry reservation additionally requires `retry_of` exactly equal to its matching base purpose. For `commit-source`, require a nonempty returned `reservation_id`, `status: "committed"`, a lowercase 64-hex `source_sha256`, and a nonnegative integer `source_size`; the helper, not runner glue, owns canonical identifier grammar and correlates that ID to the immutable scratch/purpose reservation. For `abort-source`, require the same exact nonempty ID, `status: "aborted"`, the requested fixed `reason`, and JSON null `source`. For `lookup-source`, accept only the documented status/recovery-action pair below and use its unchanged source only for that recovery. Helper-owned extra bookkeeping fields are not a failure and are never copied into a model-authored validator.
 
 After an explicit successful tool result, preserve the exact `JSON.stringify`/`JSON.parse`/zero-decoration patch recipe above and write it once to that reserved `source` in the same still-running operation. Then invoke exactly `broker_snapshot.py commit-source --scratch <same loaded scratch> --purpose <same purpose>` before any `text(...)`, `yield_control`, narration, or consumer. **Do not pass `--reservation-id` to `commit-source` and do not read `.id`, `.reservationId`, or any reservation UUID to construct this command.** The helper loads the one immutable reservation identified by scratch plus purpose, strictly re-reads its direct-child JSON, seals its bytes and file identity, and returns its journal UUID for audit. An explicitly supplied `--reservation-id` remains a checked backward-compatibility assertion for humans/tests only; unattended runner glue omits it. A checked-in consumer receives the logical purpose (`--source-purpose`, `--scan-purpose`, `--bars-purpose`, `--quotes-purpose`, `--rsi-purpose`, `--response-purpose`, `--orders-purpose`, or `--positions-purpose` as applicable), never the random path. Emit at most a compact path-free success naming the purpose.
 
@@ -801,7 +802,7 @@ This is the invocation's ONE save-path test. A failed file-change, denial envelo
 
 The built-in lease expires after 20 minutes unless renewed, shorter than the 30-minute schedule so a crashed run cannot block the next scheduled run. Renewal is also the fencing check that stops an old stalled run after a newer run takes ownership. At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT, run `& '<PYTHON_EXE>' run_lock.py renew --token '<RUN_LOCK_TOKEN>'` in PowerShell or `'<PYTHON_EXE>' run_lock.py renew --token '<RUN_LOCK_TOKEN>'` in a POSIX-style shell, always through the loaded private-token template below rather than a retyped placeholder. Renew again immediately before EVERY `cancel_equity_order` and `place_equity_order`, even if the prior renewal was moments ago. Each renewal must exit zero and return one JSON object with `schema_version: 1`, `action: "renew"`, `ok: true`, the same token, and a future `expires_at`. Missing, malformed, nonzero, expired, or different-token output means ownership is lost: make no further broker calls or order changes. If broker work already occurred, finish only the report from data already held and state `run lease lost`; never use more broker calls to fill gaps. A stale owner must not call release against the newer owner.
 
-**One private token authority for every later use:** in Codex, immediately before every renewal, release, broker call, and `order_intents.py prepare` payload / `pending` / `begin` / `retry` operation, load `rhmra.lease-state.v1`; require `schema_version: 1`, `phase: "lease-owned"`, its `invocation_id` equal to the active context/transport `lease_binding`, and `run_lock_token` remain the canonical UUIDv4 acquired above. Form the helper argument or JSON field only by mechanically quoting/inserting that loaded property. Never cache it in a second state slot or model variable across operations. A missing or mismatched slot stops before the helper and before any broker call—it does not authorize an empty test invocation. Successful renew preserves this same private object unchanged. A validated release replaces it immediately with the token-free tombstone `{schema_version: 1, phase: "lease-released", invocation_id: <same machine-loaded invocation>}`; proven fencing loss likewise removes the token and stores phase `lease-lost`. No later token consumer or broker call is legal from either terminal phase. A non-Codex runner enforces the same single opaque private-value authority.
+**One private token authority for every later use:** in Codex, immediately before every renewal, release, broker call, and `order_intents.py prepare` payload / `pending` / `begin` / `retry` operation, load `rhmra.lease-state.v1`; require `schema_version: 1`, `phase: "lease-owned"`, its `invocation_id` equal to the active context/transport `lease_binding`, and `run_lock_token` be the same exact nonempty string acquired above. Checked-in lease producers and consumers own token grammar; runner glue checks only presence and exact binding. Form the helper argument or JSON field only by mechanically quoting/inserting that loaded property. Never cache it in a second state slot or model variable across operations. A missing or mismatched slot stops before the helper and before any broker call—it does not authorize an empty test invocation. Successful renew preserves this same private object unchanged. A validated release replaces it immediately with the token-free tombstone `{schema_version: 1, phase: "lease-released", invocation_id: <same machine-loaded invocation>}`; proven fencing loss likewise removes the token and stores phase `lease-lost`. No later token consumer or broker call is legal from either terminal phase. A non-Codex runner enforces the same single opaque private-value authority.
 
 **CODEX LATER TOKEN PRECONDITION — REQUIRED IN EACH ACTIVE CELL:** paste this precondition at the beginning of every later Codex renewal, order-intent prepare/begin/retry, mutation precheck, and broker-call orchestration, and continue the operation inside the same braces. It requires the active post-bind transport `lease_binding`; terminal or missing transport state cannot use this active template. No command or broker tool may be constructed or awaited before this block succeeds:
 
@@ -813,7 +814,6 @@ const STATE_KEY = "rhmra.transport-state.v1";
 const bootstrap = load(BOOTSTRAP_KEY);
 const state = load(STATE_KEY);
 const lease = load(LEASE_KEY);
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const invocationId = state && state.lease_binding && state.lease_binding.invocation_id;
 if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.context_receipt ||
     bootstrap.context_receipt.invocation_id !== invocationId ||
@@ -821,8 +821,9 @@ if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.context_receipt |
     typeof state.python_exe !== "string" || typeof state.project_root !== "string" ||
     state.phase !== "transport-bound" ||
     !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
-    !uuid4.test(invocationId) || lease.invocation_id !== invocationId ||
-    !uuid4.test(lease.run_lock_token)) {
+    typeof invocationId !== "string" || invocationId.length === 0 ||
+    lease.invocation_id !== invocationId ||
+    typeof lease.run_lock_token !== "string" || lease.run_lock_token.length === 0) {
   text(JSON.stringify({schema_version: 1, action: "private-lease-prerequisite-failed", ok: false}));
   exit();
 }
@@ -850,7 +851,6 @@ const STATE_KEY = "rhmra.transport-state.v1";
 const bootstrap = load(BOOTSTRAP_KEY);
 const state = load(STATE_KEY);
 const lease = load(LEASE_KEY);
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const bootstrapInvocation = bootstrap &&
   ((bootstrap.context_receipt && bootstrap.context_receipt.invocation_id) ||
    (bootstrap.lifecycle_receipt && bootstrap.lifecycle_receipt.invocation_id));
@@ -872,11 +872,12 @@ const reportTerminal = state &&
     !Object.prototype.hasOwnProperty.call(state, "status_binding"));
 if (!bootstrap || bootstrap.schema_version !== 1 || !bootstrap.resolver_receipt ||
     typeof bootstrap.resolver_receipt.python !== "string" ||
-    !uuid4.test(invocationId) ||
+    typeof invocationId !== "string" || invocationId.length === 0 ||
     (stateInvocation && stateInvocation !== bootstrapInvocation) ||
     (reportSequenceStarted && !reportTerminal) ||
     !lease || lease.schema_version !== 1 || lease.phase !== "lease-owned" ||
-    lease.invocation_id !== invocationId || !uuid4.test(lease.run_lock_token)) {
+    lease.invocation_id !== invocationId ||
+    typeof lease.run_lock_token !== "string" || lease.run_lock_token.length === 0) {
   text(JSON.stringify({schema_version: 1, action: "lease-release-prerequisite-failed", ok: false}));
   exit();
 }
@@ -970,7 +971,7 @@ If recovery finds a working or partially filled non-stop order, query it once mo
 }
 ```
 
-The `order` object is exactly the already reviewed order payload minus `account_number` and `ref_id`; it must always state `market_hours` and `time_in_force` explicitly. A stop uses the canonical stop fields. `replaces_intent_id` is JSON `null` except for `stop-retry`, where it is the canonical UUID of the one terminal zero-fill stop being replaced. Validate the authored file with strict `json.load`, then run `order_intents.py prepare --intent <file>`. Require action `prepare`, `ok: true`, canonical UUID `intent_id == ref_id`, 64-character lowercase-hex `order_sha256`, `baseline_sha256`, and `intent_sha256` values, status `prepared`, the expected replacement link, and `place_order` equal to the intended fields plus only that `ref_id`. A nonzero/malformed/mismatching result means do not place.
+The `order` object is exactly the already reviewed order payload minus `account_number` and `ref_id`; it must always state `market_hours` and `time_in_force` explicitly. A stop uses the canonical stop fields. `replaces_intent_id` is JSON `null` except for `stop-retry`, where it is the exact nonempty `intent_id` returned for the one terminal zero-fill stop being replaced. Validate the authored file with strict `json.load`, then run `order_intents.py prepare --intent <file>`. Require action `prepare`, `ok: true`, nonempty string `intent_id` and `ref_id` values that are exactly equal, 64-character lowercase-hex `order_sha256`, `baseline_sha256`, and `intent_sha256` values, status `prepared`, the expected replacement link, and `place_order` equal to the intended fields plus only that `ref_id`. The checked-in order-intent producer and consumers own identifier grammar; runner glue retains and compares the exact values only. A nonzero/malformed/mismatching result means do not place.
 
 Immediately before the MCP call, after the required lease renewal (and buy clock revalidation), run `order_intents.py begin --intent-id <id> --run-token <RUN_LOCK_TOKEN>`. Require action `begin`, `ok: true`, status `submitting`, attempt `1`, the same IDs and all three hashes, and the exact persisted `place_order`. Add only this run's resolved `account_number`, then call `place_equity_order` with every other field byte-for-byte from `place_order`; never regenerate the UUID or payload.
 
@@ -1009,7 +1010,7 @@ Maintain `trade-ledger.csv` next to this document; create it with this header ro
 
 `timestamp_pt,order_id,symbol,side,quantity,price,notional,reason,realized_pnl,rules_version`
 
-**rules_version** — obtained ONCE at startup item 12 — comes only from the checked-in deterministic helper. From the project folder run PowerShell `& '<PYTHON_EXE>' rules_version.py` or POSIX-style shell `'<PYTHON_EXE>' rules_version.py`. Require exit zero and exactly one JSON object with exactly `schema_version`, `status`, and `rules_version`: integer `schema_version: 1`, string `status: "valid"`, and `rules_version` equal to `unknown` or a lowercase hexadecimal short hash with an optional `-dirty` suffix. Bind only that returned value. The helper owns the canonical rule-set file list, dirty-state interpretation, expected local-only `DRY_RUN = false` exception, and read-only Git invocation. Never run, interpret, or substitute `git describe`, `git log`, `git status`, or `git diff` in the routine. If the helper cannot run or its envelope is invalid, use `unknown` without an ad-hoc Git fallback; this stamp is telemetry and must never block or delay the run. Every ledger row carries it, and the report states it (see REPORT).
+**rules_version** — obtained ONCE at startup item 11 — comes only from the checked-in deterministic helper. From the project folder run PowerShell `& '<PYTHON_EXE>' rules_version.py` or POSIX-style shell `'<PYTHON_EXE>' rules_version.py`. Require exit zero and exactly one JSON object with exactly `schema_version`, `status`, and `rules_version`: integer `schema_version: 1`, string `status: "valid"`, and `rules_version` equal to `unknown` or a lowercase hexadecimal short hash with an optional `-dirty` suffix. Bind only that returned value. The helper owns the canonical rule-set file list, dirty-state interpretation, expected local-only `DRY_RUN = false` exception, and read-only Git invocation. Never run, interpret, or substitute `git describe`, `git log`, `git status`, or `git diff` in the routine. If the helper cannot run or its envelope is invalid, use `unknown` without an ad-hoc Git fallback; this stamp is telemetry and must never block or delay the run. Every ledger row carries it, and the report states it (see REPORT).
 
 Append one aggregate row per FILL-BEARING BROKER ORDER only after that order is terminal: buys (reason `dip-buy`), profit-take sells (`profit-take`), dust sweeps (`dust-sweep`), and — discovered via `get_equity_orders` — stop-loss sells that became terminal since the previous run (`stop-fill`). Do not append a working partial order: later executions share its order ID and would be silently lost behind the ledger's order-id dedupe. At terminal `filled` or `partially_filled_rest_cancelled` (or another terminal state with positive reconciled `cumulative_quantity`), use the final cumulative quantity and the exact execution-weighted `average_fill_price` plus `last_execution_at` returned by the final journal reconciliation. For older/discovered orders outside this run's journal, derive those same values from the fully reconciled unique executions. All unique executions must sum exactly to cumulative quantity. Before appending, read the file and dedupe by order_id: never append an order_id already present, never modify or delete existing rows. For buys, leave `realized_pnl` blank. For every sell, the checked-in `ledger_pnl.py` helper is the SOLE P&L calculator: after terminal execution reconciliation and before appending the row, run Windows/PowerShell `py -3 ledger_pnl.py --ledger "<absolute ledger path>" --symbol "<SYMBOL>" --quantity "<exact final cumulative quantity>" --sale-price "<exact final average_fill_price>" --sale-time "<exact final last-execution timestamp in Pacific>"` or the same command with `python3` on Linux/macOS. Pass the broker decimal strings unchanged. Require exit zero and exactly one JSON object with `schema_version: 1`, `status: "matched-ledger-pool"`, the exact symbol/quantity/sale price/sale time, `rounding_policy: "per-fill-half-away-from-zero-to-cent"`, decimal-string `basis_price` and `realized_pnl`, and integer `realized_pnl_cents`; copy only that `realized_pnl` string into the row. The helper chronologically reconstructs the remaining strategy acquisition pool from exact execution-weighted rows already present in this ledger using rational base-10 arithmetic. This is a ledger-derived weighted-average strategy measure, not broker tax-lot or tax-basis accounting. NEVER use the rounded `get_equity_positions.average_buy_price`, binary floating point, formatted currency, or hand arithmetic. If the helper is nonzero, unavailable, malformed, or cannot prove complete matched acquisition coverage, leave `realized_pnl` blank and report it as unavailable—never substitute an estimate or zero. Use the last broker execution time in Pacific. The ledger is local strategy telemetry (gitignored): it exists for win-rate / expectancy analysis and NEVER informs order decisions. Robinhood's `get_realized_pnl` remains the authoritative account-wide broker figure and may include tax-basis adjustments or activity the strategy ledger cannot attribute.
 
@@ -1111,13 +1112,12 @@ const reserveSnapshotSourceBeforeRead = async (generation, phase, kind, index) =
     " --purpose " + quote(purpose);
   const commandResult = await runSnapshotJsonCommand(command);
   const receipt = commandResult.receipt;
-  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (commandResult.process.exit_code !== 0 || !receipt || typeof receipt !== "object" ||
       Array.isArray(receipt) || receipt.schema_version !== 1 ||
       receipt.action !== "reserve-source" || receipt.ok !== true ||
       receipt.status !== "reserved" || receipt.idempotent !== false ||
       receipt.scratch !== scratch || receipt.purpose !== purpose ||
-      typeof receipt.reservation_id !== "string" || !uuid4.test(receipt.reservation_id) ||
+      typeof receipt.reservation_id !== "string" || receipt.reservation_id.length === 0 ||
       typeof receipt.source !== "string" || receipt.source.length < 1) {
     return failure();
   }
@@ -1144,7 +1144,7 @@ const fullToolResult = await resolvedSnapshotRead(brokerArguments);
 
 This exact order applies to every DAILY-LOSS broker response in A and B: build the canonical lowercase purpose; successfully reserve it through `runSnapshotJsonCommand`; only then invoke that page's broker tool; write the complete returned object once to `sourceReservation.source`; self-correlating commit with `sourceReservation.purpose` and **no reservation-ID argument**; stage using that same committed `sourceReservation.purpose`; bind the stage receipt; then begin another page/call. The checked-in reserve action independently parses the same closed purpose grammar and checks the persisted generation state under its reservation lock before issuing the response path; therefore an unauthorized B, stale A, exhausted B, malformed phase/kind, or wrong index stops before the broker call. Never define or use a `saveSource(purpose, fullToolResult)`-style helper that reserves after accepting an already-returned response. Never call a broker tool and then reserve its purpose. If reservation fails, no broker call has occurred; emit the compact failure and stop. If the broker read fails after reservation, use only the POST-BIND recipe's fixed `connector-failed` abort path. Do not reuse the purpose variable passed into a helper when a validated receipt exists; commit and stage only with `sourceReservation.purpose`.
 
-For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into fresh generation-specific files using the exact kind-specific command below and the literal `--auto-output-scratch '<scratch>'`; `broker_snapshot.py`, not runner JavaScript, allocates every direct-child filename. Use uppercase `A` throughout generation A and uppercase `B` throughout generation B only in the generation-valued arguments/receipts named above; source purposes always use the exact lowercase builder. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, `output_mode: "helper-allocated"`, the exact `kind` and `generation`, a canonical `set_id`, JSON-boolean `complete`, positive integer `file_count` equal to both the length of `files` and the length of `output_paths`, an ordered string `output_paths` entry for every input, and a validated hash/provenance descriptor object in `files` for every output. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. Every `files[i]` is a descriptor object, never a path. Its nested `files[i].output` must equal `output_paths[i]`, while only the separately bound `output_paths[i]` string may be passed to a command or retained as a staged-file path. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
+For every successful broker call, repeat the POST-BIND COMPOSED JSON SAVE RECIPE above with the complete `fullToolResult` and write ONE COMPLETE response JSON object exactly as returned—including all `content`, `structuredContent`, `data`, pagination, transport-envelope, and `guide` fields—to a fresh unique direct-child file in the same machine-loaded bound `SOURCE_ROOT`. The save must occur immediately after the call and before narration or another dependent action. This is a whole-response transport operation: never select fields, summarize, repair, hand-transcribe values, reuse or overwrite a source, switch directories, decorate the serialized bytes, or substitute shell/Python serialization. Immediately stage that source into fresh generation-specific files using the exact kind-specific command below and the literal `--auto-output-scratch '<scratch>'`; `broker_snapshot.py`, not runner JavaScript, allocates every direct-child filename. Use uppercase `A` throughout generation A and uppercase `B` throughout generation B only in the generation-valued arguments/receipts named above; source purposes always use the exact lowercase builder. Before making the next dependent call, require exit zero and one parsed JSON object with integer `schema_version: 1`, `action: "stage"`, JSON-boolean `ok: true`, `output_mode: "helper-allocated"`, the exact `kind` and `generation`, a nonempty string `set_id`, JSON-boolean `complete`, positive integer `file_count` equal to both the length of `files` and the length of `output_paths`, an ordered string `output_paths` entry for every input, and a validated hash/provenance descriptor object in `files` for every output. The checked-in stage producer and consumers own `set_id` grammar; runner glue retains it unchanged and compares exact bindings only. The field is literally `file_count`, never `count`; tolerate helper-owned extra bookkeeping fields instead of counting object keys. Every `files[i]` is a descriptor object, never a path. Its nested `files[i].output` must equal `output_paths[i]`, while only the separately bound `output_paths[i]` string may be passed to a command or retained as a staged-file path. The helper revalidates the invocation-bound source root, removes only a known transport envelope, rejects an MCP `isError`, strictly parses JSON, rejects duplicate/non-finite values and malformed broker semantics, atomically writes canonical payload JSON plus helper-owned provenance, reads both back, and refuses overwrites or any external source outside the bound root.
 
 **STAGE RECEIPT PATH BINDING — EXACT, FOR EVERY STAGED KIND AND EVERY PAGE/SINGLETON/AGGREGATE:** before invoking `broker_snapshot.py stage`, retain the exact positive input count in `expectedFileCount`; do not allocate, predict, construct, or retain any output path. For a positions/orders PAGE template, also freeze `pageStageBinding` with exactly `source_purpose: pageContract.source_purpose`, `row_count: pageContract.row_count`, `next_cursor: pageContract.next_cursor`, and `request_cursor` equal to that page's exact broker request cursor. For portfolio, quotes, and aggregate templates, set `pageStageBinding = null`. After exit zero and parsing the one receipt, Codex MUST invoke this exact validator in the same composed operation before any model-visible output or dependent helper. This is a receipt validator only, not a generic staging argv builder; the kind-specific command matrix below remains mandatory.
 
@@ -1164,7 +1164,6 @@ const bindStageOutputPaths = (
     return failure();
   }
   const stageReceipt = commandResult.receipt;
-  const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const sha256 = /^[0-9a-f]{64}$/;
   const allowedKinds = new Set(["portfolio", "positions", "orders", "quotes"]);
   const pageBound = expectedPageBinding !== null;
@@ -1177,7 +1176,7 @@ const bindStageOutputPaths = (
       stageReceipt.generation !== expectedGeneration ||
       typeof expectedComplete !== "boolean" ||
       stageReceipt.complete !== expectedComplete ||
-      typeof stageReceipt.set_id !== "string" || !uuid4.test(stageReceipt.set_id) ||
+      typeof stageReceipt.set_id !== "string" || stageReceipt.set_id.length === 0 ||
       !Number.isSafeInteger(stageReceipt.file_count) || stageReceipt.file_count < 1 ||
       !Array.isArray(stageReceipt.files) || !Array.isArray(stageReceipt.output_paths) ||
       !Number.isSafeInteger(expectedFileCount) || expectedFileCount < 1 ||
@@ -2005,14 +2004,14 @@ const expectedReportFile = bootstrap && bootstrap.context_receipt &&
   bootstrap.context_receipt.expected_report_file;
 const expectedStatusFile = bootstrap && bootstrap.context_receipt &&
   bootstrap.context_receipt.expected_status_file;
-const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const bareReport = /^rhmra-log-[0-9]{4}_[0-9]{2}_[0-9]{2}-[0-9]{2}_[0-9]{2}\.md$/;
 const bareStatus = /^rhmra-status-[0-9]{4}_[0-9]{2}_[0-9]{2}-[0-9]{2}_[0-9]{2}\.json$/;
 const statusPublished = state && state.phase === "status-published";
 const statusUnavailable = state && state.phase === "status-unavailable";
 if (!bootstrap || bootstrap.schema_version !== 1 ||
     !bootstrap.resolver_receipt || typeof bootstrap.resolver_receipt.python !== "string" ||
-    !bootstrap.context_receipt || !uuid4.test(invocationId) ||
+    !bootstrap.context_receipt || typeof invocationId !== "string" ||
+    invocationId.length === 0 ||
     !state || state.schema_version !== 1 || typeof state.project_root !== "string" ||
     !state.context_receipt || state.context_receipt.invocation_id !== invocationId ||
     state.context_receipt.expected_report_file !== expectedReportFile ||

@@ -28,6 +28,7 @@ Commands (all successful commands emit one JSON object):
       --report-file rhmra-log-2026_08_04-12_02.md \
       --status-file rhmra-status-2026_08_04-12_02.json
   py -3 run_lifecycle.py status --invocation-id UUID
+  py -3 run_lifecycle.py acquire-bind-context --invocation-id UUID
   py -3 run_lifecycle.py bind-context --invocation-id UUID --run-token TOKEN
   py -3 run_lifecycle.py recover-context
   py -3 run_lifecycle.py export
@@ -38,16 +39,19 @@ Pacific run timestamp begins as null.  A successful clock preflight binds
 ``run_start_pt`` exactly once through a ``preflight`` event.  File references
 require that binding; an early configuration halt remains visible without it.
 
-Only fixed classifications, phases, and reason codes are accepted.  There is
-deliberately no free-text, account, credential, lease-token, broker-token, or
-API-response field.  ``invocation_id`` is a non-secret correlation UUID.
+Only fixed classifications, phases, and reason codes are accepted.  Lifecycle
+journal, projection, and active-context records deliberately contain no
+free-text, account, credential, raw lease-token, broker-token, or API-response
+field.  The successful ``acquire-bind-context`` stdout receipt is the sole raw
+lease-token exception so nested orchestration can store it privately; every
+failure receipt is token-free.  ``invocation_id`` is a non-secret correlation UUID.
 ``--state-file``, ``--projection-file``, and ``--now-utc`` are for tests and
 diagnostics; trading runs use the checked-in defaults.
 
 Exit codes:
   0  action succeeded
   1  invalid input, unsafe/corrupt state, or projection publication failure
-  2  lifecycle conflict (duplicate start, unknown invocation, already finished)
+  2  lifecycle conflict or an active owner blocking acquire-bind-context
 """
 
 from __future__ import annotations
@@ -70,6 +74,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from market_clock import PACIFIC_STD_OFFSET, zone_time
+import run_lock as run_lock_module
 
 
 SCHEMA_VERSION = 1
@@ -1495,6 +1500,13 @@ def bind_active_context(
         state_file=state_file,
         projection_file=projection_file,
     )
+    if (
+        lifecycle['classification'] != 'running'
+        or lifecycle['phase'] != 'preflight'
+    ):
+        raise LifecycleConflict(
+            'bind-context requires a running preflight invocation'
+        )
     owner = _active_lease_token(lock_file, now_utc)
     if owner != run_token:
         raise LifecycleConflict('run token does not own the active lease')
@@ -1513,6 +1525,153 @@ def bind_active_context(
     }
     _atomic_write_context(context_file, document)
     return _context_result('bind-context', document, lifecycle)
+
+
+def acquire_and_bind_active_context(
+    *, invocation_id: str,
+    state_file: str = DEFAULT_STATE_FILE,
+    projection_file: str = DEFAULT_PROJECTION_FILE,
+    context_file: str = DEFAULT_CONTEXT_FILE,
+    lock_file: str = DEFAULT_LOCK_FILE,
+    now_utc: str | None = None,
+    lease_seconds: int = run_lock_module.DEFAULT_LEASE_SECONDS,
+) -> dict[str, Any]:
+    """Acquire the run lease and bind lifecycle context in one checked-in action.
+
+    The raw fencing token is returned only on complete success so a nested
+    executor can place it directly into private state.  An active owner is a
+    token-free overlap result.  If context binding fails after acquisition,
+    this function makes one owner-fenced compensating release and returns a
+    bounded token-free failure.
+    """
+    invocation_id = _canonical_uuid(invocation_id, 'invocation_id')
+    lifecycle = invocation_status(
+        invocation_id=invocation_id,
+        state_file=state_file,
+        projection_file=projection_file,
+    )
+    if (
+        lifecycle['classification'] != 'running'
+        or lifecycle['phase'] != 'preflight'
+    ):
+        raise LifecycleConflict(
+            'acquire-bind-context requires a running preflight invocation'
+        )
+
+    lock_now: float | None = None
+    if now_utc is not None:
+        canonical_now = _now_utc(now_utc)
+        lock_now = datetime.fromisoformat(
+            canonical_now.replace('Z', '+00:00')
+        ).timestamp()
+
+    try:
+        acquisition = run_lock_module.acquire(
+            lock_file=lock_file,
+            lease_seconds=lease_seconds,
+            now=lock_now,
+        )
+    except Exception as exc:
+        raise LifecycleError('run lease acquisition failed') from exc
+    if (
+        not isinstance(acquisition, dict)
+        or acquisition.get('schema_version') != run_lock_module.SCHEMA_VERSION
+        or acquisition.get('action') != 'acquire'
+        or not isinstance(acquisition.get('ok'), bool)
+    ):
+        raise LifecycleError('run lease acquisition returned invalid state')
+    if acquisition.get('ok') is not True:
+        if acquisition.get('reason') != 'active_run':
+            raise LifecycleError('run lease acquisition returned invalid state')
+        holder = acquisition.get('holder')
+        if not isinstance(holder, dict) or set(holder) != {
+            'acquired_at', 'renewed_at', 'expires_at'
+        } or any(not isinstance(holder[name], str) for name in holder):
+            raise LifecycleError('active run holder receipt is malformed')
+        return {
+            'schema_version': SCHEMA_VERSION,
+            'action': 'acquire-bind-context',
+            'ok': False,
+            'reason': 'active_run',
+            'holder': holder,
+        }
+
+    raw_token = acquisition.get('token')
+    try:
+        run_token = _canonical_uuid(raw_token, 'acquired run token')
+    except LifecycleError:
+        released = False
+        if isinstance(raw_token, str) and raw_token:
+            try:
+                release_result = run_lock_module.release(
+                    raw_token, lock_file=lock_file, now=lock_now
+                )
+                released = release_result.get('ok') is True
+            except Exception:
+                released = False
+        reason = (
+            'acquired_token_invalid'
+            if released
+            else 'acquired_token_invalid_release_unconfirmed'
+        )
+        return {
+            'schema_version': SCHEMA_VERSION,
+            'action': 'acquire-bind-context',
+            'ok': False,
+            'reason': reason,
+            'lease_released': released,
+        }
+
+    try:
+        context_receipt = bind_active_context(
+            invocation_id=invocation_id,
+            run_token=run_token,
+            state_file=state_file,
+            projection_file=projection_file,
+            context_file=context_file,
+            lock_file=lock_file,
+            now_utc=now_utc,
+        )
+        if (
+            not isinstance(context_receipt, dict)
+            or context_receipt.get('action') != 'bind-context'
+            or context_receipt.get('ok') is not True
+            or context_receipt.get('invocation_id') != invocation_id
+            or context_receipt.get('classification') != 'running'
+            or context_receipt.get('phase') != 'preflight'
+        ):
+            raise LifecycleError(
+                'active context binding returned invalid state'
+            )
+    except Exception:
+        released = False
+        try:
+            release_result = run_lock_module.release(
+                run_token, lock_file=lock_file, now=lock_now
+            )
+            released = release_result.get('ok') is True
+        except Exception:
+            released = False
+        reason = (
+            'bind_context_failed'
+            if released
+            else 'bind_context_failed_release_unconfirmed'
+        )
+        return {
+            'schema_version': SCHEMA_VERSION,
+            'action': 'acquire-bind-context',
+            'ok': False,
+            'reason': reason,
+            'lease_released': released,
+        }
+
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'action': 'acquire-bind-context',
+        'ok': True,
+        'run_lock_token': run_token,
+        'context_receipt': context_receipt,
+    }
 
 
 def recover_active_context(
@@ -1905,8 +2064,8 @@ def main() -> int:
     parser.add_argument(
         "action",
         choices=(
-            "start", "event", "finish", "status", "bind-context",
-            "recover-context", "export", "validate",
+            "start", "event", "finish", "status", "acquire-bind-context",
+            "bind-context", "recover-context", "export", "validate",
         ),
     )
     parser.add_argument("--invocation-id")
@@ -1999,6 +2158,20 @@ def main() -> int:
                 state_file=args.state_file,
                 projection_file=args.projection_file,
             )
+        elif args.action == "acquire-bind-context":
+            _reject_unused(args, {"invocation_id"})
+            if args.invocation_id is None:
+                raise LifecycleError(
+                    "acquire-bind-context requires --invocation-id"
+                )
+            result = acquire_and_bind_active_context(
+                invocation_id=args.invocation_id,
+                state_file=args.state_file,
+                projection_file=args.projection_file,
+                context_file=args.context_file,
+                lock_file=args.lock_file,
+                now_utc=args.now_utc,
+            )
         elif args.action == "bind-context":
             _reject_unused(args, {"invocation_id", "run_token"})
             if args.invocation_id is None or args.run_token is None:
@@ -2085,6 +2258,8 @@ def main() -> int:
         return 1
 
     print(json.dumps(result, allow_nan=False, sort_keys=True))
+    if result.get("ok") is not True:
+        return 2 if result.get("reason") == "active_run" else 1
     return 0
 
 
