@@ -24,7 +24,8 @@ Usage (routine):  python3 market_clock.py --json \
                     --expected-constants-sha256 <preflight source_sha256>
 Pre-buy recheck:  use the same command and preflight hash
 Human-readable:    python3 market_clock.py
-Testing:           python3 market_clock.py --now-utc 2026-07-21T15:07:00Z
+Testing:           import ``main`` and pass ``now_utc=...``; the production
+                   CLI rejects ``--now-utc`` so a runner cannot choose time
                    python3 market_clock.py --no-buy-first-minutes 5    # override
 
 The blackout minute count is read through validate_constants.py's shared,
@@ -144,7 +145,7 @@ def read_no_buy_first_minutes(constants_path=None):
     return validated.values["NO_BUY_FIRST_MINUTES"]
 
 
-def main():
+def main(argv=None, *, now_utc=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-buy-first-minutes", type=int, default=None,
                     help="OPTIONAL override for tests; the routine must NOT pass this — the value is read from constants.md so the agent never re-types it")
@@ -153,9 +154,17 @@ def main():
         "--expected-constants-sha256",
         help="preflight constants hash; REQUIRED by the routine, optional for tests",
     )
-    ap.add_argument("--now-utc", help="override the clock, ISO-8601 UTC (testing only)")
+    ap.add_argument("--now-utc", help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    if args.now_utc is not None:
+        print(
+            "market_clock.py: ERROR: --now-utc is test-only through the "
+            "imported API and is not valid on the CLI",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         validated_constants = validate_constants_file(args.constants)
@@ -201,8 +210,8 @@ def main():
             )
             return 2
 
-    if args.now_utc:
-        utc = datetime.strptime(args.now_utc.rstrip("Z")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    if now_utc:
+        utc = datetime.strptime(now_utc.rstrip("Z")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     else:
         utc = datetime.now(timezone.utc)
 

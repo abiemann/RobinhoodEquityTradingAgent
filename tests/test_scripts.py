@@ -29,7 +29,7 @@ import uuid
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -61,6 +61,10 @@ from evaluate_candidates import (
 import validate_constants as constants_validator
 import broker_snapshot as broker_snapshot_module
 import daily_loss as daily_loss_module
+import filter_scan as filter_scan_module
+import market_clock as market_clock_module
+import order_intents as order_intents_module
+import run_lock as run_lock_module
 from broker_snapshot import (
     SourceHandoffError,
     SnapshotError,
@@ -120,6 +124,27 @@ def run_cli(script, args):
     if proc.returncode != 0:
         raise AssertionError(f"{os.path.basename(script)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
+
+
+def run_imported_main(main_function, argv, **injected):
+    """Exercise an imported CLI dispatcher with test-only injected state.
+
+    Production subprocesses must never receive clock-override flags.  Helpers
+    that deliberately expose an imported-only clock hook are captured here
+    with the same stdout/stderr/return-code shape used by CLI assertions.
+    """
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        try:
+            returncode = main_function(list(argv), **injected)
+        except SystemExit as exc:
+            returncode = exc.code
+    if returncode is None:
+        returncode = 0
+    return subprocess.CompletedProcess(
+        list(argv), int(returncode), stdout.getvalue(), stderr.getvalue()
+    )
 
 
 def _bound_source_scratch(directory):
@@ -1343,7 +1368,9 @@ class DailyLossTests(unittest.TestCase):
             routine.index("run_lifecycle.py start"),
             routine.index("validate_constants.py --json"),
         )
-        self.assertIn("finish the invocation exactly once", lifecycle.lower())
+        self.assertIn(
+            "terminalize the invocation exactly once", lifecycle.lower()
+        )
         self.assertIn("<START CLOCK pt_iso>", lifecycle)
         self.assertIn("clock-unavailable", lifecycle)
         for classification in (
@@ -1384,7 +1411,11 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn("stop_count_date_pt", block)
         self.assertIn("stop_fills_today", block)
         self.assertIn("stopped_out_symbols", block)
-        self.assertIn("successful FINAL `daily_loss.py` receipt is the SOLE authority", block)
+        self.assertIn(
+            "successful FINAL lifecycle-bound `daily_loss.py` wrapper is "
+            "the SOLE authority",
+            block,
+        )
         self.assertIn("Never issue a separate `get_equity_orders` call", block)
         self.assertIn("count historical order rows", block)
         connector_failures = routine.split("### CONNECTOR FAILURES", 1)[1].split(
@@ -1515,11 +1546,33 @@ class DailyLossTests(unittest.TestCase):
             '"daily_loss_input_failed"',
             '"daily_loss_output_failed"',
             '"daily_loss_internal_failed"',
+            'receipt.error.code === "daily_loss_checkpoint_failed"',
+            'expectedMode === "calculation"',
             'receipt.recovery_action === expectedRecovery',
             'failure: "daily-loss-command-unclassified"',
             'recovery_action: "coordination-state"',
+            'recovery_action: "retry-identical-calculation"',
         ):
             self.assertIn(required, daily_loss_failure_binding)
+        self.assertIn(
+            "Exact `daily_loss_checkpoint_failed` is accepted only when "
+            "the same closed envelope binds `mode: \"calculation\"`",
+            block,
+        )
+        self.assertIn(
+            "Its sole classification is `retry-identical-calculation`; it "
+            "is not `coordination-state`",
+            block,
+        )
+        self.assertIn(
+            "initializes one local `checkpointRetryUsed` Boolean to false",
+            block,
+        )
+        self.assertIn(
+            "invoke the already-frozen `evaluationCommand` exactly once",
+            block,
+        )
+        self.assertIn("never execute a third calculation", block)
         self.assertEqual(block.count("--failure-json"), 3)
         self.assertIn(
             "every allowed external A semantic outcome",
@@ -1882,22 +1935,24 @@ class DailyLossTests(unittest.TestCase):
             block,
         )
         self.assertIn(
-            "stdout is exactly one compact JSON object containing the "
-            "complete authoritative result",
-            block,
-        )
-        self.assertIn("Bind and validate that stdout object directly", block)
-        self.assertIn("retained only as a scratch audit artifact", block)
-        self.assertIn(
-            "do not read it with a file tool, shell command, or second "
-            "Python command",
+            "Durable `<scratch>/daily-loss-<a|b>.json` and stdout are the "
+            "same wrapper object",
             block,
         )
         self.assertIn(
-            "never embed its Windows path in `-c` source",
+            "Store and consume the complete parsed wrapper unchanged",
             block,
         )
-        self.assertIn("`schema_version` exactly `1`", block)
+        self.assertIn(
+            "Never read the durable evidence file with a file tool, shell "
+            "command, `Get-Content`, `ReadAllText`, or a second Python "
+            "command",
+            block,
+        )
+        self.assertIn("Require schema 1, action `daily-loss`, `ok: true`", block)
+        self.assertIn(
+            "Pass the exact generation-specific output basename", block
+        )
         self.assertIn("make no new buys", block)
         self.assertIn("NEVER feed its result into `daily_loss.py`", block)
         self.assertNotIn("compute trailing-day P&L", block)
@@ -3059,6 +3114,10 @@ class PriceBandScannerTests(unittest.TestCase):
 
 class FilterScanTests(unittest.TestCase):
     @staticmethod
+    def constants_result():
+        return constants_validator.validate_constants_file()
+
+    @staticmethod
     def filter_proc(args):
         return subprocess.run(
             [sys.executable, FILTER, *args],
@@ -3072,11 +3131,8 @@ class FilterScanTests(unittest.TestCase):
         args = [] if scratch is None else ["--scratch", scratch]
         return args + [
             "--scan-file", scan,
-            "--price-min", "2.50",
-            "--price-max", "5",
-            "--min-rel-volume", "2",
-            "--min-abs-pct-change", "3",
-            "--top-n", "15",
+            "--expected-constants-sha256",
+            FilterScanTests.constants_result().source_sha256,
             "--json-out", output,
         ]
 
@@ -3131,11 +3187,8 @@ class FilterScanTests(unittest.TestCase):
             output = os.path.join(scratch, "purpose-filter.json")
             common = [
                 "--scratch", scratch,
-                "--price-min", "2.50",
-                "--price-max", "5",
-                "--min-rel-volume", "2",
-                "--min-abs-pct-change", "3",
-                "--top-n", "15",
+                "--expected-constants-sha256",
+                self.constants_result().source_sha256,
             ]
             proc = self.filter_proc([
                 *common,
@@ -3143,6 +3196,41 @@ class FilterScanTests(unittest.TestCase):
                 "--json-out", output,
             ])
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            receipt = json.loads(proc.stdout)
+            canonical_scratch, marker = (
+                broker_snapshot_module.validate_scratch_directory(scratch)
+            )
+            with open(reserved["source"], "rb") as handle:
+                scan_raw = handle.read()
+            self.assertEqual(receipt["scratch"], str(canonical_scratch))
+            self.assertEqual(receipt["scratch_id"], marker["scratch_id"])
+            self.assertEqual(receipt["scan_selector_kind"], "purpose")
+            self.assertEqual(receipt["scan_purpose"], "run-scan")
+            self.assertIsNone(receipt["scan_file"])
+            constants_result = self.constants_result()
+            self.assertEqual(
+                receipt["constants_source_sha256"],
+                constants_result.source_sha256,
+            )
+            self.assertEqual(
+                receipt["price_min"], constants_result.raw_values["PRICE_MIN"]
+            )
+            self.assertEqual(
+                receipt["price_max"], constants_result.raw_values["PRICE_MAX"]
+            )
+            self.assertEqual(
+                receipt["min_rel_volume"],
+                constants_result.raw_values["MIN_REL_VOLUME"],
+            )
+            self.assertEqual(
+                receipt["min_abs_pct_change"],
+                constants_result.raw_values["MIN_ABS_PCT_CHANGE"],
+            )
+            self.assertEqual(receipt["top_n"], constants_result.values["TOP_N"])
+            self.assertEqual(
+                receipt["scan_source_sha256"],
+                hashlib.sha256(scan_raw).hexdigest(),
+            )
             with open(output, encoding="utf-8") as handle:
                 document = json.load(handle)
             self.assertEqual(
@@ -3161,7 +3249,13 @@ class FilterScanTests(unittest.TestCase):
             self.assertIn("not allowed with argument", proc.stderr)
             self.assertFalse(os.path.exists(mixed_output))
 
-    def run_filter(self, rows, top_n=15, mcp_envelope=False, mcp_error=False):
+    def run_filter(
+        self,
+        rows,
+        mcp_envelope=False,
+        mcp_error=False,
+        return_receipt=False,
+    ):
         with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
             out = os.path.join(td, "out.json")
             document = {
@@ -3175,12 +3269,39 @@ class FilterScanTests(unittest.TestCase):
                 }
 
             scan = write_test_source(source_root, "scan.json", value=document)
-            run_cli(FILTER, ["--scratch", td, "--scan-file", scan,
-                             "--price-min", "2.50", "--price-max", "5",
-                             "--min-rel-volume", "2", "--min-abs-pct-change", "3",
-                             "--top-n", str(top_n), "--json-out", out])
-            with open(out, encoding="utf-8") as f:
-                return json.load(f)
+            with open(scan, "rb") as handle:
+                scan_raw = handle.read()
+            stdout = run_cli(FILTER, ["--scratch", td, "--scan-file", scan,
+                                      "--expected-constants-sha256",
+                                      self.constants_result().source_sha256,
+                                      "--json-out", out])
+            receipt = json.loads(stdout)
+            canonical_scratch, marker = (
+                broker_snapshot_module.validate_scratch_directory(td)
+            )
+            self.assertEqual(receipt["scratch"], str(canonical_scratch))
+            self.assertEqual(receipt["scratch_id"], marker["scratch_id"])
+            self.assertEqual(receipt["scan_selector_kind"], "file")
+            self.assertIsNone(receipt["scan_purpose"])
+            self.assertEqual(receipt["scan_file"], str(Path(scan).resolve()))
+            self.assertEqual(
+                receipt["scan_source_sha256"],
+                hashlib.sha256(scan_raw).hexdigest(),
+            )
+            with open(out, "rb") as f:
+                raw = f.read()
+            data = json.loads(raw)
+            for field in (
+                "total_items",
+                "rows_returned",
+                "rows_skipped",
+                "passed_filters",
+                "working_list",
+            ):
+                self.assertEqual(receipt[field], data[field])
+            if return_receipt:
+                return data, receipt, raw, stdout
+            return data
 
     def test_filters_band_relvol_and_move(self):
         rows = [scan_row("KEEP", 4.45, 0.1528, 557.75),
@@ -3211,6 +3332,34 @@ class FilterScanTests(unittest.TestCase):
             ["KEEP"],
         )
 
+    def test_recognized_result_requires_results_and_total_items(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            common = {
+                "results": [scan_row("KEEP", 4.0, 0.05, 10.0)],
+                "total_items": 1,
+            }
+            for missing in ("results", "total_items"):
+                result = dict(common)
+                del result[missing]
+                scan = write_test_source(
+                    source_root,
+                    f"missing-{missing}.json",
+                    value={"data": {"result": result}},
+                )
+                out = os.path.join(td, f"missing-{missing}-out.json")
+                proc = self.filter_proc(
+                    self.filter_args(scan, out, scratch=td)
+                )
+
+                with self.subTest(missing=missing):
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(proc.stdout, "")
+                    self.assertIn(
+                        f"run_scan result missing required field(s): {missing}",
+                        proc.stderr,
+                    )
+                    self.assertFalse(os.path.exists(out))
+
     def test_rejects_mcp_error_envelope(self):
         with self.assertRaises(AssertionError):
             self.run_filter(
@@ -3220,11 +3369,332 @@ class FilterScanTests(unittest.TestCase):
             )
 
     def test_top_n_caps_by_relative_volume(self):
-        rows = [scan_row(f"S{i}", 3.0, 0.05, 10.0 + i) for i in range(6)]
-        data = self.run_filter(rows, top_n=3)
+        rows = [scan_row(f"S{i}", 3.0, 0.05, 10.0 + i) for i in range(20)]
+        data = self.run_filter(rows)
         symbols = [w["symbol"] for w in data["working_list"]]
-        self.assertEqual(symbols, ["S5", "S4", "S3"])
-        self.assertEqual(data["passed_filters"], 6)
+        self.assertEqual(symbols, [f"S{i}" for i in range(19, 4, -1)])
+        self.assertEqual(data["passed_filters"], 20)
+
+    def test_success_receipt_is_compact_inline_and_bound_to_durable_handoff(self):
+        rows = [scan_row(f"S{i}", 3.0, 0.05, 10.0 + i) for i in range(20)]
+        data, receipt, raw, stdout = self.run_filter(
+            rows, return_receipt=True
+        )
+
+        self.assertEqual(stdout.count("\n"), 1)
+        self.assertEqual(
+            set(receipt),
+            {
+                "schema_version",
+                "action",
+                "ok",
+                "scratch",
+                "scratch_id",
+                "scan_selector_kind",
+                "scan_purpose",
+                "scan_file",
+                "scan_source_sha256",
+                "constants_source_sha256",
+                "price_min",
+                "price_max",
+                "min_rel_volume",
+                "min_abs_pct_change",
+                "top_n",
+                "working_list_file",
+                "byte_count",
+                "sha256",
+                "total_items",
+                "rows_returned",
+                "rows_skipped",
+                "passed_filters",
+                "working_list",
+            },
+        )
+        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["action"], "filter-scan")
+        self.assertIs(receipt["ok"], True)
+        self.assertTrue(os.path.isabs(receipt["scratch"]))
+        self.assertRegex(
+            receipt["scratch_id"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(receipt["scan_selector_kind"], "file")
+        self.assertIsNone(receipt["scan_purpose"])
+        self.assertTrue(os.path.isabs(receipt["scan_file"]))
+        self.assertRegex(receipt["scan_source_sha256"], r"^[0-9a-f]{64}$")
+        constants_result = self.constants_result()
+        self.assertEqual(
+            receipt["constants_source_sha256"],
+            constants_result.source_sha256,
+        )
+        for field, expected in (
+            ("price_min", constants_result.raw_values["PRICE_MIN"]),
+            ("price_max", constants_result.raw_values["PRICE_MAX"]),
+            ("min_rel_volume", constants_result.raw_values["MIN_REL_VOLUME"]),
+            (
+                "min_abs_pct_change",
+                constants_result.raw_values["MIN_ABS_PCT_CHANGE"],
+            ),
+        ):
+            self.assertIs(type(receipt[field]), str)
+            self.assertEqual(receipt[field], expected)
+        self.assertIs(type(receipt["top_n"]), int)
+        self.assertEqual(receipt["top_n"], constants_result.values["TOP_N"])
+        self.assertEqual(receipt["working_list_file"], "out.json")
+        self.assertEqual(receipt["byte_count"], len(raw))
+        self.assertEqual(receipt["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertRegex(receipt["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(receipt["working_list"], data["working_list"])
+        self.assertEqual(
+            [row["symbol"] for row in receipt["working_list"]],
+            [f"S{i}" for i in range(19, 4, -1)],
+        )
+        self.assertEqual(
+            len(receipt["working_list"]), constants_result.values["TOP_N"]
+        )
+        self.assertNotIn("Scan rows:", stdout)
+        self.assertNotIn(os.sep, receipt["working_list_file"])
+
+    def test_invalid_or_stale_constants_hash_fails_without_handoff_or_receipt(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            scan = write_test_source(
+                source_root,
+                "scan.json",
+                value={
+                    "data": {
+                        "result": {
+                            "results": [scan_row("KEEP", 4.0, 0.05, 10.0)],
+                            "total_items": 1,
+                        }
+                    }
+                },
+            )
+            for label, expected_hash in (
+                ("malformed", "not-a-sha256"),
+                ("stale", "0" * 64),
+            ):
+                out = os.path.join(td, f"out-{label}.json")
+                args = self.filter_args(scan, out, scratch=td)
+                hash_index = args.index("--expected-constants-sha256") + 1
+                args[hash_index] = expected_hash
+                proc = self.filter_proc(args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
+    def test_duplicate_working_symbol_fails_closed_without_success_receipt(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            document = {
+                "data": {
+                    "result": {
+                        "results": [
+                            scan_row("DUP", 4.0, 0.05, 10.0),
+                            scan_row("DUP", 4.1, 0.06, 9.0),
+                        ],
+                        "total_items": 2,
+                    }
+                }
+            }
+            scan = write_test_source(source_root, "scan.json", value=document)
+            out = os.path.join(td, "working-list.json")
+            proc = self.filter_proc(self.filter_args(scan, out, scratch=td))
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "")
+            self.assertIn("duplicate symbol", proc.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_existing_handoff_is_never_replaced_or_reported_as_success(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td) as source_root:
+            document = {
+                "data": {
+                    "result": {
+                        "results": [scan_row("KEEP", 4.0, 0.05, 10.0)],
+                        "total_items": 1,
+                    }
+                }
+            }
+            scan = write_test_source(source_root, "scan.json", value=document)
+            out = os.path.join(td, "working-list.json")
+            sentinel = b'{"authoritative":"original"}\n'
+            with open(out, "wb") as handle:
+                handle.write(sentinel)
+
+            proc = self.filter_proc(self.filter_args(scan, out, scratch=td))
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "")
+            self.assertIn("already exists; refusing to replace it", proc.stderr)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), sentinel)
+
+    @staticmethod
+    def valid_filter_handoff():
+        return {
+            "total_items": 1,
+            "rows_returned": 1,
+            "rows_skipped": 0,
+            "passed_filters": 1,
+            "working_list": [
+                {
+                    "symbol": "KEEP",
+                    "last": 4.0,
+                    "rel_volume": 10.0,
+                    "day_pct_change": 5.0,
+                    "volume": 1000.0,
+                }
+            ],
+        }
+
+    @staticmethod
+    def scratch_binding(scratch):
+        canonical, marker = broker_snapshot_module.validate_scratch_directory(
+            scratch
+        )
+        return (
+            canonical,
+            marker["scratch_id"],
+            filter_scan_module._directory_identity(canonical),
+        )
+
+    def test_post_publication_readback_failure_leaves_artifact_for_audit(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td):
+            out = os.path.join(td, "working-list.json")
+            document = self.valid_filter_handoff()
+            canonical, scratch_id, scratch_identity = self.scratch_binding(td)
+            stdout = io.StringIO()
+            original_read_bytes = filter_scan_module.Path.read_bytes
+
+            def fail_output_readback(path_object):
+                if path_object == Path(out):
+                    raise OSError("injected readback failure")
+                return original_read_bytes(path_object)
+
+            with mock.patch.object(
+                filter_scan_module.Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=fail_output_readback,
+            ), redirect_stdout(stdout):
+                with self.assertRaisesRegex(OSError, "injected readback failure"):
+                    filter_scan_module.write_handoff(
+                        out,
+                        canonical,
+                        document,
+                        1,
+                        expected_scratch_id=scratch_id,
+                        expected_scratch_identity=scratch_identity,
+                    )
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertTrue(os.path.isfile(out))
+            with open(out, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), document)
+
+    def test_unsupported_hard_links_fail_closed_without_output(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td):
+            out = os.path.join(td, "working-list.json")
+            document = self.valid_filter_handoff()
+            canonical, scratch_id, scratch_identity = self.scratch_binding(td)
+            stdout = io.StringIO()
+            with mock.patch.object(
+                filter_scan_module.os,
+                "link",
+                side_effect=OSError("hard links unsupported"),
+            ), redirect_stdout(stdout):
+                with self.assertRaisesRegex(OSError, "hard links unsupported"):
+                    filter_scan_module.write_handoff(
+                        out,
+                        canonical,
+                        document,
+                        1,
+                        expected_scratch_id=scratch_id,
+                        expected_scratch_identity=scratch_identity,
+                    )
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse(os.path.lexists(out))
+            self.assertEqual(
+                [name for name in os.listdir(td) if name.endswith(".tmp")],
+                [],
+            )
+
+    def test_scratch_id_change_before_publication_fails_without_output(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td):
+            out = os.path.join(td, "working-list.json")
+            document = self.valid_filter_handoff()
+            canonical, scratch_id, scratch_identity = self.scratch_binding(td)
+            _same_path, marker = (
+                broker_snapshot_module.validate_scratch_directory(td)
+            )
+            changed_marker = dict(marker)
+            changed_marker["scratch_id"] = str(uuid.uuid4())
+
+            with mock.patch.object(
+                filter_scan_module,
+                "validate_scratch_directory",
+                return_value=(canonical, changed_marker),
+            ):
+                with self.assertRaisesRegex(ValueError, "scratch_id changed"):
+                    filter_scan_module.write_handoff(
+                        out,
+                        canonical,
+                        document,
+                        1,
+                        expected_scratch_id=scratch_id,
+                        expected_scratch_identity=scratch_identity,
+                    )
+
+            self.assertFalse(os.path.lexists(out))
+
+    def test_scratch_identity_change_after_readback_fails_and_keeps_artifact(self):
+        with tempfile.TemporaryDirectory() as td, bound_source_root(td):
+            out = os.path.join(td, "working-list.json")
+            document = self.valid_filter_handoff()
+            canonical, scratch_id, scratch_identity = self.scratch_binding(td)
+            changed_identity = (scratch_identity[0], scratch_identity[1] + 1)
+
+            with mock.patch.object(
+                filter_scan_module,
+                "_directory_identity",
+                side_effect=[scratch_identity, changed_identity],
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "scratch directory identity changed"
+                ):
+                    filter_scan_module.write_handoff(
+                        out,
+                        canonical,
+                        document,
+                        1,
+                        expected_scratch_id=scratch_id,
+                        expected_scratch_identity=scratch_identity,
+                    )
+
+            self.assertTrue(os.path.isfile(out))
+            with open(out, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), document)
+
+    def test_handoff_validator_enforces_counter_consistency(self):
+        valid = self.valid_filter_handoff()
+        valid["total_items"] = 2
+        valid["rows_returned"] = 2
+        filter_scan_module.validate_handoff(valid, 1)
+
+        invalid_documents = []
+        for updates in (
+            {"rows_skipped": 3},
+            {"passed_filters": 3},
+            {"rows_skipped": 2, "passed_filters": 1},
+            {"passed_filters": 0},
+        ):
+            document = json.loads(json.dumps(valid))
+            document.update(updates)
+            invalid_documents.append(document)
+        for document in invalid_documents:
+            with self.subTest(document=document):
+                with self.assertRaises(ValueError):
+                    filter_scan_module.validate_handoff(document, 1)
 
     def test_json_handoff_has_complete_unrounded_working_list(self):
         row = scan_row("PREC", 4.45678, 0.0345678, 12.34567)
@@ -3269,6 +3739,72 @@ class FilterScanTests(unittest.TestCase):
         self.assertEqual([w["symbol"] for w in data["working_list"]], ["KEEP"])
         self.assertEqual(data["rows_skipped"], 5)
 
+    def test_missing_volume_and_ticker_symbol_mismatch_are_skipped(self):
+        missing_volume = scan_row("NOVOL", 4.0, 0.05, 12.0)
+        del missing_volume["columns"]["Volume"]
+        missing_visible_symbol = scan_row("NOSYM", 4.0, 0.05, 11.0)
+        del missing_visible_symbol["columns"]["Symbol"]
+        mismatched_symbol = scan_row("TICKER", 4.0, 0.05, 10.0)
+        mismatched_symbol["columns"]["Symbol"] = "OTHER"
+        data = self.run_filter(
+            [
+                scan_row("KEEP", 4.0, 0.05, 13.0),
+                missing_volume,
+                missing_visible_symbol,
+                mismatched_symbol,
+            ]
+        )
+
+        self.assertEqual(
+            [row["symbol"] for row in data["working_list"]], ["KEEP"]
+        )
+        self.assertEqual(data["rows_skipped"], 3)
+        self.assertEqual(data["passed_filters"], 1)
+
+    def test_only_canonical_robinhood_tickers_enter_working_list(self):
+        rows = [
+            scan_row("ABC", 4.0, 0.05, 20.0),
+            scan_row("abc", 4.0, 0.05, 19.0),
+            scan_row("ABC ", 4.0, 0.05, 18.0),
+            scan_row("BRK.A", 4.0, 0.05, 17.0),
+            scan_row("$ABC", 4.0, 0.05, 16.0),
+            scan_row("ABC/WS", 4.0, 0.05, 15.0),
+            scan_row("ABC-B", 4.0, 0.05, 14.0),
+            scan_row("\N{LATIN CAPITAL LETTER A WITH ACUTE}BC", 4.0, 0.05, 13.0),
+        ]
+        data = self.run_filter(rows)
+
+        self.assertEqual(
+            [row["symbol"] for row in data["working_list"]],
+            ["ABC", "BRK.A"],
+        )
+        self.assertEqual(data["rows_skipped"], 6)
+        self.assertEqual(data["passed_filters"], 2)
+
+    def test_handoff_validator_rejects_noncanonical_symbol_text(self):
+        base = {
+            "total_items": 1,
+            "rows_returned": 1,
+            "rows_skipped": 0,
+            "passed_filters": 1,
+            "working_list": [
+                {
+                    "symbol": "BRK.A",
+                    "last": 4.0,
+                    "rel_volume": 10.0,
+                    "day_pct_change": 5.0,
+                    "volume": 1000.0,
+                }
+            ],
+        }
+        filter_scan_module.validate_handoff(base, 1)
+        for symbol in ("abc", "ABC ", "$ABC", "ABC/WS", "ABC-B", "\x00ABC"):
+            document = json.loads(json.dumps(base))
+            document["working_list"][0]["symbol"] = symbol
+            with self.subTest(symbol=repr(symbol)):
+                with self.assertRaises(ValueError):
+                    filter_scan_module.validate_handoff(document, 1)
+
     def test_nonfinite_json_constant_fails_loudly(self):
         row = scan_row("BAD", 4.0, 0.05, 10.0)
         row["columns"]["Last"] = float("nan")
@@ -3280,6 +3816,18 @@ class OrderIntentTests(unittest.TestCase):
     RUN_TOKEN = "11111111-1111-4111-8111-111111111111"
     OTHER_RUN_TOKEN = "22222222-2222-4222-8222-222222222222"
     BASELINE_ORDER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    @staticmethod
+    def clear_entry_authorization(_run_token):
+        return {
+            "schema_version": 1,
+            "action": "authorize-entry-intent",
+            "ok": True,
+            "invocation_id": "33333333-3333-4333-8333-333333333333",
+            "phase": "order-placement",
+            "entry_guard_outcome": "clear",
+            "lease_renewed": True,
+        }
 
     def invoke(self, state_file, action, *args, expected_success=True, now=None):
         args = list(args)
@@ -3304,22 +3852,29 @@ class OrderIntentTests(unittest.TestCase):
                         value,
                     ))
                 args[first:last] = replacements
-        command = [
-            sys.executable,
-            ORDER_INTENTS,
+        cli_args = [
             action,
             "--state-file",
             state_file,
         ]
         if action == "acknowledge" and "--transport-scratch" not in args:
             transport_scratch, _source_root = self.ack_transport()
-            command += ["--transport-scratch", transport_scratch]
-        if now is not None:
-            command += ["--now-utc", now]
-        command += args
-        proc = subprocess.run(
-            command, capture_output=True, text=True, cwd=ROOT
-        )
+            cli_args += ["--transport-scratch", transport_scratch]
+        cli_args += args
+        if now is None or (action == "check" and not expected_success):
+            proc = subprocess.run(
+                [sys.executable, ORDER_INTENTS, *cli_args],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+        else:
+            injected = {"now_utc": now}
+            if action in {"begin", "retry"}:
+                injected["entry_authorizer"] = self.clear_entry_authorization
+            proc = run_imported_main(
+                order_intents_module.main, cli_args, **injected
+            )
         try:
             document = json.loads(proc.stdout)
         except json.JSONDecodeError:
@@ -3336,6 +3891,38 @@ class OrderIntentTests(unittest.TestCase):
             self.assertFalse(document["ok"])
             self.assertEqual(document["reason"], "order_intent_state_error")
         return document
+
+    def test_cli_rejects_clock_override_but_imported_tests_can_inject_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "intents.sqlite3")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    ORDER_INTENTS,
+                    "check",
+                    "--state-file",
+                    state,
+                    "--now-utc",
+                    "2026-07-31T16:00:01Z",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertEqual(rejected.stderr, "")
+            document = json.loads(rejected.stdout)
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["reason"], "order_intent_state_error")
+            self.assertIn("not valid on the CLI", document["detail"])
+
+            injected = self.invoke(
+                state,
+                "check",
+                expected_success=True,
+                now="2026-07-31T16:00:01Z",
+            )
+            self.assertTrue(injected["ok"])
 
     @staticmethod
     def write_json(directory, name, value):
@@ -8857,6 +9444,131 @@ class RunLifecycleTests(unittest.TestCase):
     }
 
     def invoke(self, state_file, projection_file, action, *extra, now=None):
+        if now is not None:
+            options = {}
+            extra = list(extra)
+            index = 0
+            while index < len(extra):
+                flag = extra[index]
+                if not isinstance(flag, str) or not flag.startswith("--"):
+                    self.fail(f"unsupported lifecycle test argument: {flag!r}")
+                if index + 1 >= len(extra):
+                    self.fail(f"missing lifecycle test value for {flag}")
+                options[flag[2:].replace("-", "_")] = extra[index + 1]
+                index += 2
+            common = {
+                "state_file": state_file,
+                "projection_file": projection_file,
+                "now_utc": now,
+            }
+            try:
+                if action == "start":
+                    document = lifecycle_module.start_invocation(
+                        invocation_id=options.get("invocation_id"),
+                        lock_file=options.get("lock_file"),
+                        **common,
+                    )
+                elif action == "event":
+                    document = lifecycle_module.record_event(
+                        invocation_id=options.get("invocation_id"),
+                        phase=options.get("phase"),
+                        run_start_pt=options.get("run_start_pt"),
+                        classification=options.get("classification", "running"),
+                        reason_code=options.get("reason_code"),
+                        **common,
+                    )
+                elif action == "finish":
+                    document = lifecycle_module.finish_invocation(
+                        invocation_id=options.get("invocation_id"),
+                        classification=options.get("classification"),
+                        phase=options.get("phase", "finished"),
+                        reason_code=options.get("reason_code"),
+                        report_file=options.get("report_file"),
+                        status_file=options.get("status_file"),
+                        report_dir=options.get(
+                            "report_dir", lifecycle_module.DEFAULT_REPORT_DIR
+                        ),
+                        context_file=options.get(
+                            "context_file", lifecycle_module.DEFAULT_CONTEXT_FILE
+                        ),
+                        lock_file=options.get("lock_file"),
+                        **common,
+                    )
+                elif action == "acquire-bind-context":
+                    document = lifecycle_module.acquire_and_bind_active_context(
+                        invocation_id=options.get("invocation_id"),
+                        context_file=options.get(
+                            "context_file", lifecycle_module.DEFAULT_CONTEXT_FILE
+                        ),
+                        lock_file=options.get("lock_file"),
+                        **common,
+                    )
+                elif action == "bind-context":
+                    document = lifecycle_module.bind_active_context(
+                        invocation_id=options.get("invocation_id"),
+                        run_token=options.get("run_token"),
+                        context_file=options.get(
+                            "context_file", lifecycle_module.DEFAULT_CONTEXT_FILE
+                        ),
+                        lock_file=options.get("lock_file"),
+                        **common,
+                    )
+                elif action == "recover-context":
+                    document = lifecycle_module.recover_active_context(
+                        context_file=options.get(
+                            "context_file", lifecycle_module.DEFAULT_CONTEXT_FILE
+                        ),
+                        lock_file=options.get("lock_file"),
+                        **common,
+                    )
+                else:
+                    self.fail(
+                        f"lifecycle test action {action!r} has no imported "
+                        "clock-injection adapter"
+                    )
+                returncode = (
+                    0
+                    if document.get("ok") is True
+                    else 2 if document.get("reason") == "active_run" else 1
+                )
+            except lifecycle_module.ProjectionPublishError as exc:
+                returncode = 1
+                document = {
+                    "schema_version": lifecycle_module.SCHEMA_VERSION,
+                    "action": exc.action,
+                    "ok": False,
+                    "recorded": True,
+                    "invocation_id": exc.invocation_id,
+                    "reason": "projection_publication_failed",
+                    "detail": str(exc),
+                }
+            except lifecycle_module.LifecycleConflict as exc:
+                returncode = 2
+                document = {
+                    "schema_version": lifecycle_module.SCHEMA_VERSION,
+                    "action": action,
+                    "ok": False,
+                    "reason": "lifecycle_conflict",
+                    "detail": str(exc),
+                }
+            except (
+                lifecycle_module.LifecycleError,
+                OSError,
+                sqlite3.Error,
+            ) as exc:
+                returncode = 1
+                document = {
+                    "schema_version": lifecycle_module.SCHEMA_VERSION,
+                    "action": action,
+                    "ok": False,
+                    "reason": "lifecycle_state_error",
+                    "detail": str(exc),
+                }
+            stdout = json.dumps(document, allow_nan=False, sort_keys=True) + "\n"
+            return subprocess.CompletedProcess(
+                [action, *extra], returncode, stdout, ""
+            ), document
+
         args = [
             sys.executable,
             RUN_LIFECYCLE,
@@ -8866,8 +9578,6 @@ class RunLifecycleTests(unittest.TestCase):
             '--projection-file',
             projection_file,
         ]
-        if now is not None:
-            args += ['--now-utc', now]
         args += list(extra)
         proc = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
         try:
@@ -8898,7 +9608,6 @@ class RunLifecycleTests(unittest.TestCase):
                 state_file,
                 projection_file,
                 'start',
-                now='2026-08-27T15:34:18Z',
             )
 
             self.assertEqual(proc.returncode, 0, (document, proc.stderr))
@@ -9532,7 +10241,7 @@ class RunLifecycleTests(unittest.TestCase):
 
             with mock.patch.object(
                 lifecycle_module,
-                'bind_active_context',
+                '_atomic_write_context',
                 side_effect=lifecycle_module.LifecycleError('simulated bind failure'),
             ):
                 receipt = lifecycle_module.acquire_and_bind_active_context(
@@ -9552,6 +10261,7 @@ class RunLifecycleTests(unittest.TestCase):
                     'ok': False,
                     'reason': 'bind_context_failed',
                     'lease_released': True,
+                    'compensation_recorded': True,
                 },
             )
             self.assertNotIn('token', json.dumps(receipt))
@@ -9605,6 +10315,7 @@ class RunLifecycleTests(unittest.TestCase):
                     'ok': False,
                     'reason': 'bind_context_failed_release_unconfirmed',
                     'lease_released': False,
+                    'compensation_recorded': False,
                 },
             )
             self.assertNotIn('token', json.dumps(receipt))
@@ -9627,7 +10338,7 @@ class RunLifecycleTests(unittest.TestCase):
             self.bind(state_file, projection_file, started['invocation_id'])
             lifecycle_module.record_event(
                 invocation_id=started['invocation_id'],
-                phase='daily-loss',
+                phase='position-management',
                 state_file=state_file,
                 projection_file=projection_file,
                 now_utc='2026-08-04T16:00:02Z',
@@ -9683,8 +10394,9 @@ class RunLifecycleTests(unittest.TestCase):
                     'schema_version': 1,
                     'action': 'acquire-bind-context',
                     'ok': False,
-                    'reason': 'bind_context_failed',
+                    'reason': 'bind_context_failed_compensation_unrecorded',
                     'lease_released': True,
+                    'compensation_recorded': False,
                 },
             )
             self.assertNotIn('token', json.dumps(receipt))
@@ -9728,8 +10440,12 @@ class RunLifecycleTests(unittest.TestCase):
                     now_utc='2026-08-04T16:00:02Z',
                 )
 
-            self.assertEqual(receipt['reason'], 'bind_context_failed')
+            self.assertEqual(
+                receipt['reason'],
+                'bind_context_failed_compensation_unrecorded',
+            )
             self.assertTrue(receipt['lease_released'])
+            self.assertFalse(receipt['compensation_recorded'])
             self.assertNotIn('token', json.dumps(receipt))
             connection = sqlite3.connect(lock_file)
             try:
@@ -10193,7 +10909,7 @@ class RunLifecycleTests(unittest.TestCase):
                 '--invocation-id',
                 invocation_id,
                 '--phase',
-                'daily-loss',
+                'position-management',
                 now='2026-08-04T16:00:02Z',
             )
             self.assertEqual(proc.returncode, 0, event)
@@ -10315,13 +11031,54 @@ class RunLifecycleTests(unittest.TestCase):
 
 class RunLockTests(unittest.TestCase):
     def invoke(self, lock_file, action, token=None, now=None, lease_seconds=60):
+        if now is not None:
+            timestamp = datetime.fromisoformat(
+                now.replace("Z", "+00:00")
+            ).timestamp()
+            try:
+                if action == "acquire":
+                    document = run_lock_module.acquire(
+                        lock_file=lock_file,
+                        lease_seconds=lease_seconds,
+                        now=timestamp,
+                    )
+                elif action == "renew":
+                    document = run_lock_module.renew(
+                        token,
+                        lock_file=lock_file,
+                        lease_seconds=lease_seconds,
+                        now=timestamp,
+                    )
+                else:
+                    document = run_lock_module.release(
+                        token, lock_file=lock_file, now=timestamp
+                    )
+                returncode = (
+                    0
+                    if document["ok"]
+                    else 2 if action == "acquire" else 3
+                )
+            except Exception as exc:
+                returncode = 1
+                document = {
+                    "schema_version": run_lock_module.SCHEMA_VERSION,
+                    "action": action,
+                    "ok": False,
+                    "reason": "coordination_state_error",
+                    "detail": str(exc),
+                }
+            return subprocess.CompletedProcess(
+                [action],
+                returncode,
+                json.dumps(document, allow_nan=False) + "\n",
+                "",
+            ), document
+
         args = [sys.executable, RUN_LOCK, action,
                 "--lock-file", lock_file,
                 "--lease-seconds", str(lease_seconds)]
         if token is not None:
             args += ["--token", token]
-        if now is not None:
-            args += ["--now-utc", now]
         proc = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
         try:
             document = json.loads(proc.stdout)
@@ -10694,21 +11451,50 @@ class DashboardServerTests(unittest.TestCase):
             handle.write("\n")
 
         def lifecycle(*args):
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    RUN_LIFECYCLE,
-                    *args,
-                    "--state-file",
-                    state_file,
-                    "--projection-file",
-                    projection_file,
-                ],
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            return json.loads(proc.stdout)
+            action, *raw = args
+            options = {
+                raw[index][2:].replace("-", "_"): raw[index + 1]
+                for index in range(0, len(raw), 2)
+            }
+            now_utc = options.get("now_utc")
+            if action == "start":
+                return lifecycle_module.start_invocation(
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    now_utc=now_utc,
+                )
+            if action == "event":
+                return lifecycle_module.record_event(
+                    invocation_id=options["invocation_id"],
+                    phase=options["phase"],
+                    run_start_pt=options.get("run_start_pt"),
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    now_utc=now_utc,
+                )
+            if action == "finish":
+                return lifecycle_module.finish_invocation(
+                    invocation_id=options["invocation_id"],
+                    classification=options["classification"],
+                    reason_code=options.get("reason_code"),
+                    report_file=options.get("report_file"),
+                    status_file=options.get("status_file"),
+                    report_dir=options.get("report_dir", report_dir),
+                    state_file=state_file,
+                    projection_file=projection_file,
+                    now_utc=now_utc,
+                )
+            if action == "export":
+                document = lifecycle_module.publish_projection(
+                    state_file, projection_file
+                )
+                return {
+                    "record_count": document["record_count"],
+                    "source_event_high_watermark": document[
+                        "source_event_high_watermark"
+                    ],
+                }
+            self.fail(f"unsupported dashboard lifecycle action: {action}")
 
         started = lifecycle(
             "start", "--now-utc", "2026-08-04T19:02:00Z"
@@ -11101,11 +11887,39 @@ class DashboardClientContractTests(unittest.TestCase):
         )
 
 class MarketClockTests(unittest.TestCase):
+    def invoke(self, args, *, now_utc):
+        return run_imported_main(
+            market_clock_module.main, args, now_utc=now_utc
+        )
+
     def clock(self, now_utc, blackout=0):
-        args = ["--now-utc", now_utc, "--json"]
+        args = ["--json"]
         if blackout:
             args += ["--no-buy-first-minutes", str(blackout)]
-        return json.loads(run_cli(CLOCK, args))
+        proc = self.invoke(args, now_utc=now_utc)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_cli_rejects_clock_override_but_imported_tests_can_inject_it(self):
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                CLOCK,
+                "--now-utc",
+                "2026-07-21T15:07:00Z",
+                "--json",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("not valid on the CLI", rejected.stderr)
+        self.assertEqual(
+            self.clock("2026-07-21T15:07:00Z")["utc"],
+            "2026-07-21T15:07:00Z",
+        )
 
     def test_summer_offsets_are_daylight(self):
         # 2026-07-21 15:07Z — the run that had to improvise a clock.
@@ -11138,19 +11952,9 @@ class MarketClockTests(unittest.TestCase):
             constants = os.path.join(td, "constants.md")
             with open(constants, "w", encoding="utf-8") as f:
                 f.write(constants_text)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    CLOCK,
-                    "--constants",
-                    constants,
-                    "--now-utc",
-                    "2026-07-21T15:07:00Z",
-                    "--json",
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
+            result = self.invoke(
+                ["--constants", constants, "--json"],
+                now_utc="2026-07-21T15:07:00Z",
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -11165,19 +11969,9 @@ class MarketClockTests(unittest.TestCase):
             constants = os.path.join(td, "constants.md")
             with open(constants, "w", encoding="utf-8") as f:
                 f.write(long_text)
-            long_result = subprocess.run(
-                [
-                    sys.executable,
-                    CLOCK,
-                    "--constants",
-                    constants,
-                    "--now-utc",
-                    "2028-12-29T18:00:00Z",
-                    "--json",
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
+            long_result = self.invoke(
+                ["--constants", constants, "--json"],
+                now_utc="2028-12-29T18:00:00Z",
             )
         self.assertEqual(long_result.returncode, 0, long_result.stderr)
         self.assertEqual(
@@ -11196,33 +11990,20 @@ class MarketClockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             state_file = os.path.join(td, 'lifecycle.sqlite3')
             projection_file = os.path.join(td, 'lifecycle.json')
-            start = subprocess.run(
-                [
-                    sys.executable, RUN_LIFECYCLE, 'start',
-                    '--state-file', state_file,
-                    '--projection-file', projection_file,
-                    '--now-utc', clock['utc'],
-                ],
-                cwd=ROOT, capture_output=True, text=True,
+            started = lifecycle_module.start_invocation(
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc=clock['utc'],
             )
-            self.assertEqual(start.returncode, 0, start.stderr)
-            invocation_id = json.loads(start.stdout)['invocation_id']
-            bind = subprocess.run(
-                [
-                    sys.executable, RUN_LIFECYCLE, 'event',
-                    '--invocation-id', invocation_id,
-                    '--phase', 'preflight',
-                    '--run-start-pt', clock['pt_iso'],
-                    '--state-file', state_file,
-                    '--projection-file', projection_file,
-                    '--now-utc', clock['utc'],
-                ],
-                cwd=ROOT, capture_output=True, text=True,
+            bound = lifecycle_module.record_event(
+                invocation_id=started['invocation_id'],
+                phase='preflight',
+                run_start_pt=clock['pt_iso'],
+                state_file=state_file,
+                projection_file=projection_file,
+                now_utc=clock['utc'],
             )
-            self.assertEqual(bind.returncode, 0, bind.stdout + bind.stderr)
-            self.assertEqual(
-                json.loads(bind.stdout)['run_start_pt'], clock['pt_iso']
-            )
+            self.assertEqual(bound['run_start_pt'], clock['pt_iso'])
 
     def test_dst_spring_forward_boundary_eastern(self):
         # 2026 spring-forward: 2nd Sunday of March = Mar 8, 02:00 EST = 07:00Z.
@@ -11263,9 +12044,10 @@ class MarketClockTests(unittest.TestCase):
         # If constants.md cannot be found, the script must fail rather than
         # default to 0 (which silently disables the blackout).
         with tempfile.TemporaryDirectory() as td:
-            r = subprocess.run([sys.executable, CLOCK, "--constants", os.path.join(td, "nope.md"),
-                                "--now-utc", "2026-07-22T13:37:00Z", "--json"],
-                               capture_output=True, text=True)
+            r = self.invoke(
+                ["--constants", os.path.join(td, "nope.md"), "--json"],
+                now_utc="2026-07-22T13:37:00Z",
+            )
             self.assertNotEqual(r.returncode, 0)
 
     def test_unreadable_or_malformed_constants_file_errors_loudly(self):
@@ -11281,9 +12063,10 @@ class MarketClockTests(unittest.TestCase):
                     constants = os.path.join(td, filename)
                     with open(constants, "wb") as f:
                         f.write(content)
-                    r = subprocess.run([sys.executable, CLOCK, "--constants", constants,
-                                        "--now-utc", "2026-07-22T13:37:00Z", "--json"],
-                                       capture_output=True, text=True)
+                    r = self.invoke(
+                        ["--constants", constants, "--json"],
+                        now_utc="2026-07-22T13:37:00Z",
+                    )
                     self.assertNotEqual(r.returncode, 0)
 
     def test_clock_reuses_full_validator_not_a_single_row_regex(self):
@@ -11296,18 +12079,9 @@ class MarketClockTests(unittest.TestCase):
             constants = os.path.join(td, "constants.md")
             with open(constants, "w", encoding="utf-8") as f:
                 f.write(constants_text)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    CLOCK,
-                    "--constants",
-                    constants,
-                    "--now-utc",
-                    "2026-07-22T13:37:00Z",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
+            result = self.invoke(
+                ["--constants", constants, "--json"],
+                now_utc="2026-07-22T13:37:00Z",
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("TOP_N", result.stderr)
@@ -11320,18 +12094,9 @@ class MarketClockTests(unittest.TestCase):
             constants = os.path.join(td, "constants.md")
             with open(constants, "w", encoding="utf-8") as f:
                 f.write(oversized_text)
-            oversized = subprocess.run(
-                [
-                    sys.executable,
-                    CLOCK,
-                    "--constants",
-                    constants,
-                    "--now-utc",
-                    "2026-07-22T13:37:00Z",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
+            oversized = self.invoke(
+                ["--constants", constants, "--json"],
+                now_utc="2026-07-22T13:37:00Z",
             )
         self.assertEqual(oversized.returncode, 2)
         self.assertIn("integer literal exceeds the supported size", oversized.stderr)
@@ -11351,18 +12116,14 @@ class MarketClockTests(unittest.TestCase):
                 constants
             ).source_sha256
             command = [
-                sys.executable,
-                CLOCK,
                 "--constants",
                 constants,
                 "--expected-constants-sha256",
                 expected_hash,
-                "--now-utc",
-                "2026-07-22T13:37:00Z",
                 "--json",
             ]
-            matching = subprocess.run(
-                command, capture_output=True, text=True
+            matching = self.invoke(
+                command, now_utc="2026-07-22T13:37:00Z"
             )
             self.assertEqual(matching.returncode, 0, matching.stderr)
             self.assertEqual(
@@ -11375,8 +12136,8 @@ class MarketClockTests(unittest.TestCase):
             )
             with open(constants, "w", encoding="utf-8", newline="") as f:
                 f.write(changed_text)
-            changed = subprocess.run(
-                command, capture_output=True, text=True
+            changed = self.invoke(
+                command, now_utc="2026-07-22T13:37:00Z"
             )
 
         self.assertEqual(changed.returncode, 2)
@@ -11980,6 +12741,135 @@ class MarketClockTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
 
+    def test_routine_uses_owner_fenced_second_guard_contract(self):
+        with open(
+            os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"),
+            encoding="utf-8",
+        ) as handle:
+            routine = handle.read()
+
+        second = routine.split("**SECOND — circuit breaker check**", 1)[1].split(
+            "**THIRD — build this run", 1
+        )[0]
+        enter_code = second.split(
+            "**CODEX ENTER SECOND — EXACT OWNER-FENCED CELL:**", 1
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        for required in (
+            'run_lifecycle.py enter-second --invocation-id ',
+            '" --run-token " + quote(lease.run_lock_token)',
+            '" --scratch " + quote(preflightReceipt.scratch)',
+            '" --expected-constants-sha256 " + '
+            'quote(constantsReceipt.source_sha256)',
+            'receipt.phase !== "daily-loss"',
+            'receipt.entry_eligible !== true',
+            'receipt.daily_loss_attempted !== true',
+            'receipt.scratch_id !== preflightReceipt.scratch_id',
+            'receipt.source_root_id !== preflightReceipt.source_root_id',
+            'receipt.constants_sha256 !== constantsReceipt.source_sha256',
+            'receipt.daily_loss_halt_pct !== '
+            'constantsReceipt.values.DAILY_LOSS_HALT_PCT',
+            'receipt.stop_count_halt !== '
+            'constantsReceipt.values.STOP_COUNT_HALT',
+            'receipt.lease_renewed !== true',
+            'second_entry_receipt: receipt',
+        ):
+            self.assertIn(required, enter_code)
+        self.assertNotIn("run_lock.py renew", enter_code)
+        self.assertNotIn("run_lifecycle.py event", enter_code)
+
+        daily_loss = routine.split(
+            "### DAILY-LOSS CIRCUIT BREAKER", 1
+        )[1].split("### RUN THESE STEPS IN ORDER", 1)[0]
+        command_line = next(
+            line for line in daily_loss.splitlines()
+            if "daily_loss.py --portfolio" in line
+        )
+        for required in (
+            "--snapshot-generation <A|B>",
+            "--expected-constants-sha256 "
+            "<startup constants_receipt.source_sha256>",
+            "--invocation-id <INVOCATION_ID>",
+            "--run-token <private exact RUN_LOCK_TOKEN>",
+            "--json-out <exact bound scratch>/daily-loss-<a|b>.json",
+            "--failure-json",
+        ):
+            self.assertIn(required, command_line)
+        command_invocation = command_line.split("`; POSIX-style shell", 1)[0]
+        self.assertNotIn("--halt-pct", command_invocation)
+        for required in (
+            "Require exactly these top-level fields: `schema_version`, "
+            "`action`, `ok`, `mode`, `generation`, `invocation_id`, "
+            "`constants_sha256`, `daily_loss_halt_pct`, `stop_count_halt`, "
+            "`daily_loss_tripped`, `stop_count_tripped`, "
+            "`entry_guard_outcome`, and `result`",
+            "the runner never selects or records its clear/tripped checkpoint",
+            "make **exactly one** retry of the byte-identical "
+            "lifecycle-bound command",
+            "do not call public `complete-second` to manufacture a "
+            "conflicting terminal",
+            "daily loss has deterministic precedence when both are true",
+        ):
+            self.assertIn(required, routine)
+
+        public_completion = second.split(
+            "**PUBLIC FAIL-CLOSED SECOND COMPLETION — EXACT:**", 1
+        )[1].split("**ENTRY-ELIGIBLE NEXT-ACTION FENCE:**", 1)[0]
+        self.assertIn(
+            "run_lifecycle.py complete-second --invocation-id <ID> "
+            "--run-token <private token> --outcome <typed outcome>",
+            public_completion,
+        )
+        self.assertIn("`snapshot-terminal`", public_completion)
+        self.assertIn("`coordination-terminal`", public_completion)
+        self.assertIn(
+            "The parser does not accept `clear` or `tripped`",
+            public_completion,
+        )
+        self.assertIn("`lease_renewed: true`", public_completion)
+        self.assertIn(
+            "Do not pass a test-only state or clock override during a "
+            "trading run, including `--state-file`, `--now-utc`, or "
+            "`--lifecycle-now-utc`",
+            routine,
+        )
+        self.assertIn(
+            "production CLIs for `run_lock.py`, `run_lifecycle.py`, "
+            "`daily_loss.py`, `market_clock.py`, and `order_intents.py` "
+            "reject clock overrides",
+            routine,
+        )
+        order_handling = routine.split(
+            "### ORDER HANDLING — AUTONOMOUS, WITH NOTIFICATION", 1
+        )[1].split("### DRY RUN — simulate entries, never safety", 1)[0]
+        for required in (
+            "DIP-BUY BEGIN/RETRY AUTHORIZATION IS CHECKED-IN AND "
+            "UNCONDITIONAL",
+            "`order_intents.py begin` and `retry` internally call "
+            "`run_lifecycle.authorize_entry_intent(run_token=<the exact "
+            "journal argument>)`",
+            "derives the invocation only from the active-context receipt",
+            "requires the durable SECOND attempt plus exactly the "
+            "deterministic `daily-loss-clear` checkpoint",
+            '`action: "authorize-entry-intent"`, `ok: true`, the bound '
+            "`invocation_id`",
+            '`entry_guard_outcome: "clear"`, and `lease_renewed: true`',
+            "prevents `begin`/`retry` before submission",
+            "does not replace the separately required immediate "
+            "broker-mutation renewal",
+            "Profit-take sells, dust sells, and protective stops do not use "
+            "the entry authorizer",
+        ):
+            self.assertIn(required, order_handling)
+
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
+        self.assertIn(
+            "Every `dip-buy` begin and retry internally invokes the "
+            "checked-in lifecycle entry authorizer",
+            readme,
+        )
+        self.assertIn("There is no production CLI bypass", readme)
+
     def test_routine_fences_overlaps_and_rechecks_time_before_buys(self):
         with open(os.path.join(ROOT, "robinhood-momentum-routine-autonomous.md"), encoding="utf-8") as f:
             routine = f.read()
@@ -11988,9 +12878,11 @@ class MarketClockTests(unittest.TestCase):
             '**ENTRY-ELIGIBLE NEXT-ACTION FENCE:**', 1
         )[1].split('**THIRD — build this run', 1)[0]
         for required in (
-            'the next local operation must be the SECOND renewal',
+            'the next local operation must be the exact owner-fenced '
+            '`enter-second` action',
             'followed on success by the first prescribed DAILY-LOSS operation',
-            'only after a named attempted helper/connector operation returns',
+            'after a named attempted helper/connector operation is bound by '
+            'the matching public',
             'It may not elect to omit the chain',
             'An unattempted DAILY-LOSS chain is runner omission',
             '`final-status-unavailable` remains legal only when',
@@ -12083,8 +12975,8 @@ class MarketClockTests(unittest.TestCase):
             '### INVOCATION LIFECYCLE', 1
         )[1].split('A failed lifecycle start is terminal', 1)[0]
         self.assertIn(
-            'The checked-in `start` action owns its canonical UUID grammar '
-            'and complete schema',
+            'The checked-in `start` action owns its canonical UUID grammar, '
+            'conservative abandoned-run reconciliation, and complete schema',
             lifecycle_start,
         )
         self.assertIn(
@@ -12093,10 +12985,18 @@ class MarketClockTests(unittest.TestCase):
             lifecycle_start,
         )
         self.assertIn(
-            'Runner glue must not recreate either one, count returned fields, '
+            'Runner glue must not recreate them, count returned fields, '
             'or compare them with a model-authored key array',
             lifecycle_start,
         )
+        for required in (
+            'nonnegative integer `reconciled_abandoned_count`',
+            'Boolean `reconciliation_blocked_by_live_lease`',
+            'a live-lease block is diagnostic and never replaces or bypasses '
+            "this new invocation's later normal `acquire-bind-context` "
+            'overlap handling',
+        ):
+            self.assertIn(required, lifecycle_start)
         lifecycle_start_code = routine.split(
             '**CODEX LIFECYCLE START BIND — EXACT:**', 1
         )[1].split('```javascript', 1)[1].split('```', 1)[0]
@@ -12110,6 +13010,11 @@ class MarketClockTests(unittest.TestCase):
             'lifecycleReceipt = JSON.parse(lifecycleProcess.output)',
             'typeof lifecycleReceipt.invocation_id !== "string"',
             'lifecycleReceipt.invocation_id.length === 0',
+            '!Number.isSafeInteger('
+            'lifecycleReceipt.reconciled_abandoned_count)',
+            'lifecycleReceipt.reconciled_abandoned_count < 0',
+            'typeof lifecycleReceipt.'
+            'reconciliation_blocked_by_live_lease !== "boolean"',
             'store(BOOTSTRAP_KEY, {...bootstrap, phase: "lifecycle-bound"',
             'const rebound = load(BOOTSTRAP_KEY);',
             'text(JSON.stringify({schema_version: 1, action: "lifecycle-state-bound", ok: true}));',
@@ -12546,6 +13451,35 @@ class MarketClockTests(unittest.TestCase):
             'invoke `abort-source` with fixed reason `connector-failed`',
             post_bind_recipe,
         )
+        for required in (
+            'CONNECTOR-FAILURE ABORT COMMAND — EXACT AND ID-BOUND',
+            'same still-running composed operation',
+            'The `--reservation-id` operand is mandatory and comes only '
+            'from that same receipt',
+            'sourceReservation.reservation_id.length === 0',
+            '" --reservation-id " + '
+            'quote(sourceReservation.reservation_id)',
+            'reservation_id` equal to '
+            '`sourceReservation.reservation_id`',
+            'A purpose-only abort is forbidden',
+        ):
+            self.assertIn(required, post_bind_recipe)
+        abort_block = post_bind_recipe.split(
+            '**CONNECTOR-FAILURE ABORT COMMAND — EXACT AND ID-BOUND:**', 1
+        )[1].split('After an explicit successful tool result', 1)[0]
+        self.assertIn('broker_snapshot.py abort-source', abort_block)
+        self.assertIn('--purpose ', abort_block)
+        self.assertIn('--reservation-id ', abort_block)
+        self.assertLess(
+            abort_block.index('--purpose '),
+            abort_block.index('--reservation-id '),
+        )
+        self.assertNotIn(
+            'broker_snapshot.py abort-source --scratch " + quote(scratch) +\n'
+            '  " --purpose " + quote(sourceReservation.purpose) +\n'
+            '  " --reason connector-failed"',
+            abort_block,
+        )
         self.assertIn('**Mutation-response exception:**', post_bind_recipe)
         self.assertIn(
             'do not reserve a source before '
@@ -12599,7 +13533,13 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("Make no broker calls", coordination)
         self.assertIn('supersede REPORT, its "every run" status-snapshot rule', coordination)
         self.assertIn("expires after 20 minutes", coordination)
-        self.assertIn("At the start of FIRST, SECOND, THIRD, FOURTH, and REPORT", coordination)
+        self.assertIn(
+            "At the start of FIRST, THIRD, FOURTH, and REPORT",
+            coordination,
+        )
+        self.assertIn(
+            "SECOND is the deliberate exception", coordination
+        )
         self.assertIn(
             "`& '<PYTHON_EXE>' run_lock.py renew --token "
             "'<RUN_LOCK_TOKEN>'`",
@@ -12607,12 +13547,12 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn("immediately before EVERY `cancel_equity_order` and `place_equity_order`", coordination)
         self.assertIn("ownership is lost: make no further broker calls or order changes", coordination)
-        self.assertIn(
-            "`& '<PYTHON_EXE>' run_lock.py release --token "
-            "'<RUN_LOCK_TOKEN>'`",
+        self.assertIn("run_lifecycle.py release-finish", coordination)
+        self.assertNotIn(
+            "`& '<PYTHON_EXE>' run_lock.py release --token ",
             coordination,
         )
-        self.assertIn("final operational action", coordination)
+        self.assertIn("final owned-lease operational action", coordination)
         self.assertNotIn("py -3 run_lock.py", coordination)
         self.assertNotIn("python3 run_lock.py", coordination)
 
@@ -12961,10 +13901,17 @@ class MarketClockTests(unittest.TestCase):
             self.assertIn(
                 f"combinedReceipt.holder.{holder_field}", acquire_bind_code
             )
-        self.assertIn(
-            'reason: activeRun ? "active-run" : "coordination-state"',
-            acquire_bind_code,
-        )
+        for required in (
+            'combinedReceipt.reason === "bind_context_failed"',
+            'combinedReceipt.lease_released === true',
+            'combinedReceipt.compensation_recorded === true',
+            'combinedReceipt.reason === '
+            '"bind_context_failed_compensation_unrecorded"',
+            'compensatedBindFailure ? "bind-context-failed-compensated"',
+            'unrecordedCompensation ? '
+            '"bind-context-failed-compensation-unrecorded"',
+        ):
+            self.assertIn(required, acquire_bind_code)
         self.assertIn("holder: activeRun ?", acquire_bind_code)
         self.assertIn(
             "Only the existing checked-in deterministic protocols may "
@@ -13094,8 +14041,9 @@ class MarketClockTests(unittest.TestCase):
             "**One private token authority for every later use:**", 1
         )[1]
         for operation in (
-            "renewal", "release", "broker call", "prepare", "pending",
-            "begin", "retry",
+            "renewal", "enter-second", "daily_loss.py", "complete-second",
+            "release-finish", "broker call", "prepare", "pending", "begin",
+            "retry",
         ):
             self.assertIn(operation, later_contract)
         self.assertIn(
@@ -13128,10 +14076,10 @@ class MarketClockTests(unittest.TestCase):
         self.assertNotIn('state.phase !== "terminal"', active_precondition)
 
         release_code = later_contract.split(
-            "**CODEX RELEASE TOMBSTONE — EXACT:**", 1
+            "**CODEX RELEASE-FINISH TOMBSTONE — EXACT:**", 1
         )[1].split("```javascript", 1)[1].split("```", 1)[0]
         release_guard = release_code.index(
-            'action: "lease-release-prerequisite-failed"'
+            'action: "release-finish-prerequisite-failed"'
         )
         self.assertIn(
             'typeof invocationId !== "string"', release_code
@@ -13139,25 +14087,18 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn('invocationId.length === 0', release_code)
         self.assertNotIn("|| !invocationId ||", release_code)
         release_call = release_code.index(
-            "const releaseResult = await drainCommand("
+            "const result = await drainCommand("
         )
         released_store = release_code.index(
             'store(LEASE_KEY, {schema_version: 1, phase: "lease-released"'
         )
         released_output = release_code.index(
             'text(JSON.stringify({schema_version: 1, action: '
-            '"lease-released", ok: true}));'
-        )
-        lost_store = release_code.index(
-            'store(LEASE_KEY, {schema_version: 1, phase: "lease-lost"'
-        )
-        lost_output = release_code.index(
-            'action: "lease-release-failed", ok: false'
+            '"release-finish-complete", ok: true}));'
         )
         self.assertLess(release_guard, release_call)
         self.assertLess(release_call, released_store)
         self.assertLess(released_store, released_output)
-        self.assertLess(lost_store, lost_output)
         self.assertNotIn("run_lock_token:", release_code)
         self.assertNotIn('uuid4', routine)
         self.assertNotIn('[89ab]', routine)
@@ -13177,7 +14118,7 @@ class MarketClockTests(unittest.TestCase):
         for line in release_code.splitlines():
             if "text(" in line:
                 self.assertNotIn("runLockToken", line)
-                self.assertNotIn("releaseReceipt.token", line)
+                self.assertNotIn("lease.run_lock_token", line)
 
         finalization = routine.split(
             "**FIXED FINALIZATION ORDER", 1
@@ -13296,18 +14237,19 @@ class MarketClockTests(unittest.TestCase):
             self.assertIn(required, coordination)
 
         lifecycle_finish = routine.index(
-            '**Finalize lifecycle after persistence and release:**'
+            '**Finalize owned lifecycle with release-finish — execute now:**'
         )
         report_readback = routine.index('**Then READ THE REPORT BACK, once')
         telemetry_start = routine.index(
-            '### PERFORMANCE TELEMETRY — after lifecycle finish'
+            '### PERFORMANCE TELEMETRY — after lifecycle terminalization, '
+            'never authoritative'
         )
         summary_start = routine.index(
             '### FINAL ON-SCREEN RUN SUMMARY — immediately after '
             'performance telemetry'
         )
-        self.assertLess(lifecycle_finish, report_readback)
-        self.assertLess(report_readback, telemetry_start)
+        self.assertLess(report_readback, lifecycle_finish)
+        self.assertLess(lifecycle_finish, telemetry_start)
         self.assertLess(telemetry_start, summary_start)
         self.assertLess(
             routine.index('run_performance.py record-internal'), summary_start
@@ -13320,7 +14262,7 @@ class MarketClockTests(unittest.TestCase):
         for required in (
             'Only after all permitted report/status persistence and '
             'read-back',
-            'single successful lifecycle `finish`',
+            'one successful lifecycle terminalization',
             'exactly once for that invocation',
             '--invocation-id <INVOCATION_ID>',
             '--session',
@@ -13412,7 +14354,8 @@ class MarketClockTests(unittest.TestCase):
             routine = f.read()
 
         telemetry = routine.split(
-            '### PERFORMANCE TELEMETRY — after lifecycle finish', 1
+            '### PERFORMANCE TELEMETRY — after lifecycle terminalization, '
+            'never authoritative', 1
         )[1].split(
             '### FINAL ON-SCREEN RUN SUMMARY — immediately after '
             'performance telemetry', 1
@@ -14135,7 +15078,7 @@ class MarketClockTests(unittest.TestCase):
             "### RUN COORDINATION", 1
         )[1].split("### ORDER-INTENT JOURNAL", 1)[0]
         self.assertIn(
-            "Before release, require the report's bare name to equal "
+            "Before it, require the report's bare name to equal "
             "`EXPECTED_REPORT_FILE`", coordination
         )
         self.assertIn(
@@ -14152,12 +15095,17 @@ class MarketClockTests(unittest.TestCase):
         ):
             self.assertIn(required, coordination)
         lifecycle_finish = report.split(
-            "**Finalize lifecycle after persistence and release:**", 1
+            "**Finalize owned lifecycle with release-finish:**", 1
         )[1].split("**AUTOMATION MEMORY IS DISABLED", 1)[0]
+        self.assertIn(
+            "**Finalize owned lifecycle with release-finish — execute now:**",
+            report,
+        )
         self.assertIn("--report-file <EXPECTED_REPORT_FILE>", lifecycle_finish)
         self.assertIn("--status-file <EXPECTED_STATUS_FILE>", lifecycle_finish)
         self.assertIn(
-            "must never trigger a post-release rewrite or a second `finish`",
+            "must never trigger a post-release rewrite or a second "
+            "terminalization",
             lifecycle_finish,
         )
         self.assertIn(
@@ -14184,9 +15132,18 @@ class MarketClockTests(unittest.TestCase):
             section = routine.split(start, 1)[1].split(end, 1)[0]
             self.assertIn(f"**{phase} phase-entry fence:**", section)
             self.assertIn("required", section)
-            self.assertIn("lease renewal", section)
             self.assertIn("retained `PYTHON_EXE`", section)
-            self.assertIn("exact `RUN_LOCK_TOKEN`", section)
+            if phase == "SECOND":
+                self.assertIn("exact private `RUN_LOCK_TOKEN`", section)
+                self.assertIn("run_lifecycle.py enter-second", section)
+                self.assertIn("renews the lease", section)
+                self.assertIn(
+                    "Never issue a standalone SECOND `run_lock.py renew`",
+                    section,
+                )
+            else:
+                self.assertIn("exact `RUN_LOCK_TOKEN`", section)
+                self.assertIn("lease renewal", section)
         second = routine.split("**SECOND ", 1)[1].split(
             "**THIRD ", 1
         )[0]
@@ -14195,7 +15152,7 @@ class MarketClockTests(unittest.TestCase):
         final_refresh = routine.split(
             "**FINAL STATUS REFRESH", 1
         )[1].split(
-            "**Finalize lifecycle after persistence and release:**", 1
+            "**Report content:**", 1
         )[0]
         pnl_payload = (
             '{ "account_number": "<resolved at runtime>", "span": "day", '
@@ -14460,22 +15417,94 @@ class MarketClockTests(unittest.TestCase):
         )
         self.assertIn('<PYTHON_EXE>', filter_command)
         self.assertIn('--scratch', filter_command)
+        self.assertIn('--scan-purpose run-scan', filter_command)
+        self.assertIn(
+            '--expected-constants-sha256 '
+            "'<startup constants_receipt.source_sha256>'",
+            filter_command,
+        )
+        for forbidden_flag in (
+            '--price-min', '--price-max', '--min-rel-volume',
+            '--min-abs-pct-change', '--top-n',
+        ):
+            self.assertNotIn(forbidden_flag, filter_command)
         self.assertNotIn('py -3 filter_scan.py', filter_command)
         self.assertNotIn('python3 filter_scan.py', filter_command)
         self.assertIn("--json-out <scratch>/working-list.json", scan_phase)
         self.assertIn("NEW session-scoped scratch directory", scan_phase)
         self.assertIn("Machine-readable handoff (REQUIRED)", scan_phase)
-        self.assertIn("working_list", scan_phase)
-        self.assertIn("SOLE authority for candidate data and scan counts", scan_phase)
-        self.assertIn("formatted stdout table is diagnostic-only", scan_phase)
-        self.assertIn("All four counters must be non-negative JSON integers", scan_phase)
-        self.assertIn("finite JSON-number", scan_phase)
-        self.assertIn("no duplicate symbols", scan_phase)
+        for required in (
+            "successful `filter_scan.py` stdout is exactly one compact JSON "
+            "receipt",
+            "carries the complete validated counters and TOP_N-bounded "
+            "unrounded `working_list` inline",
+            "Consume that parsed stdout receipt directly inside the same "
+            "composed operation",
+            "durable audit artifact only and has no downstream authority",
+            "SCAN FILTER RECEIPT BINDING — EXACT",
+            'filterReceipt.action === "filter-scan"',
+            "filterReceipt.scratch === state.receipt.scratch",
+            "filterReceipt.scratch_id === state.receipt.scratch_id",
+            'filterReceipt.scan_selector_kind === "purpose"',
+            'filterReceipt.scan_purpose === "run-scan"',
+            "filterReceipt.scan_source_sha256 === "
+            "commitReceipt.source_sha256",
+            "filterReceipt.constants_source_sha256 === "
+            "constantsReceipt.source_sha256",
+            "filterReceipt.price_min === "
+            "constantsReceipt.values.PRICE_MIN",
+            "filterReceipt.price_max === "
+            "constantsReceipt.values.PRICE_MAX",
+            "filterReceipt.min_rel_volume === "
+            "constantsReceipt.values.MIN_REL_VOLUME",
+            "filterReceipt.min_abs_pct_change === "
+            "constantsReceipt.values.MIN_ABS_PCT_CHANGE",
+            "filterReceipt.top_n === topN",
+            'filterReceipt.working_list_file === "working-list.json"',
+            "Number.isSafeInteger(filterReceipt.byte_count)",
+            "sha256.test(filterReceipt.sha256)",
+            "store(STATE_KEY, {...state, working_list_receipt: "
+            "filterReceipt})",
+            "SOLE authority for candidate data and scan counts",
+            "sole complete schema/type/range authority for this receipt and "
+            "its inline rows",
+            "exact ticker/visible-Symbol equality",
+            "symbol uniqueness, and non-increasing relative-volume order",
+            "Runner glue deliberately does not count fields, call "
+            "`Object.keys`, recreate a ticker regular expression, loop over "
+            "numeric fields, check ordering/duplicates/counters",
+            "store and consume the complete receipt unchanged",
+        ):
+            self.assertIn(required, scan_phase)
+        scan_binding_code = scan_phase.split(
+            "**SCAN FILTER RECEIPT BINDING — EXACT:**", 1
+        )[1].split("```javascript", 1)[1].split("```", 1)[0]
+        for forbidden in (
+            "Object.keys", "canonicalTicker", "exactRowKeys",
+            "seenSymbols", "previousRelativeVolume", "for (const row",
+            "filterReceipt.total_items", "filterReceipt.rows_returned",
+            "filterReceipt.rows_skipped", "filterReceipt.passed_filters",
+            "filterReceipt.working_list.length",
+        ):
+            self.assertNotIn(forbidden, scan_binding_code)
+        for forbidden in (
+            "after a successful script exit, read "
+            "`<scratch>/working-list.json` as JSON",
+            "formatted stdout table is diagnostic-only",
+            "ReadAllText('<scratch>/working-list.json')",
+        ):
+            self.assertNotIn(forbidden, scan_phase)
         self.assertIn("skip the entry phase (Steps 8–12)", scan_phase)
         self.assertIn("deterministic output schema/value checks fail", scan_phase)
         self.assertIn("do NOT fall back to formatted stdout, a stale file, or ad-hoc filtering", scan_phase)
         self.assertIn("empty `working_list: []` is valid", scan_phase)
         self.assertIn("standard MCP envelope at `structuredContent.data.result`", scan_phase)
+        self.assertIn(
+            "skips a row whose `Volume` is absent/non-finite or whose exact "
+            "canonical `ticker` differs from exact canonical "
+            "`columns.Symbol`",
+            scan_phase,
+        )
         self.assertIn("never call `run_scan` again", scan_phase)
         self.assertIn("startup-bound `SOURCE_ROOT`", scan_phase)
         self.assertIn("`filter_scan.py --scan-purpose run-scan`", scan_phase)
@@ -14483,7 +15512,8 @@ class MarketClockTests(unittest.TestCase):
         self.assertIn("same composed tool operation", scan_phase)
         self.assertIn("POST-BIND COMPOSED JSON SAVE RECIPE", scan_phase)
         self.assertIn(
-            "load `rhmra.transport-state.v1`",
+            "load `rhmra.bootstrap-state.v1` and "
+            "`rhmra.transport-state.v1`",
             scan_phase,
         )
         self.assertIn("COMPLETE `fullToolResult`", scan_phase)
@@ -14498,18 +15528,22 @@ class MarketClockTests(unittest.TestCase):
             "invoke `filter_scan.py --scan-purpose run-scan` with loaded scratch",
             scan_phase,
         )
-        self.assertIn("never a saved path", scan_phase)
+        self.assertIn("compact path-free `working-list-state-bound`", scan_phase)
         scan_save = scan_phase.split(
             '**Save once, then reuse — atomic transport is REQUIRED:**', 1
         )[1]
         scan_order = (
-            'load `rhmra.transport-state.v1`',
+            'load `rhmra.bootstrap-state.v1` and '
+            '`rhmra.transport-state.v1`',
             'call `reserve-source` for purpose `run-scan`',
             'only then await `run_scan`',
             'write it once to the reservation receipt\'s exact source variable',
             'call self-correlating `commit-source` with the same purpose and '
             'no reservation-ID argument',
             'invoke `filter_scan.py --scan-purpose run-scan`',
+            'run the exact receipt binding above against that same commit '
+            'receipt',
+            'store the complete validated filter receipt',
         )
         scan_positions = [scan_save.index(marker) for marker in scan_order]
         self.assertEqual(scan_positions, sorted(scan_positions))
@@ -14711,7 +15745,7 @@ class MarketClockTests(unittest.TestCase):
             self.assertIn(required, pre_place)
 
         evaluation = routine.split(
-            "6. Run the authoritative evaluation using ONLY", 1
+            "6. Run the authoritative lifecycle-bound evaluation using ONLY", 1
         )[1].split("Only these deterministic failures", 1)[0]
         for required in (
             "const evaluationCommandParts = Object.freeze([",
@@ -15875,6 +16909,63 @@ class MarketClockTests(unittest.TestCase):
         clock = self.clock("2026-07-22T04:30:00Z")
         self.assertEqual(clock["date_et"], "2026-07-22")
         self.assertEqual(clock["date_pt"], "2026-07-21")
+
+    def test_august_28_incident_and_tested_on_are_truthful(self):
+        with open(os.path.join(ROOT, "INCIDENTS.md"), encoding="utf-8") as f:
+            incidents = f.read()
+        cohort = incidents.split(
+            "## 2026-08-28 CODEX TERRA EARLY COHORT", 1
+        )[1].split("## The pattern across all of these", 1)[0]
+        cohort_text = " ".join(cohort.split())
+        for required in (
+            "eight scheduled launches from 06:05 through 09:32 PT",
+            "seven outright orchestration failures and one safely finalized "
+            "but degraded scan path",
+            "No audited attempt reviewed, prepared, began, placed, "
+            "cancelled, or otherwise mutated a broker order",
+            "A later 11:16 PT Terra run completed a flat-account SPY-red "
+            "skip cleanly",
+            "does not validate the failed boundary above",
+            "strictly reservation-ID-bound",
+            "purpose-only abort was explicitly rejected",
+            "production command lines for `run_lock.py`, "
+            "`run_lifecycle.py`, `daily_loss.py`, `market_clock.py`, and "
+            "`order_intents.py` still exposed test clock overrides",
+            "production CLIs now reject `--now-utc` and "
+            "`--lifecycle-now-utc`",
+            "Only exact `bind_context_failed`, `lease_released: true`, "
+            "`compensation_recorded: true` evidence",
+            "permits the narrow raw `coordination-halt` / "
+            "`coordination-state` finish",
+            "a `dip-buy` journal `begin` or same-ref `retry` still trusted "
+            "the runner to have obeyed the DAILY-LOSS clear gate",
+            "journal now calls the checked-in lifecycle entry authorizer "
+            "internally with its exact private run token",
+            "There is no production CLI bypass",
+            "paused and changed from Terra/high to the maintained Sol/high "
+            "candidate",
+        ):
+            self.assertIn(required, cohort_text)
+
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        tested_on = readme.split("## Tested On", 1)[1].split(
+            "## Guardrails", 1
+        )[0]
+        tested_on_text = " ".join(tested_on.split())
+        for required in (
+            "the eight early scheduled launches from 06:05 through 09:32 PT "
+            "produced seven outright orchestration failures and one safely "
+            "finalized but degraded scan path",
+            "A later 11:16 PT SPY-red skip completed cleanly",
+            "did not exercise the entry-eligible DAILY-LOSS, scan-evaluation, "
+            "or order path",
+            "The schedule was paused and returned to the Sol/high deployment "
+            "candidate",
+            "only a supervised entry-eligible run can accept the repaired "
+            "path",
+        ):
+            self.assertIn(required, tested_on_text)
 
 
 if __name__ == "__main__":

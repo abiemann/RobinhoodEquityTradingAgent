@@ -1999,6 +1999,89 @@ degraded paths. It confirms that labeling a block exact is not enough when the r
 its validation syntax. The maintained unattended candidate remains Sol high, and the new boundary
 still requires supervised acceptance before live scheduling.
 
+## 2026-08-28 CODEX TERRA EARLY COHORT — EIGHT LAUNCHES, ZERO CLEAN ENTRY-PATH RUNS
+
+**The eight scheduled launches from 06:05 through 09:32 PT produced seven outright orchestration
+failures and one safely finalized but degraded scan path.** No audited attempt reviewed, prepared,
+began, placed, cancelled, or otherwise mutated a broker order, and the account remained flat. The
+broker and checked-in helpers were available; the failures were runner-authored control-flow and
+command-construction defects across otherwise separate invocations.
+
+- At 06:05 startup, account scope, and FIRST succeeded. The runner skipped both SECOND renewal and
+  the entire DAILY-LOSS chain, then wrote a report and falsely finished `final-status-unavailable`
+  without attempting the required final refresh/status publication.
+- At 06:36 `acquire-bind-context` succeeded, after which the runner simply stopped. It omitted the
+  remaining routine, release, and lifecycle finish, leaving an unleased unfinished lifecycle row.
+- At 07:04 the runner read the routine through EOF, made no launcher, lifecycle, helper, or broker
+  call, and stopped because Terra was selected while the document recommends Sol. The document
+  explicitly says model selection is platform configuration rather than a runtime gate; this
+  invented check prevented the attempt from reaching lifecycle and therefore from appearing in
+  the dashboard.
+- At 07:34 FIRST succeeded. The runner deliberately threw when entry eligibility meant DAILY-LOSS
+  was required, then still skipped that chain after a successful standalone SECOND renewal. It
+  released the lease, but its model-authored finalization JavaScript referenced an undefined
+  invocation variable and then misreported the already-released state as unconfirmed, leaving
+  another unfinished lifecycle row.
+- At 08:07 and 08:35 FIRST and the pre-SECOND eligibility boundary succeeded with no deterministic
+  helper error. Both runners stopped at DAILY-LOSS, released safely, and falsely recorded a
+  coordination halt instead of executing the required breaker.
+- At 09:03 DAILY-LOSS, scanning, and pre-RSI evaluation succeeded; one candidate passed. The RSI
+  connector returned an explicit failure, but the runner's abort command omitted the reservation
+  ID from `abort-source`. The checked-in helper correctly rejected that unsafe request, leaving the
+  response purpose pending and the entry path halted without mutation.
+- At 09:32 DAILY-LOSS and the scan completed successfully. The runner then constructed a Python
+  command whose supposed script operand was a PowerShell `[Console]::Out.Write(...)` expression,
+  so Python rejected it. This invocation did publish a truthful report/status and finish safely,
+  but only after avoidable recovery; it is the cohort's one degraded, not clean, finalization.
+
+A later 11:16 PT Terra run completed a flat-account SPY-red skip cleanly. That is useful smoke
+evidence for startup, FIRST, and finalization, but it never crossed the entry-eligible DAILY-LOSS,
+scan/evaluation, review, or order path and therefore does not validate the failed boundary above.
+
+**Repairs produced:** lifecycle start now performs a conservative no-live-lease sweep for old idle
+invocations and reports whether reconciliation occurred or was blocked by a current owner. The
+checked-in owner-fenced `enter-second` action renews SECOND, binds the exact scratch, and atomically
+records entry eligibility plus the DAILY-LOSS attempt. Calculation-mode `daily_loss.py` now publishes
+and reads back its deterministic result, then owner-fenced records clear/tripped from that result and
+the exact sealed-input provenance; the runner cannot choose either financial outcome. Public
+`complete-second` can bind only a typed snapshot/coordination fail-closed outcome after a real
+attempted operation reaches that terminal path.
+Owner-held terminal paths now use one `release-finish` process, with the unavoidable cross-database
+crash gap stated honestly and recovered only by the conservative later sweep. `filter_scan.py`
+returns the validated, TOP_N-bounded working rows in its compact invocation/source-bound receipt,
+so the runner never executes a second shell/file read of `working-list.json`; the durable file is
+audit-only. The connector-failure abort rule remains strictly reservation-ID-bound, and the exact
+same-cell operation machine-carries that ID from the matching reserve receipt. A proposed
+purpose-only abort was explicitly rejected because it would weaken the uncertain-call/no-retry
+invariant that protects against clearing the wrong pending response.
+
+The same review found a second authority gap: production command lines for `run_lock.py`,
+`run_lifecycle.py`, `daily_loss.py`, `market_clock.py`, and `order_intents.py` still exposed test
+clock overrides. A runner could therefore manufacture lease age, lifecycle time, a risk snapshot
+time, market session, or intent age instead of accepting host time from checked-in code. Those
+production CLIs now reject `--now-utc` and `--lifecycle-now-utc`; deterministic clock injection is
+available only through imported test APIs. The combined lease/context helper also now durably
+records an exact-token compensation disposition when context publication fails after acquisition.
+Only exact `bind_context_failed`, `lease_released: true`, `compensation_recorded: true` evidence,
+followed by checked-in proof that no lease is live, permits the narrow raw
+`coordination-halt` / `coordination-state` finish. If compensation release succeeds but its
+disposition is not durable, the invocation remains unfinished for conservative reconciliation;
+the runner must not invent a raw finish.
+
+Independent safety review also found that a `dip-buy` journal `begin` or same-ref `retry` still
+trusted the runner to have obeyed the DAILY-LOSS clear gate. That left a deterministic enforcement
+gap between the lifecycle checkpoint and the final pre-submission journal transition. The journal
+now calls the checked-in lifecycle entry authorizer internally with its exact private run token.
+The authorizer derives the invocation from active context, renews and proves ownership, and accepts
+only a durable SECOND attempt with exactly matching clear evidence/constants in an allowed entry
+phase. A missing, tripped, terminal, stale-owner, or malformed receipt stops `begin`/`retry` before
+broker submission. There is no production CLI bypass; profit-taking, dust sells, and protective
+stops retain their separate risk-reducing paths rather than depending on an entry-only clearance.
+
+The schedule was paused and changed from Terra/high to the maintained Sol/high candidate. That
+model correction is containment, not proof of repair: the full supervised dry-run and one clean
+entry-eligible scheduled acceptance remain required before unattended live scheduling resumes.
+
 ## The pattern across all of these
 
 Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One

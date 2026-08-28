@@ -22,8 +22,10 @@ Commands (all emit one JSON object):
   python3 run_lock.py renew --token <token>
   python3 run_lock.py release --token <token>
 
-``--lock-file``, ``--lease-seconds``, and ``--now-utc`` exist for tests and
-diagnostics. The trading routine uses the checked-in defaults.
+``--lock-file`` and ``--lease-seconds`` exist for tests and diagnostics.  A
+clock override is available only through the imported Python API; the CLI
+rejects ``--now-utc`` so an unattended caller cannot fast-forward through a
+live lease.  The trading routine uses the checked-in defaults.
 
 Exit codes:
   0  action succeeded
@@ -67,14 +69,12 @@ def positive_int(value):
 
 
 def parse_now(value):
-    if value is None:
-        return datetime.now(timezone.utc).timestamp()
-    try:
-        return datetime.strptime(
-            value.rstrip("Z"), "%Y-%m-%dT%H:%M:%S"
-        ).replace(tzinfo=timezone.utc).timestamp()
-    except ValueError as exc:
-        raise ValueError("--now-utc must be YYYY-MM-DDTHH:MM:SSZ") from exc
+    if value is not None:
+        raise ValueError(
+            "--now-utc is test-only through the imported API and is not "
+            "valid on the CLI"
+        )
+    return datetime.now(timezone.utc).timestamp()
 
 
 def iso_utc(timestamp):
@@ -97,18 +97,22 @@ def connect(lock_file):
     lock_file = os.path.abspath(lock_file)
     os.makedirs(os.path.dirname(lock_file), exist_ok=True)
     connection = sqlite3.connect(lock_file, timeout=5, isolation_level=None)
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS run_lease (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            token TEXT NOT NULL,
-            acquired_at REAL NOT NULL,
-            renewed_at REAL NOT NULL,
-            expires_at REAL NOT NULL
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_lease (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                token TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                renewed_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+            """
         )
-        """
-    )
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -326,7 +330,7 @@ def main():
                         default=DEFAULT_LEASE_SECONDS,
                         help="lease duration; routine uses the checked-in default")
     parser.add_argument("--now-utc",
-                        help="test/diagnostic override, YYYY-MM-DDTHH:MM:SSZ")
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     try:

@@ -35,6 +35,17 @@ after positions and executions have been reconciled:
            --as-of-utc 2026-07-31T16:00:00Z --halt-pct 5 \
            --json-out daily-loss.json
 
+An unattended lifecycle-bound calculation additionally supplies the active
+``--invocation-id``/``--run-token`` and the startup-pinned
+``--expected-constants-sha256``.  In that mode ``--halt-pct`` is forbidden:
+the helper validates the repository constants itself, derives both the daily
+loss and stop-count guards, publishes one deterministic no-clobber wrapper at
+the bound scratch basename ``daily-loss-a.json`` or ``daily-loss-b.json``,
+records the owner-fenced SECOND checkpoint, and only then emits the unchanged
+wrapper on stdout.  A lost-receipt retry succeeds only when the durable bytes
+and bound evidence are exactly identical.  The run token is never written to
+the wrapper or stdout.
+
 All monetary and quantity arithmetic uses :class:`decimal.Decimal`.  JSON
 numbers are loaded directly as Decimal values, non-finite JSON constants are
 rejected, pagination is checked, duplicate broker IDs must be identical, and
@@ -61,6 +72,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -82,6 +94,8 @@ from market_clock import (
     session_state,
     zone_time,
 )
+import run_lifecycle as run_lifecycle_module
+from validate_constants import ConstantsValidationError, validate_constants_file
 
 
 SCHEMA_VERSION = 1
@@ -1320,6 +1334,96 @@ def _write_json_atomic(path: str, document: Any) -> None:
         raise DailyLossError(f"{path}: cannot publish JSON: {exc}") from exc
 
 
+def _write_json_no_clobber_or_match(
+    path: str, document: Any
+) -> tuple[bytes, bool]:
+    """Publish deterministic evidence once, or reconcile identical bytes.
+
+    A pre-existing path is never removed or replaced.  An exact byte match is
+    the only idempotent lost-receipt recovery; a mismatch is retained for
+    audit and fails closed.
+    """
+    destination = Path(path)
+    parent = destination.parent
+    if not parent.exists() or not parent.is_dir():
+        raise DailyLossError(f"{path}: output directory does not exist")
+    try:
+        raw = (
+            json.dumps(
+                document,
+                indent=2,
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise DailyLossError(f"{path}: cannot serialize JSON: {exc}") from exc
+    descriptor = -1
+    temporary = ""
+    created = False
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=parent
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination)
+            created = True
+        except FileExistsError:
+            created = False
+        try:
+            before = os.lstat(destination)
+            persisted = destination.read_bytes()
+            after = os.lstat(destination)
+        except OSError as exc:
+            raise DailyLossError(
+                f"{path}: cannot read back durable JSON: {exc}"
+            ) from exc
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or persisted != raw
+        ):
+            raise DailyLossError(
+                f"{path}: existing durable JSON does not exactly match this "
+                "deterministic result"
+            )
+        return raw, created
+    except DailyLossError:
+        raise
+    except OSError as exc:
+        raise DailyLossError(f"{path}: cannot publish durable JSON: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
 def _validate_output_not_input(output: str, inputs: Sequence[str]) -> None:
     output_path = os.path.normcase(os.path.abspath(output))
     for input_path in inputs:
@@ -1407,6 +1511,19 @@ def _parser() -> argparse.ArgumentParser:
             "human-readable stderr"
         ),
     )
+    parser.add_argument("--invocation-id", help=argparse.SUPPRESS)
+    parser.add_argument("--run-token", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-state-file", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-projection-file", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-context-file", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-lock-file", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-now-utc", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--expected-constants-sha256",
+        help=(
+            "lifecycle calculation: exact startup validate_constants.py hash"
+        ),
+    )
     output_group = parser.add_mutually_exclusive_group(required=True)
     output_group.add_argument(
         "--json-out", help="write the final circuit-breaker result here"
@@ -1444,7 +1561,11 @@ def _failure_receipt(
     return receipt
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    lifecycle_now_utc: str | None = None,
+) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     inputs = list(args.positions) + list(args.orders)
@@ -1455,8 +1576,67 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.symbols_out or args.json_out
     mode = "discovery" if args.symbols_out else "calculation"
     phase = "binding"
+    lifecycle_requested = any(
+        value is not None
+        for value in (
+            args.invocation_id,
+            args.run_token,
+            args.lifecycle_state_file,
+            args.lifecycle_projection_file,
+            args.lifecycle_context_file,
+            args.lifecycle_lock_file,
+            args.lifecycle_now_utc,
+            args.expected_constants_sha256,
+        )
+    )
+    lifecycle_constants = None
 
     try:
+        if args.lifecycle_now_utc is not None:
+            raise DailyLossError(
+                "--lifecycle-now-utc is test-only through the imported API "
+                "and is not valid on the CLI"
+            )
+        if lifecycle_requested:
+            if args.invocation_id is None or args.run_token is None:
+                raise DailyLossError(
+                    "lifecycle completion requires --invocation-id and "
+                    "--run-token together"
+                )
+            if args.symbols_out:
+                raise DailyLossError(
+                    "lifecycle completion is valid only in calculation mode"
+                )
+            if args.snapshot_generation is None:
+                raise DailyLossError(
+                    "lifecycle completion requires --snapshot-generation"
+                )
+            if args.expected_constants_sha256 is None:
+                raise DailyLossError(
+                    "lifecycle completion requires "
+                    "--expected-constants-sha256"
+                )
+            if args.halt_pct is not None:
+                raise DailyLossError(
+                    "lifecycle calculation derives DAILY_LOSS_HALT_PCT from "
+                    "the bound constants and does not accept --halt-pct"
+                )
+            try:
+                lifecycle_constants = validate_constants_file()
+            except ConstantsValidationError as exc:
+                raise DailyLossError(
+                    f"constants validation failed: {exc}"
+                ) from exc
+            if (
+                not re.fullmatch(
+                    r"[0-9a-f]{64}", args.expected_constants_sha256
+                )
+                or lifecycle_constants.source_sha256
+                != args.expected_constants_sha256
+            ):
+                raise DailyLossError(
+                    "constants changed after startup validation"
+                )
         if args.symbols_out:
             unused_discovery_options = []
             if args.portfolio:
@@ -1478,13 +1658,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             missing_options = []
             if not args.portfolio:
                 missing_options.append("--portfolio")
-            if args.halt_pct is None:
+            if args.halt_pct is None and not lifecycle_requested:
                 missing_options.append("--halt-pct")
             if missing_options:
                 raise DailyLossError(
                     "calculation mode requires " + ", ".join(missing_options)
                 )
-            _decimal(args.halt_pct, "--halt-pct", positive=True)
+            if not lifecycle_requested:
+                _decimal(args.halt_pct, "--halt-pct", positive=True)
 
         phase = "input"
         paths_by_kind = {
@@ -1552,14 +1733,121 @@ def main(argv: Sequence[str] | None = None) -> int:
             quote_batches,
             args.trading_date,
             args.as_of_utc,
-            args.halt_pct,
+            (
+                lifecycle_constants.raw_values["DAILY_LOSS_HALT_PCT"]
+                if lifecycle_requested
+                else args.halt_pct
+            ),
             args.stop_date_pt,
         )
         phase = "output"
-        _write_json_atomic(args.json_out, result)
+        if lifecycle_requested:
+            assert lifecycle_constants is not None
+            stop_count_halt = int(
+                lifecycle_constants.values["STOP_COUNT_HALT"]
+            )
+            daily_loss_tripped = result["halt_new_buys"]
+            stop_count_tripped = (
+                result["stop_fills_today"] >= stop_count_halt
+            )
+            stdout_result = {
+                "schema_version": SCHEMA_VERSION,
+                "action": "daily-loss",
+                "ok": True,
+                "mode": "calculation",
+                "generation": args.snapshot_generation,
+                "invocation_id": args.invocation_id,
+                "constants_sha256": lifecycle_constants.source_sha256,
+                "daily_loss_halt_pct": lifecycle_constants.raw_values[
+                    "DAILY_LOSS_HALT_PCT"
+                ],
+                "stop_count_halt": stop_count_halt,
+                "daily_loss_tripped": daily_loss_tripped,
+                "stop_count_tripped": stop_count_tripped,
+                "entry_guard_outcome": (
+                    "tripped"
+                    if daily_loss_tripped or stop_count_tripped
+                    else "clear"
+                ),
+                "result": result,
+            }
+            try:
+                run_lifecycle_module.validate_second_result_target(
+                    invocation_id=args.invocation_id,
+                    run_token=args.run_token,
+                    result_file=os.path.abspath(args.json_out),
+                    generation=args.snapshot_generation,
+                    expected_constants_sha256=(
+                        lifecycle_constants.source_sha256
+                    ),
+                    state_file=(
+                        args.lifecycle_state_file
+                        or run_lifecycle_module.DEFAULT_STATE_FILE
+                    ),
+                    projection_file=(
+                        args.lifecycle_projection_file
+                        or run_lifecycle_module.DEFAULT_PROJECTION_FILE
+                    ),
+                    context_file=(
+                        args.lifecycle_context_file
+                        or run_lifecycle_module.DEFAULT_CONTEXT_FILE
+                    ),
+                    lock_file=args.lifecycle_lock_file,
+                    now_utc=lifecycle_now_utc,
+                )
+            except (
+                run_lifecycle_module.LifecycleError,
+                OSError,
+                sqlite3.Error,
+            ) as exc:
+                raise DailyLossError(
+                    f"lifecycle SECOND target validation failed: {exc}"
+                ) from exc
+            _write_json_no_clobber_or_match(args.json_out, stdout_result)
+            phase = "checkpoint"
+            try:
+                checkpoint = run_lifecycle_module.complete_second_result(
+                    invocation_id=args.invocation_id,
+                    run_token=args.run_token,
+                    result_file=os.path.abspath(args.json_out),
+                    generation=args.snapshot_generation,
+                    portfolio=os.path.abspath(args.portfolio),
+                    positions=[os.path.abspath(path) for path in args.positions],
+                    orders=[os.path.abspath(path) for path in args.orders],
+                    quotes=[os.path.abspath(path) for path in (args.quotes or [])],
+                    state_file=(
+                        args.lifecycle_state_file
+                        or run_lifecycle_module.DEFAULT_STATE_FILE
+                    ),
+                    projection_file=(
+                        args.lifecycle_projection_file
+                        or run_lifecycle_module.DEFAULT_PROJECTION_FILE
+                    ),
+                    context_file=(
+                        args.lifecycle_context_file
+                        or run_lifecycle_module.DEFAULT_CONTEXT_FILE
+                    ),
+                    lock_file=args.lifecycle_lock_file,
+                    now_utc=lifecycle_now_utc,
+                )
+            except (
+                run_lifecycle_module.LifecycleError,
+                OSError,
+                sqlite3.Error,
+            ) as exc:
+                raise DailyLossError(
+                    f"lifecycle SECOND completion failed: {exc}"
+                ) from exc
+            if checkpoint["outcome"] != stdout_result["entry_guard_outcome"]:
+                raise DailyLossError(
+                    "lifecycle SECOND completion outcome changed after binding"
+                )
+        else:
+            _write_json_atomic(args.json_out, result)
+            stdout_result = result
         print(
             json.dumps(
-                result,
+                stdout_result,
                 ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
@@ -1567,7 +1855,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     except (DailyLossError, OSError) as exc:
-        _remove_failed_output(output, inputs)
+        if not lifecycle_requested:
+            _remove_failed_output(output, inputs)
         if args.failure_json:
             if isinstance(exc, DailyLossInternalError) or (
                 isinstance(exc, OSError) and phase == "semantic"
@@ -1579,6 +1868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "input": "daily_loss_input_failed",
                     "semantic": "daily_loss_semantic_invalid",
                     "output": "daily_loss_output_failed",
+                    "checkpoint": "daily_loss_checkpoint_failed",
                 }.get(phase, "daily_loss_internal_failed")
             print(
                 json.dumps(

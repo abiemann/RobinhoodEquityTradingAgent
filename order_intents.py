@@ -31,8 +31,10 @@ Commands (all emit one JSON object):
   order_intents.py operator-bind --intent-id UUID --order-id UUID --note TEXT
   order_intents.py operator-resolve-not-submitted --intent-id UUID --note TEXT
 
-``--state-file`` and ``--now-utc`` are for tests and diagnostics.  The live
-routine uses the checked-in default under gitignored ``run-reports/``.
+``--state-file`` is for tests and diagnostics.  A clock override is available
+only through the imported Python API; the CLI rejects ``--now-utc`` so an
+unattended caller cannot manufacture intent age or retry eligibility.  The
+live routine uses the checked-in default under gitignored ``run-reports/``.
 
 TESTED BY tests/test_scripts.py — after ANY edit to this file, run
 ``python3 tests/test_scripts.py`` (Windows: ``py -3 tests\\test_scripts.py``)
@@ -51,7 +53,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 from broker_snapshot import (
@@ -1258,14 +1260,75 @@ def begin_or_retry(
     now: str,
     *,
     retrying: bool,
+    entry_authorizer: Callable[[str], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     run_token = _uuid(run_token, "run_token")
     action = "retry" if retrying else "begin"
+    # Probe immutable intent identity without retaining an intent-DB lock while
+    # the lifecycle/lease databases are consulted.  The write transaction
+    # below repeats every validation before changing state.
+    probe = connect(state_file)
+    try:
+        validate_persisted_state(probe)
+        probe_row = _row(probe, intent_id)
+        if probe_row["run_token"] != run_token:
+            raise OrderIntentError(
+                "cross-run replay is forbidden; reconcile the stale intent"
+            )
+        purpose = probe_row["purpose"]
+    finally:
+        probe.close()
+    if purpose == "dip-buy":
+        if entry_authorizer is None:
+            import run_lifecycle
+
+            authorizer = lambda token: run_lifecycle.authorize_entry_intent(
+                run_token=token
+            )
+        else:
+            authorizer = entry_authorizer
+        try:
+            authorization = authorizer(run_token)
+        except Exception as exc:
+            detail = str(exc).replace(run_token, "[redacted]")
+            raise OrderIntentError(
+                f"dip-buy lifecycle authorization failed: {detail}"
+            ) from exc
+        if (
+            not isinstance(authorization, Mapping)
+            or set(authorization) != {
+                "schema_version", "action", "ok", "invocation_id", "phase",
+                "entry_guard_outcome", "lease_renewed",
+            }
+            or authorization.get("schema_version") != 1
+            or authorization.get("action") != "authorize-entry-intent"
+            or authorization.get("ok") is not True
+            or authorization.get("entry_guard_outcome") != "clear"
+            or authorization.get("lease_renewed") is not True
+        ):
+            raise OrderIntentError(
+                "dip-buy lifecycle authorization receipt is invalid"
+            )
+        try:
+            _uuid(authorization.get("invocation_id"), "authorization invocation_id")
+            authorization_phase = _text(
+                authorization.get("phase"), "authorization phase"
+            )
+            if authorization_phase not in {
+                "daily-loss", "entry-scan", "entry-evaluation", "order-placement",
+            }:
+                raise OrderIntentError("authorization phase is not entry-capable")
+        except OrderIntentError as exc:
+            raise OrderIntentError(
+                "dip-buy lifecycle authorization receipt is invalid"
+            ) from exc
     connection = connect(state_file)
     try:
         connection.execute("BEGIN IMMEDIATE")
         validate_persisted_state(connection)
         row = _row(connection, intent_id)
+        if row["purpose"] != purpose:
+            raise OrderIntentError("intent purpose changed during authorization")
         if row["run_token"] != run_token:
             raise OrderIntentError(
                 "cross-run replay is forbidden; reconcile the stale intent"
@@ -2386,7 +2449,12 @@ def _operator_transition(
     }
 
 
-def main() -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    now_utc: str | None = None,
+    entry_authorizer: Callable[[str], Mapping[str, Any]] | None = None,
+) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -2400,7 +2468,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
-    parser.add_argument("--now-utc", help="test-only UTC clock override")
+    parser.add_argument("--now-utc", help=argparse.SUPPRESS)
     parser.add_argument("--intent", help="strict prepared-intent JSON file")
     parser.add_argument("--intent-id")
     parser.add_argument("--run-token")
@@ -2429,11 +2497,16 @@ def main() -> int:
     parser.add_argument("--as-of-utc")
     parser.add_argument("--note")
     parser.add_argument("--order-id")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     action = args.action
 
     try:
-        now, _ = _now(args.now_utc)
+        if args.now_utc is not None:
+            raise OrderIntentError(
+                "--now-utc is test-only through the imported API and is not "
+                "valid on the CLI"
+            )
+        now, _ = _now(now_utc)
         if action == "check":
             result = check(args.state_file)
         elif action == "pending":
@@ -2453,6 +2526,7 @@ def main() -> int:
                 args.run_token,
                 now,
                 retrying=action == "retry",
+                entry_authorizer=entry_authorizer,
             )
         elif action == "acknowledge":
             if (
