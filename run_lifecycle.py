@@ -89,7 +89,9 @@ import run_lock as run_lock_module
 SCHEMA_VERSION = 1
 PROJECTION_LIMIT = 512
 PROJECTION_REPLACE_RETRY_DELAY_SECONDS = 1.0
-ABANDONED_INVOCATION_MIN_IDLE_SECONDS = 60 * 60
+ABANDONED_INVOCATION_MIN_IDLE_SECONDS = (
+    run_lock_module.DEFAULT_LEASE_SECONDS + 60
+)
 ABANDONED_RECONCILIATION_LEASE_SECONDS = 60
 _WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -208,6 +210,18 @@ CRITICAL_CHECKPOINTS = (
     "daily-loss-tripped",
     "daily-loss-snapshot-terminal",
     "daily-loss-coordination-terminal",
+)
+# ``daily-loss-result`` was the schema-v1 terminal marker before SECOND was
+# split into deterministic clear/tripped evidence and typed fail-closed
+# terminals.  Existing journals may contain it, so storage keeps accepting it
+# for immutable audit preservation.  Runtime authorization deliberately uses
+# only ``CRITICAL_CHECKPOINTS`` and never interprets the retired marker.
+RETIRED_CHECKPOINTS = ("daily-loss-result",)
+CHECKPOINT_STORAGE_VALUES = (*CRITICAL_CHECKPOINTS, *RETIRED_CHECKPOINTS)
+LEGACY_CHECKPOINT_STORAGE_VALUES = (
+    "entry-eligible",
+    "daily-loss-attempted",
+    "daily-loss-result",
 )
 SECOND_OUTCOMES = (
     "clear",
@@ -646,6 +660,294 @@ def _prepare_state_directory(directory: str) -> None:
         _PREFLIGHTED_STATE_DIRECTORIES.add(key)
 
 
+_CHECKPOINT_CHECK_RE = re.compile(
+    r"CHECK\s*\(\s*checkpoint\s+IN\s*\((?P<values>.*?)\)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CHECKPOINT_LITERAL_RE = re.compile(r"'((?:''|[^'])*)'")
+_CHECKPOINT_MIGRATION_TABLE = "lifecycle_checkpoints_schema_v1_migration"
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    value = " ".join(sql.strip().lower().split())
+    return (
+        value.replace("create table if not exists", "create table")
+        .replace("create trigger if not exists", "create trigger")
+        .replace("create unique index if not exists", "create unique index")
+    )
+
+
+def _checkpoint_table_contract_sql(values: Sequence[str]) -> str:
+    allowed = ", ".join(repr(item) for item in values)
+    return f"""
+        CREATE TABLE lifecycle_checkpoints (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id TEXT NOT NULL,
+            checkpoint TEXT NOT NULL
+                CHECK (checkpoint IN ({allowed})),
+            occurred_at_utc TEXT NOT NULL
+        )
+    """
+
+
+def _checkpoint_constraint_values(
+    connection: sqlite3.Connection,
+) -> tuple[str, ...] | None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'lifecycle_checkpoints'"
+    ).fetchone()
+    if row is None:
+        return None
+    sql = row["sql"]
+    if not isinstance(sql, str):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has no auditable schema"
+        )
+    matches = list(_CHECKPOINT_CHECK_RE.finditer(sql))
+    if len(matches) != 1:
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsafe CHECK constraint"
+        )
+    body = matches[0].group("values")
+    literals = list(_CHECKPOINT_LITERAL_RE.finditer(body))
+    residue = _CHECKPOINT_LITERAL_RE.sub("", body)
+    if not literals or residue.replace(",", "").strip():
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsafe CHECK constraint"
+        )
+    values = tuple(
+        match.group(1).replace("''", "'") for match in literals
+    )
+    if len(values) != len(set(values)):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has a duplicated CHECK value"
+        )
+    return values
+
+
+def _validate_checkpoint_table_contract(
+    connection: sqlite3.Connection,
+) -> None:
+    info = connection.execute(
+        "PRAGMA table_xinfo(lifecycle_checkpoints)"
+    ).fetchall()
+    column_contract = [
+        (0, "sequence", "INTEGER", 0, None, 1, 0),
+        (1, "invocation_id", "TEXT", 1, None, 0, 0),
+        (2, "checkpoint", "TEXT", 1, None, 0, 0),
+        (3, "occurred_at_utc", "TEXT", 1, None, 0, 0),
+    ]
+    if [tuple(row) for row in info] != column_contract:
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsafe schema"
+        )
+    if connection.execute(
+        "PRAGMA foreign_key_list(lifecycle_checkpoints)"
+    ).fetchall():
+        raise LifecycleError(
+            "lifecycle checkpoint journal has unexpected foreign keys"
+        )
+    table_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'lifecycle_checkpoints'"
+    ).fetchone()
+    expected_table_sql = {
+        _normalize_schema_sql(
+            _checkpoint_table_contract_sql(values)
+        )
+        for values in (
+            LEGACY_CHECKPOINT_STORAGE_VALUES,
+            CRITICAL_CHECKPOINTS,
+            CHECKPOINT_STORAGE_VALUES,
+        )
+    }
+    if (
+        table_sql_row is None
+        or not isinstance(table_sql_row["sql"], str)
+        or _normalize_schema_sql(table_sql_row["sql"])
+        not in expected_table_sql
+    ):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsafe table contract"
+        )
+    indexes = connection.execute(
+        "PRAGMA index_list(lifecycle_checkpoints)"
+    ).fetchall()
+    if (
+        len(indexes) != 1
+        or indexes[0]["name"] != "lifecycle_one_checkpoint"
+        or indexes[0]["unique"] != 1
+        or indexes[0]["origin"] != "c"
+        or indexes[0]["partial"] != 0
+    ):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has unexpected indexes"
+        )
+    index_columns = tuple(
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA index_info(lifecycle_one_checkpoint)"
+        ).fetchall()
+    )
+    if index_columns != ("invocation_id", "checkpoint"):
+        raise LifecycleError(
+            "lifecycle checkpoint journal lacks its uniqueness guard"
+        )
+    schema_rows = {
+        row["name"]: row["sql"]
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'lifecycle_checkpoints'"
+        )
+    }
+    if set(schema_rows) != {
+        "lifecycle_checkpoints_no_update",
+        "lifecycle_checkpoints_no_delete",
+    }:
+        raise LifecycleError(
+            "lifecycle checkpoint journal has unsafe append-only guards"
+        )
+    index_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'lifecycle_one_checkpoint'"
+    ).fetchone()
+    expected_index_sql = _normalize_schema_sql(
+        "CREATE UNIQUE INDEX lifecycle_one_checkpoint "
+        "ON lifecycle_checkpoints(invocation_id, checkpoint)"
+    )
+    if (
+        index_sql_row is None
+        or not isinstance(index_sql_row["sql"], str)
+        or _normalize_schema_sql(index_sql_row["sql"]) != expected_index_sql
+    ):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsafe uniqueness guard"
+        )
+
+    expected_triggers = {
+        "lifecycle_checkpoints_no_update": _normalize_schema_sql(
+            """
+            CREATE TRIGGER lifecycle_checkpoints_no_update
+            BEFORE UPDATE ON lifecycle_checkpoints
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle checkpoints are append-only');
+            END
+            """
+        ),
+        "lifecycle_checkpoints_no_delete": _normalize_schema_sql(
+            """
+            CREATE TRIGGER lifecycle_checkpoints_no_delete
+            BEFORE DELETE ON lifecycle_checkpoints
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle checkpoints are append-only');
+            END
+            """
+        ),
+    }
+    if any(
+        not isinstance(schema_rows[name], str)
+        or _normalize_schema_sql(schema_rows[name]) != expected
+        for name, expected in expected_triggers.items()
+    ):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has unsafe append-only guards"
+        )
+    if connection.execute(
+        "SELECT name FROM sqlite_master WHERE name = ?",
+        (_CHECKPOINT_MIGRATION_TABLE,),
+    ).fetchone() is not None:
+        raise LifecycleError(
+            "lifecycle checkpoint migration staging table already exists"
+        )
+
+
+def _migrate_lifecycle_checkpoints_if_needed(
+    connection: sqlite3.Connection,
+    checkpoints_sql: str,
+) -> None:
+    values = _checkpoint_constraint_values(connection)
+    if values is None:
+        return
+    value_set = frozenset(values)
+    target = frozenset(CHECKPOINT_STORAGE_VALUES)
+    if value_set == target and len(values) == len(target):
+        return
+    recognized_sources = {
+        frozenset(LEGACY_CHECKPOINT_STORAGE_VALUES),
+        frozenset(CRITICAL_CHECKPOINTS),
+    }
+    if value_set not in recognized_sources or len(values) != len(value_set):
+        raise LifecycleError(
+            "lifecycle checkpoint journal has an unsupported CHECK domain"
+        )
+    _validate_checkpoint_table_contract(connection)
+    before = [
+        tuple(row)
+        for row in connection.execute(
+            "SELECT sequence, invocation_id, checkpoint, occurred_at_utc "
+            "FROM lifecycle_checkpoints ORDER BY sequence"
+        ).fetchall()
+    ]
+    sequence_row = connection.execute(
+        "SELECT seq FROM sqlite_sequence "
+        "WHERE name = 'lifecycle_checkpoints'"
+    ).fetchone()
+    prior_sequence = None if sequence_row is None else int(sequence_row["seq"])
+    connection.execute("DROP TRIGGER lifecycle_checkpoints_no_update")
+    connection.execute("DROP TRIGGER lifecycle_checkpoints_no_delete")
+    connection.execute("DROP INDEX lifecycle_one_checkpoint")
+    connection.execute(
+        "ALTER TABLE lifecycle_checkpoints RENAME TO "
+        + _CHECKPOINT_MIGRATION_TABLE
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE lifecycle_checkpoints (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id TEXT NOT NULL,
+            checkpoint TEXT NOT NULL
+                CHECK (checkpoint IN ({checkpoints_sql})),
+            occurred_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO lifecycle_checkpoints "
+        "(sequence, invocation_id, checkpoint, occurred_at_utc) "
+        "SELECT sequence, invocation_id, checkpoint, occurred_at_utc FROM "
+        + _CHECKPOINT_MIGRATION_TABLE
+        + " ORDER BY sequence"
+    )
+    after = [
+        tuple(row)
+        for row in connection.execute(
+            "SELECT sequence, invocation_id, checkpoint, occurred_at_utc "
+            "FROM lifecycle_checkpoints ORDER BY sequence"
+        ).fetchall()
+    ]
+    if after != before:
+        raise LifecycleError(
+            "lifecycle checkpoint migration did not preserve every row"
+        )
+    connection.execute("DROP TABLE " + _CHECKPOINT_MIGRATION_TABLE)
+    if prior_sequence is not None:
+        current_sequence = connection.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name = 'lifecycle_checkpoints'"
+        ).fetchone()
+        if current_sequence is None:
+            connection.execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
+                ("lifecycle_checkpoints", prior_sequence),
+            )
+        elif int(current_sequence["seq"]) < prior_sequence:
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = ?",
+                (prior_sequence, "lifecycle_checkpoints"),
+            )
+
+
 def _connect(state_file: str) -> sqlite3.Connection:
     path = os.path.abspath(state_file)
     directory = os.path.dirname(path)
@@ -664,7 +966,9 @@ def _connect(state_file: str) -> sqlite3.Connection:
     classifications_sql = ", ".join(repr(item) for item in CLASSIFICATIONS)
     phases_sql = ", ".join(repr(item) for item in PHASES)
     reasons_sql = ", ".join(repr(item) for item in REASON_CODES)
-    checkpoints_sql = ", ".join(repr(item) for item in CRITICAL_CHECKPOINTS)
+    checkpoints_sql = ", ".join(
+        repr(item) for item in CHECKPOINT_STORAGE_VALUES
+    )
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
@@ -754,6 +1058,9 @@ def _connect(state_file: str) -> sqlite3.Connection:
                 occurred_at_utc TEXT NOT NULL
             )
             """
+        )
+        _migrate_lifecycle_checkpoints_if_needed(
+            connection, checkpoints_sql
         )
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_one_checkpoint "
@@ -857,6 +1164,7 @@ def _connect(state_file: str) -> sqlite3.Connection:
                 END
                 """
             )
+        _validate_checkpoint_table_contract(connection)
         row = connection.execute(
             "SELECT value FROM lifecycle_metadata WHERE key = 'schema_version'"
         ).fetchone()
@@ -941,30 +1249,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         raise LifecycleError(
             "lifecycle checkpoint journal has an unsafe primary key"
         )
-    checkpoint_indexes = {
-        row["name"]
-        for row in connection.execute(
-            "PRAGMA index_list(lifecycle_checkpoints)"
-        )
-    }
-    if "lifecycle_one_checkpoint" not in checkpoint_indexes:
-        raise LifecycleError(
-            "lifecycle checkpoint journal lacks its uniqueness guard"
-        )
-    checkpoint_triggers = {
-        row["name"]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-            "AND tbl_name = 'lifecycle_checkpoints'"
-        )
-    }
-    if not {
-        "lifecycle_checkpoints_no_update",
-        "lifecycle_checkpoints_no_delete",
-    }.issubset(checkpoint_triggers):
-        raise LifecycleError(
-            "lifecycle checkpoint journal lacks append-only guards"
-        )
+    _validate_checkpoint_table_contract(connection)
     additive_tables = {
         "lifecycle_lease_bindings": {
             "sequence", "invocation_id", "lease_token_sha256",
@@ -2594,8 +2879,14 @@ def _guard_critical_transition(
     classification: str,
     reason_code: str | None,
     checkpoint_rows: Sequence[sqlite3.Row],
+    pending_checkpoint: str | None = None,
 ) -> None:
-    checkpoints = _checkpoint_names(checkpoint_rows)
+    checkpoints = set(_checkpoint_names(checkpoint_rows))
+    if pending_checkpoint is not None:
+        if pending_checkpoint not in _SECOND_TERMINAL_CHECKPOINTS:
+            raise LifecycleError("pending SECOND checkpoint is invalid")
+        checkpoints.add(pending_checkpoint)
+    checkpoints = frozenset(checkpoints)
     terminal_checkpoints = checkpoints & _SECOND_TERMINAL_CHECKPOINTS
     if action == "event" and phase == "daily-loss":
         raise LifecycleConflict(
@@ -3514,6 +3805,36 @@ def complete_second_result(
     }
 
 
+def _record_abandoned_second_terminal_if_exact(
+    connection: sqlite3.Connection,
+    invocation_id: str,
+    occurred_at: str,
+) -> bool:
+    """Coherently close the exact orphaned SECOND shape, never guess finance."""
+    rows = _invocation_rows(connection, invocation_id)
+    checkpoints = _checkpoint_names(
+        _checkpoint_rows(connection, invocation_id)
+    )
+    if (
+        rows
+        and rows[-1]["phase"] == "daily-loss"
+        and checkpoints == {"entry-eligible", "daily-loss-attempted"}
+        and _second_context_row(connection, invocation_id) is not None
+        and _second_evidence_row(connection, invocation_id) is None
+    ):
+        connection.execute(
+            "INSERT INTO lifecycle_checkpoints "
+            "(invocation_id, checkpoint, occurred_at_utc) VALUES (?, ?, ?)",
+            (
+                invocation_id,
+                "daily-loss-coordination-terminal",
+                occurred_at,
+            ),
+        )
+        return True
+    return False
+
+
 def reconcile_abandoned_invocation(
     *,
     invocation_id: str,
@@ -3600,6 +3921,16 @@ def reconcile_abandoned_invocation(
                 )
             reconciliation_token = _canonical_uuid(
                 acquisition.get("token"), "reconciliation lease token"
+            )
+            _record_abandoned_second_terminal_if_exact(
+                connection, invocation_id, occurred_at
+            )
+            _guard_critical_transition(
+                action="finish",
+                phase="finished",
+                classification="coordination-halt",
+                reason_code="coordination-state",
+                checkpoint_rows=_checkpoint_rows(connection, invocation_id),
             )
             cursor = connection.execute(
                 """
@@ -3758,6 +4089,18 @@ def reconcile_abandoned_invocations(
                     acquisition.get("token"), "reconciliation lease token"
                 )
                 for candidate_id in reconciled_ids:
+                    _record_abandoned_second_terminal_if_exact(
+                        connection, candidate_id, occurred_at
+                    )
+                    _guard_critical_transition(
+                        action="finish",
+                        phase="finished",
+                        classification="coordination-halt",
+                        reason_code="coordination-state",
+                        checkpoint_rows=_checkpoint_rows(
+                            connection, candidate_id
+                        ),
+                    )
                     connection.execute(
                         """
                         INSERT INTO lifecycle_events (
@@ -3917,6 +4260,32 @@ def _append_event(
         connection.close()
 
 
+def _insert_finish_row(
+    connection: sqlite3.Connection,
+    *,
+    invocation_id: str,
+    classification: str,
+    occurred_at: str,
+    phase: str,
+    reason_code: str | None,
+    report_file: str | None,
+    status_file: str | None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO lifecycle_events (
+            invocation_id, event_type, classification, occurred_at_utc,
+            run_start_pt, phase, reason_code, report_file, status_file
+        ) VALUES (?, 'finish', ?, ?, NULL, ?, ?, ?, ?)
+        """,
+        (
+            invocation_id, classification, occurred_at, phase,
+            reason_code, report_file, status_file,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
 def _publish_after_append(
     action: str,
     invocation_id: str,
@@ -4051,6 +4420,45 @@ def record_event(
     }
 
 
+def _pending_fail_closed_second_checkpoint(
+    *,
+    connection: sqlite3.Connection,
+    invocation_id: str,
+    classification: str,
+    reason_code: str | None,
+) -> str | None:
+    """Derive only a non-authorizing SECOND terminal for final recovery."""
+    rows = _invocation_rows(connection, invocation_id)
+    _require_open_invocation(rows)
+    checkpoint_rows = _checkpoint_rows(connection, invocation_id)
+    checkpoints = _checkpoint_names(checkpoint_rows)
+    terminal = checkpoints & _SECOND_TERMINAL_CHECKPOINTS
+    if terminal or "entry-eligible" not in checkpoints:
+        return None
+    if (
+        classification == "coordination-halt"
+        and reason_code == "coordination-state"
+    ):
+        checkpoint = "daily-loss-coordination-terminal"
+    else:
+        return None
+    if rows[-1]["phase"] != "daily-loss":
+        raise LifecycleConflict(
+            "fail-closed SECOND recovery requires the current daily-loss phase"
+        )
+    if checkpoints != {"entry-eligible", "daily-loss-attempted"}:
+        raise LifecycleError(
+            "DAILY-LOSS attempt boundary contains unsupported checkpoints"
+        )
+    if _second_context_row(connection, invocation_id) is None:
+        raise LifecycleError("DAILY-LOSS scratch binding is missing")
+    if _second_evidence_row(connection, invocation_id) is not None:
+        raise LifecycleError(
+            "DAILY-LOSS evidence exists without its deterministic checkpoint"
+        )
+    return checkpoint
+
+
 def _validate_finish_request(
     *,
     invocation_id: str,
@@ -4061,6 +4469,7 @@ def _validate_finish_request(
     status_file: str | None = None,
     state_file: str = DEFAULT_STATE_FILE,
     report_dir: str = DEFAULT_REPORT_DIR,
+    pending_second_checkpoint: str | None = None,
 ) -> tuple[str, str, str | None, str, str | None, str | None]:
     invocation_id = _canonical_uuid(invocation_id, "invocation_id")
     classification = _enum(
@@ -4080,6 +4489,7 @@ def _validate_finish_request(
             classification=classification,
             reason_code=reason_code,
             checkpoint_rows=_checkpoint_rows(connection, invocation_id),
+            pending_checkpoint=pending_second_checkpoint,
         )
     finally:
         connection.close()
@@ -4303,9 +4713,11 @@ def release_and_finish_invocation(
     """Owner-fenced release followed by lifecycle finish in one process.
 
     The finish request and active owner/context are fully validated before the
-    release.  SQLite cannot atomically commit across the independent lease and
-    lifecycle databases: interruption after release can therefore leave an
-    unleased unfinished invocation, never a false success.  The conservative
+    release.  The one exact attempted-SECOND coordination fallback is staged
+    with finish in the lifecycle transaction and remains non-authorizing.
+    SQLite cannot atomically commit across the independent lease and lifecycle
+    databases: interruption after release can therefore leave an unleased
+    unfinished invocation, never a false success.  The conservative
     abandoned-invocation reconciler is the bounded recovery for that gap.
     """
     lock_file = _resolved_lock_file(state_file, lock_file)
@@ -4318,6 +4730,16 @@ def release_and_finish_invocation(
         lock_file=lock_file,
         now_utc=now_utc,
     )
+    preflight_connection = _connect(state_file)
+    try:
+        pending_second_checkpoint = _pending_fail_closed_second_checkpoint(
+            connection=preflight_connection,
+            invocation_id=lifecycle["invocation_id"],
+            classification=classification,
+            reason_code=reason_code,
+        )
+    finally:
+        preflight_connection.close()
     validated = _validate_finish_request(
         invocation_id=lifecycle["invocation_id"],
         classification=classification,
@@ -4327,41 +4749,95 @@ def release_and_finish_invocation(
         status_file=status_file,
         state_file=state_file,
         report_dir=report_dir,
+        pending_second_checkpoint=pending_second_checkpoint,
     )
-    try:
-        release = run_lock_module.release(
-            run_token, lock_file=lock_file, now=lock_now
-        )
-    except Exception as exc:
-        raise LifecycleError("owner-fenced lease release failed") from exc
-    if (
-        not isinstance(release, dict)
-        or release.get("schema_version") != run_lock_module.SCHEMA_VERSION
-        or release.get("action") != "release"
-        or release.get("ok") is not True
-        or release.get("token") != run_token
-    ):
-        raise LifecycleConflict("owner-fenced lease release was rejected")
     occurred_at = _now_utc(now_utc)
+    occurred_value = datetime.fromisoformat(
+        occurred_at.replace("Z", "+00:00")
+    )
+    connection = _connect(state_file)
+    lease_released = False
+    second_terminal_recorded = False
     try:
-        sequence = _append_event(
-            action="finish",
-            state_file=state_file,
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _invocation_rows(connection, validated[0])
+        _require_open_invocation(rows)
+        transactional_pending = _pending_fail_closed_second_checkpoint(
+            connection=connection,
             invocation_id=validated[0],
-            occurred_at_utc=occurred_at,
             classification=validated[1],
+            reason_code=validated[2],
+        )
+        if transactional_pending != pending_second_checkpoint:
+            raise LifecycleConflict(
+                "SECOND terminal state changed during release-finish"
+            )
+        checkpoint_rows = _checkpoint_rows(connection, validated[0])
+        latest_activity = max(
+            datetime.fromisoformat(
+                row["occurred_at_utc"].replace("Z", "+00:00")
+            )
+            for row in [*rows, *checkpoint_rows]
+        )
+        if occurred_value < latest_activity:
+            raise LifecycleError(
+                "release-finish time cannot precede lifecycle activity"
+            )
+        if pending_second_checkpoint is not None:
+            connection.execute(
+                "INSERT INTO lifecycle_checkpoints "
+                "(invocation_id, checkpoint, occurred_at_utc) "
+                "VALUES (?, ?, ?)",
+                (validated[0], pending_second_checkpoint, occurred_at),
+            )
+            second_terminal_recorded = True
+            checkpoint_rows = _checkpoint_rows(connection, validated[0])
+        _guard_critical_transition(
+            action="finish",
+            phase=validated[3],
+            classification=validated[1],
+            reason_code=validated[2],
+            checkpoint_rows=checkpoint_rows,
+        )
+        try:
+            release = run_lock_module.release(
+                run_token, lock_file=lock_file, now=lock_now
+            )
+        except Exception as exc:
+            raise LifecycleError("owner-fenced lease release failed") from exc
+        if (
+            not isinstance(release, dict)
+            or release.get("schema_version") != run_lock_module.SCHEMA_VERSION
+            or release.get("action") != "release"
+            or release.get("ok") is not True
+            or release.get("token") != run_token
+        ):
+            raise LifecycleConflict("owner-fenced lease release was rejected")
+        lease_released = True
+        sequence = _insert_finish_row(
+            connection,
+            invocation_id=validated[0],
+            classification=validated[1],
+            occurred_at=occurred_at,
             phase=validated[3],
             reason_code=validated[2],
             report_file=validated[4],
             status_file=validated[5],
         )
+        connection.commit()
     except Exception as exc:
-        raise ReleaseFinishError(
-            f"lease released but lifecycle finish was not recorded: {exc}",
-            lifecycle["invocation_id"],
-            recorded=False,
-            reason="post_release_finish_failed",
-        ) from exc
+        if connection.in_transaction:
+            connection.rollback()
+        if lease_released:
+            raise ReleaseFinishError(
+                f"lease released but lifecycle finish was not recorded: {exc}",
+                lifecycle["invocation_id"],
+                recorded=False,
+                reason="post_release_finish_failed",
+            ) from exc
+        raise
+    finally:
+        connection.close()
     try:
         _publish_after_append(
             "release-finish", lifecycle["invocation_id"],
@@ -4389,6 +4865,8 @@ def release_and_finish_invocation(
         "status_file": validated[5],
         "lease_released": True,
         "recorded": True,
+        "second_terminal_checkpoint": pending_second_checkpoint,
+        "second_terminal_recorded": second_terminal_recorded,
     }
 
 

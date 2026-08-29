@@ -2129,6 +2129,63 @@ Python wrapper was added: it could not write executor-local `store`/`load` state
 validator and lifecycle helper already own deterministic validation, canonical identity,
 ownership, append, and projection behavior.
 
+## 2026-08-28 14:36 AND 16:18 PT CODEX TERRA — LEGACY CHECKPOINT CONSTRAINT AND STRANDED SECOND
+
+**Both attempts used the current `cce5b97-dirty` rules and successfully completed the exact
+configuration-state bind, then reached the owner-fenced attempted-SECOND boundary.** They were not
+configuration failures, stale-code runs, Robinhood outages, order failures, or evidence that Terra
+could not parse the selected model identity. The account remained flat and neither attempt
+reviewed, prepared, began, submitted, cancelled, or placed an order.
+
+At 14:36, `enter-second` durably recorded `entry-eligible` and `daily-loss-attempted` with its bound
+context. The runner then omitted the required deterministic `daily_loss.py` operation and tried to
+finish as `coordination-halt` / `coordination-state`. The lifecycle guard correctly rejected that
+finish because SECOND had no terminal checkpoint. The runner next called the prescribed public
+`complete-second --outcome coordination-terminal`, but SQLite rejected the insert. The long-lived
+schema-v1 `lifecycle_checkpoints` table still had its original `CHECK`, which allowed only
+`entry-eligible`, `daily-loss-attempted`, and the retired `daily-loss-result`. The newer code used
+`CREATE TABLE IF NOT EXISTS`, so it had added new Python checkpoint names without migrating an
+already-existing table. Fresh temporary test databases silently hid this upgrade-path defect. The
+invocation stayed open until a later start reconciled it.
+
+At 16:18, the next attempt reached the same exact SECOND state. It omitted the deterministic helper
+and public terminal operation, wrote a coordination report, and attempted finalization directly.
+The strict guard again rejected the missing checkpoint. The Codex task then completed and its
+20-minute lease expired, but the lifecycle row remained `running`, producing the truthful
+`unfinished lifecycle` dashboard label rather than a false successful finish.
+
+**Rules produced:** the schema-v1 opener now recognizes only the exact legacy, pre-migration, and
+current checkpoint table contracts. Inside one `BEGIN IMMEDIATE` transaction it validates the
+columns, primary key, unique index, append-only triggers, and exact `CHECK`; rebuilds only a known
+legacy table; copies every row with its explicit sequence; preserves the AUTOINCREMENT counter; and
+recreates the guards. Unknown, broadened, partial, nullable, generated, or inert same-name schemas
+fail closed without a partial migration. A historical `daily-loss-result` row remains permitted in
+storage only for immutable audit preservation. It is never translated to clear/tripped, included in
+the active terminal set, or accepted by entry authorization.
+
+Owner-fenced `release-finish` also gained one narrow last-resort coherence path. When and only when
+the requested pair is exactly `coordination-halt` / `coordination-state`, the lifecycle is currently
+at DAILY-LOSS, its checkpoint set is exactly `entry-eligible` plus `daily-loss-attempted`, the bound
+SECOND context exists, and neither evidence nor another terminal exists, it stages
+`daily-loss-coordination-terminal`, releases the exact lease, appends finish, and commits the
+checkpoint plus finish together. Release failure rolls both lifecycle writes back and retains the
+lease. A post-release lifecycle commit failure leaves an unleased orphan for reconciliation. The
+fallback cannot manufacture snapshot, clear, tripped, risk-halt, completed, or final-status
+outcomes and does not excuse skipping the required DAILY-LOSS operation.
+
+Abandoned-run recovery now waits until one minute beyond the normal 20-minute lease, acquires a
+short fencing lease proving no owner is live, and applies the same non-authorizing coordination
+terminal to the exact orphaned SECOND shape in the same transaction as its finish. The normal
+30-minute successor can therefore repair a stopped task instead of leaving it red for an hour.
+Malformed, retired-marker, snapshot-terminal, or financial-terminal shapes are not silently
+reclassified.
+
+Because the 14:36 terminal insert was defeated by a deterministic missing migration, these late
+runs alone are not a fair post-repair verdict on Terra. A supervised entry-eligible Terra run after
+this repair is the relevant next evidence. If Terra again omits the deterministic helper or required
+terminal call with the migration and atomic closure present, that recurrence is separate model
+instruction-following evidence and supports switching the scheduled candidate to Sol.
+
 ## The pattern across all of these
 
 Most of these are the same bug class: **the spec didn't say, so the agent improvised.** One

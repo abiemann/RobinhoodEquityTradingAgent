@@ -12826,6 +12826,16 @@ class MarketClockTests(unittest.TestCase):
             public_completion,
         )
         self.assertIn("`lease_renewed: true`", public_completion)
+        for required in (
+            "last-resort state-coherence guard only",
+            "requested pair is exactly `coordination-halt` / "
+            "`coordination-state`",
+            "never creates a snapshot outcome",
+            "cannot substitute for this required operation or justify a "
+            "snapshot label",
+            "one minute beyond the normal 20-minute lease",
+        ):
+            self.assertIn(required, routine)
         self.assertIn(
             "Do not pass a test-only state or clock override during a "
             "trading run, including `--state-file`, `--now-utc`, or "
@@ -12863,6 +12873,14 @@ class MarketClockTests(unittest.TestCase):
 
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
             readme = handle.read()
+        for required in (
+            "preserves every row and sequence including any retired marker "
+            "as non-authorizing audit data",
+            "only the exact missing attempted-SECOND coordination terminal",
+            "a supervised post-repair entry-eligible Terra run remains "
+            "pending",
+        ):
+            self.assertIn(required, readme)
         self.assertIn(
             "Every `dip-buy` begin and retry internally invokes the "
             "checked-in lifecycle entry authorizer",

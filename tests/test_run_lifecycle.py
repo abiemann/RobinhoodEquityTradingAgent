@@ -398,6 +398,68 @@ class LifecycleHardeningTests(unittest.TestCase):
             now_utc="2026-08-28T13:00:07Z",
         )
 
+    def _rebuild_checkpoint_table(self, values, *, extra_constraint=""):
+        allowed = ", ".join(repr(item) for item in values)
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            rows = connection.execute(
+                "SELECT sequence, invocation_id, checkpoint, occurred_at_utc "
+                "FROM lifecycle_checkpoints ORDER BY sequence"
+            ).fetchall()
+            sequence = connection.execute(
+                "SELECT seq FROM sqlite_sequence "
+                "WHERE name = 'lifecycle_checkpoints'"
+            ).fetchone()
+            connection.execute("DROP TRIGGER lifecycle_checkpoints_no_update")
+            connection.execute("DROP TRIGGER lifecycle_checkpoints_no_delete")
+            connection.execute("DROP INDEX lifecycle_one_checkpoint")
+            connection.execute("DROP TABLE lifecycle_checkpoints")
+            connection.execute(
+                f"""
+                CREATE TABLE lifecycle_checkpoints (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invocation_id TEXT NOT NULL,
+                    checkpoint TEXT NOT NULL
+                        CHECK (checkpoint IN ({allowed})),
+                    occurred_at_utc TEXT NOT NULL
+                    {extra_constraint}
+                )
+                """
+            )
+            connection.executemany(
+                "INSERT INTO lifecycle_checkpoints "
+                "(sequence, invocation_id, checkpoint, occurred_at_utc) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            if sequence is not None:
+                connection.execute(
+                    "UPDATE sqlite_sequence SET seq = ? WHERE name = ?",
+                    (int(sequence[0]), "lifecycle_checkpoints"),
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX lifecycle_one_checkpoint "
+                "ON lifecycle_checkpoints(invocation_id, checkpoint)"
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER lifecycle_checkpoints_no_update
+                BEFORE UPDATE ON lifecycle_checkpoints
+                BEGIN
+                    SELECT RAISE(ABORT, 'lifecycle checkpoints are append-only');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER lifecycle_checkpoints_no_delete
+                BEFORE DELETE ON lifecycle_checkpoints
+                BEGIN
+                    SELECT RAISE(ABORT, 'lifecycle checkpoints are append-only');
+                END
+                """
+            )
+            connection.commit()
+
     def test_enter_second_is_owner_fenced_bound_idempotent_and_token_private(self):
         invocation_id, token = self._start_first()
         scratch = self._bound_scratch()
@@ -447,6 +509,248 @@ class LifecycleHardeningTests(unittest.TestCase):
                 (invocation_id,),
             ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_legacy_checkpoint_schema_migrates_without_losing_audit_rows(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        self._rebuild_checkpoint_table(
+            run_lifecycle.LEGACY_CHECKPOINT_STORAGE_VALUES
+        )
+        retired_invocation = str(uuid.uuid4())
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            original = connection.execute(
+                "SELECT sequence, invocation_id, checkpoint, occurred_at_utc "
+                "FROM lifecycle_checkpoints ORDER BY sequence"
+            ).fetchall()
+            connection.execute(
+                "INSERT INTO lifecycle_checkpoints "
+                "(sequence, invocation_id, checkpoint, occurred_at_utc) "
+                "VALUES (25, ?, 'daily-loss-result', ?)",
+                (retired_invocation, "2026-08-27T13:00:00Z"),
+            )
+            connection.commit()
+            original.append(
+                (
+                    25, retired_invocation, "daily-loss-result",
+                    "2026-08-27T13:00:00Z",
+                )
+            )
+
+        completion = run_lifecycle.complete_second(
+            invocation_id=invocation_id,
+            run_token=token,
+            outcome="coordination-terminal",
+            state_file=self.state_file,
+            projection_file=self.projection_file,
+            context_file=self.context_file,
+            lock_file=self.lock_file,
+            now_utc="2026-08-28T13:00:06Z",
+        )
+        self.assertTrue(completion["recorded"])
+        self.assertGreater(completion["sequence"], 25)
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            connection.row_factory = sqlite3.Row
+            migrated = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT sequence, invocation_id, checkpoint, "
+                    "occurred_at_utc FROM lifecycle_checkpoints "
+                    "ORDER BY sequence"
+                ).fetchall()
+            ]
+            self.assertEqual(migrated[:3], [tuple(row) for row in original])
+            self.assertEqual(
+                frozenset(
+                    run_lifecycle._checkpoint_constraint_values(connection)
+                ),
+                frozenset(run_lifecycle.CHECKPOINT_STORAGE_VALUES),
+            )
+            sequence = connection.execute(
+                "SELECT seq FROM sqlite_sequence "
+                "WHERE name = 'lifecycle_checkpoints'"
+            ).fetchone()[0]
+            self.assertGreaterEqual(sequence, completion["sequence"])
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "DELETE FROM lifecycle_checkpoints WHERE sequence = 25"
+                )
+        reopened = run_lifecycle._connect(self.state_file)
+        reopened.close()
+        retry = run_lifecycle.complete_second(
+            invocation_id=invocation_id,
+            run_token=token,
+            outcome="coordination-terminal",
+            state_file=self.state_file,
+            projection_file=self.projection_file,
+            context_file=self.context_file,
+            lock_file=self.lock_file,
+            now_utc="2026-08-28T13:00:07Z",
+        )
+        self.assertFalse(retry["recorded"])
+        self.assertEqual(retry["sequence"], completion["sequence"])
+
+    def test_preterminal_six_value_checkpoint_schema_is_upgraded(self):
+        self._enter_second()
+        self._rebuild_checkpoint_table(run_lifecycle.CRITICAL_CHECKPOINTS)
+        connection = run_lifecycle._connect(self.state_file)
+        try:
+            self.assertEqual(
+                frozenset(
+                    run_lifecycle._checkpoint_constraint_values(connection)
+                ),
+                frozenset(run_lifecycle.CHECKPOINT_STORAGE_VALUES),
+            )
+        finally:
+            connection.close()
+
+    def test_checkpoint_migration_rejects_unknown_table_contract_atomically(self):
+        self._enter_second()
+        self._rebuild_checkpoint_table(
+            run_lifecycle.LEGACY_CHECKPOINT_STORAGE_VALUES,
+            extra_constraint=", CHECK (length(invocation_id) > 0)",
+        )
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            before_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'lifecycle_checkpoints'"
+            ).fetchone()[0]
+            before_rows = connection.execute(
+                "SELECT * FROM lifecycle_checkpoints ORDER BY sequence"
+            ).fetchall()
+        with self.assertRaisesRegex(
+            run_lifecycle.LifecycleError, "unsafe table contract"
+        ):
+            run_lifecycle._connect(self.state_file)
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            after_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'lifecycle_checkpoints'"
+            ).fetchone()[0]
+            after_rows = connection.execute(
+                "SELECT * FROM lifecycle_checkpoints ORDER BY sequence"
+            ).fetchall()
+        self.assertEqual(after_sql, before_sql)
+        self.assertEqual(after_rows, before_rows)
+
+    def test_target_checkpoint_schema_rejects_inert_named_trigger(self):
+        self._enter_second()
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            connection.execute("DROP TRIGGER lifecycle_checkpoints_no_update")
+            connection.execute(
+                """
+                CREATE TRIGGER lifecycle_checkpoints_no_update
+                BEFORE UPDATE ON lifecycle_checkpoints
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        with self.assertRaisesRegex(
+            run_lifecycle.LifecycleError, "unsafe append-only guards"
+        ):
+            run_lifecycle._connect(self.state_file)
+
+    def test_release_finish_atomically_binds_missing_coordination_terminal(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        result = self._finish_release(
+            invocation_id,
+            token,
+            "coordination-halt",
+            "coordination-state",
+        )
+        self.assertEqual(
+            result["second_terminal_checkpoint"],
+            "daily-loss-coordination-terminal",
+        )
+        self.assertTrue(result["second_terminal_recorded"])
+        self.assertNotIn(token, json.dumps(result))
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            checkpoints = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT checkpoint FROM lifecycle_checkpoints "
+                    "WHERE invocation_id = ?",
+                    (invocation_id,),
+                )
+            }
+            evidence_count = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_second_evidence "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()[0]
+            finish_count = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_events "
+                "WHERE invocation_id = ? AND event_type = 'finish'",
+                (invocation_id,),
+            ).fetchone()[0]
+        self.assertEqual(
+            checkpoints,
+            {
+                "entry-eligible", "daily-loss-attempted",
+                "daily-loss-coordination-terminal",
+            },
+        )
+        self.assertEqual(evidence_count, 0)
+        self.assertEqual(finish_count, 1)
+
+    def test_release_finish_does_not_infer_snapshot_or_financial_terminal(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        with self.assertRaises(run_lifecycle.LifecycleConflict):
+            self._finish_release(
+                invocation_id,
+                token,
+                "snapshot-failure",
+                "snapshot-validation-failed",
+            )
+        self.assertEqual(
+            run_lifecycle._active_lease_token(
+                self.lock_file, "2026-08-28T13:00:07Z"
+            ),
+            token,
+        )
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            terminal_count = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_checkpoints "
+                "WHERE invocation_id = ? AND checkpoint LIKE 'daily-loss-%' "
+                "AND checkpoint NOT IN ('daily-loss-attempted')",
+                (invocation_id,),
+            ).fetchone()[0]
+        self.assertEqual(terminal_count, 0)
+
+    def test_retired_checkpoint_cannot_authorize_or_use_atomic_fallback(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            connection.execute(
+                "INSERT INTO lifecycle_checkpoints "
+                "(invocation_id, checkpoint, occurred_at_utc) "
+                "VALUES (?, 'daily-loss-result', ?)",
+                (invocation_id, "2026-08-28T13:00:06Z"),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(
+            run_lifecycle.LifecycleError, "unsupported checkpoints"
+        ):
+            self._finish_release(
+                invocation_id,
+                token,
+                "coordination-halt",
+                "coordination-state",
+            )
+        with self.assertRaises(run_lifecycle.LifecycleConflict):
+            run_lifecycle.authorize_entry_intent(
+                run_token=token,
+                state_file=self.state_file,
+                projection_file=self.projection_file,
+                context_file=self.context_file,
+                lock_file=self.lock_file,
+                now_utc="2026-08-28T13:00:07Z",
+            )
+        self.assertEqual(
+            run_lifecycle._active_lease_token(
+                self.lock_file, "2026-08-28T13:00:07Z"
+            ),
+            token,
+        )
 
     def test_cross_invocation_scratch_reuse_is_rejected_atomically(self):
         first_id, first_token, scratch, _receipt = self._enter_second()
@@ -970,13 +1274,15 @@ class LifecycleHardeningTests(unittest.TestCase):
             invocation_id, token, scratch
         )
         self.assertEqual(code, 0, document)
-        real_append = run_lifecycle._append_event
-        self.addCleanup(setattr, run_lifecycle, "_append_event", real_append)
+        real_insert = run_lifecycle._insert_finish_row
+        self.addCleanup(
+            setattr, run_lifecycle, "_insert_finish_row", real_insert
+        )
 
-        def fail_append(**_kwargs):
+        def fail_insert(*_args, **_kwargs):
             raise sqlite3.OperationalError("injected pre-commit failure")
 
-        run_lifecycle._append_event = fail_append
+        run_lifecycle._insert_finish_row = fail_insert
         with self.assertRaises(run_lifecycle.ReleaseFinishError) as captured:
             self._finish_release(invocation_id, token, "completed")
         self.assertTrue(captured.exception.recorded is False)
@@ -984,6 +1290,64 @@ class LifecycleHardeningTests(unittest.TestCase):
         with self.assertRaises(run_lifecycle.LifecycleConflict):
             run_lifecycle._active_lease_token(
                 self.lock_file, "2026-08-28T13:00:07Z"
+            )
+
+    def test_post_release_failure_rolls_back_pending_second_then_reconciles(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        real_insert = run_lifecycle._insert_finish_row
+        self.addCleanup(
+            setattr, run_lifecycle, "_insert_finish_row", real_insert
+        )
+
+        def fail_insert(*_args, **_kwargs):
+            raise sqlite3.OperationalError("injected post-release failure")
+
+        run_lifecycle._insert_finish_row = fail_insert
+        with self.assertRaises(run_lifecycle.ReleaseFinishError) as captured:
+            self._finish_release(
+                invocation_id,
+                token,
+                "coordination-halt",
+                "coordination-state",
+            )
+        self.assertFalse(captured.exception.recorded)
+        self.assertNotIn(token, str(captured.exception))
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            terminal_count = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_checkpoints "
+                "WHERE invocation_id = ? "
+                "AND checkpoint = 'daily-loss-coordination-terminal'",
+                (invocation_id,),
+            ).fetchone()[0]
+            finish_count = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_events "
+                "WHERE invocation_id = ? AND event_type = 'finish'",
+                (invocation_id,),
+            ).fetchone()[0]
+        self.assertEqual(terminal_count, 0)
+        self.assertEqual(finish_count, 0)
+        with self.assertRaises(run_lifecycle.LifecycleConflict):
+            run_lifecycle._active_lease_token(
+                self.lock_file, "2026-08-28T13:00:07Z"
+            )
+        run_lifecycle._insert_finish_row = real_insert
+        recovered = run_lifecycle.reconcile_abandoned_invocation(
+            invocation_id=invocation_id,
+            state_file=self.state_file,
+            projection_file=self.projection_file,
+            lock_file=self.lock_file,
+            now_utc="2026-08-28T13:21:05Z",
+        )
+        self.assertTrue(recovered["reconciled"])
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM lifecycle_checkpoints "
+                    "WHERE invocation_id = ? "
+                    "AND checkpoint = 'daily-loss-coordination-terminal'",
+                    (invocation_id,),
+                ).fetchone()[0],
+                1,
             )
 
     def test_release_finish_prevalidation_failure_retains_lease(self):
@@ -1350,6 +1714,50 @@ class LifecycleHardeningTests(unittest.TestCase):
             token,
         )
 
+    def test_release_failure_rolls_back_automatic_second_terminal(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        real_release = run_lifecycle.run_lock_module.release
+        self.addCleanup(
+            setattr, run_lifecycle.run_lock_module, "release", real_release
+        )
+
+        def fail_release(*_args, **_kwargs):
+            raise sqlite3.OperationalError(
+                f"injected release failure containing {token}"
+            )
+
+        run_lifecycle.run_lock_module.release = fail_release
+        with self.assertRaisesRegex(
+            run_lifecycle.LifecycleError, "owner-fenced lease release failed"
+        ) as captured:
+            self._finish_release(
+                invocation_id,
+                token,
+                "coordination-halt",
+                "coordination-state",
+            )
+        self.assertNotIn(token, str(captured.exception))
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            checkpoint = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_checkpoints "
+                "WHERE invocation_id = ? "
+                "AND checkpoint = 'daily-loss-coordination-terminal'",
+                (invocation_id,),
+            ).fetchone()[0]
+            finished = connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_events "
+                "WHERE invocation_id = ? AND event_type = 'finish'",
+                (invocation_id,),
+            ).fetchone()[0]
+        self.assertEqual(checkpoint, 0)
+        self.assertEqual(finished, 0)
+        self.assertEqual(
+            run_lifecycle._active_lease_token(
+                self.lock_file, "2026-08-28T13:00:07Z"
+            ),
+            token,
+        )
+
     def test_release_finish_projection_failure_reports_recorded(self):
         invocation_id, token, scratch, _receipt = self._enter_second()
         code, document, _output, _paths = self._run_daily_loss(
@@ -1420,6 +1828,51 @@ class LifecycleHardeningTests(unittest.TestCase):
         self.assertEqual(old["classification"], "coordination-halt")
         self.assertIsNone(old["report_file"])
         self.assertIsNone(old["status_file"])
+
+    def test_abandoned_second_reconciliation_records_coordination_terminal(self):
+        invocation_id, token, _scratch, _receipt = self._enter_second()
+        released = run_lock.release(
+            token,
+            lock_file=self.lock_file,
+            now=self._timestamp("2026-08-28T13:00:06Z"),
+        )
+        self.assertTrue(released["ok"])
+        with self.assertRaisesRegex(
+            run_lifecycle.LifecycleConflict, "abandoned-idle threshold"
+        ):
+            run_lifecycle.reconcile_abandoned_invocation(
+                invocation_id=invocation_id,
+                state_file=self.state_file,
+                projection_file=self.projection_file,
+                lock_file=self.lock_file,
+                now_utc="2026-08-28T13:21:04Z",
+            )
+        receipt = run_lifecycle.reconcile_abandoned_invocation(
+            invocation_id=invocation_id,
+            state_file=self.state_file,
+            projection_file=self.projection_file,
+            lock_file=self.lock_file,
+            now_utc="2026-08-28T13:21:05Z",
+        )
+        self.assertTrue(receipt["reconciled"])
+        with closing(sqlite3.connect(self.state_file)) as connection:
+            checkpoints = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT checkpoint FROM lifecycle_checkpoints "
+                    "WHERE invocation_id = ?",
+                    (invocation_id,),
+                )
+            }
+            terminal = connection.execute(
+                "SELECT classification, reason_code FROM lifecycle_events "
+                "WHERE invocation_id = ? AND event_type = 'finish'",
+                (invocation_id,),
+            ).fetchone()
+        self.assertIn("daily-loss-coordination-terminal", checkpoints)
+        self.assertEqual(
+            terminal, ("coordination-halt", "coordination-state")
+        )
 
     def test_every_lifecycle_cli_action_rejects_now_override(self):
         actions = (
