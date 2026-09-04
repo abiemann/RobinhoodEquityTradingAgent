@@ -279,7 +279,10 @@ Claude connector and scheduler setup is intentionally not provided. Current test
 
 ### Scheduling
 
-Create a Codex scheduled task with this project folder as its working directory, enable **Act** mode, and select **Codex Sol 5.6** with **reasoning high** (`gpt-5.6-sol`, `reasoning=high`). Keep a new or repaired task paused until one supervised `DRY_RUN = true` run proves both the real accounts canary in `SOURCE_ROOT` and the final status candidate in scratch. A proof from another runner or model cohort is not transferable to this Sol configuration.
+> [!IMPORTANT]
+> **Required project folder:** Set the Codex project's **Primary folder** to the cloned `RobinhoodEquityTradingAgent` directory itself, regardless of its drive or parent directory—for example, `D:\Projects\RobinhoodEquityTradingAgent` or `C:\Projects\RobinhoodEquityTradingAgent`. Do not select a parent such as `D:\Projects` or `C:\Projects`. Scheduled routines run from the primary folder and invoke checked-in files through relative paths such as `./resolve_python.ps1`; selecting a parent directory causes launcher resolution to fail before the routine starts.
+
+Create a Codex scheduled task using that primary folder as its working directory, enable **Act** mode, and select **Codex Sol 5.6** with **reasoning high** (`gpt-5.6-sol`, `reasoning=high`). Keep a new or repaired task paused until one supervised `DRY_RUN = true` run proves both the real accounts canary in `SOURCE_ROOT` and the final status candidate in scratch. A proof from another runner or model cohort is not transferable to this Sol configuration.
 
 Do not create or enable a Claude scheduled task. The observed Sonnet 5, Haiku 4.5, and Opus 4.6 refusals occur at a higher-priority policy boundary and cannot be repaired by changing this scheduler prompt.
 
